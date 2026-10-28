@@ -193,7 +193,7 @@ describe("session config options", () => {
           configId: "mode",
           value: "plan",
         }),
-      ).rejects.toThrow("Session not found");
+      ).rejects.toMatchObject({ code: -32002, data: { sessionId: "nonexistent" } });
     });
 
     it("throws when config option not found", async () => {
@@ -203,7 +203,10 @@ describe("session config options", () => {
           configId: "unknown-option",
           value: "some-value",
         }),
-      ).rejects.toThrow("Unknown config option: unknown-option");
+      ).rejects.toMatchObject({
+        code: -32602,
+        message: expect.stringContaining("Unknown config option: unknown-option"),
+      });
     });
 
     it("throws when value is not valid for the option", async () => {
@@ -213,7 +216,10 @@ describe("session config options", () => {
           configId: "mode",
           value: "invalid-mode",
         }),
-      ).rejects.toThrow("Invalid value for config option mode: invalid-mode");
+      ).rejects.toMatchObject({
+        code: -32602,
+        message: expect.stringContaining("Invalid value for config option mode: invalid-mode"),
+      });
     });
 
     it("rejects mode and config changes once the query stream has closed (husk session)", async () => {
@@ -331,7 +337,25 @@ describe("session config options", () => {
           configId: "model",
           value: "gpt-4",
         }),
-      ).rejects.toThrow("Invalid value for config option model: gpt-4");
+      ).rejects.toMatchObject({
+        code: -32602,
+        message: expect.stringContaining("Invalid value for config option model: gpt-4"),
+      });
+    });
+
+    it("rejects a non-string value for a select option with invalid params", async () => {
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: SESSION_ID,
+          configId: "mode",
+          type: "boolean",
+          value: true,
+        }),
+      ).rejects.toMatchObject({ code: -32602 });
+    });
+
+    it("closes an unknown session without an error", async () => {
+      await expect(agent.closeSession({ sessionId: "nonexistent" })).resolves.toEqual({});
     });
 
     it("returns full configOptions in the response", async () => {

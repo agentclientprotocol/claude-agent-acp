@@ -3639,7 +3639,7 @@ describe("archive state (ACP RFD #2161)", () => {
     // A prompt fails as for a closed session.
     await expect(
       agent.prompt({ sessionId: session.id, prompt: [{ type: "text", text: "go on" }] }),
-    ).rejects.toThrow("Session not found");
+    ).rejects.toMatchObject({ code: -32002, data: { sessionId: session.id } });
 
     // Unarchive does not reopen it, and reports nothing to the closed session.
     await agent.unarchiveSession({ sessionId: session.id });

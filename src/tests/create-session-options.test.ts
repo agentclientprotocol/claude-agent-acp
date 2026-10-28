@@ -2060,7 +2060,7 @@ describe("createSession options merging", () => {
 
       await expect(
         loadAgent.loadSession({ sessionId: "replay-probe", cwd: process.cwd(), mcpServers: [] }),
-      ).rejects.toMatchObject({ code: RequestError.resourceNotFound().code });
+      ).rejects.toMatchObject({ code: -32002, data: { sessionId: "replay-probe" } });
       expect(updates).toEqual([]);
       expect((loadAgent as any).sessions["replay-probe"]).toBeUndefined();
     });
@@ -2082,7 +2082,8 @@ describe("createSession options merging", () => {
         mcpServers: [],
       });
       const failed = expect(loading).rejects.toMatchObject({
-        code: RequestError.resourceNotFound().code,
+        code: -32002,
+        data: { sessionId: "replay-probe" },
       });
 
       failInit();

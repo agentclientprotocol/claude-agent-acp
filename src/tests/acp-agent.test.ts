@@ -7627,7 +7627,7 @@ describe("subagent permission attribution (issue #851)", () => {
           configId: "model",
           value: "fallback-model",
         }),
-      ).rejects.toThrow("Session not found");
+      ).rejects.toMatchObject({ code: -32002, data: { sessionId: "agent-42" } });
     });
 
     it("announces the child as running, then sends it the prompt as a message", async () => {
@@ -14395,7 +14395,7 @@ describe("getOrCreateSession param change detection", () => {
     injectSession(agent, "s1", { cwd: "/project" });
     const createSessionSpy = vi
       .spyOn(agent as any, "createSession")
-      .mockRejectedValueOnce(RequestError.resourceNotFound("s1"))
+      .mockRejectedValueOnce(RequestError.sessionNotFound("s1"))
       .mockResolvedValueOnce({ sessionId: "s1", modes: undefined, configOptions: [] });
 
     await expect(
@@ -14425,11 +14425,11 @@ describe("getOrCreateSession param change detection", () => {
     const agent = createMockAgent();
     const createSessionSpy = vi
       .spyOn(agent as any, "createSession")
-      .mockRejectedValue(RequestError.resourceNotFound("s1"));
+      .mockRejectedValue(RequestError.sessionNotFound("s1"));
 
     await expect(
       agent.resumeSession({ sessionId: "s1", cwd: "/project", mcpServers: [] }),
-    ).rejects.toMatchObject({ code: RequestError.resourceNotFound().code });
+    ).rejects.toMatchObject({ code: -32002, data: { sessionId: "s1" } });
 
     expect(createSessionSpy).toHaveBeenCalledTimes(1);
   });
@@ -25181,7 +25181,7 @@ describe("turn steering (_session/steering)", () => {
     const agent = createMockAgent();
     await expect(
       agent.steer({ sessionId: "missing", prompt: [{ type: "text", text: "hi" }] }),
-    ).rejects.toThrow("Session not found");
+    ).rejects.toMatchObject({ code: -32002, data: { sessionId: "missing" } });
   });
 
   it("rejects when the query stream has already closed", async () => {

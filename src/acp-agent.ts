@@ -3833,7 +3833,7 @@ export class ClaudeAcpAgent {
     while (this.providerUpdate) await this.providerUpdate;
     let session = this.sessions[params.sessionId];
     if (!session) {
-      throw new Error("Session not found");
+      throw RequestError.sessionNotFound(params.sessionId);
     }
     // The one re-read per user prompt, fired here and never awaited: a prompt
     // must not wait on a CLI process, and its result is pushed on change
@@ -4146,7 +4146,7 @@ export class ClaudeAcpAgent {
     await respawn;
     const respawned = this.sessions[sessionId];
     if (!respawned) {
-      throw new Error("Session not found");
+      throw RequestError.sessionNotFound(sessionId);
     }
     return respawned;
   }
@@ -4182,7 +4182,7 @@ export class ClaudeAcpAgent {
    * `resume` names the Claude session, which shares the ACP session id, so the
    * new query continues the same conversation under the same id. Claude Code
    * writes the conversation at the first prompt, so resuming a session that was
-   * never prompted fails with `resourceNotFound`, and keeps failing. Such a
+   * never prompted fails with `sessionNotFound`, and keeps failing. Such a
    * session starts a fresh query under the same id instead: it has no history
    * to lose, and the client keeps a session it can use.
    */
@@ -4197,7 +4197,9 @@ export class ClaudeAcpAgent {
     try {
       return await this.createSession(params, { resume: sessionId, ...options });
     } catch (error) {
-      if (!(error instanceof RequestError && error.code === RequestError.resourceNotFound().code)) {
+      if (!(
+        error instanceof RequestError && error.code === RequestError.sessionNotFound(sessionId).code
+      )) {
         throw error;
       }
       this.logger.log(
@@ -4375,7 +4377,7 @@ export class ClaudeAcpAgent {
     const sessionId = params.sessionId;
     let session = this.sessions[sessionId];
     if (!session) {
-      throw new Error("Session not found");
+      throw RequestError.sessionNotFound(sessionId);
     }
     const signOutRespawn = this.respawnSignedOutSession(sessionId, session);
     if (signOutRespawn) session = await signOutRespawn;
@@ -9214,7 +9216,7 @@ export class ClaudeAcpAgent {
   ): Promise<SetSessionConfigOptionResponse> {
     const session = this.sessions[params.sessionId];
     if (!session) {
-      throw new Error("Session not found");
+      throw RequestError.sessionNotFound(params.sessionId);
     }
     // The SDK query stream already ended (see closeQueryStream); the session is
     // a husk and the `query.setModel`/`setPermissionMode`/`applyFlagSettings`
@@ -9226,7 +9228,7 @@ export class ClaudeAcpAgent {
 
     const option = session.configOptions.find((o) => o.id === params.configId);
     if (!option) {
-      throw new Error(`Unknown config option: ${params.configId}`);
+      throw RequestError.invalidParams(undefined, `Unknown config option: ${params.configId}`);
     }
 
     // Fast mode and ultracode carry a boolean value (for Clients that opted
@@ -9243,7 +9245,10 @@ export class ClaudeAcpAgent {
     }
 
     if (typeof params.value !== "string") {
-      throw new Error(`Invalid value for config option ${params.configId}: ${params.value}`);
+      throw RequestError.invalidParams(
+        undefined,
+        `Invalid value for config option ${params.configId}: ${params.value}`,
+      );
     }
 
     const allValues =
@@ -9288,7 +9293,10 @@ export class ClaudeAcpAgent {
     }
 
     if (!validValue) {
-      throw new Error(`Invalid value for config option ${params.configId}: ${params.value}`);
+      throw RequestError.invalidParams(
+        undefined,
+        `Invalid value for config option ${params.configId}: ${params.value}`,
+      );
     }
 
     // Use the canonical option value so downstream code always receives the
@@ -11984,7 +11992,7 @@ export class ClaudeAcpAgent {
           (error.message === "Query closed before response received" ||
             error.message.includes("No conversation found with session ID"))
         ) {
-          throw RequestError.resourceNotFound(sessionId);
+          throw RequestError.sessionNotFound(sessionId);
         }
         throw error;
       }
@@ -13047,7 +13055,10 @@ export function resolveFastModeEnabled(params: SetSessionConfigOptionRequest): b
   if (value === FAST_MODE_OFF) {
     return false;
   }
-  throw new Error(`Invalid value for config option ${FAST_MODE_CONFIG_ID}: ${value}`);
+  throw RequestError.invalidParams(
+    undefined,
+    `Invalid value for config option ${FAST_MODE_CONFIG_ID}: ${value}`,
+  );
 }
 
 /** Per-model Fast mode state threaded into {@link buildConfigOptions}. The
