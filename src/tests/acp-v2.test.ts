@@ -27,6 +27,7 @@ import { v1PermissionResponse, v2PermissionRequest } from "../v2/permission.js";
 import { v1PromptRequest } from "../v2/prompt.js";
 import { V2Terminals } from "../v2/terminal.js";
 import { V2ToolCallMeta } from "../v2/tool-call-meta.js";
+import { v2RestartedToolCall } from "../v2/tool-call.js";
 import { v2ChildStateUpdate, v2SessionUpdate } from "../v2/session-update.js";
 import {
   v1ForkSessionRequest,
@@ -1076,6 +1077,13 @@ describe("ACP v2 prompts", () => {
     expect(client.updates("tool_call_update")).toContainEqual(
       expect.objectContaining({ toolCallId: "toolu_w", title: "Write a.ts", content: [] }),
     );
+    // The client may hold the tool call from before the replay, so the replayed
+    // start resets what it leaves out.
+    expect(client.updates("tool_call_update")[0]).toMatchObject({
+      toolCallId: "toolu_w",
+      rawOutput: null,
+      _meta: null,
+    });
   });
 
   it("replays a subagent's history to its own session, and clears each replayed message there first", async () => {
@@ -5423,6 +5431,41 @@ describe("ACP v2 session translation", () => {
     expect(v1PermissionResponse({ outcome: { outcome: "selected", optionId: "o" } })).toEqual({
       outcome: { outcome: "selected", optionId: "o" },
     });
+  });
+
+  it("resets the fields that a restarted tool call leaves out", () => {
+    expect(
+      v2RestartedToolCall({
+        sessionUpdate: "tool_call",
+        toolCallId: "t",
+        title: "ls",
+        kind: "execute",
+        rawInput: { command: "ls" },
+      }),
+    ).toEqual({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "t",
+      title: "ls",
+      kind: "execute",
+      rawInput: { command: "ls" },
+      name: null,
+      status: null,
+      content: null,
+      locations: null,
+      rawOutput: null,
+    });
+    // A `_meta: null` from `V2ToolCallMeta` clears the client's `_meta`, so it
+    // stays, where the v2 form of a v1 report drops `null` fields.
+    expect(
+      v2RestartedToolCall({
+        sessionUpdate: "tool_call",
+        toolCallId: "t",
+        title: "ls",
+        status: "pending",
+        content: [],
+        _meta: null,
+      }),
+    ).toMatchObject({ status: "pending", content: [], locations: null, _meta: null });
   });
 
   it("fails on a v1 diff, and passes a display terminal as it is", () => {

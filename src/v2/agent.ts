@@ -33,6 +33,7 @@ import {
 import { v2ChildStateUpdate, v2SessionUpdate } from "./session-update.js";
 import { V2Terminals } from "./terminal.js";
 import { V2ToolCallMeta } from "./tool-call-meta.js";
+import { v2RestartedToolCall } from "./tool-call.js";
 
 /**
  * The ACP v2 surface, for one connection.
@@ -312,13 +313,15 @@ class V2ClientConnection implements AcpClient {
     const { terminal, report } = this.terminals.split(sessionId, update);
     if (!report) return terminal;
     const starts = report.sessionUpdate === "tool_call";
-    const [reported, metaPatch] = this.toolCallMeta.apply(
-      sessionId,
-      report,
-      starts,
-      this.replays.has(sessionId),
-    );
-    const reportUpdate = v2SessionUpdate(reported);
+    const replaying = this.replays.has(sessionId);
+    // A v1 `tool_call` starts the tool call afresh, but v2 only has updates,
+    // which keep each field they leave out. The client may already hold this
+    // id: from an earlier report on this connection, or, during a replay, from
+    // before it (a client that resumes a session it showed before).
+    const restarts =
+      starts && (replaying || this.toolCallMeta.reported(sessionId, report.toolCallId));
+    const [reported, metaPatch] = this.toolCallMeta.apply(sessionId, report, starts, replaying);
+    const reportUpdate = restarts ? v2RestartedToolCall(reported) : v2SessionUpdate(reported);
     const metaUpdate = metaPatch
       ? v2SessionUpdate({ sessionUpdate: "tool_call_update", ...metaPatch })
       : undefined;
