@@ -10655,6 +10655,23 @@ export class ClaudeAcpAgent {
         previewContent,
       );
       if (signal.aborted) throw new Error("Tool use aborted");
+      // On `session/cancel` the client answers every open permission request
+      // `cancelled`, including those of a background subagent, which the
+      // cancel does not stop. Answer such a request with a denial so the
+      // subagent reads "the user refused" and goes on. Throwing instead makes
+      // Claude Code deny it as "Tool permission request failed".
+      if (
+        response.outcome?.outcome === "cancelled" &&
+        this.sessions[sessionId] === session &&
+        !blocksForeground(session, agentID)
+      ) {
+        return {
+          behavior: "deny",
+          message: "User refused permission to run tool",
+          toolUseID,
+          decisionClassification: "user_reject",
+        };
+      }
       const decodedPermission = decodeClaudePermissionResponse(
         response,
         toolName,
