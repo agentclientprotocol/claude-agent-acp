@@ -303,8 +303,12 @@ export class SessionTitles {
    *  without `updatedAt`. */
   async publishCurrent(session: Session): Promise<void> {
     const info = await this.readSessionInfo(session);
-    const title = info?.summary
-      ? sanitizeTitle(this.agent.clientTitle?.(info.summary) ?? info.summary)
+    // A title published but not yet stored (a generated title still being
+    // written) wins over `summary`, which is then only the raw first prompt.
+    const stored =
+      info?.customTitle || (this.settled && this.lastTitle ? undefined : info?.summary);
+    const title = stored
+      ? sanitizeTitle(this.agent.clientTitle?.(stored) ?? stored)
       : this.lastTitle;
     if (!title) return;
     this.lastTitle = title;

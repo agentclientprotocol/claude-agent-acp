@@ -229,6 +229,27 @@ describe("session titles", () => {
     expect(titles()).toEqual(["Renamed", "Renamed"]);
   });
 
+  it("sends a published title that isn't stored yet instead of the raw first prompt", async () => {
+    const { client, titles } = titleRecorder();
+    const agent = newAgent(client);
+    const input = new Pushable<any>();
+    agent.sessions["test-session"] = mockSessionState(
+      { query: wrapQuery(oneTurn(input)), input },
+      agent,
+    );
+    await agent.sessions["test-session"]!.titles.setExplicitTitle("Renamed", async () => undefined);
+
+    // The file has no custom title yet, so `summary` is the raw first prompt.
+    vi.mocked(getSessionInfo).mockResolvedValue({
+      sessionId: "test-session",
+      summary: "please fix the build",
+      lastModified: 1_700_000_000_000,
+    } as any);
+    await agent.publishCurrentSessionInfo("test-session");
+
+    expect(titles()).toEqual(["Renamed", "Renamed"]);
+  });
+
   /** A stream event carrying one chunk of the assistant's answer. */
   function textDelta(text: string) {
     return {
