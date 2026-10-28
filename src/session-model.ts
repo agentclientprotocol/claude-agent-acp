@@ -1,6 +1,7 @@
-import type { SessionConfigOption } from "@agentclientprotocol/sdk";
+import type { SessionConfigOption } from "@agentclientprotocol/sdk/unstable";
 import type { ModelInfo, Query, Settings } from "@anthropic-ai/claude-agent-sdk";
 import { AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY, withAirMeta } from "./air-extension.js";
+import { bedrockRegionPrefix } from "./gateway-models.js";
 
 export const MODEL_CONFIG_ID = "model";
 
@@ -260,6 +261,55 @@ function resolveSettingsModel(
   return resolveModelPreference(models, settingsModel);
 }
 
+const MODEL_FAMILY_ALIASES = new Set(["opus", "sonnet", "haiku", "fable"]);
+
+/** A model id without the spellings that name the same model: provider
+ *  prefixes, dates, version suffixes, `:variant` suffixes, dotted versions,
+ *  `-fast` and context hints. `deniedModels` and gateway listings both match on
+ *  it. OpenRouter lists `anthropic/claude-opus-5.5:batch[1m]`, which normalizes
+ *  to `claude-opus-5-5`; `anthropic/openai/gpt-5` keeps its `openai/` prefix and
+ *  matches no Claude id. */
+function normalizeModelId(value: string): string {
+  let id = stripContextHints(value.trim().toLowerCase());
+  const providerPrefix = id.lastIndexOf("anthropic.");
+  if (providerPrefix !== -1) id = id.slice(providerPrefix + "anthropic.".length);
+  return (
+    id
+      // Only a leading `anthropic/`: OpenRouter's `anthropic/openai/gpt-5` must
+      // keep `openai/`, which `lastIndexOf` would strip along with it.
+      .replace(/^anthropic\//, "")
+      // `:batch`, `:free`. A letter must follow the colon, so Bedrock's `-v1:0`
+      // is left for the `-vN:M` step below.
+      .replace(/:[a-z][a-z0-9-]*$/, "")
+      // `claude-opus-5.5` -> `claude-opus-5-5`; only dots between two digits.
+      .replace(/(?<=\d)\.(?=\d)/g, "-")
+      .replace(/@.*$/, "")
+      .replace(/-v\d+(?::\d+)?$/, "")
+      .replace(/-fast$/, "")
+      .replace(/-\d{8}$/, "")
+  );
+}
+
+/**
+ * Whether managed `deniedModels` blocks a model id, following the CLI's rules
+ * closely enough for the picker: a family alias blocks the whole family, and a
+ * model id blocks that version in every spelling plus the later minor versions
+ * it prefixes (`claude-opus-5` also blocks `claude-opus-5-5`). Entries share
+ * `normalizeModelId`, so `claude-opus-4.5` or `anthropic/claude-opus-4.5` also
+ * blocks `claude-opus-4-5`, which the CLI may still allow. The CLI stays the
+ * enforcer; this only keeps the picker from offering a refused row.
+ */
+export function isDeniedModel(modelId: string, deniedModels: readonly string[]): boolean {
+  const id = normalizeModelId(modelId);
+  if (!id) return false;
+  return deniedModels.some((entry) => {
+    const denied = normalizeModelId(entry);
+    if (!denied) return false;
+    if (MODEL_FAMILY_ALIASES.has(denied)) return id === denied || id.includes(`-${denied}`);
+    return id === denied || id.startsWith(`${denied}-`);
+  });
+}
+
 /**
  * Restrict the SDK's model list to the user's `availableModels` allowlist
  * (already merged-and-deduped across settings sources by `SettingsManager`).
@@ -275,11 +325,14 @@ function resolveSettingsModel(
  * - `undefined` is handled by the caller (no allowlist applied).
  * - The Default option is unaffected by `availableModels` — it always remains
  *   available, even when the allowlist is `[]`.
+ * - Managed `deniedModels` wins over the allowlist, so a denied entry is
+ *   dropped even though the CLI would otherwise leave it unmatched.
  */
 export function applyAvailableModelsAllowlist(
   sdkModels: ModelInfo[],
   allowlist: string[],
   settingsModelOverrides?: Record<string, string>,
+  deniedModels: readonly string[] = [],
 ): ModelInfo[] {
   // Default is always preserved per the docs. Synthesize one if the SDK
   // didn't surface it so downstream code (e.g. `getAvailableModels` picking
@@ -310,6 +363,13 @@ export function applyAvailableModelsAllowlist(
     if (seen.has(effective)) continue;
 
     const sdkMatch = resolveModelPreference(sdkModelsWithoutDefault, trimmed);
+    if (
+      [trimmed, effective, sdkMatch?.resolvedModel].some(
+        (id) => id != null && isDeniedModel(id, deniedModels),
+      )
+    ) {
+      continue;
+    }
     if (sdkMatch) {
       result.push({ ...sdkMatch, value: effective });
     } else {
@@ -336,6 +396,48 @@ export function applyAvailableModelsAllowlist(
   return result;
 }
 
+/**
+ * Keep the SDK models the `providers/set` gateway listed (`listGatewayModels`,
+ * `listBedrockModels`). A row matches when its `resolvedModel` (or
+ * its `value` when the SDK gives none) names a listed model in any spelling:
+ * `claude-sonnet-5[1m]` matches a listed `claude-sonnet-5-20260101`, and
+ * `eu.anthropic.claude-sonnet-5` matches a listed `eu.anthropic.claude-sonnet-5-v1:0`.
+ *
+ * With a Bedrock `regionPrefix`, a row resolved to another cross-region prefix
+ * (`us.anthropic.claude-sonnet-5` under `eu`) is dropped even when the same
+ * model is listed under `eu`: the CLI would call it in the other region.
+ *
+ * A row the SDK gives no `resolvedModel` names its model only by an alias, so
+ * it is checked as far as the alias allows: `default` is kept, and a family
+ * alias such as `opus` is kept when the gateway lists a model of that family.
+ *
+ * When no row matches by its model (a `default` row kept only for lacking a
+ * `resolvedModel` does not count), the gateway serves none of the SDK's
+ * models, and nothing is left: the session offers no model.
+ */
+export function narrowToGatewayModels(
+  models: ModelInfo[],
+  listedModelIds: readonly string[],
+  regionPrefix?: string,
+): ModelInfo[] {
+  const listed = new Set(listedModelIds.map(normalizeModelId).filter(Boolean));
+  const narrowed = models.filter((model) => {
+    const modelId = model.resolvedModel ?? model.value;
+    const prefix = bedrockRegionPrefix(modelId);
+    if (regionPrefix !== undefined && prefix !== undefined && prefix !== regionPrefix) {
+      return false;
+    }
+    const id = normalizeModelId(modelId);
+    if (listed.has(id)) return true;
+    if (model.resolvedModel !== undefined) return false;
+    if (model.value === "default") return true;
+    return MODEL_FAMILY_ALIASES.has(id) && [...listed].some((entry) => entry.includes(`-${id}`));
+  });
+  return narrowed.some((model) => listed.has(normalizeModelId(model.resolvedModel ?? model.value)))
+    ? narrowed
+    : [];
+}
+
 /** Whether a rejected `setModel` was vetoed by a user-configured
  *  PreModelSwitch hook. The CLI's rejection message is the stable,
  *  distinguishable marker ("Model switch blocked by a PreModelSwitch hook:
@@ -354,7 +456,18 @@ export async function getAvailableModels(
   isResumedSession: boolean,
   sessionId: string,
   resumedModelHint?: string,
+  narrowedByGateway = false,
 ): Promise<SessionModelState> {
+  // A gateway that lists none of the SDK's models leaves none to offer
+  // (`narrowToGatewayModels`). The session stays on the model the SDK runs,
+  // and the gateway refuses its requests.
+  if (models.length === 0) {
+    return {
+      availableModels: [],
+      currentModelId: (isResumedSession && resumedModelHint) || sdkModels[0]?.value || "default",
+    };
+  }
+
   const settings = settingsManager.getSettings();
 
   let currentModel = models[0];
@@ -401,9 +514,34 @@ export async function getAvailableModels(
   //      be re-asserted to keep the reported model truthful.
   // Anything else (fuzzy match, allowlist-synthesized value, alias) gets a
   // setModel call so we don't drift from the user's intended pin.
+  // Case (a) does not hold when `narrowToGatewayModels` left the SDK on a
+  // model the gateway does not list: the dropped `default` row of a fresh or
+  // transcript-less session, or a resumed transcript model outside the list.
+  // Such a session switches to models[0].
   const sdkSawSameValue = sdkModels.some((m) => m.value === currentModel.value);
+  const sdkDefault = sdkModels.find((m) => m.value === "default");
+  const sdkDefaultDropped = sdkDefault !== undefined && !models.some((m) => m.value === "default");
+  let switchToListed = false;
+  if (resolvedFromInput === undefined) {
+    if (!isResumedSession || !resumedModelHint) {
+      switchToListed = sdkDefaultDropped;
+    } else if (
+      narrowedByGateway &&
+      (!models.some((m) => m.value === currentModel.value) ||
+        // A loose match can map the transcript's model onto a listed row of
+        // another version, which the CLI does not resume on.
+        (currentModel.resolvedModel !== undefined &&
+          normalizeModelId(currentModel.resolvedModel) !== normalizeModelId(resumedModelHint)))
+    ) {
+      currentModel = models[0];
+      switchToListed = true;
+    }
+  }
+  // When the switch fails, the SDK stays on the model it ran before it.
+  const modelBeforeSwitch = (): ModelInfo =>
+    switchToListed && sdkDefault !== undefined ? sdkDefault : models[0];
   const skipSetModel =
-    resolvedFromInput === undefined ||
+    (resolvedFromInput === undefined && !switchToListed) ||
     (!isResumedSession && currentModel.value === resolvedFromInput && sdkSawSameValue);
   if (!skipSetModel) {
     const setModelStartedAt = performance.now();
@@ -435,15 +573,19 @@ export async function getAvailableModels(
       // live model back on this path: getContextUsage isn't serviced on a
       // fresh session until the first prompt turn (issues #886/#880).
       if (!isResumedSession) {
-        if (!isPreModelSwitchHookBlock(error)) throw error;
+        // A switch onto a listed model is advisory too: the session stays on
+        // the model the SDK runs and reports it.
+        if (!switchToListed && !isPreModelSwitchHookBlock(error)) throw error;
         logger.error(
-          `Model pin "${currentModel.value}" was vetoed by a PreModelSwitch hook; staying on the default model:`,
+          `Model switch to "${currentModel.value}" failed or was vetoed by a PreModelSwitch hook; staying on the default model:`,
           error,
         );
-        currentModel = models[0];
+        currentModel = modelBeforeSwitch();
       } else {
         logger.error(`Failed to re-assert model "${currentModel.value}" on resume:`, error);
-        currentModel = resumedModelHint ? matchResumedModel(models, resumedModelHint) : models[0];
+        currentModel = resumedModelHint
+          ? matchResumedModel(models, resumedModelHint)
+          : modelBeforeSwitch();
       }
     }
   }
@@ -453,14 +595,107 @@ export async function getAvailableModels(
   for (const name of displayNames) {
     displayNameCounts.set(name, (displayNameCounts.get(name) ?? 0) + 1);
   }
+  const names = models.map((model, index) =>
+    displayNameCounts.get(displayNames[index]) === 1 ? displayNames[index] : model.displayName,
+  );
+  const nameCounts = new Map<string, number>();
+  for (const name of names) {
+    nameCounts.set(name, (nameCounts.get(name) ?? 0) + 1);
+  }
 
   return {
     availableModels: models.map((model, index) => ({
       modelId: model.value,
-      name:
-        displayNameCounts.get(displayNames[index]) === 1 ? displayNames[index] : model.displayName,
+      // Allowlisted aliases can inherit the same SDK label. Keep every ID
+      // selectable, but distinguish the rows for clients that show only names.
+      name: nameCounts.get(names[index]) === 1 ? names[index] : `${names[index]} (${model.value})`,
       description: model.description,
     })),
     currentModelId: currentModel.value,
   };
+}
+
+/** The display name of the model id `model` in `modelInfos`, if it is there. */
+export function modelDisplayName(modelInfos: ModelInfo[], model: string): string | undefined {
+  let byModel = displayNameCache.get(modelInfos);
+  if (!byModel) displayNameCache.set(modelInfos, (byModel = new Map()));
+  if (!byModel.has(model)) {
+    const info = modelInfos.find((info) => info.value === model || info.resolvedModel === model);
+    byModel.set(model, info?.displayName);
+  }
+  return byModel.get(model);
+}
+
+/** {@link modelDisplayName} per model list, which a session replaces and never edits. */
+const displayNameCache = new WeakMap<ModelInfo[], Map<string, string | undefined>>();
+
+/** The flat entries of a session's `model` select option. */
+function modelOptionEntries(option: SessionConfigOption): Array<{ value: string; name: string }> {
+  if (option.type !== "select") return [];
+  return option.options.flatMap((entry) =>
+    "value" in entry ? [{ value: entry.value, name: entry.name }] : entry.options,
+  );
+}
+
+/**
+ * The entry of the `model` option among `configOptions` for `model`, a model
+ * id that a response reported, so that a client can compare it with the
+ * session's own model. Best first:
+ *
+ * 1. the current entry, when it runs that model up to a context hint: a
+ *    session on `opus[1m]` or `default` that answers as `claude-opus-4-6`;
+ * 2. the entry whose value or resolved model is that id;
+ * 3. an entry that runs that model up to a context hint.
+ *
+ * Among several entries for one model, a concrete entry comes before
+ * `default`, as in {@link resolveModelPreference}. Undefined when no entry
+ * matches. A model's resolved id comes from `modelInfos`
+ * (`ModelInfo.resolvedModel`), the wire id that a response reports, as for
+ * {@link matchResumedModel}. It is compared as it is: a dated id such as
+ * `claude-haiku-4-5-20251001` matches only the same dated id.
+ */
+export function modelEntryFor(
+  configOptions: readonly SessionConfigOption[],
+  modelInfos: ModelInfo[],
+  model: string,
+): { value: string; name: string } | undefined {
+  // Each response of a subagent reports its model, so the result is kept per
+  // list. A session replaces its lists on a change and never edits them.
+  let byInfos = modelEntryCache.get(configOptions);
+  if (!byInfos) modelEntryCache.set(configOptions, (byInfos = new WeakMap()));
+  let byModel = byInfos.get(modelInfos);
+  if (!byModel) byInfos.set(modelInfos, (byModel = new Map()));
+  if (byModel.has(model)) return byModel.get(model);
+  const entry = findModelEntry(configOptions, modelInfos, model);
+  byModel.set(model, entry);
+  return entry;
+}
+
+const modelEntryCache = new WeakMap<
+  readonly SessionConfigOption[],
+  WeakMap<ModelInfo[], Map<string, { value: string; name: string } | undefined>>
+>();
+
+function findModelEntry(
+  configOptions: readonly SessionConfigOption[],
+  modelInfos: ModelInfo[],
+  model: string,
+): { value: string; name: string } | undefined {
+  const option = configOptions.find((candidate) => candidate.id === MODEL_CONFIG_ID);
+  if (option?.type !== "select") return undefined;
+  // Concrete entries first; `sort` keeps the list order otherwise.
+  const entries = modelOptionEntries(option).sort(
+    (left, right) => Number(left.value === "default") - Number(right.value === "default"),
+  );
+  const observed = canonicalizeModelId(model);
+  const resolved = (value: string) =>
+    canonicalizeModelId(modelInfos.find((info) => info.value === value)?.resolvedModel ?? value);
+  const sameModel = (value: string) =>
+    stripContextHints(resolved(value)) === stripContextHints(observed);
+  const current = entries.find((entry) => entry.value === option.currentValue);
+  if (current && sameModel(current.value)) return current;
+  return (
+    entries.find((entry) => entry.value === model || resolved(entry.value) === observed) ??
+    entries.find((entry) => sameModel(entry.value))
+  );
 }

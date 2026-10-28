@@ -7,7 +7,7 @@ import {
   resolveSettings,
   type Settings,
 } from "@anthropic-ai/claude-agent-sdk";
-import { CLAUDE_CONFIG_DIR } from "./acp-agent.js";
+import { claudeConfigDir } from "./paths.js";
 
 /**
  * Permission rule format examples:
@@ -49,6 +49,8 @@ export interface SettingsManagerOptions {
 export class SettingsManager {
   private cwd: string;
   private effective: Settings = {};
+  private managedDeniedModels: string[] = [];
+  private managedApiKeyHelper?: string;
   private watchers: fs.FSWatcher[] = [];
   private onChange?: () => void;
   private logger: { log: (...args: any[]) => void; error: (...args: any[]) => void };
@@ -91,7 +93,7 @@ export class SettingsManager {
    */
   private getWatchedPaths(): string[] {
     return [
-      path.join(CLAUDE_CONFIG_DIR, "settings.json"),
+      path.join(claudeConfigDir(), "settings.json"),
       path.join(this.cwd, ".claude", "settings.json"),
       path.join(this.cwd, ".claude", "settings.local.json"),
       getManagedSettingsPath(),
@@ -106,9 +108,19 @@ export class SettingsManager {
     try {
       const resolved = await resolveSettings({ cwd: this.cwd });
       this.effective = filterEscalatingDefaultMode(resolved);
+      // The CLI reads `deniedModels` from managed settings only.
+      this.managedDeniedModels = resolved.sources
+        .filter((entry) => entry.source === "managed")
+        .flatMap((entry) => entry.settings.deniedModels ?? []);
+      this.managedApiKeyHelper =
+        resolved.provenance.apiKeyHelper?.source === "managed"
+          ? resolved.effective.apiKeyHelper
+          : undefined;
     } catch (error) {
       this.logger.error("Failed to resolve settings:", error);
       this.effective = {};
+      this.managedDeniedModels = [];
+      this.managedApiKeyHelper = undefined;
     }
   }
 
@@ -169,6 +181,24 @@ export class SettingsManager {
    */
   getSettings(): Settings {
     return this.effective;
+  }
+
+  /**
+   * The `apiKeyHelper` the CLI runs: managed settings outrank the `--settings`
+   * override, which outranks the user/project/local files.
+   */
+  getApiKeyHelper(settingsOverride?: Settings): string | undefined {
+    return (
+      this.managedApiKeyHelper ?? settingsOverride?.apiKeyHelper ?? this.effective.apiKeyHelper
+    );
+  }
+
+  /**
+   * `deniedModels` entries from the managed tier, the only tier the CLI
+   * honors them from.
+   */
+  getManagedDeniedModels(): string[] {
+    return this.managedDeniedModels;
   }
 
   /**

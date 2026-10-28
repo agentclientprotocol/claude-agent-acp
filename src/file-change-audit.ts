@@ -19,6 +19,10 @@ export type FileChangeReportTurnState = {
 export type NativeFileChangeReportTurn = {
   promptUuid: string;
   fileChangeReport?: FileChangeReportTurnState;
+  /** Raw `file_path`/`notebook_path` values of the file-tool edits that
+   *  subagents of this turn completed. Checkpoints do not track files that
+   *  only a subagent edited. */
+  editedPaths?: Set<string>;
 };
 
 export type FileChangeReportWorkspace = {
@@ -94,6 +98,41 @@ export function agentFileChangeReportMeta(
   return withAirMeta(undefined, AGENT_FILE_CHANGE_REPORT_CAPABILITY, result);
 }
 
+const FILE_EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
+
+/**
+ * Adds to `turn.editedPaths` the `file_path` (`notebook_path` for NotebookEdit)
+ * of each successful file-tool edit among the tool results of a subagent
+ * message. Root-agent messages (`parentToolUseId === null`) are skipped: the
+ * checkpoint already tracks their files. Must run before `toAcpNotifications`
+ * drops the tool use cache entries.
+ */
+export function recordSubagentFileEdits(
+  turn: (NativeFileChangeReportTurn & { settled: boolean }) | null | undefined,
+  parentToolUseId: string | null,
+  content: unknown,
+  toolUses: Record<string, { name: string; input: unknown } | undefined>,
+): void {
+  if (parentToolUseId === null || !turn || turn.settled || !turn.fileChangeReport) return;
+  if (!Array.isArray(content)) return;
+  for (const block of content) {
+    if (
+      block?.type !== "tool_result" ||
+      block.is_error === true ||
+      typeof block.tool_use_id !== "string"
+    ) {
+      continue;
+    }
+    const toolUse = toolUses[block.tool_use_id];
+    if (!toolUse || !FILE_EDIT_TOOLS.has(toolUse.name)) continue;
+    const input = toolUse.input as Record<string, unknown> | undefined;
+    const editedPath = toolUse.name === "NotebookEdit" ? input?.notebook_path : input?.file_path;
+    if (typeof editedPath === "string" && editedPath.length > 0) {
+      (turn.editedPaths ??= new Set()).add(editedPath);
+    }
+  }
+}
+
 export function createNativeFileChangeReporter(
   options: NativeFileChangeReporterOptions,
 ): NativeFileChangeReporter {
@@ -101,7 +140,7 @@ export function createNativeFileChangeReporter(
   const timeoutMs = options.timeoutMs ?? AGENT_FILE_CHANGE_REPORT_TIMEOUT_MS;
   const requestIds = new Set<string>();
 
-  const publish = async (state: FileChangeReportTurnState, result: AgentFileChangeReportResult) => {
+  async function publish(state: FileChangeReportTurnState, result: AgentFileChangeReportResult) {
     if (state.phase === "finished") return;
     state.phase = "finished";
     try {
@@ -109,24 +148,55 @@ export function createNativeFileChangeReporter(
     } catch (error) {
       options.logError(`Failed to publish file-change report ${state.requestId}: ${error}`);
     }
-  };
+  }
 
-  const finishUnavailable = async (
+  async function finishUnavailable(
     state: FileChangeReportTurnState,
     reason: FileChangeReportUnavailableReason,
-  ) => {
+  ) {
     await publish(state, {
       version: 1,
       requestId: state.requestId,
       status: "unavailable",
       reason,
     });
-  };
+  }
 
-  const report = async (
+  async function publishReported(state: FileChangeReportTurnState, reportedPaths: string[]) {
+    const normalized = normalizeReportedPaths(reportedPaths, workspace);
+    await publish(
+      state,
+      fitReportedAgentFileChangeReport({
+        version: 1,
+        requestId: state.requestId,
+        status: "reported",
+        paths: normalized.paths,
+        // Checkpoints miss Bash mutations. Subagent file-tool edits are added
+        // from the message stream, but the list is still not exhaustive.
+        declaredComplete: false,
+        truncated: normalized.truncated,
+      }),
+    );
+  }
+
+  // Used when the checkpoint preview fails: the subagent edits seen in the
+  // stream are still worth reporting.
+  async function finishWithoutPreview(
+    state: FileChangeReportTurnState,
+    editedPaths: Set<string> | undefined,
+    reason: FileChangeReportUnavailableReason,
+  ) {
+    if (editedPaths && editedPaths.size > 0) {
+      await publishReported(state, [...editedPaths]);
+    } else {
+      await finishUnavailable(state, reason);
+    }
+  }
+
+  async function report(
     turn: NativeFileChangeReportTurn | null | undefined,
     query: Pick<Query, "rewindFiles">,
-  ) => {
+  ) {
     const state = turn?.fileChangeReport;
     if (!state || state.phase !== "requested") return;
     state.phase = "collecting";
@@ -145,35 +215,22 @@ export function createNativeFileChangeReporter(
         }),
       ]);
       if (preview === null) {
-        await finishUnavailable(state, "timeout");
+        await finishWithoutPreview(state, turn.editedPaths, "timeout");
         return;
       }
       if (!preview.canRewind || !Array.isArray(preview.filesChanged)) {
-        await finishUnavailable(state, "invalidOutput");
+        await finishWithoutPreview(state, turn.editedPaths, "invalidOutput");
         return;
       }
 
-      const normalized = normalizeReportedPaths(preview.filesChanged, workspace);
-      await publish(
-        state,
-        fitReportedAgentFileChangeReport({
-          version: 1,
-          requestId: state.requestId,
-          status: "reported",
-          paths: normalized.paths,
-          // Checkpoints cover Claude file tools, but not every mutation source
-          // (notably Bash and most subagents), so this list is never exhaustive.
-          declaredComplete: false,
-          truncated: normalized.truncated,
-        }),
-      );
+      await publishReported(state, [...preview.filesChanged, ...(turn.editedPaths ?? [])]);
     } catch (error) {
       options.logError(`Failed to inspect Claude file checkpoint ${turn.promptUuid}: ${error}`);
-      await finishUnavailable(state, "providerError");
+      await finishWithoutPreview(state, turn.editedPaths, "providerError");
     } finally {
       if (timer) clearTimeout(timer);
     }
-  };
+  }
 
   return {
     request(meta) {

@@ -2,21 +2,38 @@ import type {
   ClientCapabilities,
   SessionCapabilities,
   SessionNotification,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import {
   AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
   clientSupportsAirCapability,
+  isAirClient,
 } from "./air-extension.js";
 
 export { AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY } from "./air-extension.js";
 
 /**
- * Temporary typed surface for agentclientprotocol/agent-client-protocol#1992.
+ * How a client gets native subagent sessions.
  *
- * The wire contract is already defined by the ACP draft, but the published
- * TypeScript SDK does not contain it yet. Keep the compatibility boundary in
- * this file so it can be replaced by SDK exports without changing lifecycle
- * code when the draft ships.
+ * - `rfd`: the subagents RFD (agentclientprotocol/agent-client-protocol#1992,
+ *   as revised): `subagent_update` and `session_message`, which the SDK types.
+ *   A client that declares `clientCapabilities.subagents` and is not AIR gets
+ *   it. (An ACP v2 client gets it without declaring anything, since subagents
+ *   are part of v2's baseline.)
+ * - `air`: the earlier draft of that RFD, which AIR implements:
+ *   `subagent_spawned` and `subagent_state_update`, typed below. AIR gets it,
+ *   whichever capability it declares (`docs/air-extensions.md`).
+ */
+export type SubagentForm = "rfd" | "air";
+
+/** The form of native subagent sessions that the client gets, or none. */
+export function subagentForm(capabilities?: ClientCapabilities | null): SubagentForm | undefined {
+  if (!clientSupportsSubagents(capabilities)) return undefined;
+  return isAirClient(capabilities) ? "air" : "rfd";
+}
+
+/**
+ * The earlier draft of the subagents RFD, which AIR implements and the SDK
+ * does not type.
  */
 export type SubagentSessionCapabilities = {
   cancel?: boolean;
@@ -29,6 +46,12 @@ export type SubagentSpawnedUpdate = {
   subagentSessionId: string;
   name: string;
   task: string;
+  /**
+   * Adapter extension: the exact prompt of the subagent. A client can show it
+   * as the first user message of the subagent session. It is absent when the
+   * adapter does not know the prompt.
+   */
+  prompt?: string;
   capabilities: SubagentSessionCapabilities;
   _meta?: Record<string, unknown> | null;
 };
@@ -110,7 +133,7 @@ export function clientSupportsSubagents(capabilities?: ClientCapabilities | null
   return clientSupportsAirCapability(capabilities, AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY);
 }
 
-/** The only cast needed until the TypeScript SDK publishes PR #1992. */
+/** The cast that AIR's draft updates and the async task updates need. */
 export function asSdkSessionNotification(
   notification: AcpSessionNotification,
 ): SessionNotification {

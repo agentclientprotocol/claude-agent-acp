@@ -4,6 +4,8 @@
  * their own vi.fn spies via `overrides`.
  */
 
+import type { ClientCapabilities, InitializeRequest } from "@agentclientprotocol/sdk/unstable";
+
 /** The context-usage report the base mock query returns. `rawMaxTokens`
  *  matches the agent's DEFAULT_CONTEXT_WINDOW so window-related assertions
  *  don't shift in tests that don't care about context usage. */
@@ -29,9 +31,23 @@ export function makeMockQuery(overrides: Record<string, unknown> = {}) {
     supportedCommands: async () => [],
     mcpServerStatus: async () => [],
     getContextUsage: async () => DEFAULT_CONTEXT_USAGE,
+    // No ultracode fields: session creation falls back to settings and the
+    // model's effort levels, as with a CLI that does not report them.
+    getSettings: async () => ({ applied: {} }),
     close: () => {},
     interrupt: async () => undefined,
     [Symbol.asyncIterator]: async function* () {},
     ...overrides,
   };
+}
+
+/**
+ * Declares the client capabilities through `initialize`, as a real client
+ * does. The agent reads its capability choices only there.
+ */
+export async function initializeClient(
+  agent: { initialize(request: InitializeRequest): Promise<unknown> },
+  clientCapabilities: ClientCapabilities,
+): Promise<void> {
+  await agent.initialize({ protocolVersion: 1, clientCapabilities });
 }

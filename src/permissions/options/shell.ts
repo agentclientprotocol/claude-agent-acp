@@ -1,4 +1,4 @@
-import type { PermissionOption } from "@agentclientprotocol/sdk";
+import type { PermissionOption } from "@agentclientprotocol/sdk/unstable";
 import path from "node:path";
 import type { DurablePermissionChangeSet } from "../normalization.js";
 import { plainString, type PermissionOptionContext, withOptionalUpdate } from "./shared.js";

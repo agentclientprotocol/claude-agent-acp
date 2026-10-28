@@ -1,11 +1,11 @@
-import type { NewSessionRequest, SessionConfigOption } from "@agentclientprotocol/sdk";
+import type { NewSessionRequest, SessionConfigOption } from "@agentclientprotocol/sdk/unstable";
 import type {
   EffortLevel,
   Options,
   PermissionMode,
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { DEFAULT_MODEL_ID } from "./session-config-ids.js";
+import { DEFAULT_AGENT_ID, DEFAULT_MODEL_ID } from "./session-config-ids.js";
 
 export type ClearContextReset = {
   toolUseId: string;
@@ -37,12 +37,15 @@ export type ClearContextSession<Turn extends ClearContextTurn = ClearContextTurn
   accumulatedModelUsage?: Record<string, Usage>;
   models: { currentModelId: string };
   configOptions: SessionConfigOption[];
+  currentAgent: string;
   fastModeEnabled: boolean;
+  ultracodeEnabled: boolean;
   effortPinnedLevel?: string;
   activeTurn?: Turn | null;
   turnQueue?: Turn[];
   pendingExitPlanContextReset?: ClearContextReset;
   contextUsedTokens?: number;
+  sentUserUuids?: Set<string>;
   input: { push(message: SDKUserMessage): unknown };
 };
 
@@ -57,6 +60,7 @@ export type ClearContextCoordinatorHost<
     options: { publicSessionId: string; permissionMode: PermissionMode },
   ): Promise<Session>;
   applyFastMode(session: Session, enabled: boolean): Promise<void>;
+  applyUltracode(session: Session, enabled: boolean): Promise<void>;
   publishSessionState(
     sessionId: string,
     mode: PermissionMode,
@@ -88,6 +92,7 @@ function restartParams<Session extends ClearContextSession>(session: Session): N
           ...(session.models.currentModelId !== DEFAULT_MODEL_ID
             ? { model: session.models.currentModelId }
             : {}),
+          ...(session.currentAgent !== DEFAULT_AGENT_ID ? { agent: session.currentAgent } : {}),
           ...(session.effortPinnedLevel !== undefined
             ? { effort: session.effortPinnedLevel as EffortLevel }
             : {}),
@@ -143,6 +148,16 @@ export async function continuePlanInFreshContext<
     }
     assertRestartActive(freshSession);
   }
+  // The fresh query seeds ultracode from settings only, so a toggle made
+  // during the old session would otherwise be lost.
+  if (oldSession.ultracodeEnabled !== freshSession.ultracodeEnabled) {
+    try {
+      await host.applyUltracode(freshSession, oldSession.ultracodeEnabled);
+    } catch (error) {
+      host.logError("Failed to restore ultracode after clearing context:", error);
+    }
+    assertRestartActive(freshSession);
+  }
 
   oldSession.activeTurn = null;
   oldSession.turnQueue = [];
@@ -156,6 +171,7 @@ export async function continuePlanInFreshContext<
   }
   assertRestartActive(freshSession);
 
+  (freshSession.sentUserUuids ??= new Set()).add(turn.promptUuid);
   freshSession.input.push(host.continuationMessage(sessionId, reset.plan, turn.promptUuid));
   assertRestartActive(freshSession);
   host.ensureConsumer(freshSession, sessionId);

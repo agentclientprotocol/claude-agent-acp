@@ -1,39 +1,39 @@
 /**
  * `--hide-claude-auth`: this integration must never bill a claude.ai
- * subscription. The flag hides the claude.ai login method from `initialize`
- * and makes the agent behave like a logged-out CLI whenever a subscription
- * would pay for a turn. `acp-agent.ts` decides *when* the guard applies (flag
- * on, no provider override) and calls in here for the *what*.
+ * subscription. Under the flag the agent hides the claude.ai login method from
+ * `initialize`, and refuses with `authRequired` every session and every turn
+ * that a subscription would pay for. `acp-agent.ts` decides when the guard
+ * applies (flag on, no provider override); this module decides what it refuses.
  *
- * The account the CLI reports at `initialize` is the source of truth. The SDK
- * memoizes it, so it is a constant for the life of a query, and two layers
- * keep it honest:
+ * The guard judges the `AccountInfo` that the SDK caches at `initialize`. That
+ * cache never changes during the life of a query, but the CLI itself picks up
+ * a login or logout made elsewhere. So the cached account can go stale: a
+ * session started on an API key keeps passing the guard after the user swaps
+ * the key for a claude.ai login, and the subscription pays.
  *
- * 1. Session creation refuses an account that holds no credential this
- *    integration accepts. A logged-out session never exists, so the client's
- *    sign-in always leads to a new session with a fresh `initialize`. The
- *    per-turn guard repeats the check on the same cached account, which costs
- *    microseconds and covers a session created under a provider override that
- *    `providers/disable` later removed.
- * 2. A sign-out during the session ends the query. The next turn recreates it,
- *    so the next `initialize` reports the real account and layer 1 judges it.
- *    The recreation resumes the stored conversation. When the CLI never wrote
- *    one, because the first turn was the one that signed out, the recreation
- *    starts a fresh query under the same session id instead.
+ * `authStatus` cannot fix this: it only reports to the client, and the guard
+ * does not read it. The agent therefore recreates the query whenever the
+ * account may have changed, and the new `initialize` gives the guard a current
+ * account. Two signals trigger it:
  *
- * A file-based credential replaced by a subscription between two turns is seen
- * by the CLI probe the agent fires at the START of every user prompt. That read
- * is never awaited, so it usually lands mid-turn; all it does there is mark the
- * session. The guard consumes the mark at the turn boundary — the next prompt
- * recreates the query and layer 1 judges the account the new `initialize`
- * reports — so a probe never interrupts a running turn. A swap that happens
- * after the last probe stays unseen until the next prompt reads the store
- * again. Closing that window would cost a blocking read per turn.
+ * - A turn fails with `auth_required`, which means a sign-out. The query is
+ *   closed at once and recreated on the next turn.
+ * - The `claude auth status` check that runs at the start of every prompt (the
+ *   same check that feeds `authStatus`) reports a different kind of identity
+ *   than the session started with. The session is flagged and recreated at the
+ *   next turn boundary, so a running turn is never interrupted.
+ *
+ * The recreation resumes the conversation, or starts a new one under the same
+ * session id when the CLI never saved it. Session creation also refuses an
+ * account with no credential this integration accepts. So a signed-out session
+ * never exists, and a sign-in always leads to a fresh `initialize`.
+ *
+ * The check is not awaited, so a credential swapped after it ran stays unseen
+ * until the next prompt. Awaiting it would add a CLI run to every turn.
  */
 
-import { RequestError } from "@agentclientprotocol/sdk";
+import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import type { AccountInfo, Query } from "@anthropic-ai/claude-agent-sdk";
-import type { SessionFailureController } from "./session-failure-extension.js";
 
 export function shouldHideClaudeAuth(): boolean {
   return process.argv.includes("--hide-claude-auth");
@@ -144,7 +144,7 @@ export function claudeLoginRequiredError(): RequestError {
 
 /**
  * The state the guard keeps for one session. It lives on the session so that a
- * concurrent pair of turns shares one account read and one failure row, and so
+ * concurrent pair of turns shares one account read, and so
  * that each degraded-guard warning is logged once.
  */
 export type ClaudeSubscriptionGuardState = {
@@ -190,8 +190,6 @@ type GuardOptions = {
   sessionId: string;
   query: Pick<Query, "accountInfo">;
   guardState: ClaudeSubscriptionGuardState;
-  /** Built lazily: most turns pass and never need a controller. */
-  sessionFailures: () => SessionFailureController;
   logger: GuardLogger;
   /** Display hook: called with the account the guard just read, before the
    *  guard decides on it. It exists so a refused turn still reports which
@@ -219,8 +217,7 @@ type GuardOptions = {
  * mid-session. The refusal mirrors the signed-out path exactly (see
  * `failActiveWithSessionFailure` for `auth_required` in `acp-agent.ts`): every
  * client gets the `authRequired` JSON-RPC rejection that starts its own auth
- * flow, and a capable client additionally gets one session-scoped access
- * failure whose `login` action stays the way back in.
+ * flow. The guard sends no separate access message.
  *
  * Fails open when no account can be read at all: session creation already
  * refused every account without a usable credential, and an unavailable probe
@@ -241,8 +238,8 @@ export async function refuseClaudeSubscriptionTurn(options: GuardOptions): Promi
   }
 }
 
-/** Read the account, publish at most one failure row, and return the error the
- *  turn must be rejected with. Never throws: an unreadable account fails open. */
+/** Read the account and return the error for the refused turn.
+ *  Never throws: an unreadable account fails open. */
 async function evaluateGuard(options: GuardOptions): Promise<RequestError | undefined> {
   const account = await readGuardAccount(options);
   if (!account) {
@@ -259,14 +256,9 @@ async function evaluateGuard(options: GuardOptions): Promise<RequestError | unde
     );
   }
   if (billsClaudeSubscription(account)) {
-    await publishRefusal(options.sessionFailures(), {
-      details: CLAUDE_SUBSCRIPTION_NOT_SUPPORTED_MESSAGE,
-      reason: CLAUDE_SUBSCRIPTION_NOT_SUPPORTED_REASON,
-    });
     return claudeSubscriptionNotSupportedError();
   }
   if (!holdsNonSubscriptionCredential(account)) {
-    await publishRefusal(options.sessionFailures(), { details: CLAUDE_LOGIN_REQUIRED_MESSAGE });
     return claudeLoginRequiredError();
   }
   return undefined;
@@ -292,20 +284,4 @@ async function readGuardAccount(options: GuardOptions): Promise<AccountInfo | un
     );
     return undefined;
   }
-}
-
-/** The refusal state does not change between turns: publish once, and skip a
- *  republish while the previous failure with this reason is still active. */
-async function publishRefusal(
-  sessionFailures: SessionFailureController,
-  failure: { details: string; reason?: string },
-): Promise<void> {
-  if (sessionFailures.hasActiveSessionError("auth_required", failure.reason)) {
-    return;
-  }
-  await sessionFailures.publish("auth_required", {
-    sessionScoped: true,
-    details: failure.details,
-    ...(failure.reason ? { reason: failure.reason } : {}),
-  });
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ClientCapabilities } from "@agentclientprotocol/sdk";
+import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
 import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import { buildConfigOptions, clientSupportsRecommendedConfigValue } from "../acp-agent.js";
 import { AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY } from "../air-extension.js";
@@ -136,6 +136,8 @@ describe("buildConfigOptions recommended values presentation", () => {
       MODELS,
       MODEL_INFOS,
       undefined,
+      [],
+      "default",
       undefined,
       RECOMMENDED_PRESENTATION,
     );
@@ -174,6 +176,8 @@ describe("buildConfigOptions recommended values presentation", () => {
       { ...MODELS, currentModelId: "opus" },
       MODEL_INFOS,
       "high",
+      [],
+      "default",
       undefined,
       RECOMMENDED_PRESENTATION,
     );
@@ -194,6 +198,8 @@ describe("buildConfigOptions recommended values presentation", () => {
       MODELS,
       MODEL_INFOS.filter((model) => model.value === "default"),
       undefined,
+      [],
+      "default",
       undefined,
       RECOMMENDED_PRESENTATION,
     );
@@ -217,6 +223,8 @@ describe("buildConfigOptions recommended values presentation", () => {
         MODELS,
         infos,
         undefined,
+        [],
+        "default",
         undefined,
         RECOMMENDED_PRESENTATION,
       );
@@ -240,6 +248,8 @@ describe("buildConfigOptions recommended values presentation", () => {
       MODELS,
       infos,
       undefined,
+      [],
+      "default",
       undefined,
       RECOMMENDED_PRESENTATION,
     );
@@ -259,6 +269,8 @@ describe("buildConfigOptions recommended values presentation", () => {
       MODELS,
       infos,
       undefined,
+      [],
+      "default",
       undefined,
       RECOMMENDED_PRESENTATION,
     );

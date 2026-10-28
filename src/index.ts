@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
-import { claudeCliPath, runAcp } from "./acp-agent.js";
+import { claudeCliPath } from "./acp-agent.js";
 import { applyManagedPolicyEnv } from "./managed-policy.js";
+import { acpProtocolsFromEnv, serveAcp } from "./serve.js";
 import packageJson from "../package.json" with { type: "json" };
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -82,10 +83,12 @@ if (process.argv.includes("--cli")) {
     : undefined;
   logger?.log("Claude ACP started");
 
-  const { connection, agent } = runAcp(logger);
+  const acp = serveAcp(logger, {
+    protocols: acpProtocolsFromEnv(process.env.CLAUDE_AGENT_ACP_PROTOCOL),
+  });
 
   async function shutdown() {
-    await agent.dispose().catch((err) => {
+    await acp.dispose().catch((err) => {
       console.error("Error during cleanup:", err);
     });
     process.exit(0);
@@ -94,7 +97,7 @@ if (process.argv.includes("--cli")) {
   // Exit cleanly when the ACP connection closes (e.g. stdin EOF, transport
   // error). Without this, `process.stdin.resume()` keeps the event loop
   // alive indefinitely, causing orphan process accumulation in oneshot mode.
-  connection.closed.then(shutdown);
+  acp.closed.then(shutdown);
 
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);

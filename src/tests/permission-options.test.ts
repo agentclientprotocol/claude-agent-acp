@@ -3,6 +3,7 @@ import { normalizeDurablePermissionChangeSet } from "../permissions/normalizatio
 import { buildClaudePermissionOptions, PERMISSION_OPTION_ID } from "../permissions/options.js";
 import { buildClaudePermissionPresentation } from "../permissions/presentation.js";
 import { decodeClaudePermissionResponse } from "../permissions/response.js";
+import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 
 const permissionResult = (...args: Parameters<typeof decodeClaudePermissionResponse>) =>
   decodeClaudePermissionResponse(...args).permissionResult;
@@ -634,9 +635,14 @@ describe("Claude permission options and response mapping", () => {
         toolName: "mcp__computer-use__screenshot",
         input: {},
         toolUseID: "tool-computer-use",
+        capabilities: ClientCapabilities.from({
+          _meta: { jetbrains: { air: { version: 1, capabilities: [] } } },
+        }),
       })._meta,
     ).toEqual({
-      permission: { version: 1, title: "mcp__computer-use__screenshot" },
+      jetbrains: {
+        air: { version: 1, permission: { version: 1, title: "mcp__computer-use__screenshot" } },
+      },
     });
   });
 

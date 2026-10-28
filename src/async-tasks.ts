@@ -1,9 +1,12 @@
-import type { ClientCapabilities } from "@agentclientprotocol/sdk";
+import { randomUUID } from "node:crypto";
+import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
 import type { AcpSessionNotification, AsyncTaskState } from "./acp-subagents.js";
 import { AIR_ASYNC_TASKS_CAPABILITY, clientSupportsAirCapability } from "./air-extension.js";
 import { noticeOrTranscriptUpdate } from "./session-notices.js";
 
 type Publish = (notification: AcpSessionNotification) => Promise<void>;
+/** Moves an update to its owner session, or drops it with `null`. */
+type Route = (notification: AcpSessionNotification) => AcpSessionNotification | null;
 type TerminalSource = "event" | "level" | "shutdown";
 
 type AsyncTask = {
@@ -12,9 +15,23 @@ type AsyncTask = {
   taskType: string;
   description: string;
   showInTranscript: boolean;
+  /** A Monitor tool call or an SDK `local_monitor` task: published as a monitor the client cannot stop. */
+  monitor: boolean;
   outputFilePath?: string;
   toolCallId?: string;
+  /**
+   * The route to the session of the tool call that started the task. The
+   * spawn sets it, so every update of the task goes to one session. A task
+   * without a route stays in the root session.
+   */
+  route?: Route;
   announced: boolean;
+  /**
+   * Whether the spawn waits for the tool call id. The updates of a held task
+   * wait in {@link AsyncTask.deferred} and follow the spawn in order.
+   */
+  held: boolean;
+  deferred: (() => Promise<void>)[];
   ignored: boolean;
   startedObserved: boolean;
   panelOnlyRecovery: boolean;
@@ -23,9 +40,19 @@ type AsyncTask = {
   state: AsyncTaskState;
   terminalSummary?: string;
   terminalSource?: TerminalSource;
+  /** The optional fields that the client holds now, as JSON. */
+  published: Map<string, string>;
+  /**
+   * Whether the task stands for a model turn that Claude Code started on its
+   * own, see {@link AsyncTaskRuntime.autonomousTurnStarted}. The SDK knows no
+   * such task, so its background task list never ends it.
+   */
+  autonomousTurn: boolean;
 };
 
 type TaskIdentity = { taskId?: unknown; task_id?: unknown };
+
+const MAX_TOOL_RESULT_PATHS = 500;
 
 export type AsyncTaskStarted = TaskIdentity & {
   taskType?: unknown;
@@ -59,6 +86,8 @@ type TaskPatch = {
 
 export type AsyncTaskNotification = TaskIdentity & {
   status?: unknown;
+  toolCallId?: unknown;
+  tool_use_id?: unknown;
   summary?: unknown;
   outputFilePath?: unknown;
   output_file?: unknown;
@@ -66,6 +95,8 @@ export type AsyncTaskNotification = TaskIdentity & {
 
 type TaskProgress = TaskIdentity & {
   description?: unknown;
+  toolCallId?: unknown;
+  tool_use_id?: unknown;
   summary?: unknown;
   lastToolName?: unknown;
   last_tool_name?: unknown;
@@ -92,14 +123,34 @@ export class AsyncTaskRuntime {
    * a command was backgrounded can arrive after its terminal SDK edge.
    */
   private readonly tasks = new Map<string, AsyncTask>();
+  /**
+   * The task output paths in the text of each tool result, by tool call
+   * id. A task whose id and tool call are known takes its output path from
+   * here. The tool result can come before or after the SDK names the task.
+   * The oldest entries are dropped.
+   */
+  private readonly outputPathsByToolCall = new Map<string, string[]>();
+  /** The task of the autonomous turn that runs now. */
+  private autonomousTurn?: AsyncTask;
+  /** The summary of the last task notification, which usually starts the next autonomous turn. */
+  private lastNotificationSummary?: string;
 
   constructor(
     readonly enabled: boolean,
     private readonly sessionId: string,
     private readonly publish: Publish,
     /** `notices`: the client can present `notice` updates, so the stop
-     *  acknowledgement need not be a transcript line. */
-    private readonly options: { notices?: boolean } = {},
+     *  acknowledgement need not be a transcript line. `routeOf`: the route of
+     *  the tasks that a tool call in another session started, for example in
+     *  a native subagent session. `toolNameOf`: the name of the tool of a tool
+     *  call, or `undefined` when the tool call is unknown. A task that a
+     *  `Monitor` tool call started is published as a monitor: the SDK reports
+     *  it as `local_bash`, so the adapter names it a monitor. */
+    private readonly options: {
+      notices?: boolean;
+      routeOf?: (toolCallId: string) => Route | undefined;
+      toolNameOf?: (toolCallId: string) => string | undefined;
+    } = {},
   ) {}
 
   async taskStarted(message: AsyncTaskStarted): Promise<void> {
@@ -108,7 +159,7 @@ export class AsyncTaskRuntime {
     if (!taskId) return;
     const task = this.task(taskId);
     if (isSubagentTask(message)) {
-      task.ignored = true;
+      this.ignore(task);
       return;
     }
 
@@ -120,7 +171,8 @@ export class AsyncTaskRuntime {
       isBackgroundTask(
         field(message, "isBackgrounded", "is_backgrounded"),
         field(message, "taskType", "task_type"),
-      )
+      ) ||
+      task.held
     ) {
       await this.announce(task);
     }
@@ -138,7 +190,7 @@ export class AsyncTaskRuntime {
     if (!taskId) return;
     const task = this.task(taskId);
     if (isSubagentTask(message)) {
-      task.ignored = true;
+      this.ignore(task);
       return;
     }
 
@@ -187,7 +239,8 @@ export class AsyncTaskRuntime {
       }
       if (task.state !== state) {
         task.state = state;
-        if (task.announced) await this.publishState(task, state, nonBlankString(patch.error));
+        const error = nonBlankString(patch.error);
+        await this.whenAnnounced(task, () => this.publishState(task, state, error));
       } else if (task.announced && task.outputFilePath !== previousOutputFilePath) {
         await this.publishMetadata(task);
       }
@@ -202,10 +255,12 @@ export class AsyncTaskRuntime {
     const taskId = taskIdOf(message);
     if (!taskId) return;
     const task = this.tasks.get(taskId);
-    if (!task || !task.announced || task.ignored) return;
+    if (!task || task.ignored || !(task.announced || task.held)) return;
 
     const previousOutputFilePath = task.outputFilePath;
+    const previousToolCallId = task.toolCallId;
     this.mergeOutputFilePath(task, message);
+    this.mergeToolCallId(task, message);
     const outputChanged = task.outputFilePath !== previousOutputFilePath;
     if (isTerminal(task.state)) {
       if (outputChanged) await this.publishMetadata(task);
@@ -216,13 +271,20 @@ export class AsyncTaskRuntime {
     const description = nonBlankString(message.description);
     const summary = nonBlankString(message.summary);
     const lastToolName = nonBlankString(field(message, "lastToolName", "last_tool_name"));
-    await this.publishProgress(task, {
+    const progress = {
       ...(description ? { description } : {}),
       ...(summary ? { summary } : {}),
       ...(lastToolName ? { lastToolName } : {}),
       ...(usage ? { usage } : {}),
       ...(outputChanged && task.outputFilePath ? { outputFilePath: task.outputFilePath } : {}),
-    });
+      ...(task.toolCallId !== previousToolCallId && task.toolCallId
+        ? { toolCallId: task.toolCallId }
+        : {}),
+    };
+    await this.whenAnnounced(task, () => this.publishProgress(task, progress));
+    // The progress brought the tool call id of a held task: send the spawn,
+    // then the progress beats that waited for it.
+    if (task.held && task.toolCallId) await this.announce(task);
   }
 
   async taskNotification(message: AsyncTaskNotification): Promise<void>;
@@ -252,11 +314,13 @@ export class AsyncTaskRuntime {
     const state = taskState(message.status);
     if (!taskId || !state || state === "running" || state === "paused") return;
 
+    this.lastNotificationSummary = nonBlankString(message.summary) ?? this.lastNotificationSummary;
     const task = this.task(taskId);
     const wasTerminal = isTerminal(task.state);
     const correctsLevelState = wasTerminal && task.terminalSource === "level";
     const previousOutputFilePath = task.outputFilePath;
     this.mergeOutputFilePath(task, message);
+    this.mergeToolCallId(task, message);
     await this.finish(task, state, nonBlankString(message.summary), "event");
     if (
       wasTerminal &&
@@ -293,8 +357,9 @@ export class AsyncTaskRuntime {
       live.add(taskId);
       const task = this.task(taskId);
       if (task.ignored || isTerminal(task.state)) continue;
-      if (field(item, "taskType", "task_type") === "local_agent") {
-        task.ignored = true;
+      const levelTaskType = field(item, "taskType", "task_type");
+      if (levelTaskType === "local_agent") {
+        this.ignore(task);
         continue;
       }
       if (!task.startedObserved) {
@@ -310,20 +375,29 @@ export class AsyncTaskRuntime {
     }
 
     for (const task of this.tasks.values()) {
-      if (task.announced && !task.ignored && !isTerminal(task.state) && !live.has(task.id)) {
+      if (
+        (task.announced || task.held) &&
+        !task.ignored &&
+        !task.autonomousTurn &&
+        !isTerminal(task.state) &&
+        !live.has(task.id)
+      ) {
         // This replace-semantics level is itself the authoritative liveness
         // boundary. Close immediately so a lost terminal edge cannot leave a
-        // permanent running card; a following task_notification may correct
-        // the best-effort stopped state to completed/failed.
+        // permanent running card. Since SDK 0.3.292 a finishing task's level
+        // follows its terminal edges, so this is a lost or late edge; a late
+        // task_notification still corrects the best-effort stopped state to
+        // completed/failed.
         await this.finish(task, "stopped", undefined, "level");
       }
     }
   }
 
   async finishAll(state: Extract<AsyncTaskState, "failed" | "stopped">): Promise<void> {
+    this.autonomousTurn = undefined;
     const errors: unknown[] = [];
     for (const task of this.tasks.values()) {
-      if (task.announced && !task.ignored && !isTerminal(task.state)) {
+      if ((task.announced || task.held) && !task.ignored && !isTerminal(task.state)) {
         try {
           await this.finish(task, state, undefined, "shutdown");
         } catch (error) {
@@ -337,7 +411,13 @@ export class AsyncTaskRuntime {
 
   canStop(taskId: string): boolean {
     const task = this.tasks.get(taskId);
-    return task?.announced === true && !task.ignored && !task.stopping && !isTerminal(task.state);
+    return (
+      task?.announced === true &&
+      !task.monitor &&
+      !task.ignored &&
+      !task.stopping &&
+      !isTerminal(task.state)
+    );
   }
 
   claimStop(taskId: string): boolean {
@@ -355,6 +435,7 @@ export class AsyncTaskRuntime {
     const task = this.tasks.get(taskId);
     if (!task || !task.announced || task.ignored || task.stopAnnounced) return;
     task.stopAnnounced = true;
+    if (this.autonomousTurn === task) this.autonomousTurn = undefined;
     // No terminal summary: a stopped task leaves the Async Tasks panel at once,
     // so anything said there is said to nobody.
     await this.finish(task, "stopped", undefined, "event");
@@ -372,17 +453,126 @@ export class AsyncTaskRuntime {
     // `showInTranscript` does not gate it either: that flag decides whether the
     // task owns a transcript *card* (a background Bash task is already drawn as
     // its tool call), not whether the agent may answer a direct user action.
-    await this.publish({
-      sessionId: this.sessionId,
-      update: noticeOrTranscriptUpdate(
+    await this.send(
+      task,
+      noticeOrTranscriptUpdate(
         { severity: "info", title: "Task stopped by user", description: `${task.name}.` },
         this.options.notices ?? false,
       ),
-    });
+    );
+  }
+
+  /**
+   * Publishes a model turn that Claude Code started with no prompt open, for
+   * example to answer a task notification. ACP v1 has no session state, and
+   * the client already got the stop reason of its last prompt, so this task is
+   * the only sign that the agent works. The tool calls of the turn are in the
+   * transcript already, so the task is not shown there.
+   *
+   * [cause] names what started the turn when Claude Code says so, for example
+   * "A scheduled wakeup fired." It replaces the description of a task that is
+   * already open; without it, an open task is left as it is.
+   */
+  async autonomousTurnStarted(cause?: string): Promise<void> {
+    if (!this.enabled) return;
+    if (this.autonomousTurn) {
+      if (cause) await this.publishProgress(this.autonomousTurn, { description: cause });
+      return;
+    }
+    const task = this.task(`autonomous-turn-${randomUUID()}`);
+    task.autonomousTurn = true;
+    task.startedObserved = true;
+    task.name = "Claude is working";
+    task.taskType = "turn";
+    task.description =
+      cause ?? this.lastNotificationSummary ?? "Claude Code started a turn without a prompt.";
+    task.showInTranscript = false;
+    this.lastNotificationSummary = undefined;
+    this.autonomousTurn = task;
+    await this.announce(task, { withoutToolCall: true });
+  }
+
+  /** Whether the task of an autonomous turn is open. */
+  get autonomousTurnOpen(): boolean {
+    return this.autonomousTurn !== undefined;
+  }
+
+  /** Ends the task of the autonomous turn that runs now, if there is one. */
+  async autonomousTurnEnded(state: "completed" | "failed"): Promise<void> {
+    const task = this.autonomousTurn;
+    if (!task) return;
+    this.autonomousTurn = undefined;
+    await this.finish(task, state, undefined, "event");
+  }
+
+  /** Whether the task stands for an autonomous turn, which a stop interrupts. */
+  isAutonomousTurn(taskId: string): boolean {
+    return this.tasks.get(taskId)?.autonomousTurn === true;
+  }
+
+  /** Whether a task of the tool call went to the background, so the client gets it. */
+  isBackgroundedToolCall(toolCallId: string): boolean {
+    for (const task of this.tasks.values()) {
+      if (task.toolCallId === toolCallId && !task.ignored && (task.announced || task.held)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Reads the tool results in `content` for the output path of a known task.
+   * Only a path that ends with `tasks/<task id>.output` in the result of
+   * the task's own tool call counts. A tool result never creates a task.
+   */
+  async toolResults(content: unknown): Promise<void> {
+    if (!this.enabled || !Array.isArray(content)) return;
+    for (const result of content.flatMap(toolResultBlock)) {
+      const text = textContent(result.content);
+      const paths = text ? taskOutputPaths(text) : [];
+      if (paths.length === 0) continue;
+      this.outputPathsByToolCall.delete(result.toolUseId);
+      this.outputPathsByToolCall.set(result.toolUseId, paths);
+      if (this.outputPathsByToolCall.size > MAX_TOOL_RESULT_PATHS) {
+        const oldest = this.outputPathsByToolCall.keys().next().value;
+        if (oldest !== undefined) this.outputPathsByToolCall.delete(oldest);
+      }
+      for (const task of this.tasks.values()) {
+        if (task.toolCallId !== result.toolUseId || task.ignored || task.outputFilePath) continue;
+        this.mergeToolResultPath(task);
+        if (task.outputFilePath && task.announced) await this.publishMetadata(task);
+      }
+    }
+  }
+
+  /**
+   * Sends the spawn of each held task without a tool call id. The prompt
+   * result ends the model turn, and the result of the tool call that started a
+   * task comes before it. So a held task is never held for longer than one turn.
+   */
+  async releaseHeld(): Promise<void> {
+    if (!this.enabled) return;
+    for (const task of this.tasks.values()) {
+      if (task.held) await this.announce(task, { withoutToolCall: true });
+    }
   }
 
   clear(): void {
     this.tasks.clear();
+    this.outputPathsByToolCall.clear();
+    this.autonomousTurn = undefined;
+    this.lastNotificationSummary = undefined;
+  }
+
+  /**
+   * Marks a task that the client never sees. Only a task that is not announced
+   * can become ignored, so the client never holds a task without its end.
+   */
+  private ignore(task: AsyncTask): void {
+    if (task.announced) return;
+    task.ignored = true;
+    task.held = false;
+    task.deferred = [];
   }
 
   private task(taskId: string): AsyncTask {
@@ -394,13 +584,18 @@ export class AsyncTaskRuntime {
       taskType: "task",
       description: "Background task",
       showInTranscript: true,
+      monitor: false,
       announced: false,
+      held: false,
+      deferred: [],
       ignored: false,
       startedObserved: false,
       panelOnlyRecovery: false,
       stopping: false,
       stopAnnounced: false,
       state: "running",
+      published: new Map(),
+      autonomousTurn: false,
     };
     this.tasks.set(taskId, task);
     return task;
@@ -410,6 +605,7 @@ export class AsyncTaskRuntime {
     task.startedObserved = true;
     const rawTaskType = field(message, "taskType", "task_type");
     if (rawTaskType !== undefined) task.taskType = friendlyTaskType(rawTaskType);
+    if (rawTaskType === "local_monitor") task.monitor = true;
     const description = nonBlankString(message.description);
     if (description) task.description = description;
     else if (task.description === "Background task")
@@ -427,6 +623,32 @@ export class AsyncTaskRuntime {
     this.mergeOutputFilePath(task, message);
     const toolCallId = nonBlankString(field(message, "toolCallId", "tool_use_id"));
     if (toolCallId) task.toolCallId = toolCallId;
+    this.mergeToolResultPath(task);
+  }
+
+  /** Keeps the first tool call id that a later SDK message brings. */
+  private mergeToolCallId(
+    task: AsyncTask,
+    value: { toolCallId?: unknown; tool_use_id?: unknown },
+  ): void {
+    task.toolCallId ??= nonBlankString(field(value, "toolCallId", "tool_use_id"));
+    this.mergeToolResultPath(task);
+  }
+
+  /**
+   * Takes the output path from the result of the task's tool call when no
+   * structured source gave one. A structured path later replaces it.
+   */
+  private mergeToolResultPath(task: AsyncTask): void {
+    if (task.outputFilePath || !task.toolCallId) return;
+    const paths = this.outputPathsByToolCall.get(task.toolCallId);
+    if (paths) task.outputFilePath = outputFilePathOf(paths, task.id);
+  }
+
+  /** Sends an update of an announced task. A held task sends it after its spawn. */
+  private async whenAnnounced(task: AsyncTask, send: () => Promise<void>): Promise<void> {
+    if (task.announced) await send();
+    else if (task.held) task.deferred.push(send);
   }
 
   private mergePatch(task: AsyncTask, patch: TaskPatch): void {
@@ -441,6 +663,7 @@ export class AsyncTaskRuntime {
   private mergeLevel(task: AsyncTask, level: BackgroundTaskLevel): void {
     const rawTaskType = field(level, "taskType", "task_type");
     if (rawTaskType !== undefined) task.taskType = friendlyTaskType(rawTaskType);
+    if (rawTaskType === "local_monitor") task.monitor = true;
     const description = nonBlankString(level.description);
     if (description) {
       task.description = description;
@@ -456,23 +679,58 @@ export class AsyncTaskRuntime {
     if (outputFilePath) task.outputFilePath = outputFilePath;
   }
 
-  private async announce(task: AsyncTask): Promise<void> {
+  /**
+   * Sends the spawn of the task. The spawn names the tool call that started the
+   * task, so it waits for the tool call id: the task is held until the id
+   * arrives. The id comes as `tool_use_id` of the SDK `task_started`,
+   * `task_progress`, or `task_notification`, or from the Bash result of a
+   * backgrounded command. A held task gets its spawn without the id when it
+   * ends first, or when the prompt result ends the model turn
+   * ({@link releaseHeld}). No guess by the command text binds a task.
+   *
+   * A task that a `Monitor` tool call started is published as a monitor. The
+   * SDK reports it as `local_bash`, so the adapter names it a monitor instead of
+   * a shell. It has no transcript card because Monitor streams its output to
+   * the model only, and no Stop because stopping it only ends the agent's wait
+   * (the agent's own TaskStop still works). The tool_use streams before the
+   * tool runs, so the tool name is known when the spawn has the tool call id.
+   */
+  private async announce(
+    task: AsyncTask,
+    options: { withoutToolCall?: boolean } = {},
+  ): Promise<void> {
     if (task.announced || task.ignored) return;
-    await this.publish({
-      sessionId: this.sessionId,
-      update: {
-        sessionUpdate: "async_task_spawned",
-        asyncTaskId: task.id,
-        name: task.name,
-        taskType: task.taskType,
-        description: task.description,
-        showInTranscript: task.showInTranscript,
-        canStop: true,
-        ...(task.outputFilePath ? { outputFilePath: task.outputFilePath } : {}),
-        ...(task.toolCallId ? { toolCallId: task.toolCallId } : {}),
-      },
+    if (!task.toolCallId && !options.withoutToolCall && !isTerminal(task.state)) {
+      task.held = true;
+      return;
+    }
+    if (task.toolCallId && this.options.toolNameOf?.(task.toolCallId) === "Monitor") {
+      task.monitor = true;
+    }
+    if (task.monitor) {
+      task.taskType = "monitor";
+      task.showInTranscript = false;
+    }
+    if (task.toolCallId) task.route ??= this.options.routeOf?.(task.toolCallId);
+    await this.send(task, {
+      sessionUpdate: "async_task_spawned",
+      asyncTaskId: task.id,
+      name: task.name,
+      taskType: task.taskType,
+      description: task.description,
+      showInTranscript: task.showInTranscript,
+      canStop: !task.monitor,
+      ...(task.outputFilePath ? { outputFilePath: task.outputFilePath } : {}),
+      ...(task.toolCallId ? { toolCallId: task.toolCallId } : {}),
     });
     task.announced = true;
+    task.held = false;
+    recordPublished(task, {
+      description: task.description,
+      outputFilePath: task.outputFilePath,
+      toolCallId: task.toolCallId,
+    });
+    for (const send of task.deferred.splice(0)) await send();
     if (isTerminal(task.state)) {
       await this.publishState(task, task.state, task.terminalSummary);
     }
@@ -486,8 +744,9 @@ export class AsyncTaskRuntime {
   ): Promise<void> {
     if (task.ignored) return;
     if (isTerminal(task.state)) {
-      // A level event may precede the authoritative terminal edge. Correct its
-      // best-effort stopped state if that edge later arrives.
+      // A level event can precede a late terminal edge (older CLIs sent the
+      // level first). Correct its best-effort stopped state if that edge
+      // later arrives.
       if (task.terminalSource !== "level" || source !== "event") return;
     }
     const previous = {
@@ -500,6 +759,9 @@ export class AsyncTaskRuntime {
     task.terminalSource = source;
     try {
       if (task.announced) await this.publishState(task, state, summary);
+      // The task ended before its tool call id arrived. The spawn goes out now
+      // without the id, so the task still appears.
+      else if (task.held) await this.announce(task);
     } catch (error) {
       task.state = previous.state;
       task.terminalSummary = previous.terminalSummary;
@@ -521,6 +783,10 @@ export class AsyncTaskRuntime {
     }
   }
 
+  /**
+   * Publishes the progress fields that changed since the last report of the
+   * task. A beat with nothing new is not sent.
+   */
   private async publishProgress(
     task: AsyncTask,
     update: {
@@ -532,53 +798,84 @@ export class AsyncTaskRuntime {
       toolCallId?: string;
     },
   ): Promise<void> {
-    await this.publish({
-      sessionId: this.sessionId,
-      update: {
-        sessionUpdate: "async_task_progress",
-        asyncTaskId: task.id,
-        ...update,
-      },
+    const changed = changedFields(task, update);
+    if (Object.keys(changed).length === 0) return;
+    await this.send(task, {
+      sessionUpdate: "async_task_progress",
+      asyncTaskId: task.id,
+      ...changed,
     });
+    recordPublished(task, changed);
   }
 
+  /** Publishes a state, with the output path and the tool call only when they changed. */
   private async publishState(
     task: AsyncTask,
     state: AsyncTaskState,
     summary?: string,
   ): Promise<void> {
-    await this.publish({
-      sessionId: this.sessionId,
-      update: {
-        sessionUpdate: "async_task_state_update",
-        asyncTaskId: task.id,
-        state,
-        ...(summary ? { summary } : {}),
-        ...(task.outputFilePath ? { outputFilePath: task.outputFilePath } : {}),
-        ...(task.toolCallId ? { toolCallId: task.toolCallId } : {}),
-      },
+    const changed = changedFields(task, {
+      outputFilePath: task.outputFilePath,
+      toolCallId: task.toolCallId,
     });
+    await this.send(task, {
+      sessionUpdate: "async_task_state_update",
+      asyncTaskId: task.id,
+      state,
+      ...(summary ? { summary } : {}),
+      ...changed,
+    });
+    recordPublished(task, changed);
+  }
+
+  /** Publishes an update of the task in the session that owns the task. */
+  private async send(task: AsyncTask, update: AcpSessionNotification["update"]): Promise<void> {
+    const notification: AcpSessionNotification = { sessionId: this.sessionId, update };
+    const routed = task.route ? task.route(notification) : notification;
+    if (routed) await this.publish(routed);
   }
 }
 
-/** Recovers background Bash lifecycle data exposed only on its tool result. */
+/**
+ * The fields whose value differs from what the client holds. An undefined
+ * value is not a field. The caller records the fields with
+ * {@link recordPublished} after the send succeeds, so a retry after a failed
+ * send carries them again.
+ */
+function changedFields<T extends Record<string, unknown>>(task: AsyncTask, fields: T): Partial<T> {
+  const changed: Partial<T> = {};
+  for (const [key, value] of Object.entries(fields)) {
+    if (value === undefined) continue;
+    if (task.published.get(key) === JSON.stringify(value)) continue;
+    (changed as Record<string, unknown>)[key] = value;
+  }
+  return changed;
+}
+
+/** Records the fields that the client holds now. An undefined value is not a field. */
+function recordPublished(task: AsyncTask, fields: Record<string, unknown>): void {
+  for (const [key, value] of Object.entries(fields)) {
+    if (value !== undefined) task.published.set(key, JSON.stringify(value));
+  }
+}
+
+/**
+ * Recovers a background Bash task from the structured `backgroundTaskId` of
+ * its tool result. The text of a tool result never gives a task id: a
+ * foreground command can print any text.
+ */
 export function backgroundBashTaskFromToolResult(
   content: unknown,
   toolUseResult: unknown,
   toolUses: Record<string, { name: string; input: unknown }>,
-): AsyncTaskStarted | undefined {
+): (AsyncTaskStarted & { taskId: string; toolCallId: string }) | undefined {
   if (!Array.isArray(content)) return undefined;
   const toolResults = content.flatMap(toolResultBlock);
   const bashResults = toolResults.filter((result) => toolUses[result.toolUseId]?.name === "Bash");
   if (bashResults.length === 0) return undefined;
 
   const backgroundResults = structuredBackgroundResults(toolUseResult, toolUses);
-  const distinctTaskIds = new Set([
-    ...backgroundResults.map((result) => result.taskId),
-    ...bashResults
-      .map((result) => backgroundTaskIdFromText(result.content))
-      .filter((taskId): taskId is string => taskId !== undefined),
-  ]);
+  const distinctTaskIds = new Set(backgroundResults.map((result) => result.taskId));
   if (distinctTaskIds.size !== 1) return undefined;
   const taskId = [...distinctTaskIds][0];
   if (!taskId) return undefined;
@@ -612,15 +909,36 @@ export function backgroundBashTaskFromToolResult(
   };
 }
 
-function backgroundTaskIdFromText(content: unknown): string | undefined {
-  const text = textContent(content);
-  if (!text) return undefined;
-  const marker = "Command running in background with ID: ";
-  const start = text.indexOf(marker);
-  if (start < 0) return undefined;
-  const valueStart = start + marker.length;
-  const valueEnd = text.indexOf(".", valueStart);
-  return valueEnd < 0 ? undefined : nonBlankString(text.slice(valueStart, valueEnd));
+/**
+ * The Bash tool calls in `content` whose command went to the background. Only
+ * structured data counts: the task from the structured tool result, a task
+ * that the runtime knows for the tool call, or a `run_in_background` input of
+ * a call that did not fail.
+ */
+export function backgroundedBashToolCallIds(
+  content: unknown,
+  toolUses: Record<string, { name: string; input: unknown }>,
+  runtime: AsyncTaskRuntime,
+  structuredTask?: AsyncTaskStarted,
+): Set<string> {
+  const ids = new Set<string>();
+  if (!runtime.enabled || !Array.isArray(content)) return ids;
+  const structuredToolCallId = structuredTask
+    ? nonBlankString(field(structuredTask, "toolCallId", "tool_use_id"))
+    : undefined;
+  for (const result of content.flatMap(toolResultBlock)) {
+    const toolUse = toolUses[result.toolUseId];
+    if (toolUse?.name !== "Bash") continue;
+    const input = isRecord(toolUse.input) ? toolUse.input : undefined;
+    if (
+      result.toolUseId === structuredToolCallId ||
+      runtime.isBackgroundedToolCall(result.toolUseId) ||
+      (input?.run_in_background === true && !result.isError)
+    ) {
+      ids.add(result.toolUseId);
+    }
+  }
+  return ids;
 }
 
 function structuredBackgroundResults(
@@ -652,27 +970,73 @@ function structuredBackgroundResults(
   return results;
 }
 
-function toolResultBlock(value: unknown): { toolUseId: string; content?: unknown }[] {
+function toolResultBlock(
+  value: unknown,
+): { toolUseId: string; content?: unknown; isError: boolean }[] {
   if (!isRecord(value) || value.type !== "tool_result") return [];
   const toolUseId = nonBlankString(field(value, "toolUseId", "tool_use_id"));
-  return toolUseId ? [{ toolUseId, content: value.content }] : [];
+  return toolUseId
+    ? [
+        {
+          toolUseId,
+          content: value.content,
+          isError: field(value, "isError", "is_error") === true,
+        },
+      ]
+    : [];
 }
 
 function asyncTaskOutputFilePath(content: unknown, taskId: string): string | undefined {
   const text = textContent(content);
-  if (!text) return undefined;
-  const marker = "Output is being written to: ";
-  const start = text.indexOf(marker);
-  if (start < 0) return undefined;
-  const valueStart = start + marker.length;
-  const valueEnd = text.indexOf(". You will be notified", valueStart);
-  if (valueEnd < 0) return undefined;
-  const path = text.slice(valueStart, valueEnd).trim();
-  const expectedPosixSuffix = `/tasks/${taskId}.output`;
-  const expectedWindowsSuffix = `\\tasks\\${taskId}.output`;
-  return path.endsWith(expectedPosixSuffix) || path.endsWith(expectedWindowsSuffix)
-    ? path
-    : undefined;
+  return text ? outputFilePathOf(taskOutputPaths(text), taskId) : undefined;
+}
+
+/**
+ * The end of a task output path: `tasks/<id>.output`, followed by a sentence
+ * period, whitespace or the end of the text. Claude Code writes the output of
+ * a background task there.
+ */
+const TASK_OUTPUT_SUFFIX = /[/\\]tasks[/\\][^\s/\\]+?\.output(?=\.(?!\w)|\s|$)/g;
+/** An absolute POSIX, Windows drive or UNC path. */
+const ABSOLUTE_PATH = /^(?:\/|[A-Za-z]:[\\/]|\\\\)/;
+
+/**
+ * The task output paths in a tool result text. Each text of Claude Code puts
+ * the path after "Output is being written to: ", so a path starts after the
+ * nearest `": "` before its end. A drive colon has no space after it, so a
+ * path can hold spaces and a drive. The search for the start stops at a line
+ * break and at the end of the previous path end, so a path never crosses a
+ * line or holds another path. Each character is read at most once, so the
+ * parse is linear in the text length. A path that is not absolute does not
+ * count.
+ */
+function taskOutputPaths(text: string): string[] {
+  const paths: string[] = [];
+  let previousEnd = 0;
+  for (const match of text.matchAll(TASK_OUTPUT_SUFFIX)) {
+    const end = match.index + match[0].length;
+    let start = -1;
+    for (let i = match.index - 1; i >= previousEnd; i--) {
+      const char = text[i];
+      if (char === "\n" || char === "\r") break;
+      if (char === ":" && text[i + 1] === " ") {
+        start = i + 2;
+        break;
+      }
+    }
+    previousEnd = end;
+    if (start < 0) continue;
+    const path = text.slice(start, end);
+    if (ABSOLUTE_PATH.test(path)) paths.push(path);
+  }
+  return paths;
+}
+
+/** The output path of the task `taskId` among the paths, if one names it. */
+function outputFilePathOf(paths: readonly string[], taskId: string): string | undefined {
+  const posix = `/tasks/${taskId}.output`;
+  const windows = `\\tasks\\${taskId}.output`;
+  return paths.find((path) => path.endsWith(posix) || path.endsWith(windows));
 }
 
 function textContent(value: unknown): string | undefined {

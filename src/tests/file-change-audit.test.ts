@@ -8,6 +8,7 @@ import {
   createNativeFileChangeReporter,
   type AgentFileChangeReportResult,
   type NativeFileChangeReporter,
+  recordSubagentFileEdits,
 } from "../file-change-audit.js";
 
 function createSupport(options: {
@@ -26,7 +27,11 @@ function createSupport(options: {
   });
 }
 
-function requestedTurn(reporter: NativeFileChangeReporter, requestId: string) {
+function requestedTurn(
+  reporter: NativeFileChangeReporter,
+  requestId: string,
+  editedPaths?: string[],
+) {
   const fileChangeReport = reporter.request({
     jetbrains: {
       air: {
@@ -35,7 +40,11 @@ function requestedTurn(reporter: NativeFileChangeReporter, requestId: string) {
     },
   });
   expect(fileChangeReport).toBeDefined();
-  return { promptUuid: "prompt-uuid", fileChangeReport };
+  return {
+    promptUuid: "prompt-uuid",
+    fileChangeReport,
+    ...(editedPaths ? { editedPaths: new Set(editedPaths) } : {}),
+  };
 }
 
 describe("native agent file-change report", () => {
@@ -234,5 +243,164 @@ describe("native agent file-change report", () => {
 
     expect(turn.fileChangeReport?.phase).toBe("finished");
     expect(logError).toHaveBeenCalledWith(expect.stringContaining("transport closed"));
+  });
+
+  /** Subagent-edited paths are unioned with the checkpoint paths and deduped. */
+  it("adds subagent edited paths to the checkpoint paths", async () => {
+    const published: AgentFileChangeReportResult[] = [];
+    const cwd = process.cwd();
+    const support = createSupport({ cwd, publish: async (result) => void published.push(result) });
+    const turn = requestedTurn(support, "request-union", [path.join(cwd, "GEMINI.md"), "src/a.ts"]);
+
+    await support.report(turn, {
+      rewindFiles: vi.fn(async () => ({
+        canRewind: true,
+        filesChanged: ["src/a.ts", "README.md"],
+      })),
+    });
+
+    expect(published).toMatchObject([
+      {
+        status: "reported",
+        paths: [
+          path.join(cwd, "src/a.ts"),
+          path.join(cwd, "README.md"),
+          path.join(cwd, "GEMINI.md"),
+        ],
+        declaredComplete: false,
+      },
+    ]);
+  });
+
+  /** When the checkpoint cannot be previewed, the subagent edits are still reported. */
+  it("reports subagent edited paths when the checkpoint cannot be previewed", async () => {
+    const published: AgentFileChangeReportResult[] = [];
+    const cwd = process.cwd();
+    const support = createSupport({ cwd, publish: async (result) => void published.push(result) });
+    const turn = requestedTurn(support, "request-fallback", ["GEMINI.md"]);
+
+    await support.report(turn, {
+      rewindFiles: vi.fn(async () => ({ canRewind: false, error: "checkpoint missing" })),
+    });
+
+    expect(published).toEqual([
+      {
+        version: 1,
+        requestId: "request-fallback",
+        status: "reported",
+        paths: [path.join(cwd, "GEMINI.md")],
+        declaredComplete: false,
+        truncated: false,
+      },
+    ]);
+  });
+
+  /** A checkpoint preview timeout falls back to the subagent edited paths. */
+  it("reports subagent edited paths when the checkpoint preview times out", async () => {
+    const published: AgentFileChangeReportResult[] = [];
+    const cwd = process.cwd();
+    const support = createSupport({
+      cwd,
+      publish: async (result) => void published.push(result),
+      timeoutMs: 1,
+    });
+    const turn = requestedTurn(support, "request-timeout-fallback", ["GEMINI.md"]);
+    const never = new Promise<never>(() => {});
+
+    await support.report(turn, { rewindFiles: vi.fn(() => never) });
+
+    expect(published).toMatchObject([
+      { status: "reported", paths: [path.join(cwd, "GEMINI.md")], declaredComplete: false },
+    ]);
+  });
+
+  /** A thrown checkpoint error falls back to the subagent edited paths. */
+  it("reports subagent edited paths when the checkpoint preview throws", async () => {
+    const published: AgentFileChangeReportResult[] = [];
+    const cwd = process.cwd();
+    const support = createSupport({ cwd, publish: async (result) => void published.push(result) });
+    const turn = requestedTurn(support, "request-throw-fallback", ["GEMINI.md"]);
+
+    await support.report(turn, {
+      rewindFiles: vi.fn(async () => {
+        throw new Error("boom");
+      }),
+    });
+
+    expect(published).toMatchObject([{ status: "reported", paths: [path.join(cwd, "GEMINI.md")] }]);
+  });
+
+  /** Without subagent edits an unusable checkpoint is still unavailable. */
+  it("stays unavailable when there are no subagent edited paths", async () => {
+    const published: AgentFileChangeReportResult[] = [];
+    const support = createSupport({ publish: async (result) => void published.push(result) });
+    const turn = requestedTurn(support, "request-empty", []);
+
+    await support.report(turn, {
+      rewindFiles: vi.fn(async () => ({ canRewind: false, error: "checkpoint missing" })),
+    });
+
+    expect(published).toEqual([
+      { version: 1, requestId: "request-empty", status: "unavailable", reason: "invalidOutput" },
+    ]);
+  });
+});
+
+describe("recordSubagentFileEdits", () => {
+  const toolUses = {
+    edit: { name: "Edit", input: { file_path: "/work/a.ts" } },
+    write: { name: "Write", input: { file_path: "/work/b.ts" } },
+    notebook: { name: "NotebookEdit", input: { notebook_path: "/work/n.ipynb" } },
+    read: { name: "Read", input: { file_path: "/work/c.ts" } },
+  };
+  const results = (...ids: string[]) =>
+    ids.map((id) => ({ type: "tool_result", tool_use_id: id, content: "ok" }));
+  const reportTurn = () => ({
+    promptUuid: "prompt-uuid",
+    fileChangeReport: { requestId: "request", phase: "requested" as const },
+    settled: false,
+    editedPaths: undefined as Set<string> | undefined,
+  });
+
+  /** Edit, Write and NotebookEdit results of a subagent add their paths; Read does not. */
+  it("collects the paths of subagent file-tool edits", () => {
+    const turn = reportTurn();
+    recordSubagentFileEdits(
+      turn,
+      "toolu_agent",
+      results("edit", "write", "notebook", "read"),
+      toolUses,
+    );
+    expect([...(turn.editedPaths ?? [])]).toEqual(["/work/a.ts", "/work/b.ts", "/work/n.ipynb"]);
+  });
+
+  /** A failed subagent Edit changed no file, so its path is skipped. */
+  it("skips error results", () => {
+    const turn = reportTurn();
+    recordSubagentFileEdits(
+      turn,
+      "toolu_agent",
+      [{ type: "tool_result", tool_use_id: "edit", content: "failed", is_error: true }],
+      toolUses,
+    );
+    expect(turn.editedPaths).toBeUndefined();
+  });
+
+  /** Root-agent edits are left to the checkpoint, so a root message adds nothing. */
+  it("skips root-agent messages", () => {
+    const turn = reportTurn();
+    recordSubagentFileEdits(turn, null, results("edit"), toolUses);
+    expect(turn.editedPaths).toBeUndefined();
+  });
+
+  /** A settled turn, or one without a requested report, collects nothing. */
+  it("skips turns that are settled or have no report", () => {
+    const settled = { ...reportTurn(), settled: true };
+    recordSubagentFileEdits(settled, "toolu_agent", results("edit"), toolUses);
+    expect(settled.editedPaths).toBeUndefined();
+
+    const unrequested = { ...reportTurn(), fileChangeReport: undefined };
+    recordSubagentFileEdits(unrequested, "toolu_agent", results("edit"), toolUses);
+    expect(unrequested.editedPaths).toBeUndefined();
   });
 });

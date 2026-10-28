@@ -3,21 +3,29 @@ import {
   CreateElicitationRequest,
   RequestError,
   SessionNotification,
-} from "@agentclientprotocol/sdk";
-import type { ClientCapabilities } from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
+import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
 import { getSessionMessages, type Options } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import type { AcpSessionNotification } from "../acp-subagents.js";
 import { ALLOW_BYPASS } from "../permissions/modes.js";
+import { NativeSubagentRuntime } from "../native-subagents.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
 let capturedOptions: Options | undefined;
 let contextUsageResult: (() => Promise<{ rawMaxTokens: number; model?: string }>) | undefined;
+let contextUsageCalls: Array<{ detail?: "summary" | "full" } | undefined> = [];
 let sessionMessages: Record<string, unknown>[];
 let sessionMessagesResult: () => Promise<Record<string, unknown>[]>;
 let initModels: Record<string, unknown>[] | undefined;
+/** Holds the CLI initialization until the test resolves it. */
+let initGate: Promise<void> | undefined;
+let initError: Error | undefined;
 let setModelImpl: ((model: string) => Promise<void>) | undefined;
+let interruptImpl: (() => Promise<undefined>) | undefined;
+let closeSpy: ReturnType<typeof vi.fn<() => void>>;
 let mcpServerStatusResult: () => Promise<Array<{ name: string; status: string }>>;
 let mcpAuthenticateImpl: (serverName: string) => Promise<{
   authUrl?: string;
@@ -34,21 +42,18 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
     query: (args: { prompt: unknown; options: Options }) => {
       capturedOptions = args.options;
       return makeMockQuery({
-        interrupt: async () => undefined,
-        close: () => {},
-        initializationResult: async () => ({
-          models: initModels ?? [
-            {
-              value: "claude-sonnet-4-6",
-              displayName: "Claude Sonnet",
-              description: "Fast",
-              supportsAutoMode: true,
-            },
-          ],
-        }),
+        interrupt: () => (interruptImpl ? interruptImpl() : Promise.resolve(undefined)),
+        close: () => closeSpy(),
+        initializationResult: async () => {
+          await initGate;
+          if (initError) throw initError;
+          return initializationResponse();
+        },
         setModel: (model: string) => (setModelImpl ? setModelImpl(model) : Promise.resolve()),
-        getContextUsage: () =>
-          contextUsageResult ? contextUsageResult() : Promise.resolve(DEFAULT_CONTEXT_USAGE),
+        getContextUsage: (opts?: { detail?: "summary" | "full" }) => {
+          contextUsageCalls.push(opts);
+          return contextUsageResult ? contextUsageResult() : Promise.resolve(DEFAULT_CONTEXT_USAGE);
+        },
         mcpServerStatus: () => mcpServerStatusResult(),
         mcpAuthenticate: (serverName: string) => mcpAuthenticateImpl(serverName),
       });
@@ -56,6 +61,19 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
     getSessionMessages: vi.fn(() => sessionMessagesResult()),
   };
 });
+
+function initializationResponse() {
+  return {
+    models: initModels ?? [
+      {
+        value: "claude-sonnet-4-6",
+        displayName: "Claude Sonnet",
+        description: "Fast",
+        supportsAutoMode: true,
+      },
+    ],
+  };
+}
 
 vi.mock("../tools.js", async () => {
   const actual = await vi.importActual<typeof import("../tools.js")>("../tools.js");
@@ -81,11 +99,16 @@ describe("createSession options merging", () => {
   beforeEach(async () => {
     capturedOptions = undefined;
     contextUsageResult = undefined;
+    contextUsageCalls = [];
     sessionMessages = [];
     sessionMessagesResult = async () => sessionMessages;
     vi.mocked(getSessionMessages).mockClear();
     initModels = undefined;
+    initGate = undefined;
+    initError = undefined;
     setModelImpl = undefined;
+    interruptImpl = undefined;
+    closeSpy = vi.fn<() => void>();
     mcpServerStatusResult = async () => [];
     mcpAuthenticateImpl = async () => ({
       requiresUserAction: false,
@@ -152,6 +175,223 @@ describe("createSession options merging", () => {
     });
   });
 
+  it("registers the PreToolUse hook of the change previews only on a v2 connection", async () => {
+    await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    // A v1 client gets the input's diff, so Claude Code waits on no hook.
+    expect(capturedOptions!.hooks?.PreToolUse).toBeUndefined();
+
+    const v2Agent = new ClaudeAcpAgent(createMockClient(), undefined, { v2: true });
+    await v2Agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    expect(capturedOptions!.hooks?.PreToolUse).toEqual([
+      { matcher: "Edit|Write", hooks: [expect.any(Function)] },
+    ]);
+  });
+
+  it.each([false, true])("reports child settings through registered hooks (v2: %s)", async (v2) => {
+    const updates: AcpSessionNotification[] = [];
+    const client = createMockClient();
+    client.sessionUpdate = async (notification) => {
+      updates.push(notification);
+    };
+    const observedAgent = new ClaudeAcpAgent(client, undefined, { v2 });
+    await observedAgent.initialize({ protocolVersion: 1, clientCapabilities: { subagents: {} } });
+    const { sessionId } = await observedAgent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    const session = observedAgent.sessions[sessionId]!;
+    const parentOptions = structuredClone(session.configOptions);
+    const runtime = (session.nativeSubagentRuntime = new NativeSubagentRuntime(
+      "rfd",
+      sessionId,
+      session,
+      (notification) => client.sessionUpdate(notification),
+      { log: () => {} },
+    ));
+    const invoke = async (
+      event: "PreToolUse" | "PostToolUse" | "PostModelSwitch" | "SubagentStart" | "SubagentStop",
+      fields: Record<string, unknown>,
+    ) => {
+      const matcher = capturedOptions!.hooks![event]!.find((matcher) => !matcher.matcher);
+      expect(matcher).toBeDefined();
+      for (const hook of matcher!.hooks) {
+        await expect(
+          hook(
+            {
+              hook_event_name: event,
+              session_id: sessionId,
+              cwd: process.cwd(),
+              transcript_path: "/tmp/transcript",
+              ...fields,
+            } as any,
+            undefined,
+            { signal: new AbortController().signal },
+          ),
+        ).resolves.toMatchObject({ continue: true });
+      }
+    };
+    // A main-thread --agent persona has agent_type too, but no agent_id.
+    await invoke("PreToolUse", {
+      agent_type: "reviewer",
+      permission_mode: "plan",
+      effort: { level: "max" },
+    });
+    expect(updates).toEqual([]);
+    await invoke("SubagentStart", {
+      agent_id: "child",
+      agent_type: "Explore",
+      permission_mode: "acceptEdits",
+    });
+    expect(updates).toEqual([]);
+    await runtime.taskStarted({ taskId: "child", subagentType: "Explore" }, async () => {});
+    const configs = () =>
+      updates.flatMap(({ update }) =>
+        update.sessionUpdate === "config_option_update" ? [update.configOptions] : [],
+      );
+    expect(
+      configs()
+        .at(-1)
+        ?.map((option) => [option.id, option.currentValue]),
+    ).toEqual([
+      ["mode", "acceptEdits"],
+      ["agent", "Explore"],
+    ]);
+    await invoke("PreToolUse", {
+      agent_id: "child",
+      agent_type: "Explore",
+      effort: { level: "high" },
+    });
+    expect(
+      configs()
+        .at(-1)
+        ?.find((option) => option.id === "effort"),
+    ).toMatchObject({
+      category: "thought_level",
+      currentValue: "high",
+      options: [{ value: "high", name: "High" }],
+    });
+    await invoke("PostToolUse", {
+      agent_id: "child",
+      tool_name: "EnterPlanMode",
+      permission_mode: "plan",
+    });
+    await invoke("PostModelSwitch", {
+      agent_id: "child",
+      to_model: "child-model",
+      source: "auto",
+      effort: { level: "low" },
+    });
+    await invoke("SubagentStop", { agent_id: "child", agent_type: "Explore" });
+    expect(
+      configs()
+        .at(-1)
+        ?.map((option) => [option.id, option.currentValue]),
+    ).toEqual([
+      ["mode", "plan"],
+      ["model", "child-model"],
+      ["effort", "low"],
+      ["agent", "Explore"],
+    ]);
+    expect(
+      configs()
+        .at(-1)
+        ?.every((option) => option.type === "select" && option.options.length === 1),
+    ).toBe(true);
+    // A model of the root session's list goes as that list's entry, with its name.
+    const rootModel = session.configOptions.find((option) => option.id === "model");
+    const listed =
+      rootModel?.type === "select"
+        ? (rootModel.options as Array<{ value: string; name: string }>).find(
+            (entry) => entry.value !== "default",
+          )
+        : undefined;
+    expect(listed).toBeDefined();
+    await invoke("PostModelSwitch", { agent_id: "child", to_model: listed!.value, source: "auto" });
+    expect(
+      configs()
+        .at(-1)
+        ?.find((option) => option.id === "model"),
+    ).toMatchObject({
+      currentValue: listed!.value,
+      options: [{ value: listed!.value, name: listed!.name }],
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(session.configOptions).toEqual(parentOptions);
+    expect(
+      updates
+        .filter(({ update }) => update.sessionUpdate === "config_option_update")
+        .every(({ sessionId: target }) => target === "child"),
+    ).toBe(true);
+  });
+
+  it("reports an AIR child's model switch under its current generation", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const client = createMockClient();
+    client.sessionUpdate = async (notification) => {
+      updates.push(notification);
+    };
+    const observedAgent = new ClaudeAcpAgent(client);
+    await observedAgent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["nativeSubagentSessions"] } } },
+      } as ClientCapabilities,
+    });
+    const { sessionId } = await observedAgent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    const session = observedAgent.sessions[sessionId]!;
+    const runtime = (session.nativeSubagentRuntime = new NativeSubagentRuntime(
+      "air",
+      sessionId,
+      session,
+      (notification) => client.sessionUpdate(notification),
+      { log: () => {} },
+    ));
+    const matcher = capturedOptions!.hooks!.PostModelSwitch!.find((matcher) => !matcher.matcher);
+    const switchModel = async (fields: Record<string, unknown>) => {
+      for (const hook of matcher!.hooks) {
+        await hook(
+          {
+            hook_event_name: "PostModelSwitch",
+            session_id: sessionId,
+            cwd: process.cwd(),
+            transcript_path: "/tmp/transcript",
+            source: "auto",
+            ...fields,
+          } as any,
+          undefined,
+          { signal: new AbortController().signal },
+        );
+      }
+    };
+    const deliver = async () => {};
+    await runtime.taskStarted({ taskId: "child", subagentType: "Explore" }, deliver);
+    await runtime.finishTask("child", "completed", deliver);
+    await runtime.taskResumed("child", deliver, "Continue");
+    // The hook names the SDK agent id; AIR's draft runs the resumed agent in a new session.
+    await switchModel({ agent_id: "child", to_model: "claude-sonnet-4-6" });
+    const rootModel = session.configOptions.find((option) => option.id === "model");
+    const rootEntryName =
+      rootModel?.type === "select"
+        ? (rootModel.options as Array<{ value: string; name: string }>).find(
+            (entry) => entry.value === "claude-sonnet-4-6",
+          )?.name
+        : undefined;
+    expect(rootEntryName).toBeDefined();
+    const models = updates.flatMap(({ sessionId: target, update }) =>
+      update.sessionUpdate === "config_option_update"
+        ? update.configOptions.map((option) => [target, option.currentValue, option])
+        : [],
+    );
+    expect(models).toEqual([
+      [
+        "child:generation:2",
+        "claude-sonnet-4-6",
+        expect.objectContaining({
+          id: "model",
+          // The name of the root session's entry for the model.
+          options: [{ value: "claude-sonnet-4-6", name: rootEntryName }],
+        }),
+      ],
+    ]);
+  });
+
   it("merges user-provided disallowedTools with ACP internal list", async () => {
     await agent.newSession({
       cwd: process.cwd(),
@@ -179,21 +419,6 @@ describe("createSession options merging", () => {
     });
 
     expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
-  });
-
-  it("ignores the provider-specific main-thread agent option", async () => {
-    const response = await agent.newSession({
-      cwd: process.cwd(),
-      mcpServers: [],
-      _meta: {
-        claudeCode: {
-          options: { agent: "reviewer" },
-        },
-      },
-    });
-
-    expect(capturedOptions).not.toHaveProperty("agent");
-    expect(response.configOptions?.some((option) => option.id === "agent")).toBe(false);
   });
 
   it("works when user provides empty disallowedTools", async () => {
@@ -303,6 +528,25 @@ describe("createSession options merging", () => {
     });
 
     expect(capturedOptions?.env?.HOME).toBe("/custom/home");
+  });
+
+  it("asks the SDK for a predicted follow-up prompt per turn", async () => {
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+    });
+
+    expect(capturedOptions!.promptSuggestions).toBe(true);
+  });
+
+  it("lets a caller turn the predicted follow-up prompt off", async () => {
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: { claudeCode: { options: { promptSuggestions: false } } },
+    });
+
+    expect(capturedOptions!.promptSuggestions).toBe(false);
   });
 
   it("defaults tools to claude_code preset when not provided", async () => {
@@ -439,6 +683,85 @@ describe("createSession options merging", () => {
     });
   });
 
+  describe("per-task stop affordance", () => {
+    function sessionFor(sessionId: string) {
+      return (agent as unknown as { sessions: Record<string, any> }).sessions[sessionId];
+    }
+
+    // Declared, Claude Code's interrupt spares background subagents, which a
+    // client on the subagents RFD form stops one at a time with its child's
+    // `cancel`. It spares background workflows too, which that client cannot
+    // stop, so the session's cancel stops them.
+    it("declares it for a client on the subagents RFD form", async () => {
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { subagents: {} } as ClientCapabilities,
+      });
+      const { sessionId } = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(capturedOptions!.perTaskStopAffordance).toBe(true);
+      expect(sessionFor(sessionId).stopsWorkflowsOnCancel).toBe(true);
+    });
+
+    it("stops workflows on a cancel only when declared and the client cannot stop them", async () => {
+      const { sessionId: plain } = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(sessionFor(plain).stopsWorkflowsOnCancel).toBe(false);
+
+      // A caller's own declaration counts.
+      const { sessionId: declared } = await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { claudeCode: { options: { perTaskStopAffordance: true } } },
+      });
+      expect(sessionFor(declared).stopsWorkflowsOnCancel).toBe(true);
+
+      // AIR stops a workflow itself, as an async task.
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {
+          _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+        } as ClientCapabilities,
+      });
+      const { sessionId: air } = await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { claudeCode: { options: { perTaskStopAffordance: true } } },
+      });
+      expect(sessionFor(air).stopsWorkflowsOnCancel).toBe(false);
+    });
+
+    it("does not declare it for a client that cannot cancel one subagent", async () => {
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(capturedOptions!.perTaskStopAffordance).toBeUndefined();
+
+      // AIR's draft grants a child no `cancel`.
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {
+          subagents: {},
+          _meta: { jetbrains: { air: { version: 1, capabilities: ["nativeSubagentSessions"] } } },
+        } as ClientCapabilities,
+      });
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(capturedOptions!.perTaskStopAffordance).toBeUndefined();
+    });
+
+    it("lets a caller's perTaskStopAffordance win", async () => {
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { subagents: {} } as ClientCapabilities,
+      });
+      const { sessionId } = await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { claudeCode: { options: { perTaskStopAffordance: false } } },
+      });
+
+      expect(capturedOptions!.perTaskStopAffordance).toBe(false);
+      expect(sessionFor(sessionId).stopsWorkflowsOnCancel).toBe(false);
+    });
+  });
+
   describe("systemPrompt via _meta", () => {
     it("defaults to the claude_code preset when not provided", async () => {
       await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
@@ -447,6 +770,56 @@ describe("createSession options merging", () => {
         type: "preset",
         preset: "claude_code",
       });
+    });
+
+    it("appends AIR custom instructions to the claude_code preset", async () => {
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: {
+          jetbrains: {
+            air: { customInstructions: "Follow the project rules." },
+          },
+        },
+      });
+
+      expect(capturedOptions!.systemPrompt).toEqual({
+        type: "preset",
+        preset: "claude_code",
+        append: "Follow the project rules.",
+      });
+    });
+
+    it("ignores malformed AIR custom instructions", async () => {
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: {
+          jetbrains: {
+            air: { customInstructions: 42 },
+          },
+        },
+      });
+
+      expect(capturedOptions!.systemPrompt).toEqual({
+        type: "preset",
+        preset: "claude_code",
+      });
+    });
+
+    it("gives the legacy system prompt precedence over AIR custom instructions", async () => {
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: {
+          systemPrompt: "legacy prompt",
+          jetbrains: {
+            air: { customInstructions: "AIR instructions" },
+          },
+        },
+      });
+
+      expect(capturedOptions!.systemPrompt).toBe("legacy prompt");
     });
 
     it("replaces the preset when a string is provided", async () => {
@@ -528,6 +901,108 @@ describe("createSession options merging", () => {
     });
   });
 
+  describe("systemPrompt", () => {
+    const text = (value: string) => ({ type: "text" as const, text: value });
+
+    it("appends text blocks to the claude_code preset", async () => {
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        systemPrompt: { mode: "append", content: [text("First."), text("Second.")] },
+      });
+
+      expect(capturedOptions!.systemPrompt).toEqual({
+        type: "preset",
+        preset: "claude_code",
+        append: "First.\n\nSecond.",
+      });
+    });
+
+    it("replaces the claude_code preset in override mode", async () => {
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        systemPrompt: { mode: "override", content: [text("You are a release bot.")] },
+      });
+
+      expect(capturedOptions!.systemPrompt).toBe("You are a release bot.");
+    });
+
+    it("takes precedence over _meta.systemPrompt and keeps AIR custom instructions", async () => {
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        systemPrompt: { mode: "append", content: [text("Client prompt.")] },
+        _meta: {
+          systemPrompt: "legacy prompt",
+          jetbrains: { air: { customInstructions: "AIR instructions" } },
+        },
+      });
+
+      expect(capturedOptions!.systemPrompt).toEqual({
+        type: "preset",
+        preset: "claude_code",
+        append: "Client prompt.\n\nAIR instructions",
+      });
+    });
+
+    it("rejects an unsupported mode without creating a session", async () => {
+      capturedOptions = undefined;
+      await expect(
+        agent.newSession({
+          cwd: process.cwd(),
+          mcpServers: [],
+          systemPrompt: { mode: "_vendor", content: [text("x")] },
+        }),
+      ).rejects.toMatchObject({ code: RequestError.invalidParams().code });
+      expect(capturedOptions).toBeUndefined();
+    });
+
+    it("rejects content other than text without creating a session", async () => {
+      capturedOptions = undefined;
+      await expect(
+        agent.newSession({
+          cwd: process.cwd(),
+          mcpServers: [],
+          systemPrompt: {
+            mode: "append",
+            content: [{ type: "image", data: "", mimeType: "image/png" }],
+          },
+        }),
+      ).rejects.toMatchObject({ code: RequestError.invalidParams().code });
+      expect(capturedOptions).toBeUndefined();
+    });
+
+    it("recreates a live session when resume sends a different systemPrompt", async () => {
+      const { sessionId } = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      capturedOptions = undefined;
+
+      await agent.resumeSession({
+        sessionId,
+        cwd: process.cwd(),
+        systemPrompt: { mode: "append", content: [text("New instructions.")] },
+      });
+
+      expect(capturedOptions!.systemPrompt).toEqual({
+        type: "preset",
+        preset: "claude_code",
+        append: "New instructions.",
+      });
+    });
+
+    it("rejects an unsupported systemPrompt on resume of a live session", async () => {
+      const { sessionId } = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      await expect(
+        agent.resumeSession({
+          sessionId,
+          cwd: process.cwd(),
+          systemPrompt: { mode: "_vendor", content: [text("x")] },
+        }),
+      ).rejects.toMatchObject({ code: RequestError.invalidParams().code });
+    });
+  });
+
   describe("CLAUDE_MODEL_CONFIG", () => {
     let originalModelConfig: string | undefined;
 
@@ -588,9 +1063,71 @@ describe("createSession options merging", () => {
       expect(capturedOptions!.settings).toBeUndefined();
     });
 
-    it("ignores env var when _meta provides settings", async () => {
+    it("keeps model settings when session settings add hooks", async () => {
       process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({
         modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
+        availableModels: ["opus"],
+      });
+      const hooks = { PostToolUse: [{ hooks: [{ type: "command", command: "echo ready" }] }] };
+
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { claudeCode: { options: { settings: { hooks } } } },
+      });
+
+      expect(capturedOptions!.settings).toEqual({
+        modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
+        availableModels: ["opus"],
+        hooks,
+      });
+      // The CLI adds these hooks to the ones in the user and project settings.
+      expect(capturedOptions!.settingSources).toEqual(["user", "project", "local"]);
+    });
+
+    it("applies session hooks on session/load with model settings", async () => {
+      process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({ availableModels: ["opus"] });
+      const cwd = process.cwd();
+      const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+      const hooks = { Stop: [{ hooks: [{ type: "command", command: "echo done" }] }] };
+
+      await agent.loadSession({
+        sessionId,
+        cwd,
+        mcpServers: [],
+        _meta: { claudeCode: { options: { settings: { hooks } } } },
+      });
+
+      expect(capturedOptions!.resume).toBe(sessionId);
+      expect(capturedOptions!.settings).toEqual({ availableModels: ["opus"], hooks });
+    });
+
+    it("merges model settings with a session settings file", async () => {
+      process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({ availableModels: ["opus"] });
+      const settingsDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-settings-"));
+      const settingsFile = path.join(settingsDir, "settings.json");
+      fs.writeFileSync(settingsFile, JSON.stringify({ hooks: { Stop: [] } }));
+
+      try {
+        await agent.newSession({
+          cwd: process.cwd(),
+          mcpServers: [],
+          _meta: { claudeCode: { options: { settings: settingsFile } } },
+        });
+
+        expect(capturedOptions!.settings).toEqual({
+          availableModels: ["opus"],
+          hooks: { Stop: [] },
+        });
+      } finally {
+        fs.rmSync(settingsDir, { recursive: true });
+      }
+    });
+
+    it("prefers session settings when both sources set the same field", async () => {
+      process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({
+        modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
+        availableModels: ["opus"],
       });
 
       await agent.newSession({
@@ -608,10 +1145,10 @@ describe("createSession options merging", () => {
         },
       });
 
-      // _meta settings take precedence; env var is ignored entirely
       expect(capturedOptions!.settings).toEqual({
         model: "claude-sonnet-4-6",
         modelOverrides: { "claude-opus-4-6": "meta-value" },
+        availableModels: ["opus"],
       });
     });
 
@@ -907,30 +1444,83 @@ describe("createSession options merging", () => {
     });
   });
 
+  describe("session/close right after session/new", () => {
+    it("answers at once and closes the query", async () => {
+      const { sessionId } = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      await agent.closeSession({ sessionId });
+
+      expect(closeSpy).toHaveBeenCalledOnce();
+      expect((agent as unknown as { sessions: Record<string, unknown> }).sessions[sessionId]).toBe(
+        undefined,
+      );
+    });
+
+    it("does not wait for an interrupt queued behind the background getContextUsage", async () => {
+      // SDK control requests are serialized. On a fresh session the background
+      // getContextUsage is still in flight, so a real CLI answers an interrupt
+      // only after it, which took ~3s and timed out the client's close.
+      contextUsageResult = () => new Promise<never>(() => {});
+      interruptImpl = () => new Promise<never>(() => {});
+      const { sessionId } = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      const closed = await Promise.race([
+        agent.closeSession({ sessionId }).then(() => "closed"),
+        new Promise((resolve) => setTimeout(() => resolve("timed out"), 500)),
+      ]);
+
+      expect(closed).toBe("closed");
+      expect(closeSpy).toHaveBeenCalledOnce();
+    });
+  });
+
   describe("context window seeding", () => {
     function sessionFor(sessionId: string) {
       return (agent as unknown as { sessions: Record<string, any> }).sessions[sessionId];
     }
 
-    it("does not call getContextUsage during session creation", async () => {
-      // getContextUsage stalls until the session's first prompt turn has run
-      // (it is not serviced pre-turn), so session/new must never call it —
+    it("does not wait for getContextUsage during session creation", async () => {
+      // SDK control requests are serialized and getContextUsage used to stall
+      // until the first prompt turn, so session/new only kicks it off —
       // awaiting it inline is what regressed session/new latency in 0.59.0.
-      const ctxSpy = vi.fn(async () => ({ rawMaxTokens: 967000 }));
+      const ctxSpy = vi.fn(() => new Promise<never>(() => {}));
       contextUsageResult = ctxSpy;
 
-      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
-      expect(ctxSpy).not.toHaveBeenCalled();
+      expect(ctxSpy).toHaveBeenCalledOnce();
+      expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);
+      expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(false);
     });
 
-    it("seeds contextWindowSize from text inference, falling back to the default when it misses", async () => {
+    it("refines a guessed window from getContextUsage in the background", async () => {
       // The mock model ("claude-sonnet-4-6" / "Claude Sonnet" / "Fast") carries
-      // no "1m" token anywhere, so inference misses and the window falls back to
-      // the default; the authoritative value arrives later via result.modelUsage.
+      // no "1m" token anywhere, so inference misses and the seed is the default
+      // until the background getContextUsage answers.
       contextUsageResult = async () => ({ rawMaxTokens: 967000 });
 
       const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      await vi.waitFor(() => expect(sessionFor(response.sessionId).contextWindowSize).toBe(967000));
+      expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(true);
+    });
+
+    it("asks for the summary context usage so the CLI sends no count_tokens requests", async () => {
+      // The default `full` detail counts each context category with its own
+      // messages/count_tokens request — a burst that hit rate limits on every
+      // model switch — while only `rawMaxTokens` is needed here.
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      await vi.waitFor(() => expect(contextUsageCalls).toEqual([{ detail: "summary" }]));
+    });
+
+    it("keeps the guessed window when getContextUsage reports a non-positive size", async () => {
+      const ctxSpy = vi.fn(async () => ({ rawMaxTokens: 0 }));
+      contextUsageResult = ctxSpy;
+
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      await vi.waitFor(() => expect(ctxSpy).toHaveBeenCalled());
+      await new Promise((resolve) => setImmediate(resolve));
 
       expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);
       expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(false);
@@ -978,7 +1568,7 @@ describe("createSession options merging", () => {
       expect(response.configOptions?.find((option) => option.id === "model")?.currentValue).toBe(
         "haiku",
       );
-      expect(ctxSpy).not.toHaveBeenCalled();
+      // Kicked off in the background, never awaited: it never answers here.
       expect(sessionFor("resumed-model-probe").contextWindowAuthoritative).toBe(false);
       expect(getSessionMessages).toHaveBeenCalledTimes(1);
       expect(getSessionMessages).toHaveBeenCalledWith("resumed-model-probe");
@@ -1417,6 +2007,369 @@ describe("createSession options merging", () => {
       await new Promise((resolve) => setImmediate(resolve));
       await new Promise((resolve) => setImmediate(resolve));
       expect((agent as any).sessions[sessionId].models.currentModelId).toBe("claude-sonnet-4-6");
+    });
+  });
+
+  describe("loadSession history replay", () => {
+    const userMessage = (uuid: string, text: string) => ({
+      type: "user",
+      uuid,
+      session_id: "replay-probe",
+      parent_tool_use_id: null,
+      parent_agent_id: null,
+      message: { role: "user", content: [{ type: "text", text }] },
+    });
+
+    function capturingAgent(updates: SessionNotification[]) {
+      return new ClaudeAcpAgent({
+        ...createMockClient(),
+        sessionUpdate: async (notification: SessionNotification) => {
+          updates.push(notification);
+        },
+      } as AcpClient);
+    }
+
+    it("replays the history while the CLI starts", async () => {
+      let releaseInit!: () => void;
+      initGate = new Promise((resolve) => (releaseInit = resolve));
+      sessionMessages = [userMessage("u1", "first"), userMessage("u2", "second")];
+      const updates: SessionNotification[] = [];
+      const loading = capturingAgent(updates).loadSession({
+        sessionId: "replay-probe",
+        cwd: process.cwd(),
+        mcpServers: [],
+      });
+      let loaded = false;
+      void loading.then(() => (loaded = true));
+
+      await vi.waitFor(() => expect(updates).toHaveLength(2));
+      expect(loaded).toBe(false);
+      expect(updates.map((update) => update.update.sessionUpdate)).toEqual([
+        "user_message_chunk",
+        "user_message_chunk",
+      ]);
+
+      releaseInit();
+      await expect(loading).resolves.toMatchObject({ sessionId: "replay-probe" });
+    });
+
+    it("keeps the not-found error when the CLI finds no conversation", async () => {
+      initError = new Error("No conversation found with session ID: replay-probe");
+      const updates: SessionNotification[] = [];
+      const loadAgent = capturingAgent(updates);
+
+      await expect(
+        loadAgent.loadSession({ sessionId: "replay-probe", cwd: process.cwd(), mcpServers: [] }),
+      ).rejects.toMatchObject({ code: RequestError.resourceNotFound().code });
+      expect(updates).toEqual([]);
+      expect((loadAgent as any).sessions["replay-probe"]).toBeUndefined();
+    });
+
+    it("stops the replay when the CLI start fails", async () => {
+      let failInit!: () => void;
+      initGate = new Promise((resolve) => (failInit = resolve));
+      initError = new Error("No conversation found with session ID: replay-probe");
+      let releaseRead!: () => void;
+      const readGate = new Promise<void>((resolve) => (releaseRead = resolve));
+      sessionMessagesResult = async () => {
+        await readGate;
+        return [userMessage("u1", "first")];
+      };
+      const updates: SessionNotification[] = [];
+      const loading = capturingAgent(updates).loadSession({
+        sessionId: "replay-probe",
+        cwd: process.cwd(),
+        mcpServers: [],
+      });
+      const failed = expect(loading).rejects.toMatchObject({
+        code: RequestError.resourceNotFound().code,
+      });
+
+      failInit();
+      // The failed start closes its query, and the load then stops the replay.
+      await vi.waitFor(() => expect(closeSpy).toHaveBeenCalled());
+      await new Promise((resolve) => setImmediate(resolve));
+      releaseRead();
+      await failed;
+      expect(updates).toEqual([]);
+    });
+
+    it("sends no update after a load that fails while the replay runs", async () => {
+      let failInit!: () => void;
+      initGate = new Promise((resolve) => (failInit = resolve));
+      initError = new Error("Claude Code process exited with code 1");
+      sessionMessages = [
+        userMessage("u1", "first"),
+        userMessage("u2", "second"),
+        userMessage("u3", "third"),
+      ];
+      const updates: SessionNotification[] = [];
+      let releaseClient!: () => void;
+      const clientGate = new Promise<void>((resolve) => (releaseClient = resolve));
+      const loading = new ClaudeAcpAgent({
+        ...createMockClient(),
+        sessionUpdate: async (notification: SessionNotification) => {
+          updates.push(notification);
+          await clientGate;
+        },
+      } as AcpClient).loadSession({
+        sessionId: "replay-probe",
+        cwd: process.cwd(),
+        mcpServers: [],
+      });
+      let updatesAtError: number | undefined;
+      const failed = loading.then(
+        () => expect.unreachable("the load must fail"),
+        () => (updatesAtError = updates.length),
+      );
+
+      // The client still handles the first replayed update when the CLI start fails.
+      await vi.waitFor(() => expect(updates).toHaveLength(1));
+      failInit();
+      await vi.waitFor(() => expect(closeSpy).toHaveBeenCalled());
+      releaseClient();
+      await failed;
+      for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+
+      expect(updatesAtError).toBeGreaterThan(0);
+      expect(updates).toHaveLength(updatesAtError!);
+    });
+
+    it("rejects an invalid cwd before it sends an update", async () => {
+      sessionMessages = [userMessage("u1", "first")];
+      const updates: SessionNotification[] = [];
+
+      await expect(
+        capturingAgent(updates).loadSession({
+          sessionId: "replay-probe",
+          cwd: path.join(os.tmpdir(), "no-such-directory-for-replay-probe"),
+          mcpServers: [],
+        }),
+      ).rejects.toMatchObject({ code: RequestError.invalidParams().code });
+      expect(updates).toEqual([]);
+      expect(getSessionMessages).not.toHaveBeenCalled();
+    });
+
+    describe("load replay end", () => {
+      const LOAD_REPLAY_END_CLIENT: ClientCapabilities = {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["loadReplayEnd"] } } },
+      };
+
+      async function endAgent(
+        updates: SessionNotification[],
+        sessionUpdate?: (notification: SessionNotification) => Promise<void>,
+        clientCapabilities: ClientCapabilities = LOAD_REPLAY_END_CLIENT,
+      ) {
+        const endAgent = new ClaudeAcpAgent({
+          ...createMockClient(),
+          sessionUpdate:
+            sessionUpdate ??
+            (async (notification: SessionNotification) => {
+              updates.push(notification);
+            }),
+        } as AcpClient);
+        await endAgent.initialize({ protocolVersion: 1, clientCapabilities });
+        return endAgent;
+      }
+
+      const isEnd = (notification: SessionNotification) =>
+        (notification.update._meta as any)?.jetbrains?.air?.loadReplayEnd === true;
+
+      /** The update kinds, with the end event as "end". */
+      const kinds = (updates: SessionNotification[]) =>
+        updates.map((update) => (isEnd(update) ? "end" : update.update.sessionUpdate));
+
+      it("sends one end event after the replay and before the response", async () => {
+        sessionMessages = [userMessage("u1", "first"), userMessage("u2", "second")];
+        const updates: SessionNotification[] = [];
+        const loadAgent = await endAgent(updates);
+        let atResponse: string[] | undefined;
+        await loadAgent
+          .loadSession({ sessionId: "replay-probe", cwd: process.cwd(), mcpServers: [] })
+          .then(() => (atResponse = kinds(updates)));
+        // `afterSetupResponse` sends the commands after the response.
+        await vi.waitFor(() => expect(kinds(updates)).toContain("available_commands_update"));
+
+        expect(atResponse).toEqual(["user_message_chunk", "user_message_chunk", "end"]);
+        expect(updates.filter(isEnd)).toHaveLength(1);
+        const end = updates.find(isEnd)!;
+        expect(end.sessionId).toBe("replay-probe");
+        // No `title` and no `updatedAt` key: a `null` would clear them.
+        expect(end.update).toEqual({
+          sessionUpdate: "session_info_update",
+          _meta: { jetbrains: { air: { version: 1, loadReplayEnd: true } } },
+        });
+      });
+
+      it("sends the end event before the CLI start finishes", async () => {
+        let releaseInit!: () => void;
+        initGate = new Promise((resolve) => (releaseInit = resolve));
+        sessionMessages = [userMessage("u1", "first")];
+        const updates: SessionNotification[] = [];
+        const loading = (await endAgent(updates)).loadSession({
+          sessionId: "replay-probe",
+          cwd: process.cwd(),
+          mcpServers: [],
+        });
+
+        await vi.waitFor(() => expect(kinds(updates)).toEqual(["user_message_chunk", "end"]));
+
+        releaseInit();
+        await loading;
+      });
+
+      it.each([
+        ["without subagents", [] as Record<string, unknown>[]],
+        [
+          "with a subagent",
+          [
+            {
+              type: "assistant",
+              uuid: "child-message",
+              session_id: "replay-probe",
+              parent_tool_use_id: "agent-call",
+              message: {
+                id: "api-child-message",
+                model: "claude-sonnet-4-6",
+                role: "assistant",
+                content: [{ type: "text", text: "child report" }],
+              },
+            },
+          ],
+        ],
+      ])(
+        "sends the end event before the CLI start finishes for native subagent sessions (%s)",
+        async (_label, history) => {
+          let releaseInit!: () => void;
+          initGate = new Promise((resolve) => (releaseInit = resolve));
+          sessionMessages = [userMessage("u1", "first"), ...history];
+          const updates: SessionNotification[] = [];
+          const loading = (
+            await endAgent(updates, undefined, {
+              _meta: {
+                jetbrains: {
+                  air: {
+                    version: 1,
+                    capabilities: ["loadReplayEnd", "nativeSubagentSessions"],
+                  },
+                },
+              },
+            } as ClientCapabilities)
+          ).loadSession({ sessionId: "replay-probe", cwd: process.cwd(), mcpServers: [] });
+
+          // The child's model goes as the replay reaches it, with no model list yet.
+          await vi.waitFor(() =>
+            expect(kinds(updates)).toEqual(
+              history.length === 0
+                ? ["user_message_chunk", "end"]
+                : [
+                    "user_message_chunk",
+                    "subagent_spawned",
+                    "config_option_update",
+                    "agent_message_chunk",
+                    "subagent_state_update",
+                    "end",
+                  ],
+            ),
+          );
+
+          releaseInit();
+          await loading;
+        },
+      );
+
+      it("sends the end event for an empty history", async () => {
+        sessionMessages = [];
+        const updates: SessionNotification[] = [];
+        let atResponse: string[] | undefined;
+        await (
+          await endAgent(updates)
+        )
+          .loadSession({ sessionId: "replay-probe", cwd: process.cwd(), mcpServers: [] })
+          .then(() => (atResponse = kinds(updates)));
+
+        expect(atResponse).toEqual(["end"]);
+      });
+
+      it("sends the end event after the replay of a session that is already live", async () => {
+        const updates: SessionNotification[] = [];
+        const loadAgent = await endAgent(updates);
+        const { sessionId } = await loadAgent.newSession({ cwd: process.cwd(), mcpServers: [] });
+        sessionMessages = [userMessage("u1", "first"), userMessage("u2", "second")];
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        updates.length = 0;
+
+        let atResponse: string[] | undefined;
+        await loadAgent
+          .loadSession({ sessionId, cwd: process.cwd(), mcpServers: [] })
+          .then(() => (atResponse = kinds(updates)));
+
+        expect(atResponse).toEqual(["user_message_chunk", "user_message_chunk", "end"]);
+      });
+
+      it("sends no end event when the CLI start fails part way through the replay", async () => {
+        let failInit!: () => void;
+        initGate = new Promise((resolve) => (failInit = resolve));
+        initError = new Error("Claude Code process exited with code 1");
+        sessionMessages = [
+          userMessage("u1", "first"),
+          userMessage("u2", "second"),
+          userMessage("u3", "third"),
+        ];
+        const updates: SessionNotification[] = [];
+        let releaseClient!: () => void;
+        const clientGate = new Promise<void>((resolve) => (releaseClient = resolve));
+        const loading = (
+          await endAgent(updates, async (notification) => {
+            updates.push(notification);
+            await clientGate;
+          })
+        ).loadSession({ sessionId: "replay-probe", cwd: process.cwd(), mcpServers: [] });
+        const failed = expect(loading).rejects.toThrow("exited with code 1");
+
+        // The client still handles the first replayed update when the CLI start fails.
+        await vi.waitFor(() => expect(updates).toHaveLength(1));
+        failInit();
+        await vi.waitFor(() => expect(closeSpy).toHaveBeenCalled());
+        releaseClient();
+        await failed;
+        for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+
+        expect(updates.length).toBeLessThan(3);
+        expect(updates.some(isEnd)).toBe(false);
+      });
+
+      it("sends no end event when the replay fails", async () => {
+        const updates: SessionNotification[] = [];
+        const loadAgent = await endAgent(updates);
+        const { sessionId } = await loadAgent.newSession({ cwd: process.cwd(), mcpServers: [] });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        updates.length = 0;
+        sessionMessagesResult = async () => {
+          throw new Error("history unreadable");
+        };
+
+        await expect(
+          loadAgent.loadSession({ sessionId, cwd: process.cwd(), mcpServers: [] }),
+        ).rejects.toThrow("history unreadable");
+        expect(updates.some(isEnd)).toBe(false);
+      });
+
+      it("sends no end event to a client without the capability", async () => {
+        sessionMessages = [userMessage("u1", "first")];
+        for (const clientCapabilities of [
+          {},
+          { _meta: { jetbrains: { air: { version: 1, capabilities: [] } } } },
+        ] as ClientCapabilities[]) {
+          const updates: SessionNotification[] = [];
+          await (
+            await endAgent(updates, undefined, clientCapabilities)
+          ).loadSession({ sessionId: "replay-probe", cwd: process.cwd(), mcpServers: [] });
+          await vi.waitFor(() => expect(kinds(updates)).toContain("available_commands_update"));
+
+          expect(kinds(updates)).toEqual(["user_message_chunk", "available_commands_update"]);
+        }
+      });
     });
   });
 });
