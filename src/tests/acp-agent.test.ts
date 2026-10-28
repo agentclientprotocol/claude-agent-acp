@@ -4730,6 +4730,36 @@ describe("prompt conversion", () => {
       },
     ]);
   });
+
+  it("sends image, PDF and text blob resources to Claude, and skips other blobs", () => {
+    const blob = (uri: string, mimeType: string, data: string) => ({
+      type: "resource" as const,
+      resource: { uri, mimeType, blob: data },
+    });
+    const message = promptToClaude({
+      sessionId: "test",
+      prompt: [
+        blob("file:///work/shot.png", "image/png", "iVBORw0K"),
+        blob("file:///work/spec.pdf", "application/pdf", "JVBERi0x"),
+        blob("file:///work/notes.md", "text/markdown; charset=utf-8", "IyBOb3Rlcw=="),
+        blob("file:///work/data.json", "application/json", "eyJhIjoxfQ=="),
+        blob("file:///work/archive.zip", "application/zip", "UEsDBA=="),
+      ],
+    });
+    expect(message.message.content).toEqual([
+      { type: "text", text: "[@shot.png](file:///work/shot.png)" },
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0K" } },
+      { type: "text", text: "[@spec.pdf](file:///work/spec.pdf)" },
+      {
+        type: "document",
+        source: { type: "base64", media_type: "application/pdf", data: "JVBERi0x" },
+      },
+      { type: "text", text: "[@notes.md](file:///work/notes.md)" },
+      { type: "text", text: "[@data.json](file:///work/data.json)" },
+      { type: "text", text: '\n<context ref="file:///work/notes.md">\n# Notes\n</context>' },
+      { type: "text", text: '\n<context ref="file:///work/data.json">\n{"a":1}\n</context>' },
+    ]);
+  });
 });
 
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("SDK behavior", () => {

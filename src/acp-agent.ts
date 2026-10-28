@@ -104,6 +104,7 @@ import {
   parseGoalRequest,
   toGoalSnapshot,
 } from "./goal-extension.js";
+import { blobResourceToClaude } from "./blob-resources.js";
 import { promptSuggestionsMeta, promptSuggestionText } from "./prompt-suggestions.js";
 import { sanitizeTitle, SessionTitles } from "./session-titles.js";
 import {
@@ -13311,18 +13312,26 @@ export function promptToClaude(prompt: PromptRequest): SDKUserMessage {
         break;
       }
       case "resource": {
-        if ("text" in chunk.resource) {
-          const formattedUri = formatUriAsLink(chunk.resource.uri);
-          content.push({
-            type: "text",
-            text: formattedUri,
-          });
+        const { uri } = chunk.resource;
+        // A blob resource becomes an image or document block, or its decoded
+        // text. A v1 prompt skips a blob of any other type, e.g.
+        // `application/zip`; a v2 prompt rejects it (see `v1PromptRequest`).
+        const blob = "blob" in chunk.resource ? blobResourceToClaude(chunk.resource) : undefined;
+        const text =
+          "text" in chunk.resource
+            ? chunk.resource.text
+            : blob?.kind === "text"
+              ? blob.text
+              : undefined;
+        if (blob?.kind === "image" || blob?.kind === "document") {
+          content.push({ type: "text", text: formatUriAsLink(uri) }, blob.block);
+        } else if (text !== undefined) {
+          content.push({ type: "text", text: formatUriAsLink(uri) });
           context.push({
             type: "text",
-            text: `\n<context ref="${chunk.resource.uri}">\n${chunk.resource.text}\n</context>`,
+            text: `\n<context ref="${uri}">\n${text}\n</context>`,
           });
         }
-        // Ignore blob resources (unsupported)
         break;
       }
       case "image":

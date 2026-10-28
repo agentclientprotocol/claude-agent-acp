@@ -13,6 +13,7 @@ import {
 } from "@agentclientprotocol/sdk/unstable";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { ClaudeAcpAgent } from "../acp-agent.js";
+import { isSupportedBlobMimeType } from "../blob-resources.js";
 import type { ForegroundEvents, StopReason, TurnEvents, TurnOutcome } from "../turn-events.js";
 
 /**
@@ -145,10 +146,28 @@ function idle({ stopReason, usage, _meta }: TurnOutcome): v2.SessionUpdate {
  * which it does not advertise and Claude cannot read, a custom one, or one
  * from a newer ACP version. Clients send only the kinds the agent advertised,
  * so such a block fails the request with invalid params (-32602) rather than
- * being dropped from the prompt.
+ * being dropped from the prompt. The same goes for an embedded blob that
+ * Claude cannot read, e.g. an `application/zip` resource: `promptToClaude`
+ * would drop it.
  */
 export function v1PromptRequest({ prompt, ...request }: v2.PromptRequest): PromptRequest {
-  return { ...request, prompt: prompt.map(v1ContentBlock) };
+  return {
+    ...request,
+    prompt: prompt.map((block) => {
+      if (
+        v2.ContentBlock.isResource(block) &&
+        "blob" in block.resource &&
+        !isSupportedBlobMimeType(block.resource.mimeType)
+      ) {
+        const mimeType = block.resource.mimeType ?? null;
+        throw RequestError.invalidParams(
+          { uri: block.resource.uri, mimeType },
+          `Embedded blob resources of type ${mimeType ?? "unknown"} are not supported`,
+        );
+      }
+      return v1ContentBlock(block);
+    }),
+  };
 }
 
 export function v1ContentBlock(block: v2.ContentBlock): ContentBlock {

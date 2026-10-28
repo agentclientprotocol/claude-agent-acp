@@ -5635,23 +5635,23 @@ describe("ACP v2 session translation", () => {
         prompt: [{ type: "audio", data: "AAAA", mimeType: "audio/wav" }],
       }),
     ).toThrow(expect.objectContaining({ code: -32602, data: { type: "audio" } }));
-    // An embedded blob resource still converts.
-    expect(
+  });
+
+  it("rejects an embedded blob that Claude cannot read, and passes one it can", () => {
+    const prompt = (mimeType?: string) =>
       v1PromptRequest({
         sessionId: "s",
-        prompt: [
-          {
-            type: "resource",
-            resource: { uri: "file:///a.bin", blob: "AAAA", mimeType: "application/octet-stream" },
-          },
-        ],
-      }).prompt,
-    ).toEqual([
-      {
-        type: "resource",
-        resource: { uri: "file:///a.bin", blob: "AAAA", mimeType: "application/octet-stream" },
-      },
-    ]);
+        prompt: [{ type: "resource", resource: { uri: "file:///work/a", blob: "AAAA", mimeType } }],
+      }).prompt[0];
+    expect(prompt("application/pdf")).toEqual({
+      type: "resource",
+      resource: { uri: "file:///work/a", blob: "AAAA", mimeType: "application/pdf" },
+    });
+    expect(() => prompt("application/zip")).toThrow(
+      "Embedded blob resources of type application/zip are not supported",
+    );
+    expect(() => prompt("application/zip")).toThrow(expect.objectContaining({ code: -32602 }));
+    expect(() => prompt()).toThrow("Embedded blob resources of type unknown are not supported");
   });
 
   it("fails on a message chunk without a messageId, which v2 requires", () => {
