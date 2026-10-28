@@ -4760,6 +4760,31 @@ describe("prompt conversion", () => {
       { type: "text", text: '\n<context ref="file:///work/data.json">\n{"a":1}\n</context>' },
     ]);
   });
+
+  it("reads image/jpg as JPEG and decodes text blobs with their charset", () => {
+    const blob = (uri: string, mimeType: string, data: string) => ({
+      type: "resource" as const,
+      resource: { uri, mimeType, blob: data },
+    });
+    const message = promptToClaude({
+      sessionId: "test",
+      prompt: [
+        blob("file:///work/shot.jpg", "image/jpg", "/9j/4AAQ"),
+        // "café" in ISO-8859-1: 63 61 66 e9.
+        blob("file:///work/menu.csv", "text/csv; charset=ISO-8859-1", "Y2Fm6Q=="),
+        // "hi" in UTF-8 with a byte order mark: ef bb bf 68 69.
+        blob("file:///work/bom.txt", "text/plain", "77u/aGk="),
+      ],
+    });
+    expect(message.message.content).toEqual([
+      { type: "text", text: "[@shot.jpg](file:///work/shot.jpg)" },
+      { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "/9j/4AAQ" } },
+      { type: "text", text: "[@menu.csv](file:///work/menu.csv)" },
+      { type: "text", text: "[@bom.txt](file:///work/bom.txt)" },
+      { type: "text", text: '\n<context ref="file:///work/menu.csv">\ncafé\n</context>' },
+      { type: "text", text: '\n<context ref="file:///work/bom.txt">\nhi\n</context>' },
+    ]);
+  });
 });
 
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("SDK behavior", () => {

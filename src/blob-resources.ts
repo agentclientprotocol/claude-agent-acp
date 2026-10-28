@@ -40,10 +40,30 @@ export type BlobResourceContent =
   /** The decoded text, to send like a text resource. */
   | { kind: "text"; text: string };
 
-/** The MIME type without parameters or case, e.g. `text/plain; charset=utf-8` -> `text/plain`. */
+/**
+ * The MIME type without parameters or case, e.g. `text/plain; charset=utf-8` ->
+ * `text/plain`. `image/jpg`, which some clients send, becomes `image/jpeg`.
+ */
 function baseMimeType(mimeType: string | null | undefined): string | undefined {
   const base = mimeType?.split(";")[0].trim().toLowerCase();
+  if (base === "image/jpg") return "image/jpeg";
   return base || undefined;
+}
+
+/**
+ * Decodes a text blob with the `charset` parameter of its MIME type, e.g.
+ * `text/csv; charset=iso-8859-1`, and UTF-8 when there is none or the label is
+ * unknown. A leading byte order mark is dropped.
+ */
+function decodeText(blob: string, mimeType: string | null | undefined): string {
+  const charset = /;\s*charset\s*=\s*"?([^";\s]+)/i.exec(mimeType ?? "")?.[1];
+  let decoder: TextDecoder;
+  try {
+    decoder = new TextDecoder(charset ?? "utf-8");
+  } catch {
+    decoder = new TextDecoder("utf-8");
+  }
+  return decoder.decode(Buffer.from(blob, "base64"));
 }
 
 function isImageMimeType(mimeType: string): mimeType is ImageMimeType {
@@ -71,7 +91,7 @@ export function isSupportedBlobMimeType(mimeType: string | null | undefined): bo
 
 /**
  * The Claude content for a blob resource: an `image` block for PNG, JPEG, GIF
- * and WebP, a `document` block for PDF, and the UTF-8 decoded text for text
+ * and WebP, a `document` block for PDF, and the decoded text for text
  * types such as `text/markdown` or `application/json`. Returns `undefined` for
  * any other type, e.g. `application/zip`.
  */
@@ -99,7 +119,7 @@ export function blobResourceToClaude(
     };
   }
   if (isTextMimeType(mimeType)) {
-    return { kind: "text", text: Buffer.from(resource.blob, "base64").toString("utf8") };
+    return { kind: "text", text: decodeText(resource.blob, resource.mimeType) };
   }
   return undefined;
 }
