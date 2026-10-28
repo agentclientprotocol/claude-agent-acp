@@ -103,6 +103,12 @@ Without either signal, Agent and Task stay ordinary tool calls and child interac
 root session. Clients that use the historical `_meta["subagent-transcript"]` capability or the
 `forwardSubagentText` session option retain the flattened child transcript.
 
+### Question form timeout
+
+After five minutes without a submitted response, the adapter cancels an `AskUserQuestion` form and asks Claude to repeat its questions in a normal reply. Each form has its own deadline, and expiry never selects an answer. Unsubmitted input may be lost. Permission prompts and other forms are unaffected.
+
+Set `CLAUDE_AGENT_ACP_ASK_USER_QUESTION_TIMEOUT_MS` in the adapter process’s environment to change the timeout in milliseconds, or set it to `0` to disable it.
+
 ### Experimental ACP v2
 
 The adapter also serves the [draft ACP v2](https://agentclientprotocol.com/protocol/v2/overview):
