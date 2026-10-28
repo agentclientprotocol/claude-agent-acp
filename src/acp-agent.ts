@@ -312,7 +312,11 @@ import {
   type ToolCallUpdate,
   type ToolUpdateMeta,
 } from "./tool-calls/renderer.js";
-import { resolveSkillPath, type SkillScanCache } from "./tool-calls/reporters/interaction.js";
+import {
+  resolveNestedSkillPath,
+  resolveSkillPath,
+  type SkillScanCache,
+} from "./tool-calls/reporters/interaction.js";
 import {
   messageLoopYielder,
   nodeToWebReadable,
@@ -1148,6 +1152,13 @@ export type Session = {
    *  the command name. A `commands_changed` clears it, because the skill
    *  files can have changed then. */
   skillPaths?: Map<string, string | undefined>;
+  /** Names of the skills `system`/init lists (`skills`), including the ones
+   *  bundled with the CLI (`simplify`). Builtin commands such as `compact`
+   *  are not in it, which is how a bundled skill is told from a builtin. */
+  initSkills?: Set<string>;
+  /** Plugin name to root directory, from `system`/init `plugins`. Lets a
+   *  plugin loaded from a path find its `skills/` directory. */
+  pluginPaths?: Map<string, string>;
   /** Serialized `system`/init `plugin_errors` last logged, so the per-turn
    *  init re-emit logs a plugin load failure once, not every turn. */
   loggedPluginErrors?: string;
@@ -6180,21 +6191,48 @@ export class ClaudeAcpAgent {
                   message.fast_mode_disabled_reason,
                 );
                 // Terminal-bound slash commands (absent when none, and on
-                // older CLIs). The session/new advertisement runs before any
-                // init frame can be observed, so the first latch (or a
-                // genuine change) re-publishes the now-filtered list.
-                if (
-                  message.terminal_slash_commands &&
-                  JSON.stringify(message.terminal_slash_commands) !==
-                    JSON.stringify(session.terminalSlashCommands)
-                ) {
-                  session.terminalSlashCommands = message.terminal_slash_commands;
-                  try {
-                    await this.sendAvailableCommandsUpdate(params.sessionId);
-                  } catch (error) {
-                    // Advisory reconcile only — the client keeps its current
-                    // (unfiltered) list; never fail the turn over it.
-                    this.logger.error(`Failed to re-advertise slash commands: ${error}`);
+                // older CLIs), skills and plugin roots (absent on older CLIs).
+                // The session/new advertisement runs before any init frame can
+                // be observed, so its list is unfiltered and lacks the plugin
+                // paths. Work out every change first, then re-publish the list
+                // once.
+                {
+                  let readvertise = false;
+                  if (
+                    message.terminal_slash_commands &&
+                    JSON.stringify(message.terminal_slash_commands) !==
+                      JSON.stringify(session.terminalSlashCommands)
+                  ) {
+                    session.terminalSlashCommands = message.terminal_slash_commands;
+                    readvertise = true;
+                  }
+                  if (message.skills || message.plugins) {
+                    const initSkills = new Set(message.skills ?? []);
+                    const pluginPaths = new Map<string, string>();
+                    for (const plugin of message.plugins ?? []) {
+                      if (plugin.name && plugin.path) pluginPaths.set(plugin.name, plugin.path);
+                    }
+                    if (
+                      JSON.stringify([...initSkills].sort()) !==
+                        JSON.stringify([...(session.initSkills ?? [])].sort()) ||
+                      JSON.stringify([...pluginPaths].sort()) !==
+                        JSON.stringify([...(session.pluginPaths ?? [])].sort())
+                    ) {
+                      session.initSkills = initSkills;
+                      session.pluginPaths = pluginPaths;
+                      // The cached SKILL.md paths were resolved without these plugin roots.
+                      session.skillPaths = new Map();
+                      readvertise = true;
+                    }
+                  }
+                  if (readvertise) {
+                    try {
+                      await this.sendAvailableCommandsUpdate(params.sessionId);
+                    } catch (error) {
+                      // Advisory reconcile only — the client keeps its current
+                      // list; never fail the turn over it.
+                      this.logger.error(`Failed to re-advertise slash commands: ${error}`);
+                    }
                   }
                 }
                 // Plugin load failures (CLI 2.1.283+) have no ACP surface;
@@ -6515,6 +6553,7 @@ export class ClaudeAcpAgent {
                       this.toolCallCapabilities.air.client ? session.cwd : undefined,
                       session.skillPaths,
                       session.query,
+                      session,
                     ),
                   },
                 });
@@ -10981,6 +11020,7 @@ export class ClaudeAcpAgent {
       this.toolCallCapabilities.air.client ? session.cwd : undefined,
       (session.skillPaths ??= new Map()),
       session.query,
+      session,
     );
   }
 
@@ -13268,15 +13308,29 @@ function getAvailableSlashCommands(
   // The resolved SKILL.md paths of the session, keyed by the cwd and the name.
   skillPaths?: Map<string, string | undefined>,
   query?: Query,
+  // What `system`/init reported: the skill names (to tell a skill bundled
+  // with the CLI from a builtin command) and the plugin root directories.
+  initInfo?: { initSkills?: ReadonlySet<string>; pluginPaths?: ReadonlyMap<string, string> },
 ): AvailableCommand[] {
   // The container listings of this one pass, so a list of a hundred commands lists each container once.
   const skillScans: SkillScanCache = new Map();
-  const skillPath = (name: string, cwd: string): string | undefined => {
-    const key = `${cwd}\0${name}`;
-    if (skillPaths?.has(key)) return skillPaths.get(key);
-    const resolved = resolveSkillPath(name, cwd, skillScans);
-    skillPaths?.set(key, resolved);
-    return resolved;
+  const skillPath = (command: SlashCommand, cwd: string): string | undefined => {
+    const key = `${cwd}\0${command.name}`;
+    let resolved: string | undefined;
+    if (skillPaths?.has(key)) {
+      resolved = skillPaths.get(key);
+    } else {
+      resolved = resolveSkillPath(command.name, cwd, skillScans, initInfo?.pluginPaths);
+      skillPaths?.set(key, resolved);
+    }
+    if (resolved) return resolved;
+    // The nested path comes from the description, which the name-only key above
+    // ignores, so it is cached under a key that includes the description.
+    const nestedKey = `${key}\0${command.description}`;
+    if (skillPaths?.has(nestedKey)) return skillPaths.get(nestedKey);
+    const nested = resolveNestedSkillPath(command.name, command.description ?? "", cwd);
+    skillPaths?.set(nestedKey, nested);
+    return nested;
   };
 
   const UNSUPPORTED_COMMANDS = [
@@ -13320,9 +13374,10 @@ function getAvailableSlashCommands(
         name = `mcp:${name.replace(" (MCP)", "")}`;
       }
       const skillMdPath =
-        airSkillCwd && !command.builtin && !mcpPrompt
-          ? skillPath(command.name, airSkillCwd)
-          : undefined;
+        airSkillCwd && !command.builtin && !mcpPrompt ? skillPath(command, airSkillCwd) : undefined;
+      // A skill bundled with the CLI has no file, so it gets the kind only.
+      const bundledSkill =
+        airSkillCwd && command.builtin && !mcpPrompt && initInfo?.initSkills?.has(command.name);
       return {
         name,
         description: command.description || "",
@@ -13335,7 +13390,9 @@ function getAvailableSlashCommands(
                 skillMdPath,
               ),
             }
-          : {}),
+          : bundledSkill
+            ? { _meta: withAirMeta(undefined, AIR_KIND_KEY, "skill") }
+            : {}),
       };
     })
     .filter((command: AvailableCommand) => !UNSUPPORTED_COMMANDS.includes(command.name));
