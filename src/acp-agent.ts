@@ -194,6 +194,7 @@ import {
   extractAskUserQuestions,
   extractRefusalFallbackPrompt,
   mcpElicitationToCreateRequest,
+  parseAskUserQuestionTimeout,
   REFUSAL_FALLBACK_DIALOG_KIND,
   refusalFallbackResultFromResponse,
   refusalFallbackToCreateRequest,
@@ -2708,6 +2709,11 @@ export class ClaudeAcpAgent {
   private toolCallCapabilities = new ToolCallClientCapabilities();
   logger: Logger;
   private readonly sessionModes: SessionModeManager<Session>;
+  private readonly askUserQuestionTimeoutMs: number;
+  /** Turns, autonomous cycles, and subagent task records whose question forms expired. */
+  private readonly timedOutQuestionOwners = new WeakSet<object>();
+  /** Links an autonomous cycle to its adopting turn so either blocks new forms after expiry. */
+  private readonly questionOwnerAdoptions = new WeakMap<object, Turn>();
   gatewayAuthRequest?: GatewayAuthRequest;
   /** Set while ACP overrides the agent's native provider configuration. */
   providerConfig?: ProviderConfig;
@@ -2820,6 +2826,9 @@ export class ClaudeAcpAgent {
     this.sessions = {};
     this.client = new ChangedMetaClient(client, () => this.toolCallCapabilities.air.client);
     this.logger = logger ?? console;
+    this.askUserQuestionTimeoutMs = parseAskUserQuestionTimeout(
+      process.env.CLAUDE_AGENT_ACP_ASK_USER_QUESTION_TIMEOUT_MS,
+    );
     this.exitPlan = new ExitPlanCoordinator<Session, Turn>({
       currentSession: (id) => this.sessions[id],
       closeQueryStream: (session) => this.closeQueryStream(session),
@@ -10048,6 +10057,10 @@ export class ClaudeAcpAgent {
   private startForeground(sessionId: string, owner: ForegroundOwner): void {
     const current = this.foregroundWork.get(sessionId);
     if (current) {
+      if (current.owner === AUTONOMOUS_CYCLE && owner !== AUTONOMOUS_CYCLE) {
+        this.questionOwnerAdoptions.set(current, owner);
+        if (this.timedOutQuestionOwners.has(current)) this.timedOutQuestionOwners.add(owner);
+      }
       current.owner = owner;
       return;
     }
@@ -10613,6 +10626,12 @@ export class ClaudeAcpAgent {
       // than the interactive dialog). Present it as an ACP form elicitation and
       // feed the answers back as updatedInput for the tool's own call() to read.
       if (toolName === "AskUserQuestion" && this.clientCapabilities?.elicitation?.form) {
+        // Keep the owner across ensureToolCallEmitted, even if another turn becomes active.
+        // A new task record distinguishes a resumed child from its previous run.
+        // Untracked work still gets a timer, but no retry latch.
+        const questionOwner = agentID
+          ? session.liveBackgroundTasks.get(agentID)
+          : (this.requestOwnerTurn(sessionId, session) ?? this.foregroundWork.get(sessionId));
         // Like permission requests, the elicitation references this toolUseID, so
         // make sure the tool_call has surfaced to the client before we send it.
         await this.ensureToolCallEmitted(
@@ -10631,6 +10650,7 @@ export class ClaudeAcpAgent {
           toolUseID,
           signal,
           agentID,
+          questionOwner,
         );
       }
 
@@ -10871,6 +10891,7 @@ export class ClaudeAcpAgent {
     toolUseID: string,
     signal: AbortSignal,
     agentID: string | undefined,
+    owner: object | undefined,
   ): Promise<PermissionResult> {
     const questions = extractAskUserQuestions(toolInput);
     if (!questions) {
@@ -10883,15 +10904,59 @@ export class ClaudeAcpAgent {
       toolUseID,
       this.toolCallCapabilities.air.client,
     );
+    const fallback: PermissionResult = {
+      behavior: "deny",
+      message:
+        "No answer was received for this question request. A question form timed out. " +
+        (agentID
+          ? "Report every question and its options from this tool call to the parent agent. " +
+            "Ask it to present them to the user and wait for an answer. " +
+            "Do not continue work that depends on these answers. "
+          : "Restate every question and its options from this tool call in your next normal reply, " +
+            "then wait for the user. ") +
+        "Do not infer an answer, treat the timeout as a user rejection, " +
+        "or call AskUserQuestion again during this turn. Preserve answers from other question requests.",
+    };
+    const formsSuppressed = () => {
+      if (!owner) return false;
+      const adopter = this.questionOwnerAdoptions.get(owner);
+      return (
+        this.timedOutQuestionOwners.has(owner) ||
+        (adopter !== undefined && this.timedOutQuestionOwners.has(adopter))
+      );
+    };
+    if (signal.aborted) throw new Error("Tool use aborted");
+    if (this.askUserQuestionTimeoutMs > 0 && formsSuppressed()) return fallback;
+    const elicit = async (): Promise<CreateElicitationResponse | undefined> => {
+      if (signal.aborted) throw new Error("Tool use aborted");
+      if (this.askUserQuestionTimeoutMs === 0) return this.elicitFromClient(createRequest, signal);
+      // Check after the child’s state publication, immediately before opening a form.
+      if (formsSuppressed()) return undefined;
+      const timeout = new AbortController();
+      const requestSignal = AbortSignal.any([signal, timeout.signal]);
+      const timer = setTimeout(() => {
+        if (signal.aborted) return;
+        if (owner) {
+          this.timedOutQuestionOwners.add(owner);
+          const adopter = this.questionOwnerAdoptions.get(owner);
+          if (adopter) this.timedOutQuestionOwners.add(adopter);
+        }
+        timeout.abort();
+      }, this.askUserQuestionTimeoutMs);
+      try {
+        const answer = await this.elicitFromClient(createRequest, requestSignal);
+        return timeout.signal.aborted ? undefined : answer;
+      } catch (error) {
+        if (signal.aborted || !timeout.signal.aborted) throw error;
+        return undefined;
+      } finally {
+        clearTimeout(timer);
+      }
+    };
     let response;
     try {
       response = await this.withChildAwaitingUser(sessionId, requestSessionId, signal, () =>
-        this.withPendingUserInput(
-          sessionId,
-          signal,
-          () => this.elicitFromClient(createRequest, signal),
-          agentID,
-        ),
+        this.withPendingUserInput(sessionId, signal, elicit, agentID),
       );
     } catch (error) {
       // A cancellation we requested (signal aborted) settles as an aborted tool
@@ -10906,6 +10971,7 @@ export class ClaudeAcpAgent {
       throw new Error("Tool use aborted");
     }
 
+    if (response === undefined) return fallback;
     const outcome = applyAskElicitationResponse(response, toolInput, questions);
     if (outcome.action === "cancel") {
       throw new Error("Tool use aborted");

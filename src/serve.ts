@@ -1,5 +1,6 @@
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 import { v1AgentApp, type ClaudeAcpAgent, type Logger } from "./acp-agent.js";
+import { parseAskUserQuestionTimeout } from "./elicitation.js";
 import { nodeToWebReadable, nodeToWebWritable } from "./utils.js";
 import { v2AgentApp } from "./v2/agent.js";
 
@@ -28,6 +29,8 @@ export function serveAcp(
   logger: Logger | undefined,
   options: { protocols: AcpProtocols },
 ): { closed: Promise<void>; dispose(): Promise<void> } {
+  // Validate before connecting. The SDK closes connections without reporting constructor errors.
+  parseAskUserQuestionTimeout(process.env.CLAUDE_AGENT_ACP_ASK_USER_QUESTION_TIMEOUT_MS);
   const output = nodeToWebWritable(process.stdout);
   const input = nodeToWebReadable(process.stdin);
   // The router opens the connection of the negotiated version only when it

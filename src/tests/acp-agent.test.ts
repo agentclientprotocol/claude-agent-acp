@@ -5230,7 +5230,9 @@ describe("permission request cancellation", () => {
     "does not wait for $name when its client ignores cancellation",
     async ({ start, aborted }) => {
       // The client holds the elicitation and never answers $/cancel_request.
-      const createElicitation = vi.fn(() => new Promise<CreateElicitationResponse>(() => {}));
+      const createElicitation = vi.fn<AcpClient["createElicitation"]>(
+        () => new Promise<CreateElicitationResponse>(() => {}),
+      );
       const mockClient = {
         sessionUpdate: async () => {},
         createElicitation,
@@ -5243,9 +5245,11 @@ describe("permission request cancellation", () => {
       const controller = new AbortController();
       const pending = start(agent, controller.signal);
       await vi.waitFor(() => expect(createElicitation).toHaveBeenCalledOnce());
-      // The client was asked to cancel the request, and ignores that.
-      expect(createElicitation.mock.calls[0]).toEqual([expect.anything(), controller.signal]);
+      const requestSignal = createElicitation.mock.calls[0][1] as AbortSignal;
+      expect(requestSignal.aborted).toBe(false);
+      // AskUserQuestion combines SDK cancellation with its form timeout.
       controller.abort();
+      expect(requestSignal.aborted).toBe(true);
 
       await aborted(pending);
       expect(session.openUserInputs?.size ?? 0).toBe(0);
