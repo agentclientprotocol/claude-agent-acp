@@ -13409,16 +13409,16 @@ describe("MCP server startup failures", () => {
   });
 
   it("reports a needs-auth server only when the client can't run OAuth", async () => {
-    const withoutOAuth = setup([{ name: "client-api", status: "needs-auth" }]);
-    await withoutOAuth.agent.initialize({
+    const withoutUrlElicitation = setup([{ name: "client-api", status: "needs-auth" }]);
+    await withoutUrlElicitation.agent.initialize({
       protocolVersion: 1,
       clientCapabilities: { session: { notices: {} } },
     });
-    await withoutOAuth.agent.prompt({
+    await withoutUrlElicitation.agent.prompt({
       sessionId: "test-session",
       prompt: [{ type: "text", text: "hi" }],
     });
-    expect(withoutOAuth.updates().filter((u) => u.sessionUpdate === "notice")).toEqual([
+    expect(withoutUrlElicitation.updates().filter((u) => u.sessionUpdate === "notice")).toEqual([
       {
         sessionUpdate: "notice",
         severity: "info",
@@ -13427,20 +13427,20 @@ describe("MCP server startup failures", () => {
       },
     ]);
 
-    const withOAuth = setup([{ name: "client-api", status: "needs-auth" }]);
+    const withUrlElicitation = setup([{ name: "client-api", status: "needs-auth" }]);
     // The OAuth flow also needs the query's `mcpAuthenticate`.
-    (withOAuth.agent as any).sessions["test-session"].query.mcpAuthenticate = vi.fn(
+    (withUrlElicitation.agent as any).sessions["test-session"].query.mcpAuthenticate = vi.fn(
       async () => ({}),
     );
-    await withOAuth.agent.initialize({
+    await withUrlElicitation.agent.initialize({
       protocolVersion: 1,
       clientCapabilities: { session: { notices: {} }, elicitation: { url: {} } },
     });
-    await withOAuth.agent.prompt({
+    await withUrlElicitation.agent.prompt({
       sessionId: "test-session",
       prompt: [{ type: "text", text: "hi" }],
     });
-    expect(withOAuth.updates().filter((u) => u.sessionUpdate === "notice")).toEqual([]);
+    expect(withUrlElicitation.updates().filter((u) => u.sessionUpdate === "notice")).toEqual([]);
   });
 
   it("falls back to a transcript line without the notices capability", async () => {
