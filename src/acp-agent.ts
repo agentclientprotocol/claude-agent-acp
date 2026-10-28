@@ -85,6 +85,7 @@ import {
   SDKMessage,
   SDKMessageOrigin,
   SDKPartialAssistantMessage,
+  SDKSystemMessage,
   SessionMessage,
   SDKUserMessage,
   SDKUserMessageReplay,
@@ -276,6 +277,7 @@ import {
   normalizeNoticeText,
   noticeOrTranscriptUpdate,
   sentenceCase,
+  type SessionNotice,
   splitNoticeText,
 } from "./session-notices.js";
 import {
@@ -1143,6 +1145,10 @@ export type Session = {
   /** Serialized `system`/init `plugin_errors` last logged, so the per-turn
    *  init re-emit logs a plugin load failure once, not every turn. */
   loggedPluginErrors?: string;
+  /** Names of client-provided MCP servers already reported as failed or
+   *  needing authentication. `system`/init re-emits on every turn with the
+   *  same statuses, and each server is reported once per session. */
+  reportedMcpServers?: Set<string>;
   /** The long-lived consumer task. Lazily started on the first `prompt()` and
    *  kept alive for the session so between-turn/background messages are still
    *  drained and forwarded. */
@@ -4151,6 +4157,55 @@ export class ClaudeAcpAgent {
     return respawned;
   }
 
+  /** Tells the user about client-provided MCP servers that `system`/init
+   *  reports as `failed` or `needs-auth`, once per server per session. Servers
+   *  from the user's Claude Code settings are left to `/mcp`: they are the same
+   *  in every session, so a broken one would be reported in every session. A
+   *  `needs-auth` server is reported only when the client can't run the OAuth
+   *  flow (no URL elicitation); otherwise `startMcpAuthentication` asks the
+   *  user to sign in. */
+  private async reportMcpServerStartupFailures(
+    session: Session,
+    servers: SDKSystemMessage["mcp_servers"] | undefined,
+    supportsNotices: boolean,
+    sendUpdate: (notification: AcpSessionNotification) => Promise<void>,
+    sessionId: string,
+  ): Promise<void> {
+    if (!servers?.length) return;
+    const clientServers = new Set(
+      (session.creationParams?.mcpServers ?? []).map((server) => server.name),
+    );
+    const oauthAvailable = !!this.clientCapabilities?.elicitation?.url;
+    for (const server of servers) {
+      if (!clientServers.has(server.name) || session.reportedMcpServers?.has(server.name)) {
+        continue;
+      }
+      let notice: SessionNotice;
+      if (server.status === "failed") {
+        notice = {
+          severity: "warning",
+          title: `MCP server "${server.name}" failed to start`,
+          description: "Its tools are unavailable in this session. Run /mcp for the error.",
+        };
+      } else if (server.status === "needs-auth" && !oauthAvailable) {
+        notice = {
+          severity: "info",
+          title: `MCP server "${server.name}" needs authentication`,
+          description: "Its tools are unavailable until the server is authenticated.",
+        };
+      } else {
+        continue;
+      }
+      (session.reportedMcpServers ??= new Set()).add(server.name);
+      await sendUpdate({
+        sessionId,
+        update: noticeOrTranscriptUpdate(notice, supportsNotices, undefined, {
+          claudeCode: { kind: "mcpServerStatus", server: server.name, status: server.status },
+        }),
+      });
+    }
+  }
+
   private async recreateSignedOutQuery(sessionId: string, session: Session): Promise<void> {
     const creationParams = session.creationParams;
     if (!creationParams) {
@@ -6137,6 +6192,13 @@ export class ClaudeAcpAgent {
                     }
                   }
                 }
+                await this.reportMcpServerStartupFailures(
+                  session,
+                  message.mcp_servers,
+                  supportsNotices,
+                  sendUpdate,
+                  params.sessionId,
+                );
                 break;
               case "status": {
                 // A model request that serves none of the prompts a cancel

@@ -13320,6 +13320,142 @@ describe("model refusal fallback handling", () => {
   });
 });
 
+describe("MCP server startup failures", () => {
+  function setup(mcpServersStatus: { name: string; status: string; source?: string }[]) {
+    const sessionUpdate = vi.fn(async () => {});
+    const agent = new ClaudeAcpAgent({ sessionUpdate } as unknown as AcpClient, {
+      log: () => {},
+      error: () => {},
+    });
+    const init = {
+      type: "system",
+      subtype: "init",
+      session_id: "test-session",
+      mcp_servers: mcpServersStatus,
+    };
+    async function* generator(input: Pushable<any>) {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield {
+        type: "user",
+        message: userMessage.message,
+        parent_tool_use_id: null,
+        uuid: userMessage.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+      // init re-emits on every turn with the same statuses.
+      yield init;
+      yield init;
+      yield {
+        type: "result",
+        subtype: "success",
+        stop_reason: null,
+        is_error: false,
+        result: "",
+        errors: [],
+        duration_ms: 0,
+        duration_api_ms: 0,
+        num_turns: 1,
+        total_cost_usd: 0,
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+        modelUsage: {},
+        permission_denials: [],
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+    injectGeneratorSession(agent, generator, {
+      creationParams: {
+        cwd: "/tmp",
+        mcpServers: [
+          { name: "client-fs", command: "fs-server", args: [], env: [] },
+          { name: "client-api", type: "http", url: "https://example.com/mcp", headers: [] },
+        ],
+      },
+    });
+    const updates = () =>
+      sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
+    return { agent, updates };
+  }
+
+  it("sends one notice per failed client-provided server and ignores settings servers", async () => {
+    const { agent, updates } = setup([
+      { name: "client-fs", status: "failed", source: "dynamic" },
+      { name: "client-api", status: "connected", source: "dynamic" },
+      { name: "from-settings", status: "failed", source: "user" },
+    ]);
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { session: { notices: {} } },
+    });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    expect(updates().filter((u) => u.sessionUpdate === "notice")).toEqual([
+      {
+        sessionUpdate: "notice",
+        severity: "warning",
+        title: 'MCP server "client-fs" failed to start',
+        description: "Its tools are unavailable in this session. Run /mcp for the error.",
+      },
+    ]);
+  });
+
+  it("reports a needs-auth server only when the client can't run OAuth", async () => {
+    const withoutOAuth = setup([{ name: "client-api", status: "needs-auth" }]);
+    await withoutOAuth.agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { session: { notices: {} } },
+    });
+    await withoutOAuth.agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "hi" }],
+    });
+    expect(withoutOAuth.updates().filter((u) => u.sessionUpdate === "notice")).toEqual([
+      {
+        sessionUpdate: "notice",
+        severity: "info",
+        title: 'MCP server "client-api" needs authentication',
+        description: "Its tools are unavailable until the server is authenticated.",
+      },
+    ]);
+
+    const withOAuth = setup([{ name: "client-api", status: "needs-auth" }]);
+    await withOAuth.agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { session: { notices: {} }, elicitation: { url: {} } },
+    });
+    await withOAuth.agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "hi" }],
+    });
+    expect(withOAuth.updates().filter((u) => u.sessionUpdate === "notice")).toEqual([]);
+  });
+
+  it("falls back to a transcript line without the notices capability", async () => {
+    const { agent, updates } = setup([{ name: "client-fs", status: "failed" }]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    const lines = updates().filter(
+      (u) =>
+        u.sessionUpdate === "agent_message_chunk" &&
+        u._meta?.claudeCode?.kind === "mcpServerStatus",
+    );
+    expect(lines).toHaveLength(1);
+    expect(lines[0].content.text).toBe(
+      '**MCP server "client-fs" failed to start:** Its tools are unavailable in this session. Run /mcp for the error.',
+    );
+  });
+});
+
 describe("terminal slash command filtering", () => {
   it("latches init's terminal_slash_commands and re-advertises without them", async () => {
     const sessionUpdate = vi.fn(async () => {});
