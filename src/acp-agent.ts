@@ -9252,17 +9252,6 @@ export class ClaudeAcpAgent {
         : [];
     let validValue = allValues.find((o) => o.value === params.value);
 
-    // The option's reported currentValue is always a valid target, even when
-    // it has no options entry: a session running an out-of-picker model
-    // (resumed onto an allowlist-excluded model, or a refusal fallback)
-    // reports a currentValue that isn't selectable, and a client
-    // round-tripping it must not get "Invalid value". It flows through the
-    // normal apply path below — re-asserting an already-current value is
-    // harmless and can repair SDK drift.
-    if (!validValue && option.currentValue === params.value) {
-      validValue = { value: params.value, name: params.value };
-    }
-
     // For model options, fall back to resolveModelPreference when the exact
     // value doesn't match.  This lets callers use human-friendly aliases like
     // "opus" or "sonnet" instead of full model IDs like "claude-opus-4-6".
@@ -11240,9 +11229,9 @@ export class ClaudeAcpAgent {
     // Map the SDK-reported model onto one of the session's model options
     // (handles display names and `resolvedModel` ids). The switched-to model
     // may not be among the options — e.g. excluded by the user's
-    // `availableModels` allowlist — in which case we track the raw id: the
-    // picker shows no selection, but the model-dependent bookkeeping and any
-    // later `setModel` round-trip stay truthful to what the SDK is running.
+    // `availableModels` allowlist — in which case we track the raw id.
+    // `buildModelConfigOption` then lists that id as an extra entry, so the
+    // picker shows what the SDK is running and a client can send it back.
     const resolved = resolveModelPreference(session.modelInfos, switchedModel);
     const value = resolved?.value ?? switchedModel;
     if (session.models.currentModelId === value) return;
@@ -12076,9 +12065,10 @@ export class ClaudeAcpAgent {
       const currentModelInfo = allowlistedModelInfo ?? fallbackModelInfo;
       // Register the fallback-resolved capabilities under the verbatim live id
       // so every modelInfos consumer (buildConfigOptions' effort lookup, later
-      // rebuilds via session.modelInfos) agrees with the gating below. The
-      // picker options themselves come from `models.availableModels`, so this
-      // adds no selectable entry. The spread keeps every capability flag
+      // rebuilds via session.modelInfos) agrees with the gating below.
+      // `buildModelConfigOption` lists this model as its own entry while it is
+      // current and drops it once the user switches to a listed model; it is
+      // never added to `models.availableModels`. The spread keeps every capability flag
       // (current and future); the identity fields are overridden because the
       // fuzzy-matched sibling's resolvedModel/displayName/description can
       // describe a different context lane and would poison later resolvedModel

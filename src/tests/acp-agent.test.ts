@@ -13097,7 +13097,13 @@ describe("model refusal fallback handling", () => {
     // model-dependent bookkeeping doesn't keep advertising the refused model.
     expect(session.models.currentModelId).toBe("claude-mystery-9");
     const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
-    expect(updates.some((u) => u.sessionUpdate === "config_option_update")).toBe(true);
+    const configUpdate = updates.find((u) => u.sessionUpdate === "config_option_update");
+    // ACP requires currentValue to be one of the options, so the raw id is listed.
+    const modelOption = configUpdate.configOptions.find((o: any) => o.id === "model");
+    expect(modelOption.currentValue).toBe("claude-mystery-9");
+    expect(modelOption.options).toContainEqual(
+      expect.objectContaining({ value: "claude-mystery-9", name: "claude-mystery-9" }),
+    );
   });
 
   it("skips the config update when the fallback equals the tracked model", async () => {
