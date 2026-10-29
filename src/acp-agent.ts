@@ -2320,6 +2320,17 @@ function isTaskNotificationRecord(message: unknown): boolean {
 }
 
 /**
+ * True when CLI error text tells the user to sign in with `/login`. The CLI
+ * words this several ways — "Not logged in · Please run /login", "Not logged
+ * in · Run /login", "Login expired · Run /login to sign in again, or
+ * re-authenticate your Anthropic profile" — so match the "run /login"
+ * instruction rather than one sentence.
+ */
+export function isLoginRequiredText(text: string): boolean {
+  return /\brun \/login\b/i.test(text);
+}
+
+/**
  * True for the synthetic assistant message the CLI injects into the transcript
  * when a turn fails authentication (e.g. "Not logged in · Please run /login",
  * "Session expired. Please run /login to sign in again."). The `/login`
@@ -2331,9 +2342,13 @@ function isTaskNotificationRecord(message: unknown): boolean {
  * session/load even after the user has logged back in.
  *
  * Takes the API message (`message.message`), which replay only knows as
- * `unknown`. The persisted record's structured `error: "authentication_failed"`
- * marker is stripped by `getSessionMessages`, so the synthetic model + text is
- * all both paths have to match on.
+ * `unknown`. The persisted record's structured `error` marker is stripped by
+ * `getSessionMessages`, and the CLI does not always set it to
+ * `authentication_failed` anyway: an expired login with no refresh token
+ * ("Login expired · Run /login to sign in again, …") arrives as
+ * `invalid_request`. So the synthetic model + text is what both paths match on.
+ * Usage-limit banners are excluded because some of them also mention `/login`
+ * (to switch accounts) and have their own handling.
  */
 export function isSyntheticLoginMessage(apiMessage: unknown): boolean {
   if (!apiMessage || typeof apiMessage !== "object") {
@@ -2348,7 +2363,8 @@ export function isSyntheticLoginMessage(apiMessage: unknown): boolean {
     !!block &&
     block.type === "text" &&
     typeof block.text === "string" &&
-    block.text.includes("Please run /login")
+    isLoginRequiredText(block.text) &&
+    !isSyntheticUsageLimitMessage(apiMessage)
   );
 }
 
@@ -7105,7 +7121,7 @@ export class ClaudeAcpAgent {
                     message.stop_reason === "refusal" ||
                     ("result" in message &&
                       message.is_error &&
-                      message.result.includes("Please run /login"));
+                      isLoginRequiredText(message.result));
                   if (goalCommandFailed) {
                     await this.publishGoal(params.sessionId, pendingGoalUpdate.previous ?? null);
                   }
@@ -7335,7 +7351,7 @@ export class ClaudeAcpAgent {
               // drained hold at their results is as good as the idle
               // fallback.) Then stop: everything below is user-turn
               // lifecycle, and an autonomous outcome must never touch it —
-              // its is_error or "Please run /login" text would otherwise
+              // its is_error or "run /login" text would otherwise
               // failActive a live turn (the held one, or the user's next
               // prompt) whose own result recorded a different outcome.
               if (isAutonomousResult) {
@@ -7589,7 +7605,7 @@ export class ClaudeAcpAgent {
 
               switch (message.subtype) {
                 case "success": {
-                  if (message.is_error && message.result.includes("Please run /login")) {
+                  if (message.is_error && isLoginRequiredText(message.result)) {
                     await failActiveWithSessionFailure(
                       "auth_required",
                       RequestError.authRequired(),
@@ -9678,7 +9694,7 @@ export class ClaudeAcpAgent {
         replaySession.messageIdToUuid.set(replayMessageId, message.uuid);
       }
 
-      // The live prompt loop converts the synthetic "Please run /login"
+      // The live prompt loop converts the synthetic "run /login"
       // assistant message into an authRequired error instead of showing its
       // TUI-specific text; skip it on replay too (issue #863).
       if (message.type === "assistant" && isSyntheticLoginMessage(message.message)) {
