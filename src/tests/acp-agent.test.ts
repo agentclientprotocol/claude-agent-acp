@@ -3501,6 +3501,114 @@ describe("usage-limit failure replay", () => {
   });
 });
 
+describe("compacted session replay", () => {
+  it("replays the messages before the compaction, then the compaction", async () => {
+    const configDir = await mkdtemp(path.join(os.tmpdir(), "claude-acp-compacted-replay-"));
+    const originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = configDir;
+    try {
+      const sessionId = "44444444-4444-4444-8444-444444444444";
+      const directory = path.join(configDir, "projects", "-tmp-proj");
+      await mkdir(directory, { recursive: true });
+      const base = { sessionId, isSidechain: false, timestamp: "2026-10-11T00:00:00.000Z" };
+      const summary =
+        "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n" +
+        "Summary:\n1. Primary Request and Intent:\n   Say hi.\n\n" +
+        "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary.";
+      const assistant = (uuid: string, parentUuid: string, text: string) => ({
+        ...base,
+        type: "assistant",
+        uuid,
+        parentUuid,
+        message: {
+          id: `msg_${uuid}`,
+          role: "assistant",
+          model: "claude-opus-5",
+          content: [{ type: "text", text }],
+        },
+      });
+      // The records of `/compact` between two prompts, as Claude Code writes
+      // them: the boundary has no parent and links "Hello" logically.
+      await writeFile(
+        path.join(directory, `${sessionId}.jsonl`),
+        [
+          {
+            ...base,
+            type: "user",
+            uuid: "u1",
+            parentUuid: null,
+            message: { role: "user", content: "hi" },
+          },
+          assistant("a1", "u1", "Hello"),
+          {
+            ...base,
+            type: "system",
+            subtype: "compact_boundary",
+            uuid: "b1",
+            parentUuid: null,
+            logicalParentUuid: "a1",
+            compactMetadata: { trigger: "manual", preTokens: 1000 },
+          },
+          {
+            ...base,
+            type: "user",
+            uuid: "s1",
+            parentUuid: "b1",
+            isCompactSummary: true,
+            message: { role: "user", content: summary },
+          },
+          {
+            ...base,
+            type: "user",
+            uuid: "u2",
+            parentUuid: "s1",
+            message: { role: "user", content: "identify yourself" },
+          },
+          assistant("a2", "u2", "Claude"),
+        ]
+          .map((record) => JSON.stringify(record))
+          .join("\n") + "\n",
+      );
+      const updates: SessionNotification[] = [];
+      const client = {
+        sessionUpdate: async (update: SessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient;
+      const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+      await initializeClient(agent, { session: { compaction: {} } } as ClientCapabilities);
+
+      await (
+        agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+      ).replaySessionHistory(sessionId);
+
+      expect(
+        updates.flatMap(({ update }) => {
+          if (update.sessionUpdate === "compaction_update") return [["compaction", update.status]];
+          if (
+            (update.sessionUpdate === "user_message_chunk" ||
+              update.sessionUpdate === "agent_message_chunk") &&
+            update.content.type === "text"
+          ) {
+            return [[update.sessionUpdate, update.content.text]];
+          }
+          return [];
+        }),
+      ).toEqual([
+        ["user_message_chunk", "hi"],
+        ["agent_message_chunk", "Hello"],
+        ["compaction", "completed"],
+        ["user_message_chunk", "identify yourself"],
+        ["agent_message_chunk", "Claude"],
+      ]);
+    } finally {
+      if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
+      await rm(configDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("session/list", () => {
   const sdkSession = (index: number) => ({
     sessionId: `session-${index}`,

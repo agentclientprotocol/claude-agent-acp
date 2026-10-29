@@ -6,11 +6,10 @@ import {
 import {
   forkSession as forkClaudeSession,
   getSessionMessages,
-  importSessionToStore,
-  type SessionStore,
   type SessionStoreEntry,
 } from "@anthropic-ai/claude-agent-sdk";
 import { createHash } from "node:crypto";
+import { loadFullSessionHistory } from "./resumed-session.js";
 import { assistantMessageText } from "./session-failure-extension.js";
 import { SessionTiming } from "./session-timing.js";
 
@@ -67,22 +66,6 @@ function forkPointMessageIdCandidates(messageId: string): string[] {
   // Older AIR builds sent their visible segment id. Prefer the exact id before its ACP source id.
   const protocolMessageId = messageId.replace(/:segment:\d+$/, "");
   return protocolMessageId === messageId ? [messageId] : [messageId, protocolMessageId];
-}
-
-async function loadFullSessionHistory(
-  sessionId: string,
-  cwd: string,
-): Promise<SessionStoreEntry[]> {
-  // getSessionMessages returns only the active parentUuid chain. The import keeps inactive branches that AIR can still reference.
-  const entries: SessionStoreEntry[] = [];
-  const store: SessionStore = {
-    append: async (_key, batch) => {
-      entries.push(...batch);
-    },
-    load: async () => null,
-  };
-  await importSessionToStore(sessionId, store, { dir: cwd, includeSubagents: false });
-  return entries;
 }
 
 function assistantGroups(
@@ -210,6 +193,7 @@ export async function forkSession(
             .find((message) => dependencies.messageIdForGrouping(message) === candidateId)?.uuid,
       )
       .find(Boolean);
+  // getSessionMessages returns only the active parentUuid chain. The full history keeps inactive branches that AIR can still reference.
   const fullHistoryUuid = messageUuid
     ? undefined
     : resolveFromFullHistory(
