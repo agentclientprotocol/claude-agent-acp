@@ -406,6 +406,94 @@ describe("NativeSubagentRuntime lifecycle", () => {
     expect(terminalIds).toEqual(spawnedIds);
   });
 
+  it("routes launch-parent traffic after a SendMessage resume without moving older tool owners", async () => {
+    const published: AcpSessionNotification[] = [];
+    const runtime = new NativeSubagentRuntime(
+      "air",
+      "root",
+      {},
+      async (n) => {
+        published.push(n);
+      },
+      { log: () => {} },
+    );
+    const output = (id: string, sessionUpdate: string = "tool_call") =>
+      ({
+        sessionId: "root",
+        update: {
+          sessionUpdate,
+          toolCallId: id,
+          title: "Bash",
+          status: "pending",
+          _meta: { claudeCode: { toolName: "Bash", parentToolUseId: "agent-tool" } },
+        },
+      }) as AcpSessionNotification;
+    const nestedControl = (id: string, status: "pending" | "failed") =>
+      ({
+        sessionId: "root",
+        update: {
+          sessionUpdate: status === "pending" ? "tool_call" : "tool_call_update",
+          toolCallId: id,
+          title: "Agent",
+          status,
+          _meta: { claudeCode: { toolName: "Agent", parentToolUseId: "agent-tool" } },
+        },
+      }) as AcpSessionNotification;
+    await runtime.route(control("tool_call", "pending"), async () => {});
+    await runtime.taskStarted(
+      { taskId: "worker-1", toolUseId: "agent-tool", subagentType: "general-purpose" },
+      async () => {},
+    );
+    await expect(runtime.route(output("old-bash"), async () => {})).resolves.toMatchObject({
+      sessionId: "worker-1",
+    });
+    await runtime.route(nestedControl("old-nested", "pending"), async () => {});
+    await runtime.finishTask("worker-1", "completed", async () => {}, "agent-tool");
+    await runtime.route(
+      {
+        sessionId: "root",
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "send-1",
+          title: "SendMessage",
+          _meta: { claudeCode: { toolName: "SendMessage" } },
+        },
+      } as AcpSessionNotification,
+      async () => {},
+    );
+    await runtime.taskStarted(
+      { taskId: "worker-1", toolUseId: "send-1", subagentType: "general-purpose" },
+      async () => {},
+    );
+    await expect(runtime.route(output("new-bash"), async () => {})).resolves.toMatchObject({
+      sessionId: "worker-1:generation:2",
+    });
+    await expect(
+      runtime.route(output("old-bash", "tool_call_update"), async () => {}),
+    ).resolves.toBeNull();
+    await expect(
+      runtime.route(nestedControl("old-nested", "failed"), async () => {}),
+    ).resolves.toBeNull();
+    await expect(
+      runtime.route(nestedControl("old-nested", "failed"), async () => {}, "root"),
+    ).resolves.toMatchObject({ sessionId: "root" });
+    await runtime.route(nestedControl("new-nested", "pending"), async () => {});
+    await expect(
+      runtime.route(nestedControl("new-nested", "failed"), async () => {}),
+    ).resolves.toMatchObject({ sessionId: "worker-1:generation:2" });
+    await runtime.finishTask("worker-1", "failed", async () => {}, "agent-tool");
+    expect(
+      published.filter(({ update }) => update.sessionUpdate === "subagent_state_update"),
+    ).toHaveLength(1);
+    await expect(runtime.route(output("another-new-bash"), async () => {})).resolves.toMatchObject({
+      sessionId: "worker-1:generation:2",
+    });
+    await runtime.finishTask("worker-1", "completed", async () => {}, "send-1");
+    expect(
+      published.filter(({ update }) => update.sessionUpdate === "subagent_state_update"),
+    ).toHaveLength(2);
+  });
+
   it("announces resumed subagent generation immediately when SendMessage restarts the task (#1158)", async () => {
     const published: AcpSessionNotification[] = [];
     const runtime = new NativeSubagentRuntime(

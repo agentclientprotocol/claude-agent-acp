@@ -194,7 +194,9 @@ describe.skipIf(!enabled)("real ACP resumed subagent tool lifecycle", () => {
           form === "air"
             ? {
                 _meta: {
-                  jetbrains: { air: { version: 1, capabilities: ["nativeSubagentSessions"] } },
+                  jetbrains: {
+                    air: { version: 1, capabilities: ["nativeSubagentSessions", "asyncTasks"] },
+                  },
                 },
               }
             : form === "rfd"
@@ -320,6 +322,27 @@ describe.skipIf(!enabled)("real ACP resumed subagent tool lifecycle", () => {
               (receipt) => receipt.success === true && receipt.resumedAgentId === agentId,
             ),
           ).toBe(true);
+          if (form === "air") {
+            const resumedTask = resumedRaw.find(
+              (entry) =>
+                entry.type === "system" &&
+                entry.subtype === "task_started" &&
+                entry.task_id === agentId,
+            );
+            const launchId = launched?.tool_use_id;
+            expect(typeof launchId).toBe("string");
+            expect(resumedTask?.tool_use_id).toBeDefined();
+            expect(resumedTask?.tool_use_id).not.toBe(launchId);
+            const childTools = resumedRaw.filter(
+              (entry) =>
+                entry.type === "assistant" &&
+                entry.message?.content?.some(
+                  (block: Json) => block.type === "tool_use" && block.name === "Bash",
+                ),
+            );
+            expect(childTools.length).toBeGreaterThanOrEqual(2);
+            expect(childTools.every((entry) => entry.parent_tool_use_id === launchId)).toBe(true);
+          }
         }
         expect(readFileSync(path.join(cwd, "first.txt"), "utf8")).toBe("FIRST");
         expect(readFileSync(path.join(cwd, "resumed.txt"), "utf8")).toBe("RESUMED");

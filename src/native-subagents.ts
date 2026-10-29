@@ -174,9 +174,9 @@ export class NativeSubagentRuntime {
   private readonly configBySession = new Map<string, ChildConfiguration>();
   private readonly childByParentToolUse = new Map<string, NativeSubagent>();
   /**
-   * The child session of each tool call that went to a child session. A later
-   * update of that tool call can lose `parentToolUseId`, for example a progress
-   * beat after the child finished. It still belongs to the child session.
+   * The owning child session of each tool call, including AIR's hidden
+   * Agent/Task controls. A later update can lose `parentToolUseId`, for example
+   * a progress beat after the child finished. Its owner stays the same.
    */
   private readonly childByToolCall = new Map<string, NativeSubagent>();
   private readonly taskFinishPromises = new Map<string, Promise<void>>();
@@ -414,6 +414,13 @@ export class NativeSubagentRuntime {
 
     if (this.enabled && isControl) {
       const toolCallId = update.toolCallId;
+      const controlOwner = this.form === "air" ? this.childByToolCall.get(toolCallId) : undefined;
+      if (
+        !forcedSessionId &&
+        (controlOwner?.terminalState !== undefined || controlOwner?.terminalPromise)
+      ) {
+        return this.toChild(controlOwner, notification, toolCallId);
+      }
       if (update.sessionUpdate === "tool_call") {
         this.controlByToolUse.set(toolCallId, notification);
       }
@@ -424,9 +431,15 @@ export class NativeSubagentRuntime {
           mergeSubagentIdentity(this.identityByToolUse.get(toolCallId), identity),
         );
       }
-      const parentChild = claudeMeta?.parentToolUseId
-        ? this.childByParentToolUse.get(claudeMeta.parentToolUseId)
-        : undefined;
+      const parentChild =
+        controlOwner ??
+        (claudeMeta?.parentToolUseId
+          ? this.childForTraffic(claudeMeta.parentToolUseId)
+          : undefined);
+      if (this.form === "air" && parentChild && update.sessionUpdate === "tool_call") {
+        const owner = forcedSessionId ? this.childOfSession(forcedSessionId) : parentChild;
+        if (owner) this.rememberToolCallOwner(toolCallId, owner);
+      }
       const parentSessionId = claudeMeta?.parentToolUseId
         ? parentChild?.sessionId
         : this.rootSessionId;
@@ -496,9 +509,7 @@ export class NativeSubagentRuntime {
     const owner = toolCallId ? this.childByToolCall.get(toolCallId) : undefined;
     const announcedChild =
       owner ??
-      (claudeMeta?.parentToolUseId
-        ? this.childByParentToolUse.get(claudeMeta.parentToolUseId)
-        : undefined);
+      (claudeMeta?.parentToolUseId ? this.childForTraffic(claudeMeta.parentToolUseId) : undefined);
     if (announcedChild?.announced && update.sessionUpdate === "config_option_update") {
       await this.reportConfiguration(announcedChild.sessionId, update.configOptions, update._meta);
       return null;
@@ -510,7 +521,7 @@ export class NativeSubagentRuntime {
     if (owner) return this.toChild(owner, notification, toolCallId);
 
     if (this.enabled && claudeMeta?.parentToolUseId) {
-      const child = this.childByParentToolUse.get(claudeMeta.parentToolUseId);
+      const child = this.childForTraffic(claudeMeta.parentToolUseId);
       if (!child || !child.announced) {
         const launchId = claudeMeta.parentToolUseId;
         this.buffer(launchId, notification);
@@ -525,6 +536,19 @@ export class NativeSubagentRuntime {
     }
 
     return notification;
+  }
+
+  private childForTraffic(parentToolUseId: string): NativeSubagent | undefined {
+    const previous = this.childByParentToolUse.get(parentToolUseId);
+    if (this.form !== "air" || previous?.terminalState === undefined) return previous;
+    const taskId = this.taskByToolUse.get(parentToolUseId);
+    const current = taskId ? this.children.get(taskId) : undefined;
+    // The SDK starts a resumed run under SendMessage but stamps its messages
+    // with the original Agent launch. Completion stays tied to its delegation;
+    // only traffic follows the current resumed generation.
+    return current?.parentToolUseId && this.senderByToolUse.has(current.parentToolUseId)
+      ? current
+      : previous;
   }
 
   async taskStarted(task: TaskStarted, deliver: Publish): Promise<void> {
