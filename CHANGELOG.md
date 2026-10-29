@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.99.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.99.0...v0.99.1) (2026-10-29)
+
+
+### Bug Fixes
+
+* add approval id to plan ([#1469](https://github.com/agentclientprotocol/claude-agent-acp/issues/1469)) ([4b4b2c4](https://github.com/agentclientprotocol/claude-agent-acp/commit/4b4b2c4de7c492070f6260cacea5680b2e045a5a))
+* allow forking sessions into a different directory ([#1483](https://github.com/agentclientprotocol/claude-agent-acp/issues/1483)) ([8bd0bc9](https://github.com/agentclientprotocol/claude-agent-acp/commit/8bd0bc9b03fb4a30e0b1755128baad12a214a58d))
+* detect "Run /login" login-expired messages as authRequired ([#1481](https://github.com/agentclientprotocol/claude-agent-acp/issues/1481)) ([fccaebc](https://github.com/agentclientprotocol/claude-agent-acp/commit/fccaebcf87e8f37144ec1a64920c0c53997edabe))
+* mark plugin, bundled and nested Claude skills as skills for AIR ([#1473](https://github.com/agentclientprotocol/claude-agent-acp/issues/1473)) ([52c241e](https://github.com/agentclientprotocol/claude-agent-acp/commit/52c241e71512ec19c4dd79c95c51ce67f04d7aac))
+* title subagent sessions by their task ([#1479](https://github.com/agentclientprotocol/claude-agent-acp/issues/1479)) ([7dcb629](https://github.com/agentclientprotocol/claude-agent-acp/commit/7dcb62923d38ac24e386b0626fe123334341c445))
+
 ## [0.99.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.98.0...v0.99.0) (2026-10-28)
 
 
