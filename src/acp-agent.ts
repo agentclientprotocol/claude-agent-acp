@@ -3094,6 +3094,9 @@ export class ClaudeAcpAgent {
     const response = await this.createSession(params, {
       // Revisit these meta values once we support resume
       resume: (params._meta as NewSessionMeta | undefined)?.claudeCode?.options?.resume,
+      // A caller-chosen id for a brand-new conversation. The transcript is
+      // written under it, so hosts can anchor their own session records to it.
+      reuseSessionId: (params._meta as NewSessionMeta | undefined)?.claudeCode?.options?.sessionId,
     });
     this.afterSetupResponse(response.sessionId, params.mcpServers);
     return response;
@@ -12393,6 +12396,27 @@ export class ClaudeAcpAgent {
       };
       timing.phase("register");
       this.refreshContextWindowInBackground(sessionId, this.sessions[sessionId]);
+
+      // Report the actual Claude session id when it diverges from the ACP
+      // session id: the transcript is written under it, so hosts anchoring
+      // their own session records to it must follow rotations (fresh-context
+      // restarts run a new Claude session under the stable ACP session id).
+      // Best-effort: a failing notification must not fail the session that
+      // was just created.
+      const claudeSessionId = options.sessionId ?? options.resume;
+      if (claudeSessionId !== undefined && claudeSessionId !== sessionId) {
+        try {
+          await this.client.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: "session_info_update",
+              _meta: { claudeCode: { sessionId: claudeSessionId } },
+            },
+          });
+        } catch (error) {
+          this.logger.error(`Failed to report the Claude session id for ${sessionId}`, error);
+        }
+      }
 
       return {
         sessionId,

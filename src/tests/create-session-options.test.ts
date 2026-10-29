@@ -86,10 +86,13 @@ vi.mock("../tools.js", async () => {
 describe("createSession options merging", () => {
   let agent: ClaudeAcpAgentType;
   let ClaudeAcpAgent: typeof ClaudeAcpAgentType;
+  let sessionUpdates: SessionNotification[];
 
   function createMockClient(): AcpClient {
     return {
-      sessionUpdate: async (_notification: SessionNotification) => {},
+      sessionUpdate: async (notification: SessionNotification) => {
+        sessionUpdates.push(notification);
+      },
       requestPermission: async () => ({ outcome: { outcome: "cancelled" } }),
       readTextFile: async () => ({ content: "" }),
       writeTextFile: async () => ({}),
@@ -97,6 +100,7 @@ describe("createSession options merging", () => {
   }
 
   beforeEach(async () => {
+    sessionUpdates = [];
     capturedOptions = undefined;
     contextUsageResult = undefined;
     contextUsageCalls = [];
@@ -2372,5 +2376,31 @@ describe("createSession options merging", () => {
         }
       });
     });
+  });
+
+  it("forwards _meta.claudeCode.options.sessionId to the SDK as a caller-chosen fresh-session id", async () => {
+    const cwd = process.cwd();
+    const { sessionId } = await agent.newSession({
+      cwd,
+      mcpServers: [],
+      _meta: { claudeCode: { options: { sessionId: "01991111-1111-7111-8111-3b6ac9e1f001" } } },
+    });
+
+    expect(capturedOptions?.sessionId).toBe("01991111-1111-7111-8111-3b6ac9e1f001");
+    expect(sessionId).toBe("01991111-1111-7111-8111-3b6ac9e1f001");
+  });
+
+  it("does not emit a session_info_update when the Claude session id matches the ACP session id", async () => {
+    const cwd = process.cwd();
+    await agent.newSession({ cwd, mcpServers: [] });
+
+    // The transcript id equals the ACP session id for fresh and resumed
+    // sessions; only rotations (fresh-context restarts) warrant a report.
+    const reported = sessionUpdates.some(
+      (n) =>
+        (n as unknown as { update: { sessionUpdate: string } }).update.sessionUpdate ===
+        "session_info_update",
+    );
+    expect(reported).toBe(false);
   });
 });
