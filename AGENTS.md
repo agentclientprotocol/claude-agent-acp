@@ -39,10 +39,10 @@ opening a PR.
 ## Architecture and design fit
 
 - Before coding, read the code the change plugs into and find the module that
-  owns the state or concept. Build on that module, not beside it. `acp-agent.ts`
-  is already large: give a feature with its own state its own module (as
-  `task-notifications.ts` or `clear-context-coordinator.ts` do) and call it
-  from there.
+  owns the state or concept. Build on that module, not beside it.
+- Don't add new features or components to `acp-agent.ts`. If no existing module fits the new
+  code cleanly, create a dedicated one that owns the feature's state and logic,
+  and keep the change in `acp-agent.ts` to the calls that wire it in.
 - Prefer extending an existing mechanism over adding a new one, even if it takes
   a small refactor (moving a helper, generalizing a function). Add a parallel
   path, special case or flag only when the existing structure can't support the
