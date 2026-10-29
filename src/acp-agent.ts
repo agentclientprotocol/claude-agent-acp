@@ -978,7 +978,8 @@ type Turn = {
    *  `steeredSettle`. `steeredSettle` can already hold the interrupted cycle's
    *  outcome (or a held turn's, moved over by `steer()`) when the echo lands, so
    *  while this is set the recorded outcome predates the steered work and an
-   *  idle must not settle on it. */
+   *  idle must not settle on it. A result of an autonomous cycle that names
+   *  none of the turn's steers is not steered work, so it does not clear it. */
   steeredAwaitingResult?: boolean;
   /** What a steered turn settles with once its steered work has run: the outcome
    *  of its latest result, so its usage covers every cycle the turn ran. */
@@ -5397,14 +5398,19 @@ export class ClaudeAcpAgent {
      *  calling settleActive directly bypasses the hold and re-opens the
      *  out-of-turn permission deadlock (issue #866) through its lane. For a
      *  client with `backgroundSubagents` this always settles now. */
-    const settleOrDefer = async (outcome: TurnOutcome) => {
+    const settleOrDefer = async (
+      outcome: TurnOutcome,
+      { steeredWork = true }: { steeredWork?: boolean } = {},
+    ) => {
       // No result ends a steered turn: the steer aborted the cycle this result
       // may belong to, and the steered one is still to come. Record the outcome
       // for the idle lane (see Turn.steeredEchoes); later cycles overwrite it,
       // so the last result and its usage win.
       if (isSteering(session.activeTurn)) {
         session.activeTurn.steeredSettle = outcome;
-        session.activeTurn.steeredAwaitingResult = false;
+        // Only a result of the steered work ends the wait for it (see
+        // Turn.steeredAwaitingResult).
+        if (steeredWork) session.activeTurn.steeredAwaitingResult = false;
         return;
       }
       if (
@@ -7105,6 +7111,10 @@ export class ClaudeAcpAgent {
               // commands whose shared or late result this is, even when the
               // result is the ACTIVE turn's (ensureActiveTurn never looks at
               // the map in that case).
+              // Whether this result names one of the turn's steers. The settle
+              // calls below read it too: a result of a cycle Claude Code started
+              // that names none of them is not the steered work's result.
+              let answersSteer = false;
               if (!isAutonomousResult) {
                 recordResultForOrphanCommands();
                 await ensureActiveTurn(message.user_message_uuid, message.user_message_uuids);
@@ -7122,7 +7132,6 @@ export class ClaudeAcpAgent {
                   const consumed =
                     message.user_message_uuids ??
                     (message.user_message_uuid !== undefined ? [message.user_message_uuid] : []);
-                  let answersSteer = false;
                   for (const uuid of consumed) {
                     steeredTurn.steeredEchoes.delete(uuid);
                     if (steeredTurn.steeredUuids?.has(uuid)) answersSteer = true;
@@ -7585,7 +7594,9 @@ export class ClaudeAcpAgent {
                 // settling it out from under them would strand their output
                 // and permission requests out-of-turn (issue #866's deadlock,
                 // through the refusal lane).
-                await settleOrDefer(turnOutcome(session, "refusal"));
+                await settleOrDefer(turnOutcome(session, "refusal"), {
+                  steeredWork: !startedByClaudeCode || answersSteer,
+                });
                 break;
               }
 
@@ -7798,7 +7809,9 @@ export class ClaudeAcpAgent {
                 await compaction.reset();
               }
               if (!session.cancelled) {
-                await settleOrDefer(turnOutcome(session, stopReason));
+                await settleOrDefer(turnOutcome(session, stopReason), {
+                  steeredWork: !startedByClaudeCode || answersSteer,
+                });
               }
             } finally {
               if (!isAutonomousResult) {

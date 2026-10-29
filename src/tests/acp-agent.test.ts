@@ -27704,6 +27704,64 @@ describe("turn steering (_session/steering)", () => {
     expect(agent.sessions["test-session"].owedTrailingIdles).toBe(0);
   });
 
+  // The same guard when the autonomous cycle's result is stamped with the
+  // original prompt: answersPendingPrompt then routes it to the user lane, and
+  // its idle must still not settle the turn while the steered work runs.
+  it.each(["end_turn", "refusal"] as const)(
+    "does not settle a steered turn on an autonomous %s result naming the original prompt",
+    async (stopReason) => {
+      const timeline: string[] = [];
+      const agent = new ClaudeAcpAgent(timelineClient(timeline), {
+        log: () => {},
+        error: () => {},
+      });
+
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const u1 = await iter.next();
+          yield userEcho(u1.value);
+          yield createAssistantText("working on it");
+          const steered = await iter.next();
+          yield { ...interruptedCycleResult(), user_message_uuid: u1.value.uuid };
+          yield userEcho(steered.value);
+          // A background cycle's result, stamped with the original prompt only.
+          yield {
+            ...createResultMessage(),
+            stop_reason: stopReason,
+            origin: { kind: "task-notification" },
+            user_message_uuid: u1.value.uuid,
+            user_message_uuids: [u1.value.uuid],
+          };
+          yield idleMessage(); // that cycle's trailer
+          yield createAssistantText("STEERED-OK");
+          yield createResultMessage();
+          yield idleMessage();
+        }
+        return messageGenerator();
+      });
+
+      const turn = agent
+        .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "start" }] })
+        .then((response) => {
+          timeline.push(`prompt:${response.stopReason}`);
+          return response;
+        });
+      await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+      await agent.steer({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "also handle X" }],
+      });
+
+      await turn;
+      await agent.sessions["test-session"]?.consumer;
+
+      // The turn keeps one stop reason across its cycles, so a refusal trailer's
+      // reason is reported; what matters here is that the prompt ends last.
+      expect(timeline).toEqual(["working on it", "STEERED-OK", `prompt:${stopReason}`]);
+    },
+  );
+
   it("always injects at 'now' priority, ignoring any client-supplied priority", async () => {
     const agent = createMockAgent();
     const captured: any[] = [];
