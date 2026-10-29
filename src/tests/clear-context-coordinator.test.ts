@@ -28,6 +28,7 @@ function testSession(overrides: Partial<TestSession> = {}): TestSession {
       },
     },
     models: { currentModelId: "default" },
+    contextWindowSize: 200_000,
     configOptions: [],
     currentAgent: "default",
     fastModeEnabled: false,
@@ -464,6 +465,7 @@ describe("ExitPlanCoordinator", () => {
     expect(order).toEqual([
       "current_mode_update",
       "config_option_update",
+      "usage_update",
       ...(supportsPlanOperations
         ? [
             "plan_update " +
@@ -476,6 +478,10 @@ describe("ExitPlanCoordinator", () => {
         : []),
       "continuation",
     ]);
+    expect(host.sessionUpdate).toHaveBeenCalledWith({
+      sessionId: "public-session",
+      update: { sessionUpdate: "usage_update", used: 0, size: 200_000 },
+    });
     if (airClient) {
       expect(host.sessionUpdate).toHaveBeenCalledWith({
         sessionId: "public-session",

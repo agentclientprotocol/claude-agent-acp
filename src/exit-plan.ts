@@ -213,7 +213,7 @@ export class ExitPlanCoordinator<
     try {
       const clearContextHost: ClearContextCoordinatorHost<Session, Turn> = {
         ...this.host,
-        publishSessionState: async (id, mode, configOptions) => {
+        publishSessionState: async (id, mode, configOptions, contextWindowSize) => {
           await this.host.sessionUpdate({
             sessionId: id,
             update: { sessionUpdate: "current_mode_update", currentModeId: mode },
@@ -221,6 +221,12 @@ export class ExitPlanCoordinator<
           await this.host.sessionUpdate({
             sessionId: id,
             update: { sessionUpdate: "config_option_update", configOptions },
+          });
+          // Otherwise the client shows the old context's usage until the fresh
+          // context first reports its own.
+          await this.host.sessionUpdate({
+            sessionId: id,
+            update: { sessionUpdate: "usage_update", used: 0, size: contextWindowSize },
           });
           // The approved plan becomes the session's plan once the fresh
           // context that carries it out exists. Its ExitPlanMode ended with
