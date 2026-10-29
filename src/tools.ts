@@ -431,7 +431,7 @@ export const createPostToolUseHook =
   async (input: any, toolUseID: string | undefined): Promise<{ continue: boolean }> => {
     if (input.hook_event_name === "PostToolUse") {
       // Handle EnterPlanMode tool - notify client of mode change after successful execution
-      if (input.tool_name === "EnterPlanMode" && options?.onEnterPlanMode) {
+      if (input.tool_name === "EnterPlanMode" && !input.agent_id && options?.onEnterPlanMode) {
         await options.onEnterPlanMode();
       }
 

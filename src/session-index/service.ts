@@ -15,6 +15,7 @@ import {
   RequestError,
   type ListSessionsRequest,
   type ListSessionsResponse,
+  type SessionInfo,
 } from "@agentclientprotocol/sdk/unstable";
 import { deleteSession as sdkDeleteSession } from "@anthropic-ai/claude-agent-sdk";
 import { airExtensionMeta } from "../air-extension.js";
@@ -37,7 +38,7 @@ import {
 import { LiveSessionRegistry } from "./live-registry.js";
 import {
   canonicalPath,
-  errorCode,
+  exists,
   isExactProjectDir,
   isSessionId,
   projectDirMatches,
@@ -65,6 +66,7 @@ import { sessionInfoOf } from "./session-info.js";
 export const SESSION_RENAME_METHOD = "_session/rename";
 export const SESSION_ARCHIVE_METHOD = "_session/archive";
 export const SESSION_UNARCHIVE_METHOD = "_session/unarchive";
+export const SESSION_BATCH_GET_METHOD = "_session/batch_get";
 
 /** The JSON-RPC code of an unknown session (ACP `ResourceNotFound`). */
 const RESOURCE_NOT_FOUND = -32002;
@@ -73,6 +75,27 @@ const CURSOR_VERSION = 5;
 
 export type SessionIdRequest = { sessionId: string };
 export type RenameSessionRequest = { sessionId: string; title: string };
+export type BatchGetSessionsRequest = { sessionIds: string[] };
+export type BatchGetSessionsResponse = {
+  sessions: SessionInfo[];
+};
+
+export function parseBatchGetSessionsRequest(value: unknown): BatchGetSessionsRequest {
+  const record = asRecord(value);
+  const ids = record.sessionIds;
+  if (
+    Object.keys(record).length !== 1 ||
+    !Array.isArray(ids) ||
+    ids.some((id) => typeof id !== "string" || !id.trim()) ||
+    new Set(ids).size !== ids.length
+  ) {
+    throw RequestError.invalidParams(
+      undefined,
+      "params require only sessionIds: distinct, non-blank strings",
+    );
+  }
+  return { sessionIds: ids };
+}
 
 export function sessionNotFound(sessionId: string): RequestError {
   return new RequestError(RESOURCE_NOT_FOUND, `Session not found: ${sessionId}`, { sessionId });
@@ -364,16 +387,6 @@ function isSdkNotFound(error: unknown): boolean {
   return error instanceof Error && /^Session \S+ not found in /.test(error.message);
 }
 
-async function exists(target: string): Promise<boolean> {
-  try {
-    await fs.lstat(target);
-    return true;
-  } catch (error) {
-    if (errorCode(error) === "ENOENT" || errorCode(error) === "ENOTDIR") return false;
-    throw error;
-  }
-}
-
 /** The error the SDK `deleteSession` gives for a session id it rejects or
  *  does not find, which a client without `sessionIndex` got before. */
 function sdkDeleteError(sessionId: string): Error {
@@ -518,6 +531,22 @@ export class SessionIndexService {
       .map((row) => sessionInfoOf(row, own(row.sessionId), live.get(row.sessionId), now));
     const last = rows[rows.length - 1];
     return hasMore && last ? { sessions, nextCursor: encodeListCursor(last, scope) } : { sessions };
+  }
+
+  /** Metadata for known ids, independent of list pages and project filters. */
+  async batchGet(
+    { sessionIds }: BatchGetSessionsRequest,
+    own: (sessionId: string) => OwnSessionState | undefined,
+  ): Promise<BatchGetSessionsResponse> {
+    if (sessionIds.length === 0) return { sessions: [] };
+    const live = await this.registry.snapshot();
+    const now = this.now();
+    const rows = await this.index.getSessions(sessionIds);
+    return {
+      sessions: rows.map((row) =>
+        sessionInfoOf(row, own(row.sessionId), live.get(row.sessionId), now),
+      ),
+    };
   }
 
   /** Runs `mutation` after the previous mutation of the session ended. */

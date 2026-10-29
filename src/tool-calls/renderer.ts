@@ -319,13 +319,16 @@ export class AcpToolCallRenderer {
     const facts = this.facts(toolUse, options.cwd);
     if (!this.capabilities.air.client) {
       // The upstream shape: the whole tool call again. A v2 client also gets
-      // the exact preview patch, which the tool call does not show.
+      // the exact preview patch, which the tool call does not show, but not the
+      // status: its subject is an update of the call, which was emitted before
+      // the request (`ensureToolCallEmitted`), and a `pending` there would move
+      // a call that already runs back.
       const content = options.previewContent ?? this.toolUseContent(toolUse.id, facts);
       const locations = [...(facts.locations ?? []), ...(options.extraLocations ?? [])];
       return {
         toolCallId: toolUse.id,
         name: toolUse.name,
-        status: "pending",
+        ...(this.capabilities.v2 ? {} : { status: "pending" as const }),
         rawInput: toolUse.input,
         title: options.title ?? facts.title,
         kind: facts.kind,

@@ -292,9 +292,13 @@ function isForkDirectiveMessage(message: { type?: unknown; message?: unknown }):
  * The transcript of a `subagent_type: "fork"` child without the context it
  * inherited. A fork transcript starts with a copy of the parent's launching
  * assistant message (its text, thinking and every tool_use, including the
- * Agent call itself), then a user message with a "Fork started — processing
- * in background" tool_result for each of those tool_uses and the text
- * `<fork-boilerplate>…</fork-boilerplate>\nYour directive: <prompt>`. A fork
+ * Agent call itself), then a user message with a placeholder tool_result for
+ * each of those tool_uses and the text
+ * `<fork-boilerplate>…</fork-boilerplate>\nYour directive: <prompt>`. Since
+ * Claude Code 2.1.307 the fork's own Agent call gets "Fork started — that fork
+ * is you." and the other tool_uses get "This is the parent's call, not
+ * yours. …"; before that, every one got "Fork started — processing in
+ * background". Only the directive text is matched here. A fork
  * launched from inside a subagent also gets a copy of that subagent's history
  * before them. None of it is the child's own work: replayed as is, the
  * parent's text and tool calls would show again in the child.

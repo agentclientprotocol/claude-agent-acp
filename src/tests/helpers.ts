@@ -31,6 +31,9 @@ export function makeMockQuery(overrides: Record<string, unknown> = {}) {
     supportedCommands: async () => [],
     mcpServerStatus: async () => [],
     getContextUsage: async () => DEFAULT_CONTEXT_USAGE,
+    // No ultracode fields: session creation falls back to settings and the
+    // model's effort levels, as with a CLI that does not report them.
+    getSettings: async () => ({ applied: {} }),
     close: () => {},
     interrupt: async () => undefined,
     [Symbol.asyncIterator]: async function* () {},

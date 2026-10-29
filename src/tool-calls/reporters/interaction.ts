@@ -72,6 +72,13 @@ export class ExitPlanModeReporter implements ToolReporter {
   }
 }
 
+/** EnterPlanMode switches the session to plan mode, so it has the `switch_mode` kind like ExitPlanMode. */
+export class EnterPlanModeReporter implements ToolReporter {
+  toolUse(): ToolUseFacts {
+    return { title: "EnterPlanMode", kind: "switch_mode" };
+  }
+}
+
 /** The plan file of a result: the path of the input, else the `filePath` of the structured result. */
 function resultPlanFile({ toolUse, structured, capabilities }: ToolResultContext) {
   if (!capabilities.air.planFile) return undefined;

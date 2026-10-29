@@ -65,7 +65,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("session load/resume lifecyc
     q2.return(undefined);
   }, 30000);
 
-  it("ACP: loadSession throws resourceNotFound for a non-existent session", async () => {
+  it("ACP: loadSession throws sessionNotFound for a non-existent session", async () => {
     const agent = new ClaudeAcpAgent(createMockClient());
     const bogusSessionId = randomUUID();
 
@@ -82,7 +82,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("session load/resume lifecyc
     }
   }, 30000);
 
-  it("ACP: resumeSession throws resourceNotFound for a non-existent session", async () => {
+  it("ACP: resumeSession throws sessionNotFound for a non-existent session", async () => {
     const agent = new ClaudeAcpAgent(createMockClient());
     const bogusSessionId = randomUUID();
 
@@ -99,7 +99,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("session load/resume lifecyc
     }
   }, 30000);
 
-  it("ACP: newSession without prompt, then loadSession on fresh agent throws resourceNotFound", async () => {
+  it("ACP: newSession without prompt, then loadSession on fresh agent throws sessionNotFound", async () => {
     // Step 1: Create a real session via ACP, never prompt, dispose
     const agentA = new ClaudeAcpAgent(createMockClient());
     const { sessionId } = await agentA.newSession({
@@ -125,7 +125,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("session load/resume lifecyc
     }
   }, 30000);
 
-  it("ACP: newSession without prompt, then resumeSession on fresh agent throws resourceNotFound", async () => {
+  it("ACP: newSession without prompt, then resumeSession on fresh agent throws sessionNotFound", async () => {
     const agentA = new ClaudeAcpAgent(createMockClient());
     const { sessionId } = await agentA.newSession({
       cwd: process.cwd(),

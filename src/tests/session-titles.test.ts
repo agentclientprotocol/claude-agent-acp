@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
@@ -73,7 +74,7 @@ describe("SDK title generation contract", () => {
   });
 });
 
-describe("session titles at turn-end", () => {
+describe("session titles", () => {
   beforeEach(() => {
     vi.mocked(getSessionInfo).mockReset();
   });
@@ -179,7 +180,199 @@ describe("session titles at turn-end", () => {
     expect(titles()).toEqual(["Stable title"]);
   });
 
-  it("generates a title at turn-end instead of publishing the raw prompt", async () => {
+  it("sends the current title and updatedAt on request, even when already sent", async () => {
+    const updates: any[] = [];
+    const agent = newAgent({
+      sessionUpdate: async (u: any) => {
+        updates.push(u.update);
+      },
+    } as unknown as AcpClient);
+    vi.mocked(getSessionInfo).mockResolvedValue({
+      sessionId: "test-session",
+      summary: "Fix the\nbuild",
+      lastModified: 1_700_000_000_000,
+    } as any);
+    const input = new Pushable<any>();
+    agent.sessions["test-session"] = mockSessionState(
+      { query: wrapQuery(oneTurn(input)), input },
+      agent,
+    );
+
+    await agent.publishCurrentSessionInfo("test-session");
+    await agent.publishCurrentSessionInfo("test-session");
+
+    const current = {
+      sessionUpdate: "session_info_update",
+      title: "Fix the build",
+      updatedAt: new Date(1_700_000_000_000).toISOString(),
+    };
+    expect(updates).toEqual([current, current]);
+    expect(getSessionInfo).toHaveBeenCalledWith("test-session", { dir: "/test" });
+  });
+
+  it("sends the last published title without updatedAt when the session has no file", async () => {
+    const { client, titles } = titleRecorder();
+    const agent = newAgent(client);
+    const input = new Pushable<any>();
+    agent.sessions["test-session"] = mockSessionState(
+      { query: wrapQuery(oneTurn(input)), input },
+      agent,
+    );
+
+    // No file and no title yet: nothing to send.
+    vi.mocked(getSessionInfo).mockResolvedValue(undefined);
+    await agent.publishCurrentSessionInfo("test-session");
+    expect(titles()).toEqual([]);
+
+    await agent.sessions["test-session"]!.titles.setExplicitTitle("Renamed", async () => undefined);
+    await agent.publishCurrentSessionInfo("test-session");
+    expect(titles()).toEqual(["Renamed", "Renamed"]);
+  });
+
+  it("sends a published title that isn't stored yet instead of the raw first prompt", async () => {
+    const { client, titles } = titleRecorder();
+    const agent = newAgent(client);
+    const input = new Pushable<any>();
+    agent.sessions["test-session"] = mockSessionState(
+      { query: wrapQuery(oneTurn(input)), input },
+      agent,
+    );
+    await agent.sessions["test-session"]!.titles.setExplicitTitle("Renamed", async () => undefined);
+
+    // The file has no custom title yet, so `summary` is the raw first prompt.
+    vi.mocked(getSessionInfo).mockResolvedValue({
+      sessionId: "test-session",
+      summary: "please fix the build",
+      lastModified: 1_700_000_000_000,
+    } as any);
+    await agent.publishCurrentSessionInfo("test-session");
+
+    expect(titles()).toEqual(["Renamed", "Renamed"]);
+  });
+
+  /** A stream event carrying one chunk of the assistant's answer. */
+  function textDelta(text: string) {
+    return {
+      type: "stream_event",
+      event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } },
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  /** A promise and the function that resolves it. */
+  function deferred<T = void>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((r) => (resolve = r));
+    return { promise, resolve };
+  }
+
+  it("publishes the generated title while the first turn is still running", async () => {
+    const { client, titles } = titleRecorder();
+    const agent = newAgent(client);
+
+    vi.mocked(getSessionInfo).mockResolvedValue({
+      sessionId: "test-session",
+      summary: LONG_PROMPT,
+      lastModified: 1_700_000_000_000,
+    } as any);
+
+    const input = new Pushable<any>();
+    const turnMayEnd = deferred();
+    async function* longTurn() {
+      const { value: userMessage } = await input[Symbol.asyncIterator]().next();
+      yield userEcho(userMessage);
+      await turnMayEnd.promise;
+      yield successfulResultMessage();
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+    const { query, generateSessionTitle } = wrapTitleQuery(longTurn(), "Explain add() in hello.py");
+    agent.sessions["test-session"] = mockSessionState({ query, input }, agent);
+
+    let turnEnded = false;
+    const turn = agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: LONG_PROMPT }] })
+      .then(() => (turnEnded = true));
+
+    await vi.waitFor(() => {
+      expect(titles()).toEqual(["Explain add() in hello.py"]);
+    });
+    expect(turnEnded).toBe(false);
+    expect(generateSessionTitle).toHaveBeenCalledWith(LONG_PROMPT, { persist: true });
+
+    turnMayEnd.resolve();
+    await turn;
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(generateSessionTitle).toHaveBeenCalledTimes(1);
+    expect(titles()).toEqual(["Explain add() in hello.py"]);
+  });
+
+  it("does not publish the raw prompt at turn end while the title is being generated", async () => {
+    const { client, titles } = titleRecorder();
+    const agent = newAgent(client);
+
+    vi.mocked(getSessionInfo).mockResolvedValue({
+      sessionId: "test-session",
+      summary: LONG_PROMPT,
+      lastModified: 1_700_000_000_000,
+    } as any);
+
+    const input = new Pushable<any>();
+    const generated = deferred<string | null>();
+    const generateSessionTitle = vi.fn(() => generated.promise);
+    const query = Object.assign(wrapQuery(oneTurn(input)), { generateSessionTitle });
+    agent.sessions["test-session"] = mockSessionState({ query, input }, agent);
+
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: LONG_PROMPT }],
+    });
+    await agent.sessions["test-session"]?.consumer;
+    expect(titles()).toEqual([]);
+
+    generated.resolve("Explain add() in hello.py");
+    await vi.waitFor(() => {
+      expect(titles()).toEqual(["Explain add() in hello.py"]);
+    });
+    expect(generateSessionTitle).toHaveBeenCalledTimes(1);
+  });
+
+  it("titles a prompt too short to title from at turn end, from the prompt and the reply", async () => {
+    const { client, titles } = titleRecorder();
+    const agent = newAgent(client);
+
+    vi.mocked(getSessionInfo).mockResolvedValue({
+      sessionId: "test-session",
+      summary: "hi",
+      lastModified: 1_700_000_000_000,
+    } as any);
+
+    const input = new Pushable<any>();
+    async function* greetingTurn() {
+      const { value: userMessage } = await input[Symbol.asyncIterator]().next();
+      yield userEcho(userMessage);
+      yield textDelta("Hello! What are we working on today?");
+      yield successfulResultMessage();
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+    const { query, generateSessionTitle } = wrapTitleQuery(greetingTurn(), "Greeting");
+    agent.sessions["test-session"] = mockSessionState({ query, input }, agent);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+    await agent.sessions["test-session"]?.consumer;
+    await vi.waitFor(() => {
+      expect(titles()).toEqual(["Greeting"]);
+    });
+
+    expect(generateSessionTitle).toHaveBeenCalledTimes(1);
+    expect(generateSessionTitle).toHaveBeenCalledWith("hi\nHello! What are we working on today?", {
+      persist: true,
+    });
+  });
+
+  it("generates a title from the prompt instead of publishing the raw prompt", async () => {
     const { client, titles } = titleRecorder();
     const agent = newAgent(client);
 
@@ -203,7 +396,6 @@ describe("session titles at turn-end", () => {
       prompt: [{ type: "text", text: LONG_PROMPT }],
     });
     await agent.sessions["test-session"]?.consumer;
-    // Generation is fired off the turn-end path, so it lands after `idle`.
     await vi.waitFor(() => {
       expect(generateSessionTitle).toHaveBeenCalledTimes(1);
     });
@@ -302,8 +494,12 @@ describe("session titles at turn-end", () => {
       prompt: [{ type: "text", text: "And what is the capital of France?" }],
     });
     await agent.sessions["test-session"]?.consumer;
+    // One try per prompt: a turn end does not ask again after its prompt did.
     await vi.waitFor(() => {
       expect(generateSessionTitle).toHaveBeenCalledTimes(2);
+    });
+    expect(generateSessionTitle).toHaveBeenLastCalledWith("And what is the capital of France?", {
+      persist: true,
     });
 
     // Nothing generated, so the client still gets the summary fallback.

@@ -126,10 +126,9 @@ export function isExitPlanInterruptionResult(
   );
 }
 
-/** The id of the plan that an approved ExitPlanMode publishes. Claude Code
- * keeps one plan file per session, which a later plan mode rewrites, so each
- * approval replaces the plan before it. The TodoWrite checklist is a
- * separate plan. */
+/** The base ID of an approved plan. AIR appends the review ID to keep each
+ * approval in the transcript. Other clients replace one plan per session.
+ * The TodoWrite checklist is a separate plan. */
 export const PLAN_MODE_PLAN_ID = "plan-mode";
 
 /** The plan, trimmed, that a successful ExitPlanMode result approved: the plan
@@ -150,11 +149,19 @@ export function approvedPlan(input: unknown, output: unknown): string | undefine
 }
 
 /** The update that shows an approved plan to a client that supports plan
- * operations (the `plan` client capability, which every v2 client has). */
-export function planModeUpdate(plan: string): SessionNotification["update"] {
+ * operations (the `plan` client capability, which every v2 client has).
+ * For AIR, pass the review ID to join the plan to its approval card. */
+export function planModeUpdate(
+  plan: string,
+  reviewToolCallId?: string,
+): SessionNotification["update"] {
   return {
     sessionUpdate: "plan_update",
-    plan: { type: "markdown", planId: PLAN_MODE_PLAN_ID, content: plan },
+    plan: {
+      type: "markdown",
+      planId: reviewToolCallId ? `${PLAN_MODE_PLAN_ID}:${reviewToolCallId}` : PLAN_MODE_PLAN_ID,
+      content: plan,
+    },
   };
 }
 
@@ -178,6 +185,7 @@ export type ExitPlanRestartHost<
   sessionUpdate(notification: SessionNotification): Promise<void>;
   /** Whether the client takes plan operations (see planModeUpdate). */
   supportsPlanOperations(): boolean;
+  isAirClient(): boolean;
   destroyReplacement(sessionId: string, session: Session): void;
   settleCancelledTurn(oldSession: Session, turnSession: Session, turn: Turn): void;
   settleFailedTurn(turnSession: Session, turn: Turn, error: unknown): void;
@@ -218,7 +226,13 @@ export class ExitPlanCoordinator<
           // context that carries it out exists. Its ExitPlanMode ended with
           // an error result, so toAcpNotifications did not publish it.
           if (this.host.supportsPlanOperations()) {
-            await this.host.sessionUpdate({ sessionId: id, update: planModeUpdate(reset.plan) });
+            await this.host.sessionUpdate({
+              sessionId: id,
+              update: planModeUpdate(
+                reset.plan,
+                this.host.isAirClient() ? reset.toolUseId : undefined,
+              ),
+            });
           }
         },
         continuationMessage: (id, plan, promptUuid) => ({
