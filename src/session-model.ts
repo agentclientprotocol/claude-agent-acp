@@ -55,7 +55,10 @@ function displayModelVersion(model: ModelInfo, family: string): string | undefin
   const familyVersion = new RegExp(`\\b${family}[-\\s]+(\\d+)(?:[-.](\\d+))?`, "i");
   // The display name is the value we are deciding whether to rewrite, so it
   // cannot validate its own normalization. Require independent SDK metadata.
-  for (const source of [model.resolvedModel, model.description, model.value]) {
+  // A resolved model is canonical, so prose or an alias cannot contradict it.
+  const sources =
+    model.resolvedModel !== undefined ? [model.resolvedModel] : [model.description, model.value];
+  for (const source of sources) {
     const match = source?.match(familyVersion);
     if (match) return match[2] ? `${match[1]}.${match[2]}` : match[1];
   }
