@@ -25,11 +25,14 @@ export type NativeSubagent = {
    * form. It is absent when the adapter has no prompt.
    */
   prompt?: string;
-  /** The RFD form: the parent's label for the child, `subagent_update.title`. */
+  /**
+   * The RFD form: the parent's label for the child, `subagent_update.title`:
+   * its name, else its task.
+   */
   title?: string;
-  /** The RFD form: the child's role, its `subagent_type`, for the title. */
+  /** The RFD form: the child's role, its `subagent_type`. */
   role?: string;
-  /** The RFD form: the child's purpose, `subagent_update.description`. */
+  /** The RFD form: `subagent_update.description`, the child's role. */
   description?: string;
   /**
    * The RFD form: the work state the client holds. The child is reusable, so
@@ -1868,26 +1871,22 @@ export function rfdEndState(state: SubagentState, end: TaskEnd | undefined): Wor
 }
 
 /**
- * The RFD form: the parent's labels for a child. The title is the agent's
- * name, with its role after it when both are known, else the role. The
- * description is the task's short description, never the prompt.
+ * The RFD form: the parent's labels for a child. The title is what tells
+ * siblings apart: the agent's name when it has one, else the task's short
+ * description (never the prompt), else its role. The description is the
+ * role, its `subagent_type`, unless the role is already the title.
  */
 export function rfdLabels(
   name: unknown,
   role: unknown,
   description: unknown,
 ): { title?: string; role?: string; description?: string } {
-  const agentName = nonBlankString(name);
   const agentRole = nonBlankString(role);
-  const title =
-    agentName && agentRole && agentName !== agentRole
-      ? `${agentName} (${agentRole})`
-      : (agentName ?? agentRole);
-  const text = nonBlankString(description);
+  const title = nonBlankString(name) ?? nonBlankString(description) ?? agentRole;
   return {
     ...(title ? { title } : {}),
     ...(agentRole ? { role: agentRole } : {}),
-    ...(text ? { description: text } : {}),
+    ...(agentRole && agentRole !== title ? { description: agentRole } : {}),
   };
 }
 

@@ -1087,8 +1087,8 @@ describe("NativeSubagentRuntime in the RFD form", () => {
         update: {
           sessionUpdate: "subagent_update",
           sessionId: "worker-1",
-          title: "builder (Explore)",
-          description: "Fix the build",
+          title: "builder",
+          description: "Explore",
           capabilities: { cancel: {} },
           state: { state: "running" },
         },
@@ -1297,10 +1297,10 @@ describe("NativeSubagentRuntime in the RFD form", () => {
     expect(published).toEqual([]);
   });
 
-  it("titles a child without a name by its role", async () => {
+  it("titles a child without a name by its task, and describes it by its role", async () => {
     const { published } = await runningWorker();
 
-    expect(published[0]?.update).toMatchObject({ title: "Explore", description: "Fix the build" });
+    expect(published[0]?.update).toMatchObject({ title: "Fix the build", description: "Explore" });
   });
 
   it("keeps the session of an idle child, which a resume runs again", async () => {
@@ -1569,8 +1569,8 @@ describe("NativeSubagentRuntime in the RFD form", () => {
           update: {
             sessionUpdate: "subagent_update",
             sessionId: "echoer-1",
-            title: "echoer (Explore)",
-            description: "Echo a word",
+            title: "echoer",
+            description: "Explore",
             capabilities: { cancel: {} },
             state: { state: "running" },
           },
@@ -1623,8 +1623,8 @@ describe("NativeSubagentRuntime in the RFD form", () => {
       expect(published[0]?.update).toEqual({
         sessionUpdate: "subagent_update",
         sessionId: "coordinator-1",
-        title: "coordinator (general-purpose)",
-        description: "Coordinate",
+        title: "coordinator",
+        description: "general-purpose",
       });
     });
 
@@ -1825,7 +1825,7 @@ describe("NativeSubagentRuntime in the RFD form", () => {
     });
   });
 
-  it("keeps the role in the title when a late frame names the child", async () => {
+  it("titles the child by the name a late frame gives it, and keeps its role", async () => {
     const published: AcpSessionNotification[] = [];
     const runtime = new NativeSubagentRuntime(
       "rfd",
@@ -1842,7 +1842,7 @@ describe("NativeSubagentRuntime in the RFD form", () => {
     );
     await runtime.route(launch("launch-1", { name: "builder" }), async () => {});
 
-    expect(published[0]?.update).toMatchObject({ title: "builder (Explore)" });
+    expect(published[0]?.update).toMatchObject({ title: "builder", description: "Explore" });
   });
 
   it("reports nothing when the parent is cancelled, until the SDK ends the child", async () => {

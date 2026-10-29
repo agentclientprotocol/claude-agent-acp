@@ -7747,8 +7747,8 @@ describe("subagent permission attribution (issue #851)", () => {
           update: {
             sessionUpdate: "subagent_update",
             sessionId: "agent-42",
-            title: "Explore",
-            description: "Investigate",
+            title: "Investigate",
+            description: "Explore",
             capabilities: { cancel: {} },
             state: { state: "running" },
           },
@@ -8302,8 +8302,8 @@ describe("subagent permission attribution (issue #851)", () => {
             update: {
               sessionUpdate: "subagent_update",
               sessionId: "agent-7",
-              title: "echoer (Explore)",
-              description: "Echo a word",
+              title: "echoer",
+              description: "Explore",
               capabilities: { cancel: {} },
               state: { state: "running" },
             },
