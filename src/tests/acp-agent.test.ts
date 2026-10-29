@@ -26357,6 +26357,60 @@ describe("turn steering (_session/steering)", () => {
     expect(JSON.stringify(injected.message.content)).toContain("also handle X");
   });
 
+  it("delivers at the priority the client requests in _meta.steering.priority", async () => {
+    const input = new Pushable<any>();
+    const inputPush = vi.spyOn(input, "push");
+    const agent = createMockAgent();
+    agent.sessions["test-session"] = mockSessionState({
+      input,
+      turnQueue: [
+        {
+          promptUuid: "running",
+          isLocalOnlyCommand: false,
+          settled: false,
+          resolve: () => {},
+          reject: () => {},
+        },
+      ],
+    });
+
+    await expect(
+      agent.steer({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "also handle this" }],
+        _meta: { steering: { priority: "next" } },
+      }),
+    ).resolves.toEqual({ outcome: "injected" });
+    expect(inputPush).toHaveBeenCalledTimes(1);
+    expect(inputPush.mock.calls[0][0].priority).toBe("next");
+  });
+
+  it("still uses priority:'later' while a user input is open, whatever the client requests", async () => {
+    const input = new Pushable<any>();
+    const inputPush = vi.spyOn(input, "push");
+    const agent = createMockAgent();
+    agent.sessions["test-session"] = mockSessionState({
+      input,
+      openUserInputs: new Set([{ cancelled: false }]),
+      turnQueue: [
+        {
+          promptUuid: "running",
+          isLocalOnlyCommand: false,
+          settled: false,
+          resolve: () => {},
+          reject: () => {},
+        },
+      ],
+    });
+
+    await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "also handle this" }],
+      _meta: { steering: { priority: "next" } },
+    });
+    expect(inputPush.mock.calls[0][0].priority).toBe("later");
+  });
+
   /** Gives test-session a native subagent, agent-42, whose child session the client knows. */
   function announceChildSession(agent: ClaudeAcpAgent): void {
     agent.sessions["test-session"].nativeSubagentsByTaskId = new Map([
