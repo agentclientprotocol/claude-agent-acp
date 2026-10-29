@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   clientSupportsNotices,
+  collapseHookSpeaker,
   MAX_NOTICE_TITLE_LENGTH,
   normalizeNoticeText,
   noticeOrTranscriptUpdate,
@@ -8,6 +9,7 @@ import {
   noticeTranscriptText,
   sentenceCase,
   splitNoticeText,
+  transcriptBlock,
 } from "../session-notices.js";
 
 describe("session notices", () => {
@@ -30,19 +32,40 @@ describe("session notices", () => {
     expect(noticeTranscriptText({ severity: "info", title: "Done" })).toBe("**Done**");
     expect(noticeOrTranscriptUpdate(notice, false)).toEqual({
       sessionUpdate: "agent_message_chunk",
-      content: { type: "text", text: "**Fast mode turned off:** Why." },
+      content: { type: "text", text: "\n\n> **Fast mode turned off:** Why.\n\n" },
     });
     expect(noticeOrTranscriptUpdate(notice, false, "custom line")).toEqual({
       sessionUpdate: "agent_message_chunk",
-      content: { type: "text", text: "custom line" },
+      content: { type: "text", text: "\n\n> custom line\n\n" },
     });
     const meta = { claudeCode: { kind: "informational", level: "warning" } };
     expect(noticeOrTranscriptUpdate(notice, false, "custom line", meta)).toEqual({
       sessionUpdate: "agent_message_chunk",
-      content: { type: "text", text: "custom line" },
+      content: { type: "text", text: "\n\n> custom line\n\n" },
       _meta: meta,
     });
     expect(noticeOrTranscriptUpdate(notice, true, "custom line", meta)).not.toHaveProperty("_meta");
+  });
+
+  it("puts a transcript notice in its own blockquote paragraph", () => {
+    // Without blank lines the chunk renders glued to Claude's last sentence:
+    // "…all done.**Notice:** Stop says: …".
+    expect(transcriptBlock("**Notice:** one line")).toBe("\n\n> **Notice:** one line\n\n");
+    expect(transcriptBlock("**Notice:** first\nsecond\n\nfourth\n")).toBe(
+      "\n\n> **Notice:** first\n> second\n>\n> fourth\n\n",
+    );
+  });
+
+  it("keeps a hook's repeated speaker prefix on the first line only", () => {
+    expect(collapseHookSpeaker("Stop says: token: 3 calls\nStop says: hand off now")).toBe(
+      "Stop says: token: 3 calls\nhand off now",
+    );
+    expect(collapseHookSpeaker("Stop says: one line")).toBe("Stop says: one line");
+    // Left alone unless every line repeats the same prefix.
+    expect(collapseHookSpeaker("Stop says: a\nsomething else")).toBe(
+      "Stop says: a\nsomething else",
+    );
+    expect(collapseHookSpeaker("no prefix\nStop says: b")).toBe("no prefix\nStop says: b");
   });
 
   it("sends a notice update when the client can present one", () => {

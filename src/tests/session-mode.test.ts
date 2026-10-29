@@ -112,7 +112,7 @@ describe("session mode", () => {
       sessionUpdate: "agent_message_chunk",
       content: {
         type: "text",
-        text: "**Auto mode unavailable:** the selected model does not support Auto mode; using Accept edits instead.",
+        text: "\n\n> **Auto mode unavailable:** the selected model does not support Auto mode; using Accept edits instead.\n\n",
       },
     });
   });
