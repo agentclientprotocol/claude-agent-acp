@@ -278,6 +278,9 @@ export function applyTaskCreate(
 ): void {
   const taskId = output?.task?.id;
   if (!taskId || !input) return;
+  // TaskCreate can be replayed after later TaskUpdate or TaskList events.
+  // Those events own corrections and progress, so keep the newer entry intact.
+  if (state.has(taskId)) return;
   state.set(taskId, {
     subject: input.subject,
     status: "pending",
