@@ -69,10 +69,7 @@ function forkPointMessageIdCandidates(messageId: string): string[] {
   return protocolMessageId === messageId ? [messageId] : [messageId, protocolMessageId];
 }
 
-async function loadFullSessionHistory(
-  sessionId: string,
-  cwd: string,
-): Promise<SessionStoreEntry[]> {
+async function loadFullSessionHistory(sessionId: string): Promise<SessionStoreEntry[]> {
   // getSessionMessages returns only the active parentUuid chain. The import keeps inactive branches that AIR can still reference.
   const entries: SessionStoreEntry[] = [];
   const store: SessionStore = {
@@ -81,7 +78,7 @@ async function loadFullSessionHistory(
     },
     load: async () => null,
   };
-  await importSessionToStore(sessionId, store, { dir: cwd, includeSubagents: false });
+  await importSessionToStore(sessionId, store, { includeSubagents: false });
   return entries;
 }
 
@@ -185,8 +182,10 @@ export async function forkSession(
 ): Promise<ForkSessionResponse> {
   const timing = new SessionTiming(dependencies.logger, "fork", params.sessionId);
   const point = forkPoint(params._meta);
+  // SDK `dir` scopes source lookup, not the fork's working directory. Search
+  // all projects: params.cwd can name a different workspace for the new session.
   if (!point) {
-    const forked = await forkClaudeSession(params.sessionId, { dir: params.cwd });
+    const forked = await forkClaudeSession(params.sessionId);
     timing.phase("sdk-fork", " resolution=latest");
     return { sessionId: forked.sessionId };
   }
@@ -195,9 +194,7 @@ export async function forkSession(
   const liveUuid = candidateIds
     .map((candidateId) => dependencies.liveMessageIdToUuid?.get(candidateId))
     .find(Boolean);
-  const history = liveUuid
-    ? undefined
-    : await getSessionMessages(params.sessionId, { dir: params.cwd });
+  const history = liveUuid ? undefined : await getSessionMessages(params.sessionId);
   timing.phase("active-history", ` resolution=${liveUuid ? "live" : "pending"}`);
   const messageUuid =
     liveUuid ??
@@ -213,7 +210,7 @@ export async function forkSession(
   const fullHistoryUuid = messageUuid
     ? undefined
     : resolveFromFullHistory(
-        await loadFullSessionHistory(params.sessionId, params.cwd),
+        await loadFullSessionHistory(params.sessionId),
         candidateIds,
         point,
         dependencies.messageIdForGrouping,
@@ -231,7 +228,6 @@ export async function forkSession(
   }
 
   const forked = await forkClaudeSession(params.sessionId, {
-    dir: params.cwd,
     upToMessageId: messageUuid ?? fullHistoryUuid,
   });
   timing.phase("sdk-fork");

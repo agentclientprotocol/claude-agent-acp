@@ -14496,7 +14496,7 @@ describe("session/fork", () => {
     });
 
     expect(response.sessionId).toBe("fork-id");
-    expect(forkSession).toHaveBeenCalledWith("source-id", { dir: "/workspace" });
+    expect(forkSession).toHaveBeenCalledWith("source-id");
     expect(createSession).toHaveBeenCalledWith(
       expect.objectContaining({ cwd: "/workspace", additionalDirectories: ["/workspace/extra"] }),
       expect.objectContaining({ resume: "fork-id" }),
@@ -14540,10 +14540,9 @@ describe("session/fork", () => {
     });
 
     expect(response.sessionId).toBe("fork-id");
-    expect(getSessionMessages).toHaveBeenCalledWith("source-id", { dir: "/workspace" });
+    expect(getSessionMessages).toHaveBeenCalledWith("source-id");
     expect(importSessionToStore).not.toHaveBeenCalled();
     expect(forkSession).toHaveBeenCalledWith("source-id", {
-      dir: "/workspace",
       upToMessageId: "assistant-uuid",
     });
   });
@@ -14668,11 +14667,9 @@ describe("session/fork", () => {
 
     expect(response.sessionId).toBe("fork-id");
     expect(importSessionToStore).toHaveBeenLastCalledWith("source-id", expect.any(Object), {
-      dir: "/workspace",
       includeSubagents: false,
     });
     expect(forkSession).toHaveBeenLastCalledWith("source-id", {
-      dir: "/workspace",
       upToMessageId: "inactive-assistant-uuid",
     });
   });

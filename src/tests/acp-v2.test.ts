@@ -1079,8 +1079,9 @@ describe("ACP v2 prompts", () => {
     ]);
   });
 
-  it("forks a session into one that the client can prompt at once", async () => {
+  it.each(["same", "different"])("forks a promptable session in the %s cwd", async (dir) => {
     const forkId = "99999999-8888-4777-8666-555555555555";
+    const forkCwd = dir === "same" ? cwd : await mkdtemp(path.join(tempDir, "fork-"));
     const echoed = scriptTurns(async function* (options) {
       yield assistantText(options, "Forked.");
       yield result(options);
@@ -1091,17 +1092,18 @@ describe("ACP v2 prompts", () => {
       const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
       const fork = await agent.request(v2.methods.agent.session.fork, {
         sessionId,
-        cwd,
+        cwd: forkCwd,
         mcpServers: [{ type: "http", name: "linear", url: "https://mcp.linear.app/mcp" }],
       });
 
       expect(fork.sessionId).toBe(forkId);
       expect(fork.configOptions?.map((option) => option.configId)).toContain("mode");
-      expect(forkSession).toHaveBeenCalledWith(sessionId, { dir: cwd });
+      expect(forkSession).toHaveBeenCalledWith(sessionId);
       // The fork runs as its own Claude Code session, resumed from the copied
       // transcript, with the MCP servers of the fork request.
       const forkQuery = sdk.queryOptions.at(-1)!;
       expect(forkQuery.resume).toBe(forkId);
+      expect(forkQuery.cwd).toBe(forkCwd);
       expect(Object.keys(forkQuery.mcpServers ?? {})).toContain("linear");
 
       // No session/resume needed before the first prompt.
