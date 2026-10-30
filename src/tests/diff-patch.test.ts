@@ -466,6 +466,12 @@ describe("ACP v2 diffs", () => {
     );
   });
 
+  it("keeps a Windows path native in a git patch, so it matches the changes entry", () => {
+    expect(gitPatchText("C:\\work\\App.ts", "update", [hunk], "absolute")).toContain(
+      'diff --git "C:\\\\work\\\\App.ts" "C:\\\\work\\\\App.ts"\n--- "C:\\\\work\\\\App.ts"\n+++ "C:\\\\work\\\\App.ts"\n',
+    );
+  });
+
   it("shows no diff at tool use, where the input holds a snippet or no old text", () => {
     const renderer = new AcpToolCallRenderer(v2);
     const edit = { file_path: "/work/a.ts", old_string: "old", new_string: "new" };
