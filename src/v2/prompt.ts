@@ -148,9 +148,13 @@ function idle({ stopReason, usage, _meta }: TurnOutcome): v2.SessionUpdate {
  * so such a block fails the request with invalid params (-32602) rather than
  * being dropped from the prompt. The same goes for an embedded blob that
  * Claude cannot read, e.g. an `application/zip` resource: `promptToClaude`
- * would drop it.
+ * would drop it. An empty `prompt` fails the same way: v2 requires at least
+ * one content block.
  */
 export function v1PromptRequest({ prompt, ...request }: v2.PromptRequest): PromptRequest {
+  if (prompt.length === 0) {
+    throw RequestError.invalidParams({ prompt }, "`prompt` must hold at least one content block");
+  }
   return {
     ...request,
     prompt: prompt.map((block) => {

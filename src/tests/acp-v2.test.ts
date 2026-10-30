@@ -322,6 +322,23 @@ describe("ACP protocol routing", () => {
     }
   });
 
+  it("does not advertise the AIR async tasks and goal extensions to a v2 AIR client", async () => {
+    const { app, authUpdate } = v2Client();
+    const response = await app.connectWith(connectRouter(), async (agent) => {
+      const response = await initializeV2(agent, {
+        _meta: { jetbrains: { air: { version: 1, capabilities: [] } } },
+      });
+      await authUpdate(1);
+      return response;
+    });
+
+    // The v2 app registers neither `_session/async_task/stop` nor `_session/goal`.
+    const air = (response._meta as any)?.jetbrains?.air;
+    expect(air.capabilities).toContain("sessionFailure");
+    expect(air.capabilities).not.toContain("asyncTasks");
+    expect(air).not.toHaveProperty("goal");
+  });
+
   it("negotiates a v2 client down to v1 when limited to v1", async () => {
     // On the raw stream, since the v2 client app cannot read the v1 response
     // that a real client would switch to v1 on.
@@ -492,6 +509,39 @@ describe("ACP v2 sessions", () => {
       await authUpdate(1);
     });
     expect(sdk.queryOptions).toHaveLength(0);
+  });
+
+  it("rejects two MCP servers with the same name in new, resume, and fork", async () => {
+    const { app, authUpdate } = v2Client();
+    const mcpServers: v2.McpServer[] = [
+      { type: "stdio", name: "files", command: "/usr/local/bin/mcp-files" },
+      { type: "http", name: "files", url: "https://mcp.example.com/mcp" },
+    ];
+    const duplicate = { code: -32602, data: { name: "files" } };
+    await app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      await expect(
+        agent.request(v2.methods.agent.session.new, { cwd, mcpServers }),
+      ).rejects.toMatchObject(duplicate);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await expect(
+        agent.request(v2.methods.agent.session.resume, { sessionId, cwd, mcpServers }),
+      ).rejects.toMatchObject(duplicate);
+      await expect(
+        agent.request(v2.methods.agent.session.resume, {
+          sessionId,
+          cwd,
+          mcpServers,
+          replayFrom: { type: "start" },
+        }),
+      ).rejects.toMatchObject(duplicate);
+      await expect(
+        agent.request(v2.methods.agent.session.fork, { sessionId, cwd, mcpServers }),
+      ).rejects.toMatchObject(duplicate);
+      await authUpdate(1);
+    });
+    // Only the session without MCP servers started.
+    expect(sdk.queryOptions).toHaveLength(1);
   });
 
   it("lists, resumes, closes, and deletes sessions", async () => {
@@ -5704,6 +5754,12 @@ describe("ACP v2 session translation", () => {
         prompt: [{ type: "audio", data: "AAAA", mimeType: "audio/wav" }],
       }),
     ).toThrow(expect.objectContaining({ code: -32602, data: { type: "audio" } }));
+  });
+
+  it("rejects an empty prompt", () => {
+    expect(() => v1PromptRequest({ sessionId: "s", prompt: [] })).toThrow(
+      expect.objectContaining({ code: -32602, data: { prompt: [] } }),
+    );
   });
 
   it("rejects an embedded blob that Claude cannot read, and passes one it can", () => {

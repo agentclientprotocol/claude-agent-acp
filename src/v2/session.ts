@@ -20,6 +20,7 @@ import {
   type SystemPrompt,
 } from "@agentclientprotocol/sdk/unstable";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
+import { V2_SESSION_CAPABILITIES } from "./initialize.js";
 import { v1ContentBlock } from "./prompt.js";
 
 export function v1NewSessionRequest(params: v2.NewSessionRequest): NewSessionRequest {
@@ -27,7 +28,7 @@ export function v1NewSessionRequest(params: v2.NewSessionRequest): NewSessionReq
   // v1 requires the list; v2 treats an omitted list as an empty one.
   return {
     ...request,
-    mcpServers: (mcpServers ?? []).map(v1McpServer),
+    mcpServers: v1McpServers(mcpServers) ?? [],
     ...v1SystemPromptField(systemPrompt),
   };
 }
@@ -51,9 +52,10 @@ export function v1RestoreSessionRequest(
   if (replayFrom == null) {
     return {
       method: "resume",
-      request: { ...request, ...(mcpServers ? { mcpServers: mcpServers.map(v1McpServer) } : {}) },
+      request: { ...request, ...(mcpServers ? { mcpServers: v1McpServers(mcpServers) } : {}) },
     };
   }
+  const servers = v1McpServers(mcpServers);
   if (replayFrom.type !== "start") {
     throw RequestError.invalidParams(
       { replayFrom },
@@ -62,7 +64,7 @@ export function v1RestoreSessionRequest(
   }
   return {
     method: "load",
-    request: { ...request, mcpServers: (mcpServers ?? []).map(v1McpServer) },
+    request: { ...request, mcpServers: servers ?? [] },
   };
 }
 
@@ -74,7 +76,7 @@ export function v1ForkSessionRequest(params: v2.ForkSessionRequest): ForkSession
   const { mcpServers, systemPrompt, ...request } = params;
   return {
     ...request,
-    ...(mcpServers ? { mcpServers: mcpServers.map(v1McpServer) } : {}),
+    ...(mcpServers ? { mcpServers: v1McpServers(mcpServers) } : {}),
     ...v1SystemPromptField(systemPrompt),
   };
 }
@@ -163,12 +165,22 @@ function v2ConfigOptionsField(options: SessionConfigOption[] | null | undefined)
 }
 
 /**
+ * The v1 list of the MCP servers of a v2 setup request, or undefined for no
+ * list. A request with two servers of the same `name`, or with a transport
+ * that the agent does not advertise in `session.mcp` (such as `acp` or a
+ * custom `_` type), fails with invalid params (-32602): the v1 session setup
+ * would otherwise drop the server without telling the client.
+ */
+function v1McpServers(servers: v2.McpServer[] | null | undefined): McpServer[] | undefined {
+  if (servers == null) return undefined;
+  v2.assertSupportedMcpServers(servers, V2_SESSION_CAPABILITIES.mcp);
+  return servers.map(v1McpServer);
+}
+
+/**
  * v2 requires a `type` on every transport and makes the empty lists optional.
  * The agent recognizes a v1 stdio server by its missing `type`, so the v2 tag
- * is dropped. Any other transport, such as `acp` or a custom `_` type, fails
- * the request with invalid params (-32602): the agent advertises only stdio
- * and HTTP, and the v1 session setup would otherwise drop the server without
- * telling the client.
+ * is dropped. {@link v1McpServers} has already rejected every other transport.
  */
 function v1McpServer(server: v2.McpServer): McpServer {
   if (v2.McpServer.isStdio(server)) {
@@ -178,8 +190,5 @@ function v1McpServer(server: v2.McpServer): McpServer {
   if (v2.McpServer.isHttp(server)) {
     return { ...server, headers: server.headers ?? [] };
   }
-  throw RequestError.invalidParams(
-    { type: server.type },
-    `MCP servers of type ${server.type} are not supported`,
-  );
+  throw new Error(`Unreachable: MCP server of type ${server.type} passed the transport check`);
 }

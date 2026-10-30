@@ -176,7 +176,35 @@ function resolveFromFullHistory(
   return occurrenceMatches.length === 1 ? occurrenceMatches[0]?.uuid : undefined;
 }
 
+/**
+ * Whether `error` is the Claude SDK's report that `sessionId` has no
+ * transcript: `forkSession` and `importSessionToStore` throw
+ * `Error("Session <id> not found")`, and both throw
+ * `"Invalid sessionId: <id>"` for an id that is not a UUID.
+ */
+function isUnknownSessionError(error: unknown, sessionId: string): boolean {
+  if (!(error instanceof Error)) return false;
+  return (
+    error.message === `Session ${sessionId} not found` ||
+    error.message === `Invalid sessionId: ${sessionId}`
+  );
+}
+
 export async function forkSession(
+  params: ForkSessionRequest,
+  dependencies: ForkSessionDependencies,
+): Promise<ForkSessionResponse> {
+  try {
+    return await forkTranscript(params, dependencies);
+  } catch (error) {
+    if (isUnknownSessionError(error, params.sessionId)) {
+      throw RequestError.sessionNotFound(params.sessionId);
+    }
+    throw error;
+  }
+}
+
+async function forkTranscript(
   params: ForkSessionRequest,
   dependencies: ForkSessionDependencies,
 ): Promise<ForkSessionResponse> {
