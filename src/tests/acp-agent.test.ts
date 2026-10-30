@@ -5114,10 +5114,11 @@ describe("permission request cancellation", () => {
     // Let canUseTool reach the awaited requestPermission before cancelling.
     await Promise.resolve();
 
-    // The tool-call signal is threaded through as the cancellation signal.
-    expect(receivedSignal).toBe(controller.signal);
+    // The cancellation signal follows the tool-call signal.
+    expect(receivedSignal?.aborted).toBe(false);
 
     controller.abort();
+    expect(receivedSignal?.aborted).toBe(true);
 
     await expect(pending).rejects.toThrow("Tool use aborted");
   });
@@ -5288,14 +5289,74 @@ describe("permission request cancellation", () => {
       const controller = new AbortController();
       const pending = start(agent, controller.signal);
       await vi.waitFor(() => expect(createElicitation).toHaveBeenCalledOnce());
-      // The client was asked to cancel the request, and ignores that.
-      expect(createElicitation.mock.calls[0]).toEqual([expect.anything(), controller.signal]);
+      const [, requestSignal] = createElicitation.mock.calls[0] as unknown as [
+        unknown,
+        AbortSignal,
+      ];
       controller.abort();
+      // The client was asked to cancel the request, and ignores that.
+      expect(requestSignal.aborted).toBe(true);
 
       await aborted(pending);
       expect(session.openUserInputs?.size ?? 0).toBe(0);
     },
   );
+
+  it.each(elicitations)(
+    "cancels $name before session/close responds",
+    async ({ start, aborted }) => {
+      const events: string[] = [];
+      const createElicitation = vi.fn(
+        (_params: unknown, signal: AbortSignal) =>
+          new Promise<CreateElicitationResponse>(() => {
+            signal.addEventListener("abort", () => events.push("cancel_request"), { once: true });
+          }),
+      );
+      const mockClient = {
+        sessionUpdate: async () => {},
+        createElicitation,
+      } as unknown as AcpClient;
+      const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+      await initializeClient(agent, { elicitation: { form: {}, url: {} } });
+      const session = injectSession(agent, "session-1");
+      session.emittedToolCalls.add("tool-1");
+
+      // Claude Code's own signal for the callback never aborts here.
+      const pending = start(agent, new AbortController().signal);
+      await vi.waitFor(() => expect(createElicitation).toHaveBeenCalledOnce());
+      await agent.closeSession({ sessionId: "session-1" });
+      events.push("closed");
+
+      expect(events).toEqual(["cancel_request", "closed"]);
+      await aborted(pending);
+    },
+  );
+
+  it("cancels a permission request before session/close responds", async () => {
+    const events: string[] = [];
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: (_params: RequestPermissionRequest, signal?: AbortSignal) =>
+        new Promise<RequestPermissionResponse>(() => {
+          signal?.addEventListener("abort", () => events.push("cancel_request"), { once: true });
+        }),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const session = injectSession(agent, "session-1");
+    session.emittedToolCalls.add("tool-1");
+
+    const pending = agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "tool-1",
+    } as any);
+    await vi.waitFor(() => expect(session.openUserInputs?.size).toBe(1));
+    await agent.closeSession({ sessionId: "session-1" });
+    events.push("closed");
+
+    expect(events).toEqual(["cancel_request", "closed"]);
+    await expect(pending).rejects.toThrow("Tool use aborted");
+  });
 
   it("observes a client rejection when the signal aborts during request creation", async () => {
     const controller = new AbortController();
@@ -20012,6 +20073,72 @@ describe("post-error recovery", () => {
     await agent.sessions["test-session"]?.consumer;
   });
 
+  it("does not cancel a prompt received while the cancel awaits", async () => {
+    // Turn 1 runs and turn 2 is queued when the cancel arrives. Turn 3 arrives
+    // while the cancel awaits `contextCompaction.interrupt()`: ACP v2 cancels
+    // only prompts received before `session/cancel`, so turn 3 must run.
+    const agent = createMockAgent();
+    let releaseInterrupt!: () => void;
+    const interruptGate = new Promise<void>((resolve) => (releaseInterrupt = resolve));
+    let releaseStream!: () => void;
+    const streamGate = new Promise<void>((resolve) => (releaseStream = resolve));
+    const orphanResult = createResultMessage({
+      subtype: "success",
+      stop_reason: "end_turn",
+      is_error: false,
+    });
+    injectGeneratorSession(
+      agent,
+      (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const u1 = await iter.next();
+          yield userEcho(u1.value); // turn 1 active
+          await iter.next(); // turn 2, queued before the cancel
+          const u3 = await iter.next(); // turn 3, queued during the cancel
+          await streamGate;
+          yield { type: "system", subtype: "session_state_changed", state: "idle" }; // turn 1 cancelled
+          yield orphanResult; // turn 2's result, skipped as an orphan
+          yield userEcho(u3.value);
+          yield createResultMessage({
+            subtype: "success",
+            stop_reason: "end_turn",
+            is_error: false,
+          });
+          yield { type: "system", subtype: "session_state_changed", state: "idle" };
+        }
+        return messageGenerator();
+      },
+      { contextCompaction: { interrupt: () => interruptGate } },
+    );
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    await waitFor(() => (agent.sessions["test-session"]?.turnQueue?.length ?? 0) >= 2);
+
+    const cancel = agent.cancel({ sessionId: "test-session" });
+    const third = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "third" }],
+    });
+    await waitFor(() => (agent.sessions["test-session"]?.turnQueue?.length ?? 0) >= 3);
+    releaseInterrupt();
+    await cancel;
+    releaseStream();
+
+    await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+    await expect(second).resolves.toEqual({ stopReason: "cancelled" });
+    await expect(third).resolves.toMatchObject({ stopReason: "end_turn" });
+    await agent.sessions["test-session"]?.consumer;
+  });
+
   it("drains the orphan count, then promotes a no-echo /compact while still cancelled", async () => {
     // The case that ONLY the orphan-count gate handles (the old `!cancelled`
     // gate would hang it): cancel removes a queued turn (count=1), its orphan
@@ -21869,7 +21996,7 @@ describe("output after a cancel", () => {
     expect(texts).toEqual(["Starting the build.", "The build", " passed."]);
   });
 
-  it("drops the answer to a prompt sent while the cancel was still in progress", async () => {
+  it("answers a prompt sent while the cancel was still in progress", async () => {
     const interrupting = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     const cancelDone = Promise.withResolvers<void>();
@@ -21918,14 +22045,20 @@ describe("output after a cancel", () => {
     await cancelling;
     cancelDone.resolve();
 
+    // The cancel covers only the prompts received before it.
     await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
-    await expect(second).resolves.toEqual({ stopReason: "cancelled" });
+    await expect(second).resolves.toMatchObject({ stopReason: "end_turn" });
     await consumer;
-    expect(texts).toEqual(["Starting the build.", "The build", " passed."]);
+    expect(texts).toEqual([
+      "Starting the build.",
+      "Here is the second answer.",
+      "The build",
+      " passed.",
+    ]);
     expect(session.lastTurnFailed).not.toBe(true);
   });
 
-  it("drops the answer to a prompt sent during the cancel whose request comes before the cancel abandons it", async () => {
+  it("answers a prompt sent during the cancel that Claude Code takes before the cancel ends", async () => {
     const interrupting = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     const requested = Promise.withResolvers<void>();
@@ -21978,10 +22111,16 @@ describe("output after a cancel", () => {
     await cancelling;
     swept.resolve();
 
+    // The cancel covers only the prompts received before it.
     await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
-    await expect(second).resolves.toEqual({ stopReason: "cancelled" });
+    await expect(second).resolves.toMatchObject({ stopReason: "end_turn" });
     await consumer;
-    expect(texts).toEqual(["Starting the build.", "The build", " passed."]);
+    expect(texts).toEqual([
+      "Starting the build.",
+      "Here is the second answer.",
+      "The build",
+      " passed.",
+    ]);
   });
 
   it("keeps the prompts an earlier cancel stopped when the user cancels again", async () => {
