@@ -3548,9 +3548,18 @@ describe("session/list", () => {
     expect(second.sessions.map((session) => session.sessionId)).toEqual(["session-1000"]);
     expect(second.nextCursor).toBeUndefined();
     expect(vi.mocked(listSessions).mock.calls).toEqual([
-      [{ dir: "/workspace", limit: 1001, offset: 0 }],
-      [{ dir: "/workspace", limit: 1001, offset: 1000 }],
+      [{ dir: "/workspace", includeWorktrees: false, limit: 1001, offset: 0 }],
+      [{ dir: "/workspace", includeWorktrees: false, limit: 1001, offset: 1000 }],
     ]);
+  });
+
+  it("rejects a relative cwd", async () => {
+    vi.mocked(listSessions).mockClear();
+    await expect(agent().listSessions({ cwd: "workspace" })).rejects.toMatchObject({
+      code: -32602,
+      data: { cwd: "workspace" },
+    });
+    expect(listSessions).not.toHaveBeenCalled();
   });
 
   it("rejects a cursor that it did not issue", async () => {
@@ -4716,6 +4725,58 @@ describe("escape markdown", () => {
   });
 });
 
+describe("request validation", () => {
+  function agent() {
+    return new ClaudeAcpAgent({ sessionUpdate: async () => {} } as unknown as AcpClient, {
+      log: () => {},
+      error: () => {},
+    });
+  }
+
+  it("rejects a session/new with a relative additional directory", async () => {
+    await expect(
+      agent().newSession({ cwd: os.tmpdir(), mcpServers: [], additionalDirectories: ["extra"] }),
+    ).rejects.toMatchObject({ code: -32602, data: { additionalDirectories: ["extra"] } });
+  });
+
+  it("rejects authenticate with an unknown method id", async () => {
+    await expect(agent().authenticate({ methodId: "unknown-method" })).rejects.toMatchObject({
+      code: -32602,
+      data: { methodId: "unknown-method" },
+    });
+  });
+
+  it("rejects a v1 prompt with audio before it looks up the session", async () => {
+    // An unknown session would fail with -32002 if the check ran later.
+    await expect(
+      agent().prompt({
+        sessionId: "unknown-session",
+        prompt: [
+          { type: "text", text: "listen" },
+          { type: "audio", data: "AAAA", mimeType: "audio/wav" },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: -32602, data: { type: "audio" } });
+  });
+
+  it("drops slash commands whose name has whitespace, and repeats of a name", async () => {
+    const a = agent();
+    const supportedCommands = async () => [
+      { name: "review", description: "first" },
+      { name: "review", description: "second" },
+      { name: "my command", description: "spaced" },
+      { name: "compact", description: "Compact the conversation" },
+    ];
+    a.sessions["test-session"] = mockSessionState({ query: { supportedCommands } }, a) as any;
+    const commands = await a.availableCommands("test-session");
+    expect(commands.map((command) => [command.name, command.description])).toEqual([
+      ["review", "first"],
+      ["compact", "Compact the conversation"],
+      ["mcp", expect.any(String)],
+    ]);
+  });
+});
+
 describe("prompt conversion", () => {
   it("should not change built-in slash commands", () => {
     const message = promptToClaude({
@@ -4750,6 +4811,22 @@ describe("prompt conversion", () => {
         text: "/server:name (MCP) args",
         type: "text",
       },
+    ]);
+  });
+
+  it("rewrites an MCP slash command with multi-line input, in the first text block only", () => {
+    const message = promptToClaude({
+      sessionId: "test",
+      prompt: [
+        { type: "resource_link", uri: "file:///work/a.ts", name: "a.ts" },
+        { type: "text", text: "/mcp:server:name first line\nsecond line" },
+        { type: "text", text: "/mcp:server:other args" },
+      ],
+    });
+    expect(message.message.content).toEqual([
+      { type: "text", text: "[@a.ts](file:///work/a.ts)" },
+      { type: "text", text: "/server:name (MCP) first line\nsecond line" },
+      { type: "text", text: "/mcp:server:other args" },
     ]);
   });
 
@@ -14411,6 +14488,8 @@ describe("session/fork", () => {
       { sessionUpdate: async (n: SessionNotification) => updates.push(n) } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
+    // The scripted sessions run in a cwd that does not exist here.
+    vi.spyOn(agent as any, "validateCwd").mockResolvedValue(undefined);
     const createSession = vi
       .spyOn(agent as any, "createSession")
       .mockImplementation(async (params: any, options: any) => {
@@ -14505,6 +14584,35 @@ describe("session/fork", () => {
     await expect(
       agent.unstable_forkSession({ sessionId: "source-id", cwd: "/workspace", mcpServers: [] }),
     ).rejects.toThrow("Claude Code did not start");
+  });
+
+  it("rejects a bad cwd or a relative additional directory before copying the transcript", async () => {
+    const { agent, createSession } = forkingAgent();
+    (agent as any).validateCwd.mockRestore();
+    const missing = path.join(os.tmpdir(), `missing-${randomUUID()}`);
+
+    for (const params of [
+      { cwd: "workspace" },
+      { cwd: missing },
+      { cwd: os.tmpdir(), additionalDirectories: ["extra"] },
+    ]) {
+      await expect(
+        agent.unstable_forkSession({ sessionId: "source-id", mcpServers: [], ...params }),
+      ).rejects.toMatchObject({ code: -32602 });
+    }
+    expect(forkSession).not.toHaveBeenCalled();
+    expect(createSession).not.toHaveBeenCalled();
+  });
+
+  it("reports an unknown source session as not found", async () => {
+    const { agent, createSession } = forkingAgent();
+    // What the Claude SDK `forkSession` throws for a session without a transcript.
+    vi.mocked(forkSession).mockRejectedValueOnce(new Error("Session source-id not found"));
+
+    await expect(
+      agent.unstable_forkSession({ sessionId: "source-id", cwd: "/workspace", mcpServers: [] }),
+    ).rejects.toMatchObject({ code: -32002, data: { sessionId: "source-id" } });
+    expect(createSession).not.toHaveBeenCalled();
   });
 
   it("forks the latest turn in the requested workspace", async () => {
@@ -14968,7 +15076,10 @@ describe("getOrCreateSession param change detection", () => {
     const mockClient = {
       sessionUpdate: async () => {},
     } as unknown as AcpClient;
-    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    // The injected sessions run in cwds that do not exist here, such as "/test".
+    vi.spyOn(agent as any, "validateCwd").mockResolvedValue(undefined);
+    return agent;
   }
 
   function injectSession(
@@ -15082,6 +15193,32 @@ describe("getOrCreateSession param change detection", () => {
       expect.objectContaining({ cwd: "/new" }),
       expect.objectContaining({ resume: "s1" }),
     );
+  });
+
+  it("keeps the live session when a resume or load names a bad cwd or additional directory", async () => {
+    const agent = createMockAgent();
+    (agent as any).validateCwd.mockRestore();
+    const session = injectSession(agent, "s1", { cwd: "/old" });
+    const createSessionSpy = vi.spyOn(agent as any, "createSession");
+    const missing = path.join(os.tmpdir(), `missing-${randomUUID()}`);
+
+    for (const params of [
+      { cwd: "relative" },
+      { cwd: missing },
+      { cwd: os.tmpdir(), additionalDirectories: ["extra"] },
+    ]) {
+      await expect(
+        agent.resumeSession({ sessionId: "s1", mcpServers: [], ...params }),
+      ).rejects.toMatchObject({ code: -32602 });
+    }
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([]);
+    await expect(
+      agent.loadSession({ sessionId: "s1", cwd: missing, mcpServers: [] }),
+    ).rejects.toMatchObject({ code: -32602 });
+
+    expect(agent.sessions["s1"]).toBe(session);
+    expect(session.abortController.signal.aborted).toBe(false);
+    expect(createSessionSpy).not.toHaveBeenCalled();
   });
 
   // Claude Code writes the conversation at the first prompt, so a live session

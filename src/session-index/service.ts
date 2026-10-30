@@ -387,16 +387,6 @@ function isSdkNotFound(error: unknown): boolean {
   return error instanceof Error && /^Session \S+ not found in /.test(error.message);
 }
 
-/** The error the SDK `deleteSession` gives for a session id it rejects or
- *  does not find, which a client without `sessionIndex` got before. */
-function sdkDeleteError(sessionId: string): Error {
-  return new Error(
-    isSessionId(sessionId)
-      ? `Session ${sessionId} not found in any project directory`
-      : `Invalid sessionId: ${sessionId}`,
-  );
-}
-
 /**
  * `session/delete` of a client that is neither AIR nor a `sessionIndex` client:
  * the SDK delete of the session's transcript. A session without one succeeds,
@@ -422,16 +412,18 @@ export async function deleteSessionIfStored(
 /**
  * `session/delete` of an AIR client without `sessionIndex`, which uses delete
  * to mark a session done: archives it instead, so the transcript survives. A
- * session without a transcript fails as the SDK delete did.
+ * session without a transcript has nothing to archive and succeeds, as ACP
+ * asks of a delete of a session that never existed (see
+ * {@link deleteSessionIfStored}).
  */
 export async function archiveInsteadOfDelete(
   sessionId: string,
   service: SessionIndexService,
 ): Promise<void> {
-  if (!isSessionId(sessionId)) throw sdkDeleteError(sessionId);
+  if (!isSessionId(sessionId)) return;
   // The SDK delete skips empty transcripts, so they do not count.
   const found = await service.index.findTranscripts(sessionId);
-  if (found.length === 0) throw sdkDeleteError(sessionId);
+  if (found.length === 0) return;
   await service.retitle(sessionId, archiveTo(true), { sidecar: "existing" });
 }
 

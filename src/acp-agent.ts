@@ -3157,7 +3157,7 @@ export class ClaudeAcpAgent {
     params: LoadSessionRequest,
     timing: SessionTiming,
   ): Promise<NewSessionResponse> {
-    await this.validateCwd(params.cwd);
+    await this.validateCwd(params.cwd, params.additionalDirectories);
     clientSystemPrompt(params.systemPrompt);
     const pending: PendingReplay = {
       state: {
@@ -3220,7 +3220,8 @@ export class ClaudeAcpAgent {
    */
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
     while (this.providerUpdate) await this.providerUpdate;
-    // Reject a prompt the agent cannot apply before copying the transcript.
+    // Reject a bad `cwd` or prompt before copying the transcript.
+    await this.validateCwd(params.cwd, params.additionalDirectories);
     clientSystemPrompt(params.systemPrompt);
     const { sessionId } = await forkSession(params, {
       liveMessageIdToUuid: this.sessions[params.sessionId]?.messageIdToUuid,
@@ -3283,12 +3284,21 @@ export class ClaudeAcpAgent {
    * reads the start and the end only of the transcripts of the page.
    */
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
+    if (params.cwd != null && !path.isAbsolute(params.cwd)) {
+      throw RequestError.invalidParams(
+        { cwd: params.cwd },
+        `\`cwd\` must be an absolute path, but received: ${params.cwd}`,
+      );
+    }
     const indexed = this.sessionIndex.list(params);
     if (indexed) return indexed;
     const offset = sessionListOffset(params.cursor);
     // One more session than the page tells whether a next page exists.
+    // `includeWorktrees: false`: a `cwd` filter matches sessions of exactly
+    // that directory, not of the other git worktrees of its repository.
     const sdkSessions = await listSessions({
       dir: params.cwd ?? undefined,
+      includeWorktrees: false,
       limit: SESSION_LIST_PAGE_SIZE + 1,
       offset,
     });
@@ -3374,7 +3384,10 @@ export class ClaudeAcpAgent {
       );
       return;
     }
-    throw new Error("Method not implemented.");
+    throw RequestError.invalidParams(
+      { methodId: _params.methodId },
+      `Unsupported authentication method: ${_params.methodId}`,
+    );
   }
 
   /**
@@ -3874,8 +3887,21 @@ export class ClaudeAcpAgent {
   /**
    * Serves an ACP v1 `session/prompt`, which answers when the turn ends. The
    * outcome of a turn is field for field a v1 prompt response.
+   *
+   * A content block that the agent does not advertise, such as `audio`, fails
+   * the request with invalid params (-32602) before anything is queued:
+   * `promptToClaude` would drop it. v2 prompts reach `startTurn` through
+   * `v1PromptRequest`, which rejects these blocks itself.
    */
   async prompt(params: PromptRequest): Promise<PromptResponse> {
+    for (const block of params.prompt) {
+      if (!SUPPORTED_PROMPT_CONTENT_TYPES.includes(block.type)) {
+        throw RequestError.invalidParams(
+          { type: block.type },
+          `Content blocks of type ${block.type} are not supported`,
+        );
+      }
+    }
     let events!: TurnEvents;
     const outcome = new Promise<TurnOutcome>((resolve, reject) => {
       events = { inserted() {}, ended: resolve, failed: reject };
@@ -9376,6 +9402,16 @@ export class ClaudeAcpAgent {
     if (!option) {
       throw RequestError.invalidParams(undefined, `Unknown config option: ${params.configId}`);
     }
+    // The value must match the type the option was advertised with: a
+    // `type: "boolean"` option takes `true`/`false`, not "on"/"off", and a
+    // `type: "select"` option takes a string.
+    const expectedType = option.type === "boolean" ? "boolean" : "string";
+    if (typeof params.value !== expectedType) {
+      throw RequestError.invalidParams(
+        { configId: params.configId, value: params.value },
+        `Config option ${params.configId} takes a ${expectedType} value, but received: ${JSON.stringify(params.value)}`,
+      );
+    }
 
     // Fast mode and ultracode carry a boolean value (for Clients that opted
     // into boolean config options) or the "on"/"off" select fallback, so they
@@ -11625,7 +11661,8 @@ export class ClaudeAcpAgent {
     },
     resumedSession?: ResumedSessionSnapshot,
   ): Promise<NewSessionResponse> {
-    // Reject a prompt the agent cannot apply before reusing a live session.
+    // Reject a bad `cwd` or prompt before reusing or tearing down a live session.
+    await this.validateCwd(params.cwd, params.additionalDirectories);
     clientSystemPrompt(params.systemPrompt);
     const existingSession = this.sessions[params.sessionId];
     // A recreated live session keeps its mode, not the mode of the transcript.
@@ -11677,8 +11714,22 @@ export class ClaudeAcpAgent {
    * directory before we create a session. Throws an `invalidParams` error with
    * an actionable message so clients (e.g. Zed) can surface it to the user
    * instead of failing later with an opaque SDK error.
+   *
+   * Each `additionalDirectories` entry must be absolute too. Only the lexical
+   * rule is checked there: a missing extra root does not fail a session.
    */
-  private async validateCwd(cwd: string): Promise<void> {
+  private async validateCwd(
+    cwd: string,
+    additionalDirectories?: NewSessionRequest["additionalDirectories"],
+  ): Promise<void> {
+    for (const dir of additionalDirectories ?? []) {
+      if (!path.isAbsolute(dir)) {
+        throw RequestError.invalidParams(
+          { additionalDirectories },
+          `\`additionalDirectories\` entries must be absolute paths, but received: ${dir}`,
+        );
+      }
+    }
     if (!path.isAbsolute(cwd)) {
       throw RequestError.invalidParams(
         { cwd },
@@ -11738,7 +11789,7 @@ export class ClaudeAcpAgent {
     // this check a session is created against a missing directory and the
     // failure only surfaces later as a confusing "native binary failed to
     // launch" error from the SDK (see issue #749).
-    await this.validateCwd(params.cwd);
+    await this.validateCwd(params.cwd, params.additionalDirectories);
     const clientPrompt = clientSystemPrompt(params.systemPrompt);
 
     // We want to create a new session id unless it is resume,
@@ -13589,13 +13640,21 @@ function getAvailableSlashCommands(
     })
     .filter((command: AvailableCommand) => !UNSUPPORTED_COMMANDS.includes(command.name));
 
+  // Command names must not contain whitespace and must be unique. A name
+  // like "my command" is dropped, and of two commands named "review" only the
+  // first is kept.
+  const names = new Set<string>();
   return [
     ...advertised,
     MCP_AVAILABLE_COMMAND,
     ...remoteControlCommands.filter(
       (command) => !claudeCodeOffersCommand(commands, terminalCommands, command.name),
     ),
-  ];
+  ].filter((command) => {
+    if (/\s/.test(command.name) || names.has(command.name)) return false;
+    names.add(command.name);
+    return true;
+  });
 }
 
 function formatUriAsLink(uri: string): string {
@@ -13615,16 +13674,29 @@ function formatUriAsLink(uri: string): string {
   }
 }
 
+/** The prompt content block types that `promptToClaude` converts. The agent
+ *  advertises no `audio` prompt capability. */
+const SUPPORTED_PROMPT_CONTENT_TYPES: readonly string[] = [
+  "text",
+  "image",
+  "resource_link",
+  "resource",
+];
+
 export function promptToClaude(prompt: PromptRequest): SDKUserMessage {
   const content: any[] = [];
   const context: any[] = [];
 
+  const firstText = prompt.prompt.find((chunk) => chunk.type === "text");
   for (const chunk of prompt.prompt) {
     switch (chunk.type) {
       case "text": {
         let text = chunk.text;
-        // change /mcp:server:command args -> /server:command (MCP) args
-        const mcpMatch = text.match(/^\/mcp:([^:\s]+):(\S+)(?:\s(.*))?$/);
+        // A slash command is the first text block. Change
+        // `/mcp:server:command args` to `/server:command (MCP) args`; the
+        // arguments can span lines.
+        const mcpMatch =
+          chunk === firstText ? text.match(/^\/mcp:([^:\s]+):(\S+)(?:\s+([\s\S]*))?$/) : null;
         if (mcpMatch) {
           const [, server, command, args] = mcpMatch;
           text = `/${server}:${command} (MCP)${args ? ` ${args}` : ""}`;
