@@ -2704,7 +2704,10 @@ async function authenticateMcpServer(
       elicitation.then((response) => ({ type: "elicitation" as const, response })),
     ]);
 
-    if (first.type === "elicitation" && !CreateElicitationResponse.isAccept(first.response)) {
+    // A url-mode accept carries no content to check. The guard
+    // `CreateElicitationResponse.isAccept` would also reject an accept whose
+    // `content` holds a v2-only value, such as an object.
+    if (first.type === "elicitation" && first.response.action !== "accept") {
       return;
     }
 
@@ -10273,8 +10276,9 @@ export class ClaudeAcpAgent {
    *  `signal` through as a `cancellationSignal`. When the turn is cancelled
    *  while the client's prompt is still open the signal aborts, the SDK sends
    *  `$/cancel_request`, and our local abort race settles even if the client
-   *  ignores it. A `cancelled` outcome, request rejection, and local abort all
-   *  surface the same "Tool use aborted" the callers already expect. */
+   *  ignores it. A request rejection and a local abort surface the same
+   *  "Tool use aborted" that the callers expect. `canUseTool` decides what a
+   *  `cancelled` outcome means. */
   private async requestPermissionFromClient(
     params: AcpPermissionRequest,
     toolName: string,
@@ -10813,10 +10817,14 @@ export class ClaudeAcpAgent {
       // cancel does not stop. Answer such a request with a denial so the
       // subagent reads "the user refused" and goes on. Throwing instead makes
       // Claude Code deny it as "Tool permission request failed".
+      // On ACP v2, `cancelled` also answers a prompt that the user dismissed
+      // or that the client declined by policy. Without a `session/cancel`
+      // (`session.cancelled` unset), that is the user refusing the tool, so it
+      // gets the same denial and the turn goes on.
       if (
         response.outcome?.outcome === "cancelled" &&
         this.sessions[sessionId] === session &&
-        !blocksForeground(session, agentID)
+        (!blocksForeground(session, agentID) || (this.v2 && !session.cancelled))
       ) {
         return {
           behavior: "deny",

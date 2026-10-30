@@ -5144,14 +5144,14 @@ describe("permission request cancellation", () => {
   });
 
   describe("a cancelled outcome", () => {
-    function setup() {
+    function setup(options: { v2?: boolean } = {}) {
       const mockClient = {
         sessionUpdate: async () => {},
         requestPermission: async (): Promise<RequestPermissionResponse> => ({
           outcome: { outcome: "cancelled" },
         }),
       } as unknown as AcpClient;
-      const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+      const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} }, options);
       const session = injectSession(agent, "session-1");
       session.emittedToolCalls.add("tool-1");
       const ask = (agentID?: string) =>
@@ -5171,6 +5171,29 @@ describe("permission request cancellation", () => {
 
       await expect(ask()).rejects.toThrow("Tool use aborted");
       await expect(ask("agent-fg")).rejects.toThrow("Tool use aborted");
+    });
+
+    it("denies the tool use of foreground work on v2 without a session/cancel", async () => {
+      // On v2 the client also answers `cancelled` when the user dismissed the
+      // prompt or its policy declined it. The turn goes on without the tool.
+      const { session, ask } = setup({ v2: true });
+      session.liveBackgroundTasks.set("agent-fg", { isSubagent: true });
+
+      for (const agentID of [undefined, "agent-fg"]) {
+        await expect(ask(agentID)).resolves.toEqual({
+          behavior: "deny",
+          message: "User refused permission to run tool",
+          toolUseID: "tool-1",
+          decisionClassification: "user_reject",
+        });
+      }
+    });
+
+    it("aborts the tool use of foreground work on v2 during a session/cancel", async () => {
+      const { session, ask } = setup({ v2: true });
+      session.cancelled = true;
+
+      await expect(ask()).rejects.toThrow("Tool use aborted");
     });
 
     it("denies the tool use of a background subagent", async () => {
