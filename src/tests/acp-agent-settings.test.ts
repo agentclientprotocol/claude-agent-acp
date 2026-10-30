@@ -525,11 +525,12 @@ describe("ClaudeAcpAgent settings", () => {
         return createSession(params, options);
       };
 
-      await (agent as any).recreateSignedOutQuery(sessionId, (agent as any).sessions[sessionId]);
+      const husk = (agent as any).sessions[sessionId];
+      await (agent as any).recreateSignedOutQuery(sessionId, husk);
 
       expect(creations).toEqual([
-        { resume: sessionId, permissionMode: "default" },
-        { reuseSessionId: sessionId, permissionMode: "default" },
+        { resume: sessionId, permissionMode: "default", replacingSession: husk },
+        { reuseSessionId: sessionId, permissionMode: "default", replacingSession: husk },
       ]);
       expect(getCapturedOptions().permissionMode).toBe("default");
     });

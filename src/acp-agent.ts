@@ -1226,6 +1226,8 @@ export type Session = {
   /** The currently selected main-thread agent name, or "default" for the
    *  standard Claude Code agent (no `agent` flag applied). */
   currentAgent: string;
+  /** Whether the client explicitly selected an agent, including Default. */
+  agentSelected?: boolean;
   /** Whether Fast mode is currently enabled for this session. Tracked as the
    *  user's intent so it persists across model switches; the Fast mode config
    *  option is only surfaced while the selected model supports it. */
@@ -1867,6 +1869,17 @@ export type NewSessionMeta = {
   };
   additionalRoots?: string[];
 };
+
+/** `params` without `_meta.claudeCode.options.effort`. */
+function withoutEffort(params: NewSessionRequest): NewSessionRequest {
+  const meta = params._meta as NewSessionMeta | undefined;
+  if (meta?.claudeCode?.options?.effort === undefined) {
+    return params;
+  }
+  const options = { ...meta.claudeCode.options };
+  delete options.effort;
+  return { ...params, _meta: { ...meta, claudeCode: { ...meta.claudeCode, options } } };
+}
 
 /**
  * Extra metadata for 'gateway' authentication requests.
@@ -2748,6 +2761,8 @@ export class ClaudeAcpAgent {
   providerConfig?: ProviderConfig;
   /** Serializes provider changes while every open query is recreated between turns. */
   private providerUpdate: Promise<void> | null = null;
+  /** Per session: queue that runs mode/config changes and query restarts one at a time. */
+  private readonly configurationChanges = new Map<string, Promise<void>>();
   private readonly exitPlan: ExitPlanCoordinator<Session, Turn>;
   /** Last auth identity reported to the client, connection-scoped like
    *  `authenticate`/`logout`. Undefined means "not determined yet". */
@@ -3893,7 +3908,14 @@ export class ClaudeAcpAgent {
     );
     void this.probeCliAuthStatus();
     const signOutRespawn = this.respawnSignedOutSession(params.sessionId, session);
-    if (signOutRespawn) session = await signOutRespawn;
+    if (signOutRespawn) {
+      await signOutRespawn;
+      // A provider update can queue its replacement behind the sign-out respawn.
+      // Wait for that replacement too before a prompt starts on the old route.
+      while (this.providerUpdate) await this.providerUpdate;
+      session = this.sessions[params.sessionId];
+      if (!session) throw RequestError.sessionNotFound(params.sessionId);
+    }
     // The SDK query stream already terminated (see `queryClosed`); its iterator
     // can't be revived, so enqueueing here would hang on a deferred that never
     // settles. Fail clearly and let the client start a fresh session.
@@ -4244,35 +4266,27 @@ export class ClaudeAcpAgent {
     }
   }
 
-  private async recreateSignedOutQuery(sessionId: string, session: Session): Promise<void> {
-    const creationParams = session.creationParams;
-    if (!creationParams) {
-      throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
-    }
-    this.logger.log(`Recreating Claude session ${sessionId} after a sign-out`);
-    // Already closed by `markSessionForSignOutRespawn`; idempotent here so a
-    // husk that reached this by another route still releases its resources.
-    this.closeQueryStream(session);
-    try {
-      // The very first turn may be the one that signed out, so the CLI may
-      // never have written the conversation.
-      await this.recreateLiveSession(creationParams, sessionId, {
-        permissionMode: session.modes.currentModeId as PermissionMode,
-      });
-      // The new Session has the same MCP servers; keep the ones already
-      // reported so its first `system`/init doesn't repeat their notices.
-      const recreated = this.sessions[sessionId];
-      if (recreated && session.reportedMcpServers) {
-        recreated.reportedMcpServers = new Set(session.reportedMcpServers);
+  /** Queued per session, so a choice sent during the respawn lands on the new query. */
+  private recreateSignedOutQuery(sessionId: string, session: Session): Promise<void> {
+    return this.serializeConfigurationChange(sessionId, async () => {
+      const creationParams = session.creationParams;
+      if (!creationParams) {
+        throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
       }
-    } catch (error) {
-      // Keep the husk addressable: the client answers the refusal with its own
-      // auth flow and then retries this session.
-      if (!this.sessions[sessionId]) {
-        this.sessions[sessionId] = session;
+      // Already replaced by a provider restart, or closed.
+      if (this.sessions[sessionId] !== session) return;
+      this.logger.log(`Recreating Claude session ${sessionId} after a sign-out`);
+      try {
+        // The signed-out turn may be the first, so the conversation may not be saved yet.
+        await this.replaceSessionQuery(sessionId, session, creationParams);
+      } catch (error) {
+        // Keep the husk so the client can sign in and retry; a closed session stays closed.
+        if (!session.tornDown && !this.sessions[sessionId]) {
+          this.sessions[sessionId] = session;
+        }
+        throw error;
       }
-      throw error;
-    }
+    });
   }
 
   /**
@@ -4291,6 +4305,7 @@ export class ClaudeAcpAgent {
     options: {
       permissionMode?: PermissionMode;
       resumedModelHint?: string | Promise<string | undefined>;
+      replacingSession?: Session;
     },
   ): Promise<NewSessionResponse> {
     try {
@@ -4307,6 +4322,7 @@ export class ClaudeAcpAgent {
       return await this.createSession(params, {
         reuseSessionId: sessionId,
         permissionMode: options.permissionMode,
+        replacingSession: options.replacingSession,
       });
     }
   }
@@ -9324,11 +9340,21 @@ export class ClaudeAcpAgent {
     return this.sessionIndex.deleteSession(params);
   }
 
-  async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
-    return this.sessionModes.setSessionMode(params);
+  setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
+    return this.serializeConfigurationChange(params.sessionId, () =>
+      this.sessionModes.setSessionMode(params),
+    );
   }
 
-  async setSessionConfigOption(
+  setSessionConfigOption(
+    params: SetSessionConfigOptionRequest,
+  ): Promise<SetSessionConfigOptionResponse> {
+    return this.serializeConfigurationChange(params.sessionId, () =>
+      this.selectSessionConfigOption(params),
+    );
+  }
+
+  private async selectSessionConfigOption(
     params: SetSessionConfigOptionRequest,
   ): Promise<SetSessionConfigOptionResponse> {
     const session = this.sessions[params.sessionId];
@@ -11398,6 +11424,7 @@ export class ClaudeAcpAgent {
         agent: value === DEFAULT_AGENT_ID ? null : value,
       });
       session.currentAgent = value;
+      session.agentSelected = true;
       session.configOptions = session.configOptions.map((o) =>
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
       );
@@ -11693,6 +11720,8 @@ export class ClaudeAcpAgent {
       resumedModelHint?: string | Promise<string | undefined>;
       /** The state that a replay on the same session uses before this record exists. */
       replayState?: ReplayState;
+      /** A close of this session during startup cancels registration of its replacement. */
+      replacingSession?: Session;
     } = {},
   ): Promise<NewSessionResponse> {
     const createStartedAt = performance.now();
@@ -12400,6 +12429,9 @@ export class ClaudeAcpAgent {
         allowlistedModelInfo,
       );
 
+      if (creationOpts.replacingSession?.tornDown) {
+        throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+      }
       this.sessions[sessionId] = {
         query: q,
         input: input,
@@ -12527,26 +12559,10 @@ export class ClaudeAcpAgent {
       }
 
       this.providerConfig = config;
-      for (const [sessionId, session] of sessions) {
-        if (this.sessions[sessionId] !== session || !session.creationParams) {
-          continue;
-        }
-        this.logger.log(`Recreating Claude session ${sessionId} for provider update`);
-        this.closeQueryStream(session);
-        delete this.sessions[sessionId];
-        try {
-          await this.createSession(session.creationParams, {
-            resume: sessionId,
-            permissionMode: session.modes.currentModeId as PermissionMode,
-          });
-        } catch (error) {
-          // One session that cannot come back must not abort the switch. The
-          // `--hide-claude-auth` guard makes this a normal outcome of
-          // `providers/disable`: the override kept a subscription account
-          // usable, and creation refuses without it. The session is already
-          // gone, so tell the client why and go on to the next one.
-          this.reportSessionLostOnProviderUpdate(sessionId, session, error);
-        }
+      for (const [sessionId] of sessions) {
+        await this.serializeConfigurationChange(sessionId, () =>
+          this.restartSessionForProvider(sessionId),
+        );
       }
     });
     // Sessions and prompts await `providerUpdate` before they run. A rejected
@@ -12564,6 +12580,139 @@ export class ClaudeAcpAgent {
         this.providerUpdate = null;
       }
     }
+  }
+
+  /** Starts a new query for the session under the new provider and restores its choices. */
+  private async restartSessionForProvider(sessionId: string): Promise<void> {
+    // A sign-out respawn ahead of this change can have replaced the snapshot.
+    const session = this.sessions[sessionId];
+    if (!session?.creationParams) {
+      return;
+    }
+    this.logger.log(`Recreating Claude session ${sessionId} for provider update`);
+    try {
+      await this.replaceSessionQuery(sessionId, session, session.creationParams);
+    } catch (error) {
+      if (this.sessions[sessionId] === session) delete this.sessions[sessionId];
+      if (session.tornDown) return;
+      // One session that cannot come back must not abort the switch. The
+      // `--hide-claude-auth` guard makes this a normal outcome of
+      // `providers/disable`: the override kept a subscription account
+      // usable, and creation refuses without it. The session is already
+      // gone, so tell the client why and go on to the next one.
+      this.reportSessionLostOnProviderUpdate(sessionId, session, error);
+    }
+  }
+
+  /** Recreates the session's query and restores its choices and reported MCP servers, unless it was closed meanwhile. */
+  private async replaceSessionQuery(
+    sessionId: string,
+    session: Session,
+    creationParams: NewSessionRequest,
+  ): Promise<void> {
+    this.closeQueryStream(session);
+    // Keep the old record visible so closeSession and dispose can mark it torn down.
+    // Without the creation-time effort: restoreSessionChoices restores the current pin instead.
+    await this.recreateLiveSession(withoutEffort(creationParams), sessionId, {
+      permissionMode: session.modes.currentModeId as PermissionMode,
+      replacingSession: session,
+    });
+    const recreated = this.sessions[sessionId];
+    if (!recreated || recreated.tornDown) return;
+    // Same MCP servers, so don't repeat their notices.
+    if (session.reportedMcpServers) {
+      recreated.reportedMcpServers = new Set(session.reportedMcpServers);
+    }
+    await this.restoreSessionChoices(sessionId, recreated, session);
+    if (recreated.tornDown) return;
+    // The recreated session works without this update, so a failed send is only logged.
+    await this.client
+      .sessionUpdate({
+        sessionId,
+        update: { sessionUpdate: "config_option_update", configOptions: recreated.configOptions },
+      })
+      .catch((error) => {
+        this.logger.error(
+          `Session ${sessionId}: could not publish the configuration restored after the query restart:`,
+          error,
+        );
+      });
+  }
+
+  /** Re-applies the choices of `previous` to the session that replaced it; a choice the new query rejects is logged. */
+  private async restoreSessionChoices(
+    sessionId: string,
+    session: Session,
+    previous: Session,
+  ): Promise<void> {
+    const restore = async (choice: string, apply: () => Promise<unknown>) => {
+      if (session.tornDown) return;
+      try {
+        await apply();
+      } catch (error) {
+        if (!session.tornDown) {
+          this.logger.error(`Could not restore ${choice} after the query restart:`, error);
+        }
+      }
+    };
+    const select = (configId: string, value: string) =>
+      restore(`${configId} "${value}"`, () =>
+        this.selectSessionConfigOption({ sessionId, configId, value }),
+      );
+
+    // First: the model decides which modes, effort levels, Fast mode and ultracode exist.
+    if (session.models.currentModelId !== previous.models.currentModelId) {
+      await select(MODEL_CONFIG_ID, previous.models.currentModelId);
+    }
+    // After the model: creation falls back from "auto" to acceptEdits on a model without Auto.
+    if (session.modes.currentModeId !== previous.modes.currentModeId) {
+      await select(MODE_CONFIG_ID, previous.modes.currentModeId);
+      if (session.modes.currentModeId === previous.modes.currentModeId) {
+        session.autoModeFallbackWarningPending = false;
+      }
+    }
+    if (session.modes.currentModeId === "plan") {
+      session.prePlanMode = previous.prePlanMode;
+    }
+    // Compare intent, not the option: the option is hidden on a model without support.
+    if (session.ultracodeEnabled !== previous.ultracodeEnabled) {
+      await restore("ultracode", () => this.applyUltracode(session, previous.ultracodeEnabled));
+    }
+    if (session.fastModeEnabled !== previous.fastModeEnabled) {
+      await restore("Fast mode", () => this.applyFastMode(session, previous.fastModeEnabled));
+    }
+    // After ultracode, since the effort flag carries it.
+    if (previous.effortPinnedLevel !== undefined) {
+      await select(EFFORT_CONFIG_ID, previous.effortPinnedLevel);
+    }
+    // Even when unchanged: Default over a hidden creation-time agent like "Explore" must clear it.
+    if (previous.agentSelected) {
+      if (previous.currentAgent === DEFAULT_AGENT_ID) {
+        // Default is always valid, even when discovery returned no custom agents and hid the picker.
+        await restore("Default agent", () =>
+          this.applyConfigOptionValue(sessionId, session, AGENT_CONFIG_ID, DEFAULT_AGENT_ID),
+        );
+      } else {
+        await select(AGENT_CONFIG_ID, previous.currentAgent);
+      }
+    }
+    // Keep the original params and fingerprint paired for later load/resume calls.
+    session.creationParams = previous.creationParams;
+    session.sessionFingerprint = previous.sessionFingerprint;
+  }
+
+  private serializeConfigurationChange<T>(sessionId: string, change: () => Promise<T>): Promise<T> {
+    const result = (this.configurationChanges.get(sessionId) ?? Promise.resolve()).then(change);
+    // Drops the entry once no newer change has queued behind this one.
+    const tail: Promise<void> = result
+      .catch(() => {})
+      .then(() => {
+        if (this.configurationChanges.get(sessionId) === tail) {
+          this.configurationChanges.delete(sessionId);
+        }
+      });
+    this.configurationChanges.set(sessionId, tail);
+    return result;
   }
 
   /** Tell a capable client when a non-auth error ends a session during a provider switch. */
