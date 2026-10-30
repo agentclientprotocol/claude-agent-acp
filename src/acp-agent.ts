@@ -6416,8 +6416,6 @@ export class ClaudeAcpAgent {
                   !firstUnsettledQueuedTurn()
                 ) {
                   await asyncTasks.autonomousTurnStarted();
-                } else if (message.state === "idle" && asyncTasks.autonomousTurnOpen) {
-                  await asyncTasks.autonomousTurnEnded("completed");
                 }
                 if (
                   message.state === "running" &&
@@ -6449,6 +6447,9 @@ export class ClaudeAcpAgent {
                   // here. An owed idle belongs to an earlier result: it can lag
                   // past the cycle's first output.
                   if (session.owedTrailingIdles === 0) {
+                    if (asyncTasks.autonomousTurnOpen) {
+                      await asyncTasks.autonomousTurnEnded("completed");
+                    }
                     await closeCycleToolCalls();
                     this.endAutonomousCycle(params.sessionId, {
                       outcome: { stopReason: session.cancelled ? "cancelled" : "end_turn" },
