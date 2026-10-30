@@ -2190,6 +2190,31 @@ const SESSION_ENDED_MESSAGE = "The Claude Agent session has ended. Please start 
 // message and without invoking the model.
 const LOCAL_ONLY_COMMANDS = new Set(["/context", "/heapdump", "/extra-usage"]);
 
+// Built-in commands that never use attached context. Clients like Air attach
+// editor context (resources, extra text chunks) to every prompt, but Claude
+// Code runs a slash command only when the user message is a single text block.
+const CONTEXT_FREE_COMMANDS = new Set([
+  ...LOCAL_ONLY_COMMANDS,
+  "/compact",
+  "/usage",
+  "/cost",
+  "/stats",
+  "/status",
+  "/model",
+  "/mcp",
+  "/remote-control",
+]);
+
+/** Drops the chunks after a context-free built-in command (see
+ *  `CONTEXT_FREE_COMMANDS`), keeping the command and its arguments. Returns
+ *  `prompt` itself when it isn't such a command. */
+export function withoutCommandContext(prompt: PromptRequest["prompt"]): PromptRequest["prompt"] {
+  const first = prompt[0];
+  if (prompt.length < 2 || first?.type !== "text") return prompt;
+  const command = first.text.trimStart().split(/\s/, 1)[0];
+  return CONTEXT_FREE_COMMANDS.has(command) ? [first] : prompt;
+}
+
 // Commands whose marker-only transcript records are ACP/client-local UI noise,
 // not model-visible user prompts. Marker-only custom slash skills are not in
 // this list, so replay can reconstruct them from `<command-name>`/`<command-args>`.
@@ -3900,6 +3925,9 @@ export class ClaudeAcpAgent {
     if (session.queryClosed) {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
+
+    const prompt = withoutCommandContext(params.prompt);
+    if (prompt !== params.prompt) params = { ...params, prompt };
 
     const remoteControlCommand = parseRemoteControlCommand(params.prompt);
     if (

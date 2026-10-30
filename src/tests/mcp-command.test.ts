@@ -635,25 +635,33 @@ describe("/mcp", () => {
     expect(text()).toBe(formatMcpStatus(SERVERS));
   });
 
-  it("leaves the text of other /mcp prompts unchanged", async () => {
-    const { agent, sdkQuery, forwarded, text, prompt } = setup();
+  /** A client like Air attaches editor context to `/mcp`; the adapter drops it and still shows the status. */
+  it("shows the status for /mcp with attached context", async () => {
+    const { agent, sdkQuery, forwarded, text } = setup();
 
-    await prompt("/mcp:github:prompt");
-    await prompt("/mcp help");
     await agent.prompt({
       sessionId: "test-session",
       prompt: [
         { type: "text", text: "/mcp" },
-        { type: "text", text: "more" },
+        { type: "resource", resource: { uri: "file:///a.ts", text: "const a = 1;" } },
       ],
     });
 
+    expect(forwarded).toEqual(["/mcp"]);
+    expect(text()).toBe(formatMcpStatus(SERVERS));
+    expect(sdkQuery.mcpServerStatus).toHaveBeenCalled();
+  });
+
+  it("leaves the text of other /mcp prompts unchanged", async () => {
+    const { sdkQuery, forwarded, text, prompt } = setup();
+
+    await prompt("/mcp:github:prompt");
+    await prompt("/mcp help");
+
     // The adapter rewrites an MCP prompt command into the Claude Code form.
-    expect(forwarded).toEqual(["/github:prompt (MCP)", "/mcp help", "/mcp more"]);
+    expect(forwarded).toEqual(["/github:prompt (MCP)", "/mcp help"]);
     expect(text()).toBe(
-      ["/github:prompt (MCP)", "/mcp help", "/mcp more"]
-        .map((command) => cliText(command, SERVERS))
-        .join(""),
+      ["/github:prompt (MCP)", "/mcp help"].map((command) => cliText(command, SERVERS)).join(""),
     );
     expect(sdkQuery.mcpServerStatus).not.toHaveBeenCalled();
   });

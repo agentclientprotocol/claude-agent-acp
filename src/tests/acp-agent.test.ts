@@ -36,6 +36,7 @@ import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
 import {
   toAcpNotifications,
   promptToClaude,
+  withoutCommandContext,
   isLocalCommandMetadata,
   isReplayHiddenMetaMessage,
   isSyntheticLoginMessage,
@@ -4713,6 +4714,50 @@ describe("escape markdown", () => {
     text = "for example:\n```markdown\nHello *world*!\n```\n";
     escaped = markdownEscape(text);
     expect(escaped).toEqual("````\nfor example:\n```markdown\nHello *world*!\n```\n````");
+  });
+});
+
+describe("withoutCommandContext", () => {
+  const link = { type: "resource_link", uri: "file:///a.ts", name: "a.ts" } as const;
+  const resource = {
+    type: "resource",
+    resource: { uri: "file:///a.ts", text: "const a = 1;" },
+  } as const;
+
+  /** `/compact` with attached editor context keeps only the text chunk. */
+  it("drops context after /compact", () => {
+    const text = { type: "text", text: "/compact" } as const;
+    expect(withoutCommandContext([text, link, resource])).toEqual([text]);
+  });
+
+  /** Arguments in the command chunk survive; the attached resource goes. */
+  it("keeps command arguments and drops context", () => {
+    const text = { type: "text", text: "/compact focus on tests" } as const;
+    expect(withoutCommandContext([text, resource])).toEqual([text]);
+  });
+
+  /** An extra text chunk after `/usage` is dropped too. */
+  it("drops trailing text chunks after /usage", () => {
+    const text = { type: "text", text: "/usage" } as const;
+    expect(withoutCommandContext([text, { type: "text", text: "editor context" }])).toEqual([text]);
+  });
+
+  /** Skills and custom commands use attached context, so the prompt is untouched. */
+  it("leaves custom commands unchanged", () => {
+    const prompt = [{ type: "text", text: "/code-review" } as const, resource];
+    expect(withoutCommandContext(prompt)).toBe(prompt);
+  });
+
+  /** A plain text prompt with a resource is untouched. */
+  it("leaves plain prompts unchanged", () => {
+    const prompt = [{ type: "text", text: "explain this" } as const, resource];
+    expect(withoutCommandContext(prompt)).toBe(prompt);
+  });
+
+  /** `/mcp:server:cmd` is an MCP prompt, not the `/mcp` built-in. */
+  it("leaves MCP prompt commands unchanged", () => {
+    const prompt = [{ type: "text", text: "/mcp:server:cmd" } as const, resource];
+    expect(withoutCommandContext(prompt)).toBe(prompt);
   });
 });
 
