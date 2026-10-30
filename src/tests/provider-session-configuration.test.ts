@@ -750,8 +750,8 @@ describe("provider updates preserve session configuration", { timeout: 10_000 },
 
   it("publishes the restored configuration through the v2 protocol router", async () => {
     await agent.dispose();
-    const toAgent = new TransformStream<v2.AnyWireMessage, v2.AnyWireMessage>();
-    const toClient = new TransformStream<v2.AnyWireMessage, v2.AnyWireMessage>();
+    const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
+    const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
     acpProtocolRouter({ log() {}, error() {} }, (created) => (agent = created)).connect({
       readable: toAgent.readable,
       writable: toClient.writable,

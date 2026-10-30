@@ -60,6 +60,19 @@ describe("mcpElicitationToCreateRequest", () => {
     });
   });
 
+  it("adds an empty properties map when the MCP schema has none", () => {
+    const request: ElicitationRequest = {
+      serverName: "server",
+      message: "Confirm?",
+      mode: "form",
+      requestedSchema: { type: "object" },
+    };
+
+    const result = mcpElicitationToCreateRequest(request, SESSION_ID);
+
+    expect(result).toMatchObject({ requestedSchema: { type: "object", properties: {} } });
+  });
+
   it("maps a url-mode request and preserves the elicitation id", () => {
     const request: ElicitationRequest = {
       serverName: "server",

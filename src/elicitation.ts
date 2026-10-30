@@ -377,7 +377,9 @@ export function applyAskElicitationResponse(
 /**
  * Coerce an arbitrary MCP `requestedSchema` into an ACP `ElicitationSchema`.
  * The two are structurally compatible JSON Schemas; we just guarantee the
- * `type: "object"` discriminator is present.
+ * `type: "object"` discriminator and a `properties` map are present. The v2
+ * schema requires both, so a client on SDK 2.2.0 or later rejects an MCP
+ * schema such as `{ type: "object" }` that has no `properties`.
  */
 function normalizeElicitationSchema(
   schema: Record<string, unknown> | undefined,
@@ -385,7 +387,8 @@ function normalizeElicitationSchema(
   if (!schema || typeof schema !== "object") {
     return { type: "object", properties: {} };
   }
-  return { ...(schema as ElicitationSchema), type: "object" };
+  const { properties } = schema as Partial<ElicitationSchema>;
+  return { ...(schema as ElicitationSchema), type: "object", properties: properties ?? {} };
 }
 
 /**
