@@ -993,7 +993,7 @@ describe("ACP v2 prompts", () => {
     const decisions: unknown[] = [];
     scriptTurns(async function* (options) {
       // Claude Code asks about each Bash tool use, then returns its result.
-      for (const toolUseID of ["toolu_allow", "toolu_reject", "toolu_custom"]) {
+      for (const toolUseID of ["toolu_allow", "toolu_reject", "toolu_dismissed", "toolu_custom"]) {
         yield {
           type: "assistant",
           message: {
@@ -1041,6 +1041,9 @@ describe("ACP v2 prompts", () => {
     const answers: v2.RequestPermissionResponse[] = [
       { outcome: { outcome: "selected", optionId: "allow-once" } },
       { outcome: { outcome: "selected", optionId: "reject" } },
+      // Without a session/cancel, `cancelled` means that the user dismissed
+      // the prompt or the client declined it by policy.
+      { outcome: { outcome: "cancelled" } },
       // The draft says an outcome that the agent does not know is no approval.
       { outcome: { outcome: "_later" } },
     ];
@@ -1061,13 +1064,21 @@ describe("ACP v2 prompts", () => {
         { optionId: "reject", kind: "reject_once" },
       ],
     });
+    const refused = {
+      behavior: "deny",
+      message: "User refused permission to run tool",
+      decisionClassification: "user_reject",
+    };
     expect(decisions).toEqual([
       expect.objectContaining({ behavior: "allow" }),
       expect.objectContaining({ behavior: "deny" }),
-      "Tool use aborted",
+      expect.objectContaining({ ...refused, toolUseID: "toolu_dismissed" }),
+      expect.objectContaining({ ...refused, toolUseID: "toolu_custom" }),
     ]);
     expect(turnTrace(client.sessionUpdates)).toEqual([
       "user_message",
+      "running",
+      "requires_action",
       "running",
       "requires_action",
       "running",
