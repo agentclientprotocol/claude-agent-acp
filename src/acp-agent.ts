@@ -12354,15 +12354,15 @@ export class ClaudeAcpAgent {
         }
       }
 
-      // Apply user's `availableModels` allowlist from settings.json before any
+      // Apply the effective `availableModels` allowlist before any
       // downstream model handling. `initializationResult.models` is already
       // policy-filtered by the CLI; we rebuild the picker from the allowlist
       // so the user's exact spellings (and `modelOverrides` targets) are the
       // values passed to `setModel`, keeping configOptions, the current-model
       // resolver, and the stored modelInfos consistent with what the user
       // configured. Managed `deniedModels` drops entries the CLI would refuse.
-      const settingsAvailableModels = settingsManager.getSettings().availableModels;
-      const settingsModelOverrides = settingsManager.getSettings().modelOverrides;
+      const { availableModels: settingsAvailableModels, modelOverrides: settingsModelOverrides } =
+        settingsManager.getModelSelectionSettings(configuredSettingsObject);
       const settingsAllowedModels = Array.isArray(settingsAvailableModels)
         ? applyAvailableModelsAllowlist(
             initializationResult.models,
