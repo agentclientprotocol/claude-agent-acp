@@ -209,7 +209,7 @@ export class SettingsManager {
     override?: Settings,
   ): Pick<Settings, "availableModels" | "modelOverrides"> {
     // The SDK unions non-managed allowlists, but a managed list owns the
-    // whole allowlist and its override map. Keep that policy when adding
+    // whole allowlist. Keep that policy when adding
     // models the SDK did not include in its initialization result.
     const lists = [this.effective.availableModels, override?.availableModels].filter(
       (list): list is string[] => Array.isArray(list),
@@ -218,14 +218,11 @@ export class SettingsManager {
     return {
       availableModels:
         managed.availableModels ?? (lists.length > 0 ? [...new Set(lists.flat())] : undefined),
-      modelOverrides:
-        managed.availableModels !== undefined
-          ? managed.modelOverrides
-          : {
-              ...this.effective.modelOverrides,
-              ...override?.modelOverrides,
-              ...managed.modelOverrides,
-            },
+      modelOverrides: {
+        ...this.effective.modelOverrides,
+        ...override?.modelOverrides,
+        ...managed.modelOverrides,
+      },
     };
   }
 
