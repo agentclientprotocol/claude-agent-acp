@@ -11,9 +11,10 @@ import type {
   CompleteElicitationNotification,
   CreateElicitationRequest,
   CreateElicitationResponse,
+  McpServer,
   RequestPermissionResponse,
-} from "@agentclientprotocol/sdk";
-import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+} from "@agentclientprotocol/sdk/unstable";
+import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import { ClaudeAcpAgent, type AcpClient, type Logger } from "../acp-agent.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import type { AcpPermissionRequest } from "../permissions/presentation.js";
@@ -33,6 +34,7 @@ import {
 import { v2ChildStateUpdate, v2SessionUpdate } from "./session-update.js";
 import { V2Terminals } from "./terminal.js";
 import { V2ToolCallMeta } from "./tool-call-meta.js";
+import { v2RestartedToolCall } from "./tool-call.js";
 
 /**
  * The ACP v2 surface, for one connection.
@@ -75,11 +77,11 @@ export function v2AgentApp(
       agent.unstable_disableProvider(params),
     )
     .onRequest(v2.methods.agent.session.new, async ({ params }) => {
-      const response = await agent.newSession(v1NewSessionRequest(params));
-      return {
-        ...v2NewSessionResponse(response),
-        ...(await setupCommands(agent, response.sessionId, logger)),
-      };
+      const request = v1NewSessionRequest(params);
+      const response = await agent.newSession(request);
+      const commands = await setupCommands(agent, response.sessionId, logger);
+      afterSetupResponse(agent, response.sessionId, request.mcpServers, commands, logger);
+      return { ...v2NewSessionResponse(response), ...commands };
     })
     .onRequest(v2.methods.agent.session.list, ({ params }) => agent.listSessions(params))
     .onRequest(v2.methods.agent.session.resume, async ({ params }) => {
@@ -88,6 +90,10 @@ export function v2AgentApp(
         restore.method === "resume"
           ? await agent.resumeSession(restore.request)
           : await client.replaying(params.sessionId, () => agent.loadSession(restore.request));
+      // v2 asks for the current title and `updatedAt` after the replay and
+      // before the response, also without a replay, as the client may hold
+      // none or stale ones.
+      await agent.publishCurrentSessionInfo(params.sessionId);
       // v2 requires a snapshot of the foreground state after the replay and
       // before the response, also without a replay: a resumed live session can
       // be running a turn, or waiting on a permission request.
@@ -95,19 +101,30 @@ export function v2AgentApp(
         sessionId: params.sessionId,
         update: stateSnapshot(agent.foregroundState(params.sessionId)),
       });
-      return {
-        ...v2ResumeSessionResponse(response),
-        ...(await setupCommands(agent, params.sessionId, logger)),
-      };
+      const commands = await setupCommands(agent, params.sessionId, logger);
+      // The response ends a replay. The subagents RFD treats the replayed
+      // subagent states before it as history, so their current states follow it.
+      afterSetupResponse(
+        agent,
+        params.sessionId,
+        restore.request.mcpServers ?? [],
+        commands,
+        logger,
+        () => void agent.publishCurrentSubagentStates(params.sessionId),
+      );
+      return { ...v2ResumeSessionResponse(response), ...commands };
     })
     .onRequest(v2.methods.agent.session.fork, ({ params }) =>
       agent.forking(params.sessionId, async () => {
         // The agent starts the forked session, so the client can prompt it.
-        const response = await agent.unstable_forkSession(v1ForkSessionRequest(params));
+        const request = v1ForkSessionRequest(params);
+        const response = await agent.unstable_forkSession(request);
+        const commands = await setupCommands(agent, response.sessionId, logger);
+        afterSetupResponse(agent, response.sessionId, request.mcpServers ?? [], commands, logger);
         return {
           sessionId: response.sessionId,
           ...v2ResumeSessionResponse(response),
-          ...(await setupCommands(agent, response.sessionId, logger)),
+          ...commands,
         };
       }),
     )
@@ -122,7 +139,16 @@ export function v2AgentApp(
       const { configOptions, ...response } = await agent.setSessionConfigOption(
         v1SetSessionConfigOptionRequest(params),
       );
-      return { ...response, configOptions: v2ConfigOptions(configOptions) };
+      // v2 asks for a `config_option_update` on every config change, also one
+      // that a client requested, so other attached clients see it. It goes
+      // before the response, as v2 asks of this duplicate. The agent sends v1
+      // clients none: they read the change from the response only.
+      const options = v2ConfigOptions(configOptions);
+      void client.send({
+        sessionId: params.sessionId,
+        update: { sessionUpdate: "config_option_update", configOptions: options },
+      });
+      return { ...response, configOptions: options };
     })
     .onRequest(v2.methods.agent.session.prompt, ({ params }) =>
       v2Prompt(agent, params, (update) => {
@@ -140,25 +166,58 @@ function stateSnapshot(state: "idle" | "running" | "requires_action"): v2.Sessio
 }
 
 /**
- * The `availableCommands` of a setup response, so a client can show the
- * session's commands without waiting for an update. The agent sends a v1
- * client the same list as an `available_commands_update` after the response,
- * and a v2 client none (`ClaudeAcpAgent.afterSetupResponse`). Later changes
- * still arrive as updates. An empty list is left out, as the draft asks. The
- * commands are optional, so a failure to read them does not fail the setup.
+ * The `availableCommands` of a setup response, which v2 requires when the
+ * session has commands. The agent sends a v1 client the same list as an
+ * `available_commands_update` after the response, and a v2 client none
+ * (`ClaudeAcpAgent.afterSetupResponse`). Later changes still arrive as
+ * updates. An empty list is left out, as the draft asks. A failure to read
+ * the commands does not fail the setup: the result is `undefined`, and
+ * {@link afterSetupResponse} sends the commands in an update instead.
  */
 async function setupCommands(
   agent: ClaudeAcpAgent,
   sessionId: string,
   logger: Logger | undefined,
-): Promise<{ availableCommands?: v2.AvailableCommand[] }> {
+): Promise<{ availableCommands?: v2.AvailableCommand[] } | undefined> {
   try {
     const commands = await agent.availableCommands(sessionId);
     return commands.length > 0 ? { availableCommands: v2AvailableCommands(commands) } : {};
   } catch (error) {
     (logger ?? console).error(`Session ${sessionId}: failed to read the session's commands`, error);
-    return {};
+    return undefined;
   }
+}
+
+/**
+ * The work that follows a v2 setup response, run once the response is sent
+ * (`ClaudeAcpAgent.afterSetupResponse` does it on v1):
+ *
+ * - When `commands` is `undefined` (reading them for the response failed),
+ *   an `available_commands_update` with the commands, read again.
+ * - `then`, such as sending the current states of replayed subagents.
+ * - OAuth for the MCP servers that need it. Its URL elicitation must not
+ *   reach the client before the response, which v2 asks against.
+ */
+function afterSetupResponse(
+  agent: ClaudeAcpAgent,
+  sessionId: string,
+  mcpServers: McpServer[],
+  commands: { availableCommands?: v2.AvailableCommand[] } | undefined,
+  logger: Logger | undefined,
+  then?: () => void,
+): void {
+  setTimeout(() => {
+    if (!commands) {
+      agent.sendAvailableCommandsUpdate(sessionId).catch((error) => {
+        (logger ?? console).error(
+          `Session ${sessionId}: failed to send the session's commands`,
+          error,
+        );
+      });
+    }
+    then?.();
+    agent.authenticateMcpServers(sessionId, mcpServers);
+  }, 0);
 }
 
 /**
@@ -302,13 +361,15 @@ class V2ClientConnection implements AcpClient {
     const { terminal, report } = this.terminals.split(sessionId, update);
     if (!report) return terminal;
     const starts = report.sessionUpdate === "tool_call";
-    const [reported, metaPatch] = this.toolCallMeta.apply(
-      sessionId,
-      report,
-      starts,
-      this.replays.has(sessionId),
-    );
-    const reportUpdate = v2SessionUpdate(reported);
+    const replaying = this.replays.has(sessionId);
+    // A v1 `tool_call` starts the tool call afresh, but v2 only has updates,
+    // which keep each field they leave out. The client may already hold this
+    // id: from an earlier report on this connection, or, during a replay, from
+    // before it (a client that resumes a session it showed before).
+    const restarts =
+      starts && (replaying || this.toolCallMeta.reported(sessionId, report.toolCallId));
+    const [reported, metaPatch] = this.toolCallMeta.apply(sessionId, report, starts, replaying);
+    const reportUpdate = restarts ? v2RestartedToolCall(reported) : v2SessionUpdate(reported);
     const metaUpdate = metaPatch
       ? v2SessionUpdate({ sessionUpdate: "tool_call_update", ...metaPatch })
       : undefined;

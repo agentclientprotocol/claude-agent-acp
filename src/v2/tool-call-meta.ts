@@ -21,7 +21,7 @@
  * of the stored `_meta`. Subagent routing reads it before this, on the agent's
  * v1 reports.
  */
-import type { ToolCall, ToolCallUpdate } from "@agentclientprotocol/sdk";
+import type { ToolCall, ToolCallUpdate } from "@agentclientprotocol/sdk/unstable";
 
 type Meta = Record<string, unknown>;
 
@@ -105,6 +105,11 @@ export class V2ToolCallMeta {
     const stored = this.calls.get(`${sessionId} ${toolCall.toolCallId}`)?.meta ?? {};
     if (Object.keys(stored).length > 0) result._meta = { ...result._meta, ...stored };
     return result;
+  }
+
+  /** Whether this connection reported the tool call, so the client holds it. */
+  reported(sessionId: string, toolCallId: string): boolean {
+    return this.calls.has(`${sessionId} ${toolCallId}`);
   }
 
   /** Forgets the tool calls of a session, when it closes. */

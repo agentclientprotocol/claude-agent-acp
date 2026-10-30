@@ -1,4 +1,4 @@
-import type { PermissionOption } from "@agentclientprotocol/sdk";
+import type { PermissionOption } from "@agentclientprotocol/sdk/unstable";
 import {
   buildEditPermissionOptions,
   buildGlobPermissionOptions,

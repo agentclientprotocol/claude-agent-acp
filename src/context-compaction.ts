@@ -1,4 +1,4 @@
-import { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk";
+import { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import {
   ContextCompactionMetadata,
   createContextCompactionMeta,

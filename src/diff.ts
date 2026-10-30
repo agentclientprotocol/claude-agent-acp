@@ -1,5 +1,5 @@
-import { ToolCallContent, ToolCallLocation } from "@agentclientprotocol/sdk";
-import type * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+import { ToolCallContent, ToolCallLocation } from "@agentclientprotocol/sdk/unstable";
+import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import { structuredPatch } from "diff";
 import { constants } from "node:fs";
 import { type FileHandle, open } from "node:fs/promises";
@@ -89,7 +89,7 @@ export type PatchForm = "air" | "v2";
 /**
  * How a git patch names its file. `git` is git's own form: the leading slash
  * dropped and the `a/` and `b/` prefixes added. `absolute` is the form of an
- * ACP v2 `git_patch`, whose paths must be absolute: the path itself.
+ * ACP v2 `git_patch`, whose paths must be absolute: the native path itself.
  */
 type GitPatchPaths = "git" | "absolute";
 
@@ -438,11 +438,11 @@ export function gitPatchText(
 }
 
 function gitPatchHeader(filePath: string, change: FileChange, paths: GitPatchPaths): string[] {
-  // A Windows path gets forward slashes so the header names the same file on
-  // every platform.
-  const slashed = filePath.replaceAll("\\", "/");
-  // git drops one leading slash of an absolute path.
-  const name = paths === "git" ? slashed.replace(/^\/+/u, "") : slashed;
+  // git's form uses forward slashes, so the header names the same file on
+  // every platform, and drops one leading slash of an absolute path. An ACP v2
+  // patch keeps the native path so that, once unquoted, it equals the `changes`
+  // entry: `C:\work\App.ts` is written `"C:\\work\\App.ts"`.
+  const name = paths === "git" ? filePath.replaceAll("\\", "/").replace(/^\/+/u, "") : filePath;
   const oldName = quoteGitPath(paths === "git" ? "a/" : "", name);
   const newName = quoteGitPath(paths === "git" ? "b/" : "", name);
   // git ends a ---/+++ name that contains a space with a tab, for GNU patch.

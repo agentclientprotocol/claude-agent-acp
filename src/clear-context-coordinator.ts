@@ -1,4 +1,4 @@
-import type { NewSessionRequest, SessionConfigOption } from "@agentclientprotocol/sdk";
+import type { NewSessionRequest, SessionConfigOption } from "@agentclientprotocol/sdk/unstable";
 import type {
   EffortLevel,
   Options,
@@ -39,11 +39,14 @@ export type ClearContextSession<Turn extends ClearContextTurn = ClearContextTurn
   configOptions: SessionConfigOption[];
   currentAgent: string;
   fastModeEnabled: boolean;
+  ultracodeEnabled: boolean;
   effortPinnedLevel?: string;
   activeTurn?: Turn | null;
   turnQueue?: Turn[];
   pendingExitPlanContextReset?: ClearContextReset;
   contextUsedTokens?: number;
+  contextWindowSize: number;
+  sentUserUuids?: Set<string>;
   input: { push(message: SDKUserMessage): unknown };
 };
 
@@ -58,10 +61,14 @@ export type ClearContextCoordinatorHost<
     options: { publicSessionId: string; permissionMode: PermissionMode },
   ): Promise<Session>;
   applyFastMode(session: Session, enabled: boolean): Promise<void>;
+  applyUltracode(session: Session, enabled: boolean): Promise<void>;
+  /** Publishes the fresh context's mode, config options, and usage: the
+   *  context starts empty in a window of `contextWindowSize` tokens. */
   publishSessionState(
     sessionId: string,
     mode: PermissionMode,
     configOptions: SessionConfigOption[],
+    contextWindowSize: number,
   ): Promise<void>;
   continuationMessage(sessionId: string, plan: string, promptUuid: string): SDKUserMessage;
   ensureConsumer(session: Session, sessionId: string): void;
@@ -145,6 +152,16 @@ export async function continuePlanInFreshContext<
     }
     assertRestartActive(freshSession);
   }
+  // The fresh query seeds ultracode from settings only, so a toggle made
+  // during the old session would otherwise be lost.
+  if (oldSession.ultracodeEnabled !== freshSession.ultracodeEnabled) {
+    try {
+      await host.applyUltracode(freshSession, oldSession.ultracodeEnabled);
+    } catch (error) {
+      host.logError("Failed to restore ultracode after clearing context:", error);
+    }
+    assertRestartActive(freshSession);
+  }
 
   oldSession.activeTurn = null;
   oldSession.turnQueue = [];
@@ -152,12 +169,18 @@ export async function continuePlanInFreshContext<
   freshSession.contextUsedTokens = 0;
 
   try {
-    await host.publishSessionState(sessionId, reset.mode, freshSession.configOptions);
+    await host.publishSessionState(
+      sessionId,
+      reset.mode,
+      freshSession.configOptions,
+      freshSession.contextWindowSize,
+    );
   } catch (error) {
     host.logError("Failed to publish clear-context session state:", error);
   }
   assertRestartActive(freshSession);
 
+  (freshSession.sentUserUuids ??= new Set()).add(turn.promptUuid);
   freshSession.input.push(host.continuationMessage(sessionId, reset.plan, turn.promptUuid));
   assertRestartActive(freshSession);
   host.ensureConsumer(freshSession, sessionId);

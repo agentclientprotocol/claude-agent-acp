@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ClientCapabilities } from "@agentclientprotocol/sdk";
+import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
 import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import { buildConfigOptions, clientSupportsRecommendedConfigValue } from "../acp-agent.js";
 import { AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY } from "../air-extension.js";

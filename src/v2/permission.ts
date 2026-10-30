@@ -2,8 +2,8 @@
  * The v2 form of the permission requests that `ClaudeAcpAgent` sends, and the
  * v1 form of their answers.
  */
-import type { RequestPermissionResponse } from "@agentclientprotocol/sdk";
-import type * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+import type { RequestPermissionResponse } from "@agentclientprotocol/sdk/unstable";
+import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { AcpPermissionRequest } from "../permissions/presentation.js";
 import { v2ToolCallPatch } from "./tool-call.js";
 
@@ -33,8 +33,11 @@ export function v2PermissionRequest(request: AcpPermissionRequest): v2.RequestPe
  * The v1 form of the answer to a permission request.
  *
  * v2 adds outcomes that v1 does not know, which the draft says are no
- * approval. They become `cancelled`, which the agent reads as an aborted tool
- * use, as it does a cancelled prompt.
+ * approval. They become `cancelled`. In v2, `cancelled` also means that the
+ * user dismissed the prompt or the client declined it by policy. So the agent
+ * reads a `cancelled` outcome on v2 as the user refusing the tool, unless a
+ * `session/cancel` is stopping the session's work: then the tool use is
+ * aborted, as on v1.
  */
 export function v1PermissionResponse(
   response: v2.RequestPermissionResponse,

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { SessionNotification } from "@agentclientprotocol/sdk";
+import type { SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import {
   AUTO_MODE_FALLBACK,
   resolveInitialPermissionMode,
@@ -66,10 +66,14 @@ describe("session mode", () => {
   it("rejects invalid and unavailable modes before touching the query", async () => {
     const session = createSession();
     const { manager } = createManager(session);
-    await expect(manager.selectMode(SESSION_ID, "future")).rejects.toThrow("Invalid Mode");
-    await expect(manager.selectMode(SESSION_ID, "bypassPermissions")).rejects.toThrow(
-      "Mode bypassPermissions is not available in this session",
-    );
+    await expect(manager.selectMode(SESSION_ID, "future")).rejects.toMatchObject({
+      code: -32602,
+      message: expect.stringContaining("Invalid Mode"),
+    });
+    await expect(manager.selectMode(SESSION_ID, "bypassPermissions")).rejects.toMatchObject({
+      code: -32602,
+      message: expect.stringContaining("Mode bypassPermissions is not available in this session"),
+    });
     expect(session.query.setPermissionMode).not.toHaveBeenCalled();
   });
 
@@ -152,7 +156,7 @@ describe("session mode", () => {
   it("rejects missing and closed sessions", async () => {
     await expect(
       createManager(undefined).manager.setSessionMode({ sessionId: SESSION_ID, modeId: "plan" }),
-    ).rejects.toThrow("Session not found");
+    ).rejects.toMatchObject({ code: -32002, data: { sessionId: SESSION_ID } });
 
     await expect(
       createManager(createSession({ queryClosed: true })).manager.setSessionMode({

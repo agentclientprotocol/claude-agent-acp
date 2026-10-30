@@ -11,8 +11,8 @@
  * extension (`ToolCallClientCapabilities.from`), and {@link V2Terminals} turns
  * the extension's keys into those updates.
  */
-import type { ToolCall, ToolCallUpdate } from "@agentclientprotocol/sdk";
-import type * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+import type { ToolCall, ToolCallUpdate } from "@agentclientprotocol/sdk/unstable";
+import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 
 type V1ToolCallReport =
   | (ToolCall & { sessionUpdate: "tool_call" })

@@ -22,6 +22,11 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => ({
 /** Shared spy for both `claude auth status --json` and `claude auth logout`.
  *  Tests set `execFileResults` per invoked subcommand. */
 const execFileSpy = vi.hoisted(() => vi.fn());
+/** `auth status` probes, wherever global options such as `--settings` put the subcommand. */
+function isStatusProbe(args: string[]): boolean {
+  const auth = args.indexOf("auth");
+  return auth >= 0 && args[auth + 1] === "status";
+}
 
 vi.mock("node:child_process", async () => {
   const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
@@ -409,7 +414,7 @@ describe("auth status over ACP", () => {
     execFileSpy.mockImplementation((...invocation: unknown[]) => {
       const args = invocation[1] as string[];
       const cb = invocation[invocation.length - 1] as (...a: unknown[]) => void;
-      if (args[1] === "status") {
+      if (isStatusProbe(args)) {
         const stdout = statusStdout;
         const fails = statusFails;
         const answer = () => {
@@ -451,7 +456,7 @@ describe("auth status over ACP", () => {
   });
 
   function statusCalls() {
-    return execFileSpy.mock.calls.filter((call) => (call[1] as string[])[1] === "status");
+    return execFileSpy.mock.calls.filter((call) => isStatusProbe(call[1] as string[]));
   }
 
   function updates() {
@@ -542,11 +547,11 @@ describe("auth status over ACP", () => {
       env: { ANTHROPIC_BASE_URL: "https://example.invalid/override" },
     });
     expect(statusCalls().at(-1)?.[1]).toEqual([
+      "--settings",
+      JSON.stringify({ apiKeyHelper: "central proxy start" }),
       "auth",
       "status",
       "--json",
-      "--settings",
-      JSON.stringify({ apiKeyHelper: "central proxy start" }),
     ]);
     await promptOnce(sessionId);
     await flushStatus();

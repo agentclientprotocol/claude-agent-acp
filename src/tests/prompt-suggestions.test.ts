@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import type { ClientCapabilities } from "@agentclientprotocol/sdk";
+import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
 import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
 import { promptSuggestionsMeta, promptSuggestionText } from "../prompt-suggestions.js";
 import { Pushable } from "../utils.js";

@@ -1,5 +1,10 @@
 export const AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY = "nativeSubagentSessions";
 export const AIR_ASYNC_TASKS_CAPABILITY = "asyncTasks";
+/**
+ * A prompt turn ends at its result also while its background subagents run.
+ * The subagent updates and requests then go out after the prompt response.
+ */
+export const AIR_BACKGROUND_SUBAGENTS_CAPABILITY = "backgroundSubagents";
 export const AIR_SESSION_FAILURE_CAPABILITY = "sessionFailure";
 export const AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY = "recommendedValue";
 export const AIR_CUSTOM_INSTRUCTIONS_CAPABILITY = "customInstructions";
@@ -17,6 +22,9 @@ export const AIR_PLAN_FILE_CAPABILITY = "planFile";
  * subscription. Advertised only to a client that declares it.
  */
 export const AIR_SESSION_INDEX_CAPABILITY = "sessionIndex";
+/** Metadata lookup of known ids with `_session/batch_get`. Advertised
+ *  exactly when {@link AIR_SESSION_INDEX_CAPABILITY} is negotiated. */
+export const AIR_SESSION_BATCH_GET_CAPABILITY = "sessionBatchGet";
 /**
  * The agent supports `_session/archive` and `_session/unarchive`. Advertised
  * exactly when {@link AIR_SESSION_INDEX_CAPABILITY} is; the client does not
@@ -40,6 +48,14 @@ export const AIR_SESSION_LIST_SUBSCRIBE_CAPABILITY = "sessionListSubscribe";
  * {@link AIR_SESSION_INDEX_CAPABILITY} is; the client does not declare it.
  */
 export const AIR_SESSION_WORKTREES_CAPABILITY = "sessionWorktrees";
+/**
+ * The client wants to know when the history replay of a loaded session is
+ * whole. After the last replayed update, the agent sends one
+ * `session_info_update` with `_meta.jetbrains.air.loadReplayEnd: true` (see
+ * {@link AIR_LOAD_REPLAY_END_KEY}). The client declares it; the agent does not
+ * advertise it.
+ */
+export const AIR_LOAD_REPLAY_END_CAPABILITY = "loadReplayEnd";
 
 /** The `_meta.jetbrains.air` keys that the ACP tool call contract defines. */
 export const AIR_COMMAND_TITLE_KEY = "commandTitle";
@@ -53,6 +69,8 @@ export const AIR_KIND_KEY = "kind";
 export const AIR_SKILL_PATH_KEY = "skillPath";
 export const AIR_PERMISSION_KEY = "permission";
 export const AIR_CUSTOM_ANSWER_KEY = "customAnswer";
+/** The `_meta.jetbrains.air` key of the update that ends a whole history replay. */
+export const AIR_LOAD_REPLAY_END_KEY = "loadReplayEnd";
 /**
  * The root `_meta` spelling of {@link AIR_CUSTOM_ANSWER_KEY} that released
  * AIR versions read. Remove it when the ACP registry no longer serves AIR

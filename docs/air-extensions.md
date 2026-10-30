@@ -27,8 +27,10 @@ It describes only this adapter.
 - [Session failure](#session-failure)
 - [Native subagent sessions](#native-subagent-sessions)
 - [Session index](#session-index)
+- [Background subagents](#background-subagents)
 - [Context compaction](#context-compaction)
 - [Question custom answers](#question-custom-answers)
+- [Load replay end](#load-replay-end)
 - [Session fork point](#session-fork-point)
 - [Presentation hints](#presentation-hints)
 - [Removed keys](#removed-keys)
@@ -124,7 +126,8 @@ The `initialize` response of an AIR client carries the agent side of the extensi
           "asyncTasks",
           "recommendedValue",
           "diffPatch",
-          "planFile"
+          "planFile",
+          "backgroundSubagents"
         ],
         "goal": {
           "version": 1,
@@ -138,8 +141,8 @@ The `initialize` response of an AIR client carries the agent side of the extensi
 }
 ```
 
-The agent list does not depend on the capabilities that AIR declares, except `sessionIndex`: the agent lists it, together with `sessionArchive`, `sessionRename`, `sessionListSubscribe` and `sessionWorktrees`, only for a client that declared `sessionIndex`.
-An extension is active only when the client declared its capability. The client does not declare `sessionArchive`, `sessionRename`, `sessionListSubscribe` and `sessionWorktrees`.
+The agent list does not depend on the capabilities that AIR declares, except `sessionIndex`: the agent lists it, together with `sessionBatchGet`, `sessionArchive`, `sessionRename`, `sessionListSubscribe` and `sessionWorktrees`, only for a client that declared `sessionIndex`.
+An extension is active only when the client declared its capability. The client does not declare `sessionBatchGet`, `sessionArchive`, `sessionRename`, `sessionListSubscribe` and `sessionWorktrees`.
 The response to a client that is not AIR has no `_meta.jetbrains` key.
 
 ### Capabilities
@@ -153,11 +156,14 @@ The response to a client that is not AIR has no `_meta.jetbrains` key.
 | `agentFileChangeReport`  | yes                 | Accepts a report request on `session/prompt` and sends the changed file list.                                   | [Agent file-change report](#agent-file-change-report)   |
 | `nativeSubagentSessions` | yes                 | Reports an Agent or Task subagent as a native ACP child session.                                                | [Native subagent sessions](#native-subagent-sessions)   |
 | `planFile`               | yes                 | Sends the path of the plan file in place of the plan text of an ExitPlanMode.                                   | [Plan file](#plan-file)                                 |
+| `backgroundSubagents`    | yes                 | Ends a prompt turn at its result while background subagents still run.                                          | [Background subagents](#background-subagents)           |
 | `sessionIndex`           | on request          | Pages, orders and annotates `session/list`; adds rename, archive and a list subscription.                       | [Session index](#session-index)                         |
+| `sessionBatchGet`        | with `sessionIndex` | Supports `_session/batch_get` for metadata of known session IDs.                                                | [Batch get](#batch-get)                                 |
 | `sessionArchive`         | with `sessionIndex` | Nothing on its own: the agent lists it to tell that it supports `_session/archive` and `_session/unarchive`.    | [Archive](#archive)                                     |
 | `sessionRename`          | with `sessionIndex` | Nothing on its own: the agent lists it to tell that it supports `_session/rename`.                              | [Rename](#rename)                                       |
 | `sessionListSubscribe`   | with `sessionIndex` | Nothing on its own: the agent lists it to tell that it supports `_session/list/subscribe`.                      | [List subscription](#list-subscription)                 |
 | `sessionWorktrees`       | with `sessionIndex` | Nothing on its own: the agent lists it to tell that rows carry `agentWorktree` for a worktree Claude Code made. | [List response](#list-response)                         |
+| `loadReplayEnd`          | no                  | Sends one `session_info_update` after the whole history replay of a loaded session.                             | [Load replay end](#load-replay-end)                     |
 | `rawInputRendering`      | no                  | Sends no display copy of readable input in `content`. The client renders `rawInput`.                            | [Tool call contract](#tool-call-contract)               |
 
 The adapter ignores `planContentDelta`.
@@ -193,6 +199,7 @@ The adapter sends these keys only to an AIR client. "AIR" in the Gate column mea
 | `kind`                         | session mode `_meta.jetbrains.air` and mode config option value `_meta.jetbrains.air` | `standard`, `plan`, `auto_review`, or `full_access`                    | AIR                                                                                    |
 | `kind`                         | available command `_meta.jetbrains.air` of a skill                                    | `skill`                                                                | AIR, when the skill's `SKILL.md` is found; not for a built-in command or an MCP prompt |
 | `skillPath`                    | available command `_meta.jetbrains.air` of a skill                                    | absolute path of the skill's `SKILL.md`                                | AIR, together with `kind: "skill"`                                                     |
+| `loadReplayEnd`                | `session_info_update._meta.jetbrains.air`                                             | `true`                                                                 | `loadReplayEnd`                                                                        |
 | `fork`                         | `session/fork` request `_meta.jetbrains.air` (client to agent)                        | `{version: 1, messageId, messageFingerprint?, messageOccurrence?}`     | none                                                                                   |
 
 ## JetBrains shared keys
@@ -508,6 +515,17 @@ While the adapter does not know the path, a report carries no `planFilePath` key
 The adapter never sends a blank path, because AIR reads a present non-file value as a retraction.
 Without `rawInputRendering`, a `planFile` client gets no copy of the plan in `content` either.
 
+### Approved plan identity
+
+For an AIR client with plan operations, the approved plan ID is `plan-mode:<tool-call ID>`.
+Claude uses the SDK tool-call ID of ExitPlanMode.
+Each review keeps its own plan. Repeated updates of that review keep the same plan ID.
+AIR joins the plan to its review by ID, even when the text includes user edits.
+This link needs no extra metadata.
+The live result, history replay, and clear-context approval use the same identity.
+The identity does not depend on `planFile`: it also applies when the request carries inline plan text.
+Other clients keep the `plan-mode` ID.
+
 ### Fallback
 
 The plan text goes out as before in these cases:
@@ -701,7 +719,7 @@ A non-empty plan also gets one clear-context choice with the same priority.
 After that choice, the adapter stops the old private Claude query and hides that internal rejection.
 It starts a new private query under the same ACP session.
 It continues the turn with `Implement the following plan:` and the complete plan.
-The mode, model, agent, effort, Fast mode, and turn usage stay the same.
+The mode, model, agent, effort, Fast mode, ultracode, and turn usage stay the same.
 The SDK cannot apply `allowedPrompts` again, so those hints do not survive the handoff.
 
 The adapter does not allow a callback only because the session mode is `bypassPermissions`.
@@ -991,6 +1009,20 @@ When an announced task leaves that list, the adapter reports `stopped`.
 A later terminal event can correct that state to `completed` or `failed`.
 At shutdown, the adapter finishes each open task as `failed` or `stopped`.
 
+### Autonomous turn
+
+Claude Code can start a turn of its own after the prompt ended, for example to answer the notification of a finished background task.
+ACP v1 has no session state, so the adapter publishes such a turn as an async task.
+The task has the id `autonomous-turn-<uuid>`, the name `Claude is working`, `taskType: "turn"`, and `showInTranscript: false`.
+Its description is the summary of the last task notification, when there is one.
+The task starts at the SDK `running` state while no prompt is active or queued.
+When the state stays `running`, as it does while background agents run, it starts at the first root output with no prompt open.
+It ends `completed` at the result of the turn or at the SDK `idle` state, and `failed` at an error result.
+A coalesced placeholder result (`num_turns: 0`) does not end it.
+A prompt that the turn takes in ends the task, because that prompt owns the turn now.
+A stop request interrupts the turn instead of stopping an SDK task.
+It returns `{ "stopped": false }` while a prompt waits for its turn, because the interrupt would drop that prompt.
+
 ### Stop request
 
 The client sends `_session/async_task/stop`:
@@ -1262,8 +1294,8 @@ The session index makes `session/list` a bounded, ordered page with row metadata
 
 AIR declares `sessionIndex` in `_meta.jetbrains.air.capabilities`.
 Unlike the other capabilities, the agent advertises `sessionIndex` only to a client that declared it, and never under ACP v2.
-Exactly when it advertises `sessionIndex`, the agent also advertises `sessionArchive` (it supports `_session/archive` and `_session/unarchive`), `sessionRename` (it supports `_session/rename`), `sessionListSubscribe` (it supports `_session/list/subscribe` and `_session/list/unsubscribe`) and `sessionWorktrees` (rows carry `agentWorktree`, see [List response](#list-response)).
-The client does not declare these four; declaring them without `sessionIndex` enables nothing.
+Exactly when it advertises `sessionIndex`, the agent also advertises `sessionBatchGet` (it supports `_session/batch_get`), `sessionArchive` (it supports `_session/archive` and `_session/unarchive`), `sessionRename` (it supports `_session/rename`), `sessionListSubscribe` (it supports `_session/list/subscribe` and `_session/list/unsubscribe`) and `sessionWorktrees` (rows carry `agentWorktree`, see [List response](#list-response)).
+The client does not declare these five; declaring them without `sessionIndex` enables nothing.
 Everything in this section applies only to such a client, except where [Delete and close](#delete-and-close) says otherwise.
 A client without the capability gets the `session/list` of before: the SDK `listSessions` call, pages of 1000 by file mtime, `offset:N` cursors, and no row `_meta`.
 It gets no new notification, and the adapter starts no watcher for it.
@@ -1353,6 +1385,7 @@ Each row carries `_meta.jetbrains.air` with flat row fields of the RFDs. `archiv
   - a session this connection runs: the SDK `session_state_changed` state; `error` instead of `idle` when its last turn failed (an error result, `is_error` or an `error_*` subtype, that was not a cancel). A session whose query failed here (not a cancel) is reported as any other session, but `error` until its transcript shows a prompt or a turn end after the failure, unless a busy or waiting interactive CLI holds it;
   - a session no live Claude Code process holds: `idle`, or `error` when its last turn ended with an API error (an assistant record with `isApiErrorMessage: true`, also when the CLI's turn-end records follow it, with no prompt after it);
   - a session that an interactive CLI holds (not an `sdk-*` entrypoint) whose registry status is newer than the transcript: `busy` and `shell` are `running`, `waiting` is `requires_action`, `idle` is `idle`, or `error` after such an API error;
+  - any other held session whose last turn ended with an open background task: `running`, also after 10 minutes, until the registry status is `idle`. Claude Code wakes the session again when the task ends, so the session gets one `idle` at the last turn end, not one for each task. A background shell command (`toolUseResult.backgroundTaskId`) or an async sub-agent (`isAsync` with an `agentId`) opens a task. Its `<task-notification>` with a `<status>`, as a user record or a `queue-operation` `remove`, or the result of a `TaskStop` call closes it. A notification without a `<status>`, such as the check-in of a quiet shell or a `Monitor` event, keeps it open. Sidechain records open no task. The tail gives the tasks on top of those of an earlier scan when the file only grew within the tail; else the whole transcript is read, and only for such a held session. A background task that a sub-agent starts is not seen: it is only in the transcript of the sub-agent;
   - any other held session: `idle` after a finished turn (an assistant `end_turn`, a user interrupt, or the CLI turn-end records), `error` after a turn that ended with an API error, `running` for an unfinished turn written in the last 10 minutes, and no state otherwise.
 - The live processes come from `<config>/sessions/<pid>.json`, with the liveness rules of Claude Desktop: `kill(pid, 0)` (or `EPERM`), a matching `procStart`, no foreign `pidDomain`, and records older than 24 hours only with a matching `procStart`.
   The adapter never reads the `.key` files there and never changes the directory.
@@ -1421,6 +1454,71 @@ In all of the session index methods and in `session/delete`, a session id matche
 Loading an archived session does not unarchive it.
 The CLI cleanup still deletes old transcripts (`cleanupPeriodDays`), archived or not.
 
+### Batch get
+
+`_session/batch_get` refreshes metadata for retained session IDs, such as pinned
+sessions and folder members outside the recent list page. Check for
+`sessionBatchGet` in `initialize.result._meta.jetbrains.air.capabilities` before
+calling it.
+
+The params object must contain only `sessionIds`: an array of distinct,
+non-blank strings. IDs match exactly, without trimming or case normalization.
+Malformed params, duplicates or extra fields return `Invalid params` (`-32602`).
+The agent sets no limit on the number of IDs; the client chooses the batch size
+for the latency it accepts. Archived sessions and sessions in other projects
+or worktrees are eligible.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "_session/batch_get",
+  "params": { "sessionIds": ["oldA", "oldB", "oldC"] }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "result": {
+    "sessions": [
+      {
+        "sessionId": "oldA",
+        "cwd": "/project",
+        "title": "Fix the build",
+        "updatedAt": "2026-01-01T00:00:00.000Z",
+        "_meta": { "jetbrains": { "air": { "version": 1, "archived": false } } }
+      }
+    ]
+  }
+}
+```
+
+The example IDs are placeholders for stored Claude session UUIDs. `sessions`
+contains the same full rows as `session/list` without a project filter, including
+archived sessions and `_meta.jetbrains.air`. Copies use the same
+newest-readable-copy selection as the list. Returned sessions preserve their
+relative request order. Non-UUID IDs and IDs without a listable transcript are
+omitted: absent, empty, unreadable or malformed transcripts, sidechains, sessions
+whose continuation has history, and transcripts whose cwd cannot be recovered.
+A sidecar alone does not supply a row.
+
+`{ "sessionIds": [] }` returns `{ "sessions": [] }` without reading the store.
+A store-wide failure, such as an unreadable projects root, rejects the request.
+Individual results reflect the store as each ID is read.
+
+Lookup normally addresses only the requested transcript filenames in each project
+and reads their metadata. A transcript without a cwd can use a sibling's cwd,
+as the list does. This fallback enumerates and stats sibling transcripts only
+in the directories of rows still missing a cwd, then reads at most 64 siblings
+per directory, newest mtime first. A failed recovery is cached for 60 seconds
+unless the directory mtime changes. Other project histories are not enumerated.
+The agent looks up 100 IDs at a time; the client may request any number of IDs.
+Merge returned rows with the recent page by `sessionId`. A batch read does not
+expand an existing list subscription's scope; refresh retained IDs outside that
+scope explicitly.
+
 ### List subscription
 
 `_session/list/subscribe { "cwd": "…" }` returns `{ "subscriptionId": "…" }`.
@@ -1444,6 +1542,7 @@ From then on the agent sends `_session/list/changes` notifications for the sessi
 
 - `cwd` is required and must be an absolute path; a missing, non-string or relative `cwd` is `-32602`. Other parameters are ignored.
 - The scope is the sessions of `cwd` and of the same subdirectory in every existing linked worktree of its repository, as a list with `includeWorktrees: true` resolves it, in any archive state. Sidechain and subagent transcripts are left out, as in the list.
+- There is no page or recent-session limit: changes to older pinned or folder sessions within that scope are reported even outside the page AIR loaded. Pinned IDs outside the subscribed project and worktrees are not tracked; `_session/batch_get` does not add them to the subscription. AIR must subscribe to their project scope or refresh them explicitly.
 - `sessions` holds the full current row of each session in scope that appeared, or whose `title`, `lastPromptAt`, `state`, `lastTurnEndedAt`, `cost`, `model`, `forkedFrom`, `agentWorktree` or `archived` changed since the last row sent for it on this subscription. A row is exactly the row of `session/list`, `_meta.jetbrains.air` included.
 - After subscribe, the first change of each session sends its row in full, even when only `updatedAt` changed. From then on, a change of `updatedAt` alone sends nothing; the new `updatedAt` comes with the next change.
 - `removed` holds the ids of sessions that left the scope: deleted (the transcript is gone), or moved to a path outside it. It may name a session the client does not list (one it never listed, one the list hides, such as a session continued in another one when that one changes); the client ignores such an id.
@@ -1470,7 +1569,7 @@ It is idempotent, and an unknown id also returns `{}`.
 `session/delete`:
 
 - a `sessionIndex` client: deletes every transcript of the session (empty ones too) and every `<sessionId>/` directory, also one left without a transcript by an earlier failed delete. Anything left behind fails the request. A session that runs here is closed first. As with the CLI, the session is deleted also when another Claude Code process has it open. An unknown session is `-32002`.
-- an AIR client without `sessionIndex`: archives the session instead of deleting it (the title records of [Archive](#archive)), because AIR uses delete for "Done" and can reopen the session. A session that runs here is closed first. The list hides archived sessions from such a client too: those whose custom title, as the SDK list reports it, is archived. A session without a transcript fails with the error of the SDK delete, as before.
+- an AIR client without `sessionIndex`: archives the session instead of deleting it (the title records of [Archive](#archive)), because AIR uses delete for "Done" and can reopen the session. A session that runs here is closed first. The list hides archived sessions from such a client too: those whose custom title, as the SDK list reports it, is archived. A session without a transcript has nothing to archive, so the delete succeeds, as ACP asks of a session that does not exist.
   A `sessionIndex` client sees such a session as archived (`archived: true`), as AIR's native Claude path does.
 - any other client: the SDK delete. A session without a transcript (unknown, deleted before, or
   never prompted) succeeds, as ACP asks.
@@ -1496,6 +1595,7 @@ Names and semantics follow them; the transport differs, and so do the `archived`
 | capability `sessionIndex` (`_meta.jetbrains.air`)                                                 | `sessionCapabilities.list.limit`                                                                                                                                                                                |
 | capability `sessionArchive` (`_meta.jetbrains.air`)                                               | `sessionCapabilities.archive` (#2161)                                                                                                                                                                           |
 | capability `sessionRename` (`_meta.jetbrains.air`)                                                | `sessionCapabilities.setTitle` (#1987)                                                                                                                                                                          |
+| capability `sessionBatchGet`, `_session/batch_get`                                                | none                                                                                                                                                                                                            |
 | `_meta.jetbrains.air.list.limit`                                                                  | `session/list` `limit`                                                                                                                                                                                          |
 | `_meta.jetbrains.air.list.includeWorktrees`                                                       | `session/list` `includeWorktrees`                                                                                                                                                                               |
 | `_meta.jetbrains.air.list.archived` (`"unarchived"`, `"archived"`, `"all"`)                       | `session/list` `archived` (#2161), a boolean there                                                                                                                                                              |
@@ -1520,6 +1620,45 @@ It differs in transport, until the RFD lands in the SDK, in the list filter, and
 - the capability is `sessionArchive` in `_meta.jetbrains.air.capabilities`, advertised together with `sessionIndex`, not `sessionCapabilities.archive`;
 - the list parameter is `_meta.jetbrains.air.list.archived`, and the state is `_meta.jetbrains.air.archived` on rows and in `session_info_update`, not the `archived` fields;
 - an AIR client without `sessionIndex` still archives with `session/delete` (see [Delete and close](#delete-and-close)), which the RFD asks clients not to do.
+
+## Background subagents
+
+A prompt turn can start a background Agent or Task subagent.
+A SendMessage tool call can also resume a subagent that ended.
+Claude Code sends the result of the turn when the main agent stops, also while such a subagent still runs.
+
+### Hold without the capability
+
+A client that does not declare `backgroundSubagents` gets the hold of issues #864 and #866.
+The adapter keeps the `session/prompt` request open while a subagent that the turn started or resumed runs.
+The subagent output, its permission requests and the followup summary of the model then go out inside the turn.
+The turn ends at the followup result, at an `idle` with no live subagent, at `session/cancel`, or when the next prompt starts.
+The hold protects a client that stops listening at the prompt response.
+
+### Behavior with the capability
+
+AIR declares `backgroundSubagents` in `initialize.clientCapabilities._meta.jetbrains.air.capabilities`.
+The capability applies to ACP v1 only. ACP v2 keeps the hold, and the agent does not advertise the capability to ACP v2.
+
+- The turn ends at its result with the stop reason of the result, usually `end_turn`.
+- The subagent updates, permission requests and elicitations go out after the prompt response.
+- The routing does not change: the native child session, else the root session with the parent tool call in `_meta.claudeCode.parentToolUseId`.
+- The followup cycle after a subagent ends is an autonomous cycle. Its updates go out of a turn. Its result does not end a turn.
+- A steer with no turn in flight starts a new turn, or returns `promptRequired` when the client asks for it.
+- `session/cancel` with no turn works as before: the adapter interrupts the SDK query and reports each native subagent session as cancelled.
+- The tool call of a running subagent does not fail the incomplete tool call check of the turn.
+- The [agent file-change report](#agent-file-change-report) of the turn does not include an edit that a subagent makes after the result.
+- An open permission request of a subagent counts as an open request for the next turn and for the steer priority.
+
+### Plan approval out of a turn
+
+The followup cycle can call ExitPlanMode. AIR then gets the permission request out of a turn.
+The request has no clear-context option, because the fresh query must continue an ACP turn.
+"No, keep planning" stops only the followup cycle. There is no turn to end.
+
+A prompt turn owns the request when the turn is active, or when Claude Code asks before the echo of its prompt.
+Then the request has the clear-context option.
+A turn that took over a followup cycle also owns the request of that cycle, and the accepted plan continues in that turn.
 
 ## Context compaction
 
@@ -1575,6 +1714,32 @@ A client can render the companion as the free-text choice of that question.
 For AIR, the companion field also carries the same value under the root key `_meta._askUserQuestionCustomAnswer`.
 Released AIR versions read only that key.
 A client that is not AIR gets neither key.
+
+## Load replay end
+
+ACP has no signal that the history replay of `session/load` is over, other than the response.
+The adapter replays the transcript while the Claude Code CLI starts, so the history can arrive long before the response.
+
+The client declares `loadReplayEnd` in its capabilities. The agent does not advertise it.
+After the history replay of the loaded session, the agent then sends one more update for that session:
+
+```json
+{
+  "sessionId": "<loaded session>",
+  "update": {
+    "sessionUpdate": "session_info_update",
+    "_meta": { "jetbrains": { "air": { "version": 1, "loadReplayEnd": true } } }
+  }
+}
+```
+
+- The update has no `title` and no `updatedAt`. A `null` there would clear the value.
+- It comes after every replayed update, the subagent history that the replay sends to the child sessions included, and before the `session/load` response.
+- It comes also for an empty history.
+- It comes for `session/load` of a new or an already live session, and for the ACP v2 `session/resume` with `replayFrom: {type: "start"}`.
+- It does not come when the replay stops or fails. The replay stops when the CLI start fails during the replay.
+- It does not come for a live update, and it does not come to a client without the capability.
+- The `session/load` can still fail after it, for example when the CLI start fails after the replay. The event means that the recorded history arrived whole. The client decides what to do with the failed load.
 
 ## Session fork point
 

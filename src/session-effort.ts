@@ -1,4 +1,4 @@
-import type { SessionConfigOption } from "@agentclientprotocol/sdk";
+import type { SessionConfigOption } from "@agentclientprotocol/sdk/unstable";
 import type { EffortLevel, ModelInfo, Settings } from "@anthropic-ai/claude-agent-sdk";
 import { AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY, withAirMeta } from "./air-extension.js";
 import { EFFORT_CONFIG_ID } from "./session-config-ids.js";
@@ -14,14 +14,15 @@ export function toSdkEffortLevel(value: string | undefined): EffortLevel | null 
 
 // Since CLI 2.1.284 an `effortLevel` that changes the level, sent without an
 // `ultracode` key, turns ultracode off. The CLI's own effort control keeps
-// ultracode on at any level, so carry a settings-requested ultracode along
-// with every effort apply.
+// ultracode on at any level, so send `ultracode: true` with every effort apply
+// while the session has ultracode on. When it is off, the key is omitted: an
+// effort change then leaves ultracode off, as it already was.
 export function effortFlagSettings(
   value: string | undefined,
-  settings: Settings,
+  ultracode: boolean,
 ): { effortLevel: EffortLevel | null; ultracode?: true } {
   const effortLevel = toSdkEffortLevel(value);
-  return settings.ultracode === true ? { effortLevel, ultracode: true } : { effortLevel };
+  return ultracode ? { effortLevel, ultracode: true } : { effortLevel };
 }
 
 function canonicalizeModelSettingsKey(value: string): string {
@@ -79,6 +80,13 @@ export function mergeEffortSettings(base: Settings, override: Settings | undefin
   };
 }
 
+export function effortLevelName(level: string): string {
+  return level
+    .split(/[_-]/)
+    .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : part))
+    .join(" ");
+}
+
 export function buildEffortConfigOption(
   modelInfos: ModelInfo[],
   currentModelId: string,
@@ -98,10 +106,7 @@ export function buildEffortConfigOption(
     ...(useRecommendedValue ? [] : [{ value: "default", name: "Default" }]),
     ...supportedLevels.map((level) => ({
       value: level,
-      name: level
-        .split(/[_-]/)
-        .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : part))
-        .join(" "),
+      name: effortLevelName(level),
     })),
   ];
   const includes = (level: string) =>

@@ -96,6 +96,32 @@ describe("session lifecycle serialization", () => {
     },
   );
 
+  it.each(["resume", "load"] as const)(
+    "preserves a live session after invalid cwd on %s and accepts the next request",
+    async (operation) => {
+      const f = fixture();
+      const original = f.install("s1");
+      const failure = RequestError.invalidParams(undefined, "Invalid cwd");
+      vi.mocked((f.agent as any).validateCwd).mockRejectedValueOnce(failure);
+      const request = (cwd: string) =>
+        operation === "resume"
+          ? f.agent.resumeSession({ sessionId: "s1", cwd, mcpServers: [] })
+          : f.agent.loadSession({ sessionId: "s1", cwd, mcpServers: [] });
+      try {
+        const results = await Promise.allSettled([request("/invalid"), request("/new")]);
+        expect(results[0]).toEqual({ status: "rejected", reason: failure });
+        expect(results[1]).toMatchObject({ status: "fulfilled", value: { sessionId: "s1" } });
+        expect(f.agent.sessions.s1).toBe(original);
+        expect(f.create).not.toHaveBeenCalled();
+        expect(f.queries[0].close).not.toHaveBeenCalled();
+        expect((f.agent as any).sessionLifecycleLocks.size).toBe(0);
+      } finally {
+        f.creation.release();
+        await f.agent.dispose();
+      }
+    },
+  );
+
   it("keeps a later queued creator registered when the previous creator fails", async () => {
     const f = fixture();
     const firstStarted = gate();
@@ -465,7 +491,9 @@ describe("session lifecycle serialization", () => {
     try {
       const close = f.agent.closeSession({ sessionId: "s1" });
       const respawn = (f.agent as any).respawnSignedOutSession("s1", original);
-      await expect(respawn).rejects.toThrow("Session not found");
+      await expect(respawn).rejects.toMatchObject({
+        code: RequestError.sessionNotFound("s1").code,
+      });
       await close;
       expect(f.create).not.toHaveBeenCalled();
       expect(f.agent.sessions).toEqual({});

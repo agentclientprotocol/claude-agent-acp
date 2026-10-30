@@ -2,7 +2,7 @@
 
 import { claudeCliPath } from "./acp-agent.js";
 import { applyManagedPolicyEnv } from "./managed-policy.js";
-import { serveAcp } from "./serve.js";
+import { acpProtocolsFromEnv, serveAcp } from "./serve.js";
 import packageJson from "../package.json" with { type: "json" };
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -83,9 +83,8 @@ if (process.argv.includes("--cli")) {
     : undefined;
   logger?.log("Claude ACP started");
 
-  // The draft ACP v2 is opt-in while it is a draft.
   const acp = serveAcp(logger, {
-    experimentalV2: process.env.CLAUDE_AGENT_ACP_EXPERIMENTAL_V2 === "1",
+    protocols: acpProtocolsFromEnv(process.env.CLAUDE_AGENT_ACP_PROTOCOL),
   });
 
   async function shutdown() {

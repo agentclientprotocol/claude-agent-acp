@@ -24,6 +24,11 @@ export interface SubagentRecord {
   background: boolean;
   /** Whether the user stopped it. */
   stoppedByUser: boolean;
+  /**
+   * Its working directory, when Claude Code placed it outside its parent's:
+   * in a worktree of its own or of an ancestor, or in a `cwd` of its own.
+   */
+  cwd?: string;
 }
 
 /** Where the subagent transcripts of a session are. */
@@ -43,7 +48,9 @@ export interface SubagentHistory {
  * Claude keeps the history of a subagent in its own transcript,
  * `<session>/subagents/agent-<id>.jsonl`, next to the session transcript.
  * The `agent-<id>.meta.json` file beside it names the launching tool use.
- * The ids are empty for a session without a local transcript.
+ * For a child that Claude Code placed elsewhere, it has `worktreePath`,
+ * `inheritedWorktreePath` or `cwd`; then the child's working directory is the
+ * `cwd` of its transcript's records. The ids are empty for a session without a local transcript.
  */
 export async function subagentHistory(sessionId: string): Promise<SubagentHistory> {
   const agents = new Map<string, SubagentRecord>();
@@ -67,6 +74,12 @@ export async function subagentHistory(sessionId: string): Promise<SubagentHistor
         > | null;
         if (typeof meta?.toolUseId !== "string") return;
         const text = (value: unknown) => (typeof value === "string" ? value : undefined);
+        const placement = [meta.cwd, meta.worktreePath, meta.inheritedWorktreePath]
+          .map(text)
+          .find((value) => value && path.isAbsolute(value));
+        const cwd = placement
+          ? ((await recordedCwd(path.join(directory, `agent-${match[1]!}.jsonl`))) ?? placement)
+          : undefined;
         agents.set(meta.toolUseId, {
           agentId: match[1]!,
           name: text(meta.name),
@@ -74,6 +87,7 @@ export async function subagentHistory(sessionId: string): Promise<SubagentHistor
           description: text(meta.description),
           background: meta.requestShape === "background",
           stoppedByUser: meta.stoppedByUser === true,
+          ...(cwd ? { cwd } : {}),
         });
       } catch {
         // A damaged meta file leaves its subagent without history.
@@ -85,6 +99,31 @@ export async function subagentHistory(sessionId: string): Promise<SubagentHistor
   // characters. The session info reads it back from the transcript.
   const dir = (await getSessionInfo(sessionId).catch(() => undefined))?.cwd;
   return dir ? { agents, dir } : { agents };
+}
+
+/**
+ * The `cwd` of the first record of the transcript `file` that has one, or
+ * undefined when the file cannot be read. Claude Code writes the working
+ * directory of the session or subagent on each record.
+ */
+async function recordedCwd(file: string): Promise<string | undefined> {
+  const stream = createReadStream(file, { encoding: "utf8" });
+  try {
+    for await (const line of readline.createInterface({ input: stream, crlfDelay: Infinity })) {
+      if (!line.includes('"cwd"')) continue;
+      try {
+        const cwd = (JSON.parse(line) as { cwd?: unknown } | null)?.cwd;
+        if (typeof cwd === "string" && path.isAbsolute(cwd)) return cwd;
+      } catch {
+        // A damaged record; a later one can have the `cwd`.
+      }
+    }
+  } catch {
+    // An unreadable transcript; the caller falls back to the metadata's path.
+  } finally {
+    stream.destroy();
+  }
+  return undefined;
 }
 
 /** The folder of the subagent transcripts, next to the session transcript `transcript`. */
@@ -162,6 +201,7 @@ export async function subagentLineage(
       agentId: current,
       launchId: launch.launchId,
       ...(launcher !== null ? { parentAgentId: launcher } : {}),
+      ...(launch.record.cwd ? { cwd: launch.record.cwd } : {}),
       ...(launch.record.name ? { name: launch.record.name } : {}),
       ...(launch.record.agentType ? { agentType: launch.record.agentType } : {}),
       ...(launch.record.description ? { description: launch.record.description } : {}),
@@ -202,7 +242,8 @@ async function readLaunchIdsFromTranscript(
   const stream = createReadStream(file, { encoding: "utf8" });
   try {
     for await (const line of readline.createInterface({ input: stream, crlfDelay: Infinity })) {
-      if (!line.includes('"tool_use"')) continue;
+      const forkDirective = owner !== null && line.includes(FORK_BOILERPLATE_OPEN);
+      if (!line.includes('"tool_use"') && !forkDirective) continue;
       let record: {
         type?: unknown;
         isSidechain?: unknown;
@@ -212,6 +253,13 @@ async function readLaunchIdsFromTranscript(
       try {
         record = JSON.parse(line);
       } catch {
+        continue;
+      }
+      // Every record of a fork child's transcript before its directive message
+      // is inherited context: a copy of the launching message, whose launch
+      // calls are the parent's, not the fork's.
+      if (forkDirective && record !== null && isForkDirectiveMessage(record)) {
+        launches.clear();
         continue;
       }
       if (record?.type !== "assistant") continue;
@@ -248,11 +296,72 @@ export async function readSubagentMessages(
   try {
     if (history.dir) {
       const messages = await getSubagentMessages(sessionId, agentId, { dir: history.dir });
-      if (messages.length > 0) return messages;
+      if (messages.length > 0) return stripForkPrefix(messages);
     }
-    return await getSubagentMessages(sessionId, agentId);
+    return stripForkPrefix(await getSubagentMessages(sessionId, agentId));
   } catch (error) {
     logger.error(`Failed to read the history of subagent ${agentId}:`, error);
     return [];
   }
+}
+
+/** How Claude Code opens the directive message of a `subagent_type: "fork"` child. */
+const FORK_BOILERPLATE_OPEN = "<fork-boilerplate>";
+/** What follows the boilerplate, right before the prompt of the Agent call. */
+const FORK_DIRECTIVE_MARKER = "</fork-boilerplate>\nYour directive: ";
+
+/** Whether `block` is the text block of a fork child's directive message. */
+function isForkDirectiveText(block: unknown): block is { type: "text"; text: string } {
+  return (
+    typeof block === "object" &&
+    block !== null &&
+    (block as { type?: unknown }).type === "text" &&
+    typeof (block as { text?: unknown }).text === "string" &&
+    (block as { text: string }).text.startsWith(FORK_BOILERPLATE_OPEN)
+  );
+}
+
+/** Whether the transcript record `message` is the directive message of a fork child. */
+function isForkDirectiveMessage(message: { type?: unknown; message?: unknown }): boolean {
+  if (message.type !== "user") return false;
+  const content = (message.message as { content?: unknown } | null | undefined)?.content;
+  return Array.isArray(content) && content.some(isForkDirectiveText);
+}
+
+/**
+ * The transcript of a `subagent_type: "fork"` child without the context it
+ * inherited. A fork transcript starts with a copy of the parent's launching
+ * assistant message (its text, thinking and every tool_use, including the
+ * Agent call itself), then a user message with a placeholder tool_result for
+ * each of those tool_uses and the text
+ * `<fork-boilerplate>…</fork-boilerplate>\nYour directive: <prompt>`. Since
+ * Claude Code 2.1.307 the fork's own Agent call gets "Fork started — that fork
+ * is you." and the other tool_uses get "This is the parent's call, not
+ * yours. …"; before that, every one got "Fork started — processing in
+ * background". Only the directive text is matched here. A fork
+ * launched from inside a subagent also gets a copy of that subagent's history
+ * before them. None of it is the child's own work: replayed as is, the
+ * parent's text and tool calls would show again in the child.
+ *
+ * This drops every record before the directive message, and reduces that
+ * message to the prompt. Other transcripts are returned unchanged.
+ */
+export function stripForkPrefix(messages: SessionMessage[]): SessionMessage[] {
+  const index = messages.findIndex(isForkDirectiveMessage);
+  if (index === -1) return messages;
+  const directive = messages[index];
+  const content = (directive.message as { content: unknown[] }).content;
+  const prompt = content.flatMap((block) => {
+    if (!isForkDirectiveText(block)) return [];
+    const start = block.text.indexOf(FORK_DIRECTIVE_MARKER);
+    return start === -1
+      ? []
+      : [{ type: "text", text: block.text.slice(start + FORK_DIRECTIVE_MARKER.length) }];
+  });
+  const rest = messages.slice(index + 1);
+  if (prompt.length === 0) return rest;
+  return [
+    { ...directive, message: { ...(directive.message as object), content: prompt } },
+    ...rest,
+  ];
 }
