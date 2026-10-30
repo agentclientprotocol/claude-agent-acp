@@ -50,6 +50,7 @@ export class SettingsManager {
   private cwd: string;
   private effective: Settings = {};
   private managedDeniedModels: string[] = [];
+  private managedModelSettings: Pick<Settings, "availableModels" | "modelOverrides"> = {};
   private managedApiKeyHelper?: string;
   private watchers: fs.FSWatcher[] = [];
   private onChange?: () => void;
@@ -112,6 +113,15 @@ export class SettingsManager {
       this.managedDeniedModels = resolved.sources
         .filter((entry) => entry.source === "managed")
         .flatMap((entry) => entry.settings.deniedModels ?? []);
+      this.managedModelSettings = Object.assign(
+        {},
+        ...resolved.sources
+          .filter((entry) => entry.source === "managed")
+          .map((entry) => ({
+            availableModels: entry.settings.availableModels,
+            modelOverrides: entry.settings.modelOverrides,
+          })),
+      );
       this.managedApiKeyHelper =
         resolved.provenance.apiKeyHelper?.source === "managed"
           ? resolved.effective.apiKeyHelper
@@ -120,6 +130,7 @@ export class SettingsManager {
       this.logger.error("Failed to resolve settings:", error);
       this.effective = {};
       this.managedDeniedModels = [];
+      this.managedModelSettings = {};
       this.managedApiKeyHelper = undefined;
     }
   }
@@ -191,6 +202,31 @@ export class SettingsManager {
     return (
       this.managedApiKeyHelper ?? settingsOverride?.apiKeyHelper ?? this.effective.apiKeyHelper
     );
+  }
+
+  /** Model selection settings including the inline SDK settings tier. */
+  getModelSelectionSettings(
+    override?: Settings,
+  ): Pick<Settings, "availableModels" | "modelOverrides"> {
+    // The SDK unions non-managed allowlists, but a managed list owns the
+    // whole allowlist and its override map. Keep that policy when adding
+    // models the SDK did not include in its initialization result.
+    const lists = [this.effective.availableModels, override?.availableModels].filter(
+      (list): list is string[] => Array.isArray(list),
+    );
+    const managed = this.managedModelSettings;
+    return {
+      availableModels:
+        managed.availableModels ?? (lists.length > 0 ? [...new Set(lists.flat())] : undefined),
+      modelOverrides:
+        managed.availableModels !== undefined
+          ? managed.modelOverrides
+          : {
+              ...this.effective.modelOverrides,
+              ...override?.modelOverrides,
+              ...managed.modelOverrides,
+            },
+    };
   }
 
   /**
