@@ -11,6 +11,7 @@ import type {
   CompleteElicitationNotification,
   CreateElicitationRequest,
   CreateElicitationResponse,
+  McpServer,
   RequestPermissionResponse,
 } from "@agentclientprotocol/sdk/unstable";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
@@ -76,11 +77,11 @@ export function v2AgentApp(
       agent.unstable_disableProvider(params),
     )
     .onRequest(v2.methods.agent.session.new, async ({ params }) => {
-      const response = await agent.newSession(v1NewSessionRequest(params));
-      return {
-        ...v2NewSessionResponse(response),
-        ...(await setupCommands(agent, response.sessionId, logger)),
-      };
+      const request = v1NewSessionRequest(params);
+      const response = await agent.newSession(request);
+      const commands = await setupCommands(agent, response.sessionId, logger);
+      afterSetupResponse(agent, response.sessionId, request.mcpServers, commands, logger);
+      return { ...v2NewSessionResponse(response), ...commands };
     })
     .onRequest(v2.methods.agent.session.list, ({ params }) => agent.listSessions(params))
     .onRequest(v2.methods.agent.session.resume, async ({ params }) => {
@@ -103,17 +104,27 @@ export function v2AgentApp(
       const commands = await setupCommands(agent, params.sessionId, logger);
       // The response ends a replay. The subagents RFD treats the replayed
       // subagent states before it as history, so their current states follow it.
-      setTimeout(() => void agent.publishCurrentSubagentStates(params.sessionId), 0);
+      afterSetupResponse(
+        agent,
+        params.sessionId,
+        restore.request.mcpServers ?? [],
+        commands,
+        logger,
+        () => void agent.publishCurrentSubagentStates(params.sessionId),
+      );
       return { ...v2ResumeSessionResponse(response), ...commands };
     })
     .onRequest(v2.methods.agent.session.fork, ({ params }) =>
       agent.forking(params.sessionId, async () => {
         // The agent starts the forked session, so the client can prompt it.
-        const response = await agent.unstable_forkSession(v1ForkSessionRequest(params));
+        const request = v1ForkSessionRequest(params);
+        const response = await agent.unstable_forkSession(request);
+        const commands = await setupCommands(agent, response.sessionId, logger);
+        afterSetupResponse(agent, response.sessionId, request.mcpServers ?? [], commands, logger);
         return {
           sessionId: response.sessionId,
           ...v2ResumeSessionResponse(response),
-          ...(await setupCommands(agent, response.sessionId, logger)),
+          ...commands,
         };
       }),
     )
@@ -155,25 +166,58 @@ function stateSnapshot(state: "idle" | "running" | "requires_action"): v2.Sessio
 }
 
 /**
- * The `availableCommands` of a setup response, so a client can show the
- * session's commands without waiting for an update. The agent sends a v1
- * client the same list as an `available_commands_update` after the response,
- * and a v2 client none (`ClaudeAcpAgent.afterSetupResponse`). Later changes
- * still arrive as updates. An empty list is left out, as the draft asks. The
- * commands are optional, so a failure to read them does not fail the setup.
+ * The `availableCommands` of a setup response, which v2 requires when the
+ * session has commands. The agent sends a v1 client the same list as an
+ * `available_commands_update` after the response, and a v2 client none
+ * (`ClaudeAcpAgent.afterSetupResponse`). Later changes still arrive as
+ * updates. An empty list is left out, as the draft asks. A failure to read
+ * the commands does not fail the setup: the result is `undefined`, and
+ * {@link afterSetupResponse} sends the commands in an update instead.
  */
 async function setupCommands(
   agent: ClaudeAcpAgent,
   sessionId: string,
   logger: Logger | undefined,
-): Promise<{ availableCommands?: v2.AvailableCommand[] }> {
+): Promise<{ availableCommands?: v2.AvailableCommand[] } | undefined> {
   try {
     const commands = await agent.availableCommands(sessionId);
     return commands.length > 0 ? { availableCommands: v2AvailableCommands(commands) } : {};
   } catch (error) {
     (logger ?? console).error(`Session ${sessionId}: failed to read the session's commands`, error);
-    return {};
+    return undefined;
   }
+}
+
+/**
+ * The work that follows a v2 setup response, run once the response is sent
+ * (`ClaudeAcpAgent.afterSetupResponse` does it on v1):
+ *
+ * - When `commands` is `undefined` (reading them for the response failed),
+ *   an `available_commands_update` with the commands, read again.
+ * - `then`, such as sending the current states of replayed subagents.
+ * - OAuth for the MCP servers that need it. Its URL elicitation must not
+ *   reach the client before the response, which v2 asks against.
+ */
+function afterSetupResponse(
+  agent: ClaudeAcpAgent,
+  sessionId: string,
+  mcpServers: McpServer[],
+  commands: { availableCommands?: v2.AvailableCommand[] } | undefined,
+  logger: Logger | undefined,
+  then?: () => void,
+): void {
+  setTimeout(() => {
+    if (!commands) {
+      agent.sendAvailableCommandsUpdate(sessionId).catch((error) => {
+        (logger ?? console).error(
+          `Session ${sessionId}: failed to send the session's commands`,
+          error,
+        );
+      });
+    }
+    then?.();
+    agent.authenticateMcpServers(sessionId, mcpServers);
+  }, 0);
 }
 
 /**

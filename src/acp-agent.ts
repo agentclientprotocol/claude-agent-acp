@@ -790,6 +790,9 @@ function parseSteerRequest(params: unknown): SteerRequest {
  *  queued user messages back in submission order, so `turnQueue[0]` is the turn
  *  currently running. */
 type Turn = {
+  /** The `ClaudeAcpAgent.promptsReceived` count when `startTurn()` received
+   *  this prompt. `cancelTurns` cancels only turns received before the cancel. */
+  received: number;
   /** uuid stamped on the pushed `SDKUserMessage`; the SDK echoes it back so the
    *  consumer can match the replayed user message to this turn. It is also the
    *  id of the user message the turn reports as inserted. */
@@ -2821,6 +2824,12 @@ export class ClaudeAcpAgent {
   >();
   /** See the `foreground` constructor option. */
   private readonly foregroundEvents?: (sessionId: string) => ForegroundEvents;
+  /** Counts the prompts `startTurn()` has received, across sessions. */
+  private promptsReceived = 0;
+  /** Per session, the `promptsReceived` count when its last cancel started.
+   *  A prompt received before that cancel that `startTurn()` had not queued
+   *  yet ends as cancelled instead of being queued. */
+  private readonly cancelledThrough = new Map<string, number>();
   /**
    * The foreground work of each session while it runs, by the session id that
    * the client knows, on every connection: only the `foreground` option
@@ -3891,6 +3900,7 @@ export class ClaudeAcpAgent {
    * before this resolves.
    */
   async startTurn(params: PromptRequest, events: TurnEvents): Promise<void> {
+    const received = ++this.promptsReceived;
     while (this.providerUpdate) await this.providerUpdate;
     let session = this.sessions[params.sessionId];
     if (!session) {
@@ -4032,7 +4042,9 @@ export class ClaudeAcpAgent {
     // its consumer is gone, so the prompt would never be inserted. End it as
     // the close ends a queued turn: `cancelled` on v1, -32800 on v2. A stream
     // that ended meanwhile fails the prompt as the check above does.
-    if (session.tornDown) {
+    // A `session/cancel` that arrived after this prompt, during the awaits
+    // above, ends it the same way.
+    if (session.tornDown || received <= (this.cancelledThrough.get(params.sessionId) ?? 0)) {
       session.fileChangeReporter?.finish(fileChangeReport, "cancelled");
       events.ended({ stopReason: "cancelled" });
       return;
@@ -4047,6 +4059,7 @@ export class ClaudeAcpAgent {
     // the consumer is running.
     let completeTurn!: () => void;
     const turn: Turn = {
+      received,
       promptUuid,
       events,
       isLocalOnlyCommand,
@@ -8853,6 +8866,12 @@ export class ClaudeAcpAgent {
       return;
     }
     session.cancelled = true;
+    // Only prompts received before this cancel are cancelled. A prompt that
+    // arrives while the awaits below run is queued and runs after the cancel
+    // (ACP v2: a `session/prompt` received after `session/cancel` is not
+    // cancelled by it).
+    const cancelledThrough = this.promptsReceived;
+    this.cancelledThrough.set(params.sessionId, cancelledThrough);
     // The interrupt below makes Claude Code withdraw the requests that are open
     // now (see `withPendingUserInput`).
     for (const input of session.openUserInputs ?? []) input.cancelled = true;
@@ -8860,7 +8879,7 @@ export class ClaudeAcpAgent {
     // the meantime is already judged against these prompts.
     session.cancelledPrompts ??= new Set();
     for (const turn of session.turnQueue ?? []) {
-      if (turn.settled) continue;
+      if (turn.settled || turn.received > cancelledThrough) continue;
       session.cancelledPrompts.add(turn.promptUuid);
       for (const uuid of turn.steeredUuids ?? []) session.cancelledPrompts.add(uuid);
     }
@@ -8936,7 +8955,7 @@ export class ClaudeAcpAgent {
     const orphanedTurns: Turn[] = [];
     if (session.turnQueue) {
       for (const turn of session.turnQueue) {
-        if (turn !== session.activeTurn && !turn.settled) {
+        if (turn !== session.activeTurn && !turn.settled && turn.received <= cancelledThrough) {
           session.fileChangeReporter?.finish(turn.fileChangeReport, "cancelled");
           turn.settled = true;
           // Deliberately no `usage`: a queued turn never ran, so the session
@@ -8996,9 +9015,7 @@ export class ClaudeAcpAgent {
           turn.commandStarted ? "started" : "pending",
         );
       }
-      session.turnQueue = session.turnQueue.filter(
-        (turn) => turn === session.activeTurn && !turn.settled,
-      );
+      session.turnQueue = session.turnQueue.filter((turn) => !turn.settled);
     }
     const diagnosticTurns = orphanedTurns.filter((turn) => {
       if (
@@ -9132,8 +9149,8 @@ export class ClaudeAcpAgent {
 
     // Before the interrupt: once it stops the running turn, Claude Code starts
     // the next queued message right away.
-    // A prompt or steer that arrived while this cancel awaited is abandoned
-    // too, after the record above was taken.
+    // A steer that arrived while this cancel awaited is abandoned too, after
+    // the record above was taken.
     for (const uuid of abandoned) (session.cancelledPrompts ??= new Set()).add(uuid);
     this.dropQueuedMessages(params.sessionId, session.query, abandoned);
     const interrupt = session.query.interrupt();
@@ -9292,6 +9309,7 @@ export class ClaudeAcpAgent {
     session.nativeSubagentRuntime?.clear();
     session.asyncTaskRuntime?.clear();
     this.replayedChildModels.delete(sessionId);
+    this.cancelledThrough.delete(sessionId);
     delete this.sessions[sessionId];
     this.sessionIndex.onTeardown(sessionId);
     const ended = await raceTimeoutAndAbort(
@@ -10282,13 +10300,14 @@ export class ClaudeAcpAgent {
   private async requestPermissionFromClient(
     params: AcpPermissionRequest,
     toolName: string,
-    signal: AbortSignal,
+    toolSignal: AbortSignal,
     parentToolUseId: string | undefined,
     ownerSessionId: string,
     agentID: string | undefined,
     toolInput: unknown,
     previewContent?: ToolCallContent[],
   ): Promise<RequestPermissionResponse> {
+    const signal = this.untilSessionClosed(ownerSessionId, toolSignal);
     if (signal.aborted) throw new Error("Tool use aborted");
     // The SDK may invoke `canUseTool` (and therefore this permission request)
     // before the assistant message's tool_use block streams to us. Some ACP clients
@@ -10343,6 +10362,16 @@ export class ClaudeAcpAgent {
     signal: AbortSignal,
   ): Promise<CreateElicitationResponse> {
     return raceWithAbort(this.client.createElicitation(request, signal), signal);
+  }
+
+  /** `signal`, also aborted when `teardownSession` aborts the
+   *  `abortController` of session `sessionId`. Claude Code aborts a callback's
+   *  own signal when its query closes, but not necessarily before
+   *  `session/close` responds, and v2 requires every pending elicitation of
+   *  the session to be cancelled with `$/cancel_request` before that response. */
+  private untilSessionClosed(sessionId: string, signal: AbortSignal): AbortSignal {
+    const sessionSignal = this.sessions[sessionId]?.abortController?.signal;
+    return sessionSignal ? AbortSignal.any([signal, sessionSignal]) : signal;
   }
 
   /** Settle the tool call `ensureToolCallEmitted` emitted for a
@@ -10904,7 +10933,8 @@ export class ClaudeAcpAgent {
    * an error, is a `cancel`.
    */
   private handleMcpElicitation(sessionId: string, support: ElicitationSupport): OnElicitation {
-    return async (request, { signal }) => {
+    return async (request, { signal: callbackSignal }) => {
+      const signal = this.untilSessionClosed(sessionId, callbackSignal);
       const isUrl = request.mode === "url";
       if ((isUrl && !support.url) || (!isUrl && !support.form)) {
         return { action: "cancel" };
@@ -10950,9 +10980,10 @@ export class ClaudeAcpAgent {
     requestSessionId: string,
     toolInput: Record<string, unknown>,
     toolUseID: string,
-    signal: AbortSignal,
+    toolSignal: AbortSignal,
     agentID: string | undefined,
   ): Promise<PermissionResult> {
+    const signal = this.untilSessionClosed(sessionId, toolSignal);
     const questions = extractAskUserQuestions(toolInput);
     if (!questions) {
       return { behavior: "deny", message: "AskUserQuestion called with no valid questions." };
@@ -11005,7 +11036,8 @@ export class ClaudeAcpAgent {
    * refusal-fallback consent prompt, rendered as an ACP form elicitation.
    */
   private handleUserDialog(sessionId: string): OnUserDialog {
-    return async (request, { signal }) => {
+    return async (request, { signal: callbackSignal }) => {
+      const signal = this.untilSessionClosed(sessionId, callbackSignal);
       if (request.dialogKind !== REFUSAL_FALLBACK_DIALOG_KIND) {
         return { behavior: "cancelled" };
       }
@@ -11101,7 +11133,7 @@ export class ClaudeAcpAgent {
     }
   }
 
-  private async sendAvailableCommandsUpdate(sessionId: string): Promise<void> {
+  async sendAvailableCommandsUpdate(sessionId: string): Promise<void> {
     if (!this.sessions[sessionId]) return;
     await this.client.sessionUpdate({
       sessionId,
@@ -11115,18 +11147,26 @@ export class ClaudeAcpAgent {
   /**
    * The work that follows a session setup response: the session's commands,
    * the current states of the subagents a load replayed, and MCP server
-   * authentication. A v2 client gets the commands in the setup response itself,
-   * and the subagent states from the v2 surface once it has sent its own
-   * response (`src/v2/agent.ts`), so it gets neither here.
+   * authentication. On v2 the setup handlers of `src/v2/agent.ts` do this
+   * work once they have sent their response, so it does nothing here.
    */
   private afterSetupResponse(sessionId: string, mcpServers: McpServer[]): void {
+    if (this.v2) return;
     setTimeout(() => {
-      if (!this.v2) {
-        this.sendAvailableCommandsUpdate(sessionId);
-        void this.publishCurrentSubagentStates(sessionId);
-      }
+      this.sendAvailableCommandsUpdate(sessionId);
+      void this.publishCurrentSubagentStates(sessionId);
       startMcpAuthentication(this, sessionId, mcpServers);
     }, 0);
+  }
+
+  /**
+   * Starts OAuth in the background for the servers of `mcpServers` that
+   * Claude Code reports as needing it, which sends the client a URL
+   * elicitation. The v2 surface calls it after the setup response, since v2
+   * asks for no elicitation before the `session/new` response.
+   */
+  authenticateMcpServers(sessionId: string, mcpServers: McpServer[]): void {
+    startMcpAuthentication(this, sessionId, mcpServers);
   }
 
   /**

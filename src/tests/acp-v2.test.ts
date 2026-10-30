@@ -61,6 +61,9 @@ const sdk = vi.hoisted(() => ({
   /** The query is closed, as `session/close` closes it. */
   close: (): void => {},
   mcpServerStatus: async (): Promise<Array<{ name: string; status: string }>> => [],
+  supportedCommands: async (): Promise<
+    Array<{ name: string; description: string; argumentHint: string }>
+  > => [{ name: "review", description: "Review a change", argumentHint: "<pull request>" }],
   mcpAuthenticate: async (
     _serverName: string,
   ): Promise<{ authUrl?: string; requiresUserAction: boolean; callbackExpected: boolean }> => ({
@@ -93,9 +96,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
             },
           ],
         }),
-        supportedCommands: async () => [
-          { name: "review", description: "Review a change", argumentHint: "<pull request>" },
-        ],
+        supportedCommands: () => sdk.supportedCommands(),
         mcpServerStatus: () => sdk.mcpServerStatus(),
         mcpAuthenticate: (serverName: string) => sdk.mcpAuthenticate(serverName),
         interrupt: () => sdk.interrupt(),
@@ -441,6 +442,28 @@ describe("ACP v2 sessions", () => {
     expect(client.updates("available_commands_update")).toEqual([]);
   });
 
+  it("sends the commands in an update after the response when reading them for it fails", async () => {
+    let commandsRead = 0;
+    const commands = sdkDefaults.supportedCommands;
+    sdk.supportedCommands = async () => {
+      // The first read is the response's; the second is the update's.
+      if (++commandsRead === 1) throw new Error("control request failed");
+      return commands();
+    };
+    const client = v2Client();
+    const response = await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const response = await agent.request(v2.methods.agent.session.new, { cwd });
+      await vi.waitFor(() => expect(client.updates("available_commands_update")).toHaveLength(1));
+      return response;
+    });
+
+    expect(response).not.toHaveProperty("availableCommands");
+    expect(client.updates("available_commands_update")).toEqual([
+      { sessionUpdate: "available_commands_update", availableCommands: SESSION_COMMANDS },
+    ]);
+  });
+
   it("rejects an MCP transport that v1 cannot express", async () => {
     const { app, authUpdate } = v2Client();
     await app.connectWith(connectRouter(), async (agent) => {
@@ -599,6 +622,39 @@ describe("ACP v2 sessions", () => {
     expect(client.completedElicitations).toEqual([
       { elicitationId: (client.elicitations[0] as { elicitationId: string }).elicitationId },
     ]);
+  });
+
+  it("sends the URL elicitation of MCP OAuth only after the session/new response", async () => {
+    sdk.mcpServerStatus = async () => [{ name: "linear", status: "needs-auth" }];
+    sdk.mcpAuthenticate = async () => ({
+      authUrl: "https://example.com/oauth/authorize",
+      requiresUserAction: true,
+      callbackExpected: true,
+    });
+    // Reading the commands for the response takes longer than starting OAuth.
+    const commands = sdkDefaults.supportedCommands;
+    sdk.supportedCommands = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return commands();
+    };
+    const events: string[] = [];
+    const client = v2Client({
+      answerElicitation: () => {
+        events.push("elicitation");
+        return { action: "decline" };
+      },
+    });
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent, { elicitation: { url: {} } });
+      await agent.request(v2.methods.agent.session.new, {
+        cwd,
+        mcpServers: [{ type: "http", name: "linear", url: "https://mcp.linear.app/mcp" }],
+      });
+      events.push("response");
+      await vi.waitFor(() => expect(events).toContain("elicitation"));
+    });
+
+    expect(events).toEqual(["response", "elicitation"]);
   });
 });
 
