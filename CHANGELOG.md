@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.99.2](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.99.1...v0.99.2) (2026-10-30)
+
+
+### Bug Fixes
+
+* align session/cancel, session/close, and v2 setup with the ACP v2 spec ([#1494](https://github.com/agentclientprotocol/claude-agent-acp/issues/1494)) ([f50598a](https://github.com/agentclientprotocol/claude-agent-acp/commit/f50598a39c5dc3908d4b98a7213e01d63ea867d5))
+* forward v2 elicitation values and read dismissed v2 permission prompts as a refusal ([#1493](https://github.com/agentclientprotocol/claude-agent-acp/issues/1493)) ([3bc6711](https://github.com/agentclientprotocol/claude-agent-acp/commit/3bc671193c6456516fe05a0eaa53c17bdfb6a190))
+* keep native Windows paths in v2 git patches ([#1492](https://github.com/agentclientprotocol/claude-agent-acp/issues/1492)) ([c3428de](https://github.com/agentclientprotocol/claude-agent-acp/commit/c3428de1bf411c513b0703ddd56bb6c5fdff583c))
+* preserve live session settings across provider refreshes ([#1474](https://github.com/agentclientprotocol/claude-agent-acp/issues/1474)) ([e01a288](https://github.com/agentclientprotocol/claude-agent-acp/commit/e01a28838499dd6dd7c31e35708090b938e852c6))
+* reject unreadable skill manifests ([#1482](https://github.com/agentclientprotocol/claude-agent-acp/issues/1482)) ([99a6e76](https://github.com/agentclientprotocol/claude-agent-acp/commit/99a6e76158b9164e51bd62e3b89113beadea5ce2))
+* report the fresh context's usage when ExitPlanMode clears context ([#1484](https://github.com/agentclientprotocol/claude-agent-acp/issues/1484)) ([2fd46c8](https://github.com/agentclientprotocol/claude-agent-acp/commit/2fd46c866d4ff2939fe1b1245b15a536d6de7c0b))
+* update to @agentclientprotocol/sdk 2.2.0 ([#1491](https://github.com/agentclientprotocol/claude-agent-acp/issues/1491)) ([1d2b92f](https://github.com/agentclientprotocol/claude-agent-acp/commit/1d2b92feae5eeccde3ac738edca1f1d71250762e))
+* validate session, prompt, config, and auth requests per the latest ACP spec ([#1495](https://github.com/agentclientprotocol/claude-agent-acp/issues/1495)) ([d2ef490](https://github.com/agentclientprotocol/claude-agent-acp/commit/d2ef490a318033049af00cb9164a39ac2dd1eb95))
+
 ## [0.99.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.99.0...v0.99.1) (2026-10-29)
 
 
