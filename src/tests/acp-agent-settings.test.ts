@@ -800,6 +800,136 @@ describe("ClaudeAcpAgent settings", () => {
       return { setModelSpy };
     }
 
+    it.each(["environment", "caller object", "caller file"])(
+      "includes configured models omitted by the SDK from %s settings",
+      async (source) => {
+        const configured = {
+          availableModels: ["claude-haiku-4-5", "claude-haiku-5-5"],
+          modelOverrides: {
+            "claude-haiku-4-5": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "claude-haiku-5-5": "global.anthropic.claude-haiku-5-5",
+          },
+        };
+        let settings: object | string | undefined;
+        if (source === "environment") {
+          vi.stubEnv("CLAUDE_MODEL_CONFIG", JSON.stringify(configured));
+        } else if (source === "caller file") {
+          settings = "caller-settings.json";
+          await fs.promises.writeFile(path.join(tempDir, settings), JSON.stringify(configured));
+        } else {
+          settings = configured;
+        }
+        const { setModelSpy } = mockQueryWithModels([
+          { value: "default", displayName: "Default", description: "" },
+          { value: "sonnet", displayName: "Sonnet", description: "" },
+        ]);
+        const { ClaudeAcpAgent } = await import("../acp-agent.js");
+        const agent = new ClaudeAcpAgent(createMockClient());
+        try {
+          const response = await (agent as any).createSession({
+            cwd: tempDir,
+            mcpServers: [],
+            _meta: { claudeCode: { options: { settings } } },
+          });
+          expect(querySpy.mock.calls[0][0].options.settings).toEqual(configured);
+          const ids = ["default", ...Object.values(configured.modelOverrides)];
+          expect(
+            agent.sessions[response.sessionId].models.availableModels.map(
+              (model: any) => model.modelId,
+            ),
+          ).toEqual(ids);
+          const modelOption = response.configOptions.find((option: any) => option.id === "model");
+          expect(modelOption.options.map((option: any) => option.value)).toEqual(ids);
+          await agent.setSessionConfigOption({
+            sessionId: response.sessionId,
+            configId: "model",
+            value: ids[2],
+          });
+          expect(setModelSpy).toHaveBeenLastCalledWith(ids[2]);
+          expect(agent.sessions[response.sessionId].modelInfos.map((model) => model.value)).toEqual(
+            ids,
+          );
+        } finally {
+          await agent.dispose();
+          vi.unstubAllEnvs();
+        }
+      },
+    );
+
+    it("merges file settings with caller settings after caller keys replace the env config", async () => {
+      await fs.promises.writeFile(
+        path.join(tempDir, "settings.json"),
+        JSON.stringify({
+          availableModels: ["claude-sonnet-4-6", "claude-haiku-4-5"],
+          modelOverrides: {
+            "claude-sonnet-4-6": "file-sonnet",
+            "claude-haiku-4-5": "file-haiku",
+          },
+        }),
+      );
+      vi.stubEnv(
+        "CLAUDE_MODEL_CONFIG",
+        JSON.stringify({
+          availableModels: ["claude-opus-4-6"],
+          modelOverrides: { "claude-sonnet-4-6": "env-sonnet", "claude-haiku-4-5": "env-haiku" },
+        }),
+      );
+      mockQueryWithModels([{ value: "default", displayName: "Default", description: "" }]);
+      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const agent = new ClaudeAcpAgent(createMockClient());
+      const settings = {
+        availableModels: ["claude-haiku-4-5", "claude-haiku-5-5"],
+        modelOverrides: { "claude-haiku-4-5": "caller-haiku" },
+      };
+      try {
+        const response = await (agent as any).createSession({
+          cwd: tempDir,
+          mcpServers: [],
+          _meta: { claudeCode: { options: { settings } } },
+        });
+        expect(querySpy.mock.calls[0][0].options.settings).toEqual(settings);
+        const modelOption = response.configOptions.find((option: any) => option.id === "model");
+        expect(modelOption.options.map((option: any) => option.value)).toEqual([
+          "default",
+          "file-sonnet",
+          "caller-haiku",
+          "claude-haiku-5-5",
+        ]);
+      } finally {
+        await agent.dispose();
+        vi.unstubAllEnvs();
+      }
+    });
+
+    it.each([[], undefined])(
+      "preserves empty and absent configured allowlists: %j",
+      async (availableModels) => {
+        vi.stubEnv(
+          "CLAUDE_MODEL_CONFIG",
+          JSON.stringify({
+            availableModels,
+            modelOverrides: { "claude-haiku-4-5": "provider-haiku" },
+          }),
+        );
+        mockQueryWithModels([
+          { value: "default", displayName: "Default", description: "" },
+          { value: "sonnet", displayName: "Sonnet", description: "" },
+        ]);
+        const { ClaudeAcpAgent } = await import("../acp-agent.js");
+        const agent = new ClaudeAcpAgent(createMockClient());
+        try {
+          const response = await (agent as any).createSession({ cwd: tempDir, mcpServers: [] });
+          const modelOption = response.configOptions.find((option: any) => option.id === "model");
+          expect(modelOption.options.map((option: any) => option.value)).toEqual(
+            availableModels ? ["default"] : ["default", "sonnet"],
+          );
+        } finally {
+          await agent.dispose();
+          vi.unstubAllEnvs();
+        }
+      },
+    );
+
     it("restricts configOptions to the user's allowlist using their exact IDs", async () => {
       // Reproduces the scenario from
       // https://github.com/agentclientprotocol/claude-agent-acp/issues/620:
