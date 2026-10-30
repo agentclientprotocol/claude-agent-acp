@@ -62,18 +62,31 @@ describe("model selection settings policy", () => {
     });
   });
 
-  it("does not use an inline mapping for a managed allowlist without mappings", async () => {
+  it("preserves file and inline mappings when the managed allowlist supplies no mappings", async () => {
     vi.mocked(resolveSettings).mockResolvedValue({
-      effective: { availableModels: ["claude-haiku-4-5"] },
+      effective: {
+        availableModels: ["claude-haiku-4-5"],
+        modelOverrides: { "claude-haiku-4-5": "file-haiku" },
+      },
       provenance: {},
-      sources: [{ source: "managed", settings: { availableModels: ["claude-haiku-4-5"] } }],
+      sources: [
+        { source: "user", settings: { modelOverrides: { "claude-haiku-4-5": "file-haiku" } } },
+        { source: "managed", settings: { availableModels: ["claude-haiku-4-5"] } },
+      ],
     });
     manager = new SettingsManager(process.cwd());
     await manager.initialize();
+    expect(manager.getModelSelectionSettings()).toEqual({
+      availableModels: ["claude-haiku-4-5"],
+      modelOverrides: { "claude-haiku-4-5": "file-haiku" },
+    });
     expect(
       manager.getModelSelectionSettings({
         modelOverrides: { "claude-haiku-4-5": "inline-haiku" },
       }),
-    ).toEqual({ availableModels: ["claude-haiku-4-5"], modelOverrides: undefined });
+    ).toEqual({
+      availableModels: ["claude-haiku-4-5"],
+      modelOverrides: { "claude-haiku-4-5": "inline-haiku" },
+    });
   });
 });
