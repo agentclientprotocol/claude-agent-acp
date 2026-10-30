@@ -11,12 +11,36 @@ describe("model selection settings policy", () => {
   let manager: SettingsManager;
   afterEach(() => manager?.dispose());
 
-  it("keeps the managed allowlist and mappings above inline settings", async () => {
-    const managed = {
-      availableModels: ["claude-haiku-4-5"],
-      modelOverrides: { "claude-haiku-4-5": "managed-haiku" },
-      deniedModels: ["claude-opus-5"],
-    };
+  it.each([{ availableModels: ["claude-haiku-4-5"] }, { availableModels: [] }])(
+    "keeps the managed allowlist %j and mappings above inline settings",
+    async ({ availableModels }) => {
+      const managed = {
+        availableModels,
+        modelOverrides: { "claude-haiku-4-5": "managed-haiku" },
+        deniedModels: ["claude-opus-5"],
+      };
+      vi.mocked(resolveSettings).mockResolvedValue({
+        effective: managed,
+        provenance: {},
+        sources: [{ source: "managed", settings: managed }],
+      });
+      manager = new SettingsManager(process.cwd());
+      await manager.initialize();
+      expect(
+        manager.getModelSelectionSettings({
+          availableModels: ["claude-opus-5"],
+          modelOverrides: { "claude-haiku-4-5": "inline-haiku" },
+        }),
+      ).toEqual({
+        availableModels: managed.availableModels,
+        modelOverrides: managed.modelOverrides,
+      });
+      expect(manager.getManagedDeniedModels()).toEqual(managed.deniedModels);
+    },
+  );
+
+  it("keeps managed override keys above inline keys without discarding other inline mappings", async () => {
+    const managed = { modelOverrides: { "claude-haiku-4-5": "managed-haiku" } };
     vi.mocked(resolveSettings).mockResolvedValue({
       effective: managed,
       provenance: {},
@@ -26,11 +50,16 @@ describe("model selection settings policy", () => {
     await manager.initialize();
     expect(
       manager.getModelSelectionSettings({
-        availableModels: ["claude-opus-5"],
-        modelOverrides: { "claude-haiku-4-5": "inline-haiku" },
+        availableModels: ["claude-haiku-4-5", "claude-sonnet-4-6"],
+        modelOverrides: {
+          "claude-haiku-4-5": "inline-haiku",
+          "claude-sonnet-4-6": "inline-sonnet",
+        },
       }),
-    ).toEqual({ availableModels: managed.availableModels, modelOverrides: managed.modelOverrides });
-    expect(manager.getManagedDeniedModels()).toEqual(managed.deniedModels);
+    ).toEqual({
+      availableModels: ["claude-haiku-4-5", "claude-sonnet-4-6"],
+      modelOverrides: { "claude-haiku-4-5": "managed-haiku", "claude-sonnet-4-6": "inline-sonnet" },
+    });
   });
 
   it("does not use an inline mapping for a managed allowlist without mappings", async () => {
