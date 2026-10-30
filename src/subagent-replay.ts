@@ -34,6 +34,7 @@
  */
 import type { SessionConfigOption } from "@agentclientprotocol/sdk/unstable";
 import type { SessionMessage } from "@anthropic-ai/claude-agent-sdk";
+import { statSync } from "node:fs";
 import type { AcpSessionNotification, SubagentState } from "./acp-subagents.js";
 import {
   childModelOption,
@@ -47,6 +48,7 @@ import {
   responseModelEntry,
   rfdEndState,
   rfdLabels,
+  sameDirectory,
   type SubagentModels,
   type WorkState,
 } from "./native-subagents.js";
@@ -71,6 +73,8 @@ export type ReplayChild = {
   /** The state of the child's last persisted task notification. */
   notified?: SubagentState;
   announced: boolean;
+  /** The `cwd` that the replay reported for it; undefined while it inherits its parent's. */
+  cwd?: string;
   promptSent: boolean;
   /** Whether it handed a report to its parent with a SubagentHandback call. */
   handedBack?: boolean;
@@ -118,6 +122,8 @@ export class RfdSubagentReplay {
      * {@link currentStates}, after the load response.
      */
     private readonly mapsDuringReplay = true,
+    /** The working directory of the root session, which a child inherits unless it reports its own. */
+    private readonly rootCwd?: string,
   ) {}
 
   /**
@@ -166,8 +172,9 @@ export class RfdSubagentReplay {
 
   /**
    * Announces `child` on its parent, as live: running, with the parent's
-   * labels. Then it sends `firstModel`, the model of the child's first
-   * response, when the transcript has one.
+   * labels, and with its recorded `cwd` when that differs from its parent's.
+   * Then it sends `firstModel`, the model of the child's first response, when
+   * the transcript has one.
    */
   async announce(child: ReplayChild, firstModel?: string): Promise<void> {
     if (child.announced) return;
@@ -176,6 +183,12 @@ export class RfdSubagentReplay {
       child.record.agentType ?? child.input.subagent_type,
       child.record.description ?? child.input.description,
     );
+    const inherited = this.effectiveCwd(child.parentSessionId);
+    const cwd =
+      child.record.cwd &&
+      (inherited === undefined || !(await sameDirectory(child.record.cwd, inherited)))
+        ? child.record.cwd
+        : undefined;
     await this.publish({
       sessionId: child.parentSessionId,
       update: {
@@ -183,11 +196,28 @@ export class RfdSubagentReplay {
         sessionId: child.sessionId,
         ...(labels.title ? { title: labels.title } : {}),
         ...(labels.description ? { description: labels.description } : {}),
+        ...(cwd ? { cwd } : {}),
         state: { state: "running" },
       },
     });
+    child.cwd = cwd;
     child.announced = true;
     await this.responseModel(child, firstModel);
+  }
+
+  /**
+   * The working directory of the session `sessionId` as the client holds it:
+   * a child's reported `cwd`, else its parent's, up to the root's.
+   */
+  private effectiveCwd(sessionId: string): string | undefined {
+    const seen = new Set<string>();
+    let child = this.byAgentId.get(sessionId);
+    while (child && !seen.has(child.sessionId)) {
+      if (child.cwd) return child.cwd;
+      seen.add(child.sessionId);
+      child = this.byAgentId.get(child.parentSessionId);
+    }
+    return this.rootCwd;
   }
 
   /**
@@ -370,6 +400,10 @@ export class RfdSubagentReplay {
    * when a live session is loaded again. Such a child reports that state and
    * can be cancelled, as live. Any other child cannot be running, because the
    * process that ran it is gone, so its replayed end is its current state.
+   *
+   * A replayed `cwd` whose directory is gone, such as a worktree that Claude
+   * Code removed when the child finished, is cleared with `cwd: null`, as the
+   * RFD requires after a reconnection.
    */
   currentStates(
     live: (sessionId: string) => WorkState["state"] | undefined,
@@ -395,6 +429,7 @@ export class RfdSubagentReplay {
               sessionUpdate: "subagent_update",
               sessionId: child.sessionId,
               ...(liveState !== undefined ? { capabilities: { cancel: {} } } : {}),
+              ...(child.cwd && !isDirectory(child.cwd) ? { cwd: null } : {}),
               state,
             },
           },
@@ -572,6 +607,15 @@ function textOf(content: unknown): string {
     )
     .filter((text): text is string => typeof text === "string")
     .join("\n");
+}
+
+/** Whether `dir` is an existing directory. */
+function isDirectory(dir: string): boolean {
+  try {
+    return statSync(dir).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 /** A message that a SendMessage call delivered to the child. */
