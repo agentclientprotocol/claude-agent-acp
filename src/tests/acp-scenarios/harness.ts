@@ -500,21 +500,17 @@ export async function runScenarioV2(
   const idles: unknown[] = [];
   const failures: string[] = [];
 
-  const each = (message: v2.AnyWireMessage) =>
-    (Array.isArray(message) ? message : [message]) as Record<string, any>[];
-  const toAgent = new TransformStream<v2.AnyWireMessage, v2.AnyWireMessage>({
+  const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>({
     transform(message, controller) {
-      for (const m of each(message)) {
-        if ("method" in m && "id" in m) methodsOfClientRequests.set(m.id, m.method);
+      if ("method" in message && "id" in message && message.id !== null) {
+        methodsOfClientRequests.set(message.id, message.method);
       }
       controller.enqueue(message);
     },
   });
-  const toClient = new TransformStream<v2.AnyWireMessage, v2.AnyWireMessage>({
+  const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>({
     transform(message, controller) {
-      for (const m of each(message)) {
-        if (recording) raw.push(wireRecord(m, methodsOfClientRequests));
-      }
+      if (recording) raw.push(wireRecord(message, methodsOfClientRequests));
       controller.enqueue(message);
     },
   });
