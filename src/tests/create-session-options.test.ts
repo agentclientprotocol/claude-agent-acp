@@ -321,6 +321,61 @@ describe("createSession options merging", () => {
     ).toBe(true);
   });
 
+  it("reports a worktree child's cwd from its SubagentStart hook, and none for a child in the session's cwd", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const client = createMockClient();
+    client.sessionUpdate = async (notification) => {
+      updates.push(notification);
+    };
+    const observedAgent = new ClaudeAcpAgent(client);
+    await observedAgent.initialize({ protocolVersion: 1, clientCapabilities: { subagents: {} } });
+    const { sessionId } = await observedAgent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    const session = observedAgent.sessions[sessionId]!;
+    const runtime = (session.nativeSubagentRuntime = new NativeSubagentRuntime(
+      "rfd",
+      sessionId,
+      session,
+      (notification) => client.sessionUpdate(notification),
+      { log: () => {} },
+    ));
+    const subagentStart = async (agentId: string, cwd: string) => {
+      const matcher = capturedOptions!.hooks!.SubagentStart!.find((matcher) => !matcher.matcher);
+      for (const hook of matcher!.hooks) {
+        await hook(
+          {
+            hook_event_name: "SubagentStart",
+            session_id: sessionId,
+            cwd,
+            transcript_path: "/tmp/transcript",
+            agent_id: agentId,
+            agent_type: "general-purpose",
+          },
+          undefined,
+          { signal: new AbortController().signal },
+        );
+      }
+    };
+    const worktree = path.join(process.cwd(), ".claude", "worktrees", "agent-isolated");
+    await subagentStart("isolated", worktree);
+    await subagentStart("shared", process.cwd());
+    await runtime.taskStarted(
+      { taskId: "isolated", subagentType: "general-purpose" },
+      async () => {},
+    );
+    await runtime.taskStarted(
+      { taskId: "shared", subagentType: "general-purpose" },
+      async () => {},
+    );
+    const announcements = updates.flatMap(({ update }) =>
+      update.sessionUpdate === "subagent_update" ? [update] : [],
+    );
+    expect(announcements).toMatchObject([
+      { sessionId: "isolated", cwd: worktree },
+      { sessionId: "shared" },
+    ]);
+    expect(announcements[1]).not.toHaveProperty("cwd");
+  });
+
   it("reports an AIR child's model switch under its current generation", async () => {
     const updates: AcpSessionNotification[] = [];
     const client = createMockClient();

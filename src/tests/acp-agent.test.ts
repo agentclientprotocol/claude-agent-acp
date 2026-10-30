@@ -4015,7 +4015,8 @@ describe("subagent transcript replay", () => {
               return [
                 ...response,
                 `${on} subagent_update ${u.sessionId} ${JSON.stringify(u.state)}` +
-                  (u.capabilities ? ` capabilities=${JSON.stringify(u.capabilities)}` : ""),
+                  (u.capabilities ? ` capabilities=${JSON.stringify(u.capabilities)}` : "") +
+                  ("cwd" in u ? ` cwd=${JSON.stringify(u.cwd)}` : ""),
               ];
             case "session_message": {
               const references = [
@@ -4054,6 +4055,51 @@ describe("subagent transcript replay", () => {
         await rm(configDir, { recursive: true, force: true });
       }
     }
+
+    it("announces a worktree child with its recorded cwd, and clears it when the worktree is gone", async () => {
+      const worktree = "/tmp/proj/.claude/worktrees/agent-wt1";
+      const trace = await replayRfd(
+        [
+          user("u1", "Go"),
+          assistant("a1", [
+            toolUse("toolu_wt", "Agent", { description: "Isolated", prompt: "Work apart" }),
+            toolUse("toolu_plain", "Agent", { description: "Shared", prompt: "Work here" }),
+          ]),
+          user("u2", [toolResult("toolu_wt", "Done."), toolResult("toolu_plain", "Done.")]),
+        ],
+        {
+          wt1: {
+            meta: {
+              agentType: "general-purpose",
+              toolUseId: "toolu_wt",
+              worktreePath: worktree,
+              spawnedWithWorktree: true,
+            },
+            records: [
+              user("w1", "Work apart", { cwd: worktree }),
+              assistant("w2", [{ type: "text", text: "Done." }], { cwd: worktree }),
+            ],
+          },
+          plain1: {
+            meta: { agentType: "general-purpose", toolUseId: "toolu_plain" },
+            records: [user("p1", "Work here"), assistant("p2", [{ type: "text", text: "Done." }])],
+          },
+        },
+        undefined,
+        { live: () => undefined },
+        { load: true },
+      );
+
+      expect(trace.filter((line) => line.includes(" subagent_update "))).toEqual([
+        `root subagent_update wt1 {"state":"running"} cwd="${worktree}"`,
+        'root subagent_update plain1 {"state":"running"}',
+        'root subagent_update plain1 {"state":"idle","stopReason":"end_turn"}',
+        'root subagent_update wt1 {"state":"idle","stopReason":"end_turn"}',
+        // After the response: the worktree no longer exists.
+        'root subagent_update wt1 {"state":"idle","stopReason":"end_turn"} cwd=null',
+        'root subagent_update plain1 {"state":"idle","stopReason":"end_turn"}',
+      ]);
+    });
 
     it("replays a fork child without the launching message and boilerplate it inherited", async () => {
       // A `subagent_type: "fork"` transcript starts with a copy of the

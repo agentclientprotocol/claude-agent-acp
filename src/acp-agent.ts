@@ -9715,6 +9715,7 @@ export class ClaudeAcpAgent {
             (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
             this.subagentModels(sessionId),
             !pending,
+            session?.cwd,
           )
         : undefined;
     rfdReplay?.scan(messages, sessionId);
@@ -10564,6 +10565,13 @@ export class ClaudeAcpAgent {
     return async (input) => {
       const session = this.sessions[sessionId];
       if (!session || !input.agent_id) return { continue: true };
+      // A hook's `cwd` is the child's working directory, e.g. its worktree.
+      // Reported before the hook returns, so before the work that follows it.
+      await session.nativeSubagentRuntime
+        ?.reportCwd(input.agent_id, input.cwd)
+        .catch((error) =>
+          this.logger.error(`Session ${sessionId}: failed to report subagent cwd: ${error}`),
+        );
       const options: SessionConfigOption[] = [];
       if (input.permission_mode) {
         const mode = session.modes.availableModes.find((mode) => mode.id === input.permission_mode);

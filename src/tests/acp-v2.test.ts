@@ -5265,9 +5265,12 @@ describe("ACP v2 session translation", () => {
       sessionId: "agent-1",
       title: "Explore",
       description: "Look around",
+      cwd: "/project/.claude/worktrees/agent-1",
       state: { state: "running" as const },
     };
     expect(v2SessionUpdate(announcement)).toEqual(announcement);
+    const cleared = { sessionUpdate: "subagent_update" as const, sessionId: "agent-1", cwd: null };
+    expect(v2SessionUpdate(cleared)).toEqual(cleared);
     const message = {
       sessionUpdate: "session_message" as const,
       messageId: "toolu_agent",
