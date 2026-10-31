@@ -457,7 +457,7 @@ describe("Claude permission ACP v1 presentation", () => {
 });
 
 describe("Claude permission presentation for a client that is not AIR", () => {
-  it("repeats the whole tool call and sends no AIR key", () => {
+  it("repeats the whole tool call, sends no AIR key, and sends the decision reason", () => {
     const input = { command: "npm test", description: "Run the tests" };
     const presentation = buildClaudePermissionPresentation({
       toolName: "Bash",
@@ -477,7 +477,20 @@ describe("Claude permission presentation for a client that is not AIR", () => {
         kind: "execute",
         content: [{ type: "terminal", terminalId: "tool-1" }],
       },
+      _meta: { claudeCode: { decisionReason: "Needed to verify the change." } },
     });
+  });
+
+  it("sends no _meta without a decision reason", () => {
+    expect(
+      buildClaudePermissionPresentation({
+        toolName: "Bash",
+        input: { command: "npm test" },
+        toolUseID: "tool-1",
+        decisionReason: "  ",
+        capabilities: new ClientCapabilities(true),
+      }),
+    ).not.toHaveProperty("_meta");
   });
 
   it("keeps the Write file text in rawInput and adds a blocked path", () => {
