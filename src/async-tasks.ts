@@ -15,6 +15,8 @@ type AsyncTask = {
   taskType: string;
   description: string;
   showInTranscript: boolean;
+  /** A Monitor tool call or an SDK `local_monitor` task: published as a monitor the client cannot stop. */
+  monitor: boolean;
   outputFilePath?: string;
   toolCallId?: string;
   /**
@@ -142,7 +144,8 @@ export class AsyncTaskRuntime {
      *  the tasks that a tool call in another session started, for example in
      *  a native subagent session. `toolNameOf`: the name of the tool of a tool
      *  call, or `undefined` when the tool call is unknown. A task that a
-     *  `Monitor` tool call started is ignored. */
+     *  `Monitor` tool call started is published as a monitor: the SDK reports
+     *  it as `local_bash`, so the adapter names it a monitor. */
     private readonly options: {
       notices?: boolean;
       routeOf?: (toolCallId: string) => Route | undefined;
@@ -155,7 +158,7 @@ export class AsyncTaskRuntime {
     const taskId = taskIdOf(message);
     if (!taskId) return;
     const task = this.task(taskId);
-    if (isSubagentTask(message) || isMonitorTask(message)) {
+    if (isSubagentTask(message)) {
       this.ignore(task);
       return;
     }
@@ -186,7 +189,7 @@ export class AsyncTaskRuntime {
     const taskId = taskIdOf(message);
     if (!taskId) return;
     const task = this.task(taskId);
-    if (isSubagentTask(message) || isMonitorTask(message)) {
+    if (isSubagentTask(message)) {
       this.ignore(task);
       return;
     }
@@ -355,7 +358,7 @@ export class AsyncTaskRuntime {
       const task = this.task(taskId);
       if (task.ignored || isTerminal(task.state)) continue;
       const levelTaskType = field(item, "taskType", "task_type");
-      if (levelTaskType === "local_agent" || levelTaskType === "local_monitor") {
+      if (levelTaskType === "local_agent") {
         this.ignore(task);
         continue;
       }
@@ -408,7 +411,13 @@ export class AsyncTaskRuntime {
 
   canStop(taskId: string): boolean {
     const task = this.tasks.get(taskId);
-    return task?.announced === true && !task.ignored && !task.stopping && !isTerminal(task.state);
+    return (
+      task?.announced === true &&
+      !task.monitor &&
+      !task.ignored &&
+      !task.stopping &&
+      !isTerminal(task.state)
+    );
   }
 
   claimStop(taskId: string): boolean {
@@ -575,6 +584,7 @@ export class AsyncTaskRuntime {
       taskType: "task",
       description: "Background task",
       showInTranscript: true,
+      monitor: false,
       announced: false,
       held: false,
       deferred: [],
@@ -595,6 +605,7 @@ export class AsyncTaskRuntime {
     task.startedObserved = true;
     const rawTaskType = field(message, "taskType", "task_type");
     if (rawTaskType !== undefined) task.taskType = friendlyTaskType(rawTaskType);
+    if (rawTaskType === "local_monitor") task.monitor = true;
     const description = nonBlankString(message.description);
     if (description) task.description = description;
     else if (task.description === "Background task")
@@ -652,6 +663,7 @@ export class AsyncTaskRuntime {
   private mergeLevel(task: AsyncTask, level: BackgroundTaskLevel): void {
     const rawTaskType = field(level, "taskType", "task_type");
     if (rawTaskType !== undefined) task.taskType = friendlyTaskType(rawTaskType);
+    if (rawTaskType === "local_monitor") task.monitor = true;
     const description = nonBlankString(level.description);
     if (description) {
       task.description = description;
@@ -676,24 +688,28 @@ export class AsyncTaskRuntime {
    * ends first, or when the prompt result ends the model turn
    * ({@link releaseHeld}). No guess by the command text binds a task.
    *
-   * A task that a `Monitor` tool call started is ignored: Monitor streams its
-   * output to the model only, so the task has nothing for the client. The
-   * tool_use streams before the tool runs, so the tool name is known when the
-   * spawn has the tool call id.
+   * A task that a `Monitor` tool call started is published as a monitor. The
+   * SDK reports it as `local_bash`, so the adapter names it a monitor instead of
+   * a shell. It has no transcript card because Monitor streams its output to
+   * the model only, and no Stop because stopping it only ends the agent's wait
+   * (the agent's own TaskStop still works). The tool_use streams before the
+   * tool runs, so the tool name is known when the spawn has the tool call id.
    */
   private async announce(
     task: AsyncTask,
     options: { withoutToolCall?: boolean } = {},
   ): Promise<void> {
     if (task.announced || task.ignored) return;
-    const toolName = task.toolCallId ? this.options.toolNameOf?.(task.toolCallId) : undefined;
-    if (toolName !== undefined && HIDDEN_TASK_TOOLS.has(toolName)) {
-      this.ignore(task);
-      return;
-    }
     if (!task.toolCallId && !options.withoutToolCall && !isTerminal(task.state)) {
       task.held = true;
       return;
+    }
+    if (task.toolCallId && this.options.toolNameOf?.(task.toolCallId) === "Monitor") {
+      task.monitor = true;
+    }
+    if (task.monitor) {
+      task.taskType = "monitor";
+      task.showInTranscript = false;
     }
     if (task.toolCallId) task.route ??= this.options.routeOf?.(task.toolCallId);
     await this.send(task, {
@@ -703,7 +719,7 @@ export class AsyncTaskRuntime {
       taskType: task.taskType,
       description: task.description,
       showInTranscript: task.showInTranscript,
-      canStop: true,
+      canStop: !task.monitor,
       ...(task.outputFilePath ? { outputFilePath: task.outputFilePath } : {}),
       ...(task.toolCallId ? { toolCallId: task.toolCallId } : {}),
     });
@@ -1049,13 +1065,6 @@ function isBackgroundTask(isBackgrounded: unknown, taskType: unknown): boolean {
   if (isBackgrounded === true) return true;
   if (isBackgrounded === false) return false;
   return taskType !== "local_bash" && taskType !== "local_agent";
-}
-
-/** The tools whose async tasks the client never sees. */
-const HIDDEN_TASK_TOOLS = new Set(["Monitor"]);
-
-function isMonitorTask(message: AsyncTaskStarted): boolean {
-  return field(message, "taskType", "task_type") === "local_monitor";
 }
 
 function isSubagentTask(message: AsyncTaskStarted): boolean {

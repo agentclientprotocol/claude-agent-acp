@@ -180,6 +180,76 @@ describe("session titles", () => {
     expect(titles()).toEqual(["Stable title"]);
   });
 
+  it("sends the current title and updatedAt on request, even when already sent", async () => {
+    const updates: any[] = [];
+    const agent = newAgent({
+      sessionUpdate: async (u: any) => {
+        updates.push(u.update);
+      },
+    } as unknown as AcpClient);
+    vi.mocked(getSessionInfo).mockResolvedValue({
+      sessionId: "test-session",
+      summary: "Fix the\nbuild",
+      lastModified: 1_700_000_000_000,
+    } as any);
+    const input = new Pushable<any>();
+    agent.sessions["test-session"] = mockSessionState(
+      { query: wrapQuery(oneTurn(input)), input },
+      agent,
+    );
+
+    await agent.publishCurrentSessionInfo("test-session");
+    await agent.publishCurrentSessionInfo("test-session");
+
+    const current = {
+      sessionUpdate: "session_info_update",
+      title: "Fix the build",
+      updatedAt: new Date(1_700_000_000_000).toISOString(),
+    };
+    expect(updates).toEqual([current, current]);
+    expect(getSessionInfo).toHaveBeenCalledWith("test-session", { dir: "/test" });
+  });
+
+  it("sends the last published title without updatedAt when the session has no file", async () => {
+    const { client, titles } = titleRecorder();
+    const agent = newAgent(client);
+    const input = new Pushable<any>();
+    agent.sessions["test-session"] = mockSessionState(
+      { query: wrapQuery(oneTurn(input)), input },
+      agent,
+    );
+
+    // No file and no title yet: nothing to send.
+    vi.mocked(getSessionInfo).mockResolvedValue(undefined);
+    await agent.publishCurrentSessionInfo("test-session");
+    expect(titles()).toEqual([]);
+
+    await agent.sessions["test-session"]!.titles.setExplicitTitle("Renamed", async () => undefined);
+    await agent.publishCurrentSessionInfo("test-session");
+    expect(titles()).toEqual(["Renamed", "Renamed"]);
+  });
+
+  it("sends a published title that isn't stored yet instead of the raw first prompt", async () => {
+    const { client, titles } = titleRecorder();
+    const agent = newAgent(client);
+    const input = new Pushable<any>();
+    agent.sessions["test-session"] = mockSessionState(
+      { query: wrapQuery(oneTurn(input)), input },
+      agent,
+    );
+    await agent.sessions["test-session"]!.titles.setExplicitTitle("Renamed", async () => undefined);
+
+    // The file has no custom title yet, so `summary` is the raw first prompt.
+    vi.mocked(getSessionInfo).mockResolvedValue({
+      sessionId: "test-session",
+      summary: "please fix the build",
+      lastModified: 1_700_000_000_000,
+    } as any);
+    await agent.publishCurrentSessionInfo("test-session");
+
+    expect(titles()).toEqual(["Renamed", "Renamed"]);
+  });
+
   /** A stream event carrying one chunk of the assistant's answer. */
   function textDelta(text: string) {
     return {

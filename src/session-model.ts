@@ -210,22 +210,12 @@ export function buildModelConfigOption(
     ? models.availableModels.filter((model) => model.modelId !== "default")
     : models.availableModels;
 
-  return {
-    id: MODEL_CONFIG_ID,
-    name: "Model",
-    description: "AI model to use",
-    category: "model",
-    type: "select",
-    currentValue:
-      concreteRecommendation && models.currentModelId === "default"
-        ? recommended.value
-        : models.currentModelId,
-    ...(concreteRecommendation
-      ? {
-          _meta: withAirMeta(undefined, AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY, recommended.value),
-        }
-      : {}),
-    options: available.map((model) => {
+  const currentValue =
+    concreteRecommendation && models.currentModelId === "default"
+      ? recommended.value
+      : models.currentModelId;
+  const options: Array<{ value: string; name: string; description?: string }> = available.map(
+    (model) => {
       if (model.modelId === "default" && defaultInfo?.resolvedModel) {
         const named = modelInfos.find(
           (info) => info.value !== "default" && info.resolvedModel === defaultInfo.resolvedModel,
@@ -241,7 +231,35 @@ export function buildModelConfigOption(
         name: model.name,
         description: model.description ?? undefined,
       };
-    }),
+    },
+  );
+  // ACP requires `currentValue` to be one of `options`. A session can run a
+  // model the picker does not list: resumed onto a model excluded by the
+  // `availableModels` allowlist, or switched by a refusal fallback. List that
+  // model as its own entry. It is not added to `models.availableModels`, so the
+  // next rebuild after switching to a listed model drops it.
+  if (!options.some((option) => option.value === currentValue)) {
+    const info = modelInfos.find((model) => model.value === currentValue);
+    options.push({
+      value: currentValue,
+      name: info?.displayName || currentValue,
+      description: info?.description || undefined,
+    });
+  }
+
+  return {
+    id: MODEL_CONFIG_ID,
+    name: "Model",
+    description: "AI model to use",
+    category: "model",
+    type: "select",
+    currentValue,
+    ...(concreteRecommendation
+      ? {
+          _meta: withAirMeta(undefined, AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY, recommended.value),
+        }
+      : {}),
+    options,
   };
 }
 

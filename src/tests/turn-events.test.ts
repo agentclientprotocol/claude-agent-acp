@@ -836,9 +836,9 @@ describe("turn events", () => {
   it("rejects a prompt that it refuses before starting a turn, and reports nothing", async () => {
     const turn = recordEvents();
 
-    await expect(agent.startTurn(prompt("no-such-session", "hello"), turn.events)).rejects.toThrow(
-      "Session not found",
-    );
+    await expect(
+      agent.startTurn(prompt("no-such-session", "hello"), turn.events),
+    ).rejects.toMatchObject({ code: -32002, data: { sessionId: "no-such-session" } });
 
     expect(turn.log).toEqual([]);
   });

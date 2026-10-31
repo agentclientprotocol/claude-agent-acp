@@ -1002,6 +1002,129 @@ describe("NativeSubagentRuntime in the RFD form", () => {
     ]);
   });
 
+  describe("a child's working directory", () => {
+    const worktree = "/project/.claude/worktrees/agent-1";
+    function cwdRuntime(form: "rfd" | "air" = "rfd") {
+      const published: AcpSessionNotification[] = [];
+      const runtime = new NativeSubagentRuntime(
+        form,
+        "root",
+        { cwd: "/project" },
+        async (notification) => {
+          published.push(notification);
+        },
+        { log: () => {} },
+      );
+      const deliver = async (notification: AcpSessionNotification) => {
+        const routed = await runtime.route(notification, deliver);
+        if (routed) published.push(routed);
+      };
+      const toolCall = (toolCallId: string, parentToolUseId: string): AcpSessionNotification =>
+        ({
+          sessionId: "root",
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId,
+            title: "Read",
+            status: "pending",
+            _meta: { claudeCode: { toolName: "Read", parentToolUseId } },
+          },
+        }) as AcpSessionNotification;
+      return { runtime, published, deliver, toolCall };
+    }
+    const trace = (published: AcpSessionNotification[]) =>
+      published.map(({ sessionId, update }) => {
+        const u = update as any;
+        return update.sessionUpdate === "subagent_update"
+          ? `${sessionId} subagent_update ${u.sessionId}` +
+              ("cwd" in u ? ` cwd=${JSON.stringify(u.cwd)}` : "")
+          : `${sessionId} ${update.sessionUpdate}`;
+      });
+
+    it("announces a worktree child with its cwd, before its first tool call", async () => {
+      const { runtime, published, deliver, toolCall } = cwdRuntime();
+      // The child's SubagentStart hook can come before its task_started.
+      await runtime.reportCwd("worker-1", worktree);
+      expect(published).toEqual([]);
+      await runtime.taskStarted(
+        { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+        deliver,
+      );
+      await deliver(toolCall("read-1", "launch-1"));
+      await deliver(launch("launch-1", {}));
+      expect(trace(published)).toEqual([
+        `root subagent_update worker-1 cwd="${worktree}"`,
+        "worker-1 tool_call",
+      ]);
+      // Later hooks of the same directory report nothing new.
+      await runtime.reportCwd("worker-1", worktree);
+      expect(published).toHaveLength(2);
+    });
+
+    it("reports the cwd of an announced child at once, and null when it is back in its parent's", async () => {
+      const { runtime, published, deliver, toolCall } = cwdRuntime();
+      await runtime.taskStarted(
+        { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+        deliver,
+      );
+      await deliver(launch("launch-1", {}));
+      await runtime.reportCwd("worker-1", worktree);
+      await deliver(toolCall("read-1", "launch-1"));
+      await runtime.reportCwd("worker-1", "/project/");
+      expect(trace(published)).toEqual([
+        "root subagent_update worker-1",
+        `root subagent_update worker-1 cwd="${worktree}"`,
+        "worker-1 tool_call",
+        "root subagent_update worker-1 cwd=null",
+      ]);
+    });
+
+    it("omits the cwd of a child in its parent's directory, also for a nested child in its parent's worktree", async () => {
+      const { runtime, published, deliver } = cwdRuntime();
+      await runtime.reportCwd("worker-1", "/project");
+      await deliver(launch("launch-1", {}));
+      await runtime.taskStarted(
+        { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+        deliver,
+      );
+      await runtime.reportCwd("outer", worktree);
+      await deliver(launch("launch-outer", {}));
+      await runtime.taskStarted(
+        { taskId: "outer", toolUseId: "launch-outer", subagentType: "Explore" },
+        deliver,
+      );
+      await runtime.reportCwd("inner", worktree);
+      await deliver(launch("launch-inner", {}, "launch-outer"));
+      await runtime.taskStarted(
+        { taskId: "inner", toolUseId: "launch-inner", subagentType: "Explore" },
+        deliver,
+      );
+      expect(
+        trace(published).filter(
+          (line) =>
+            line.startsWith("root subagent_update") || line.startsWith("outer subagent_update"),
+        ),
+      ).toEqual([
+        "root subagent_update worker-1",
+        `root subagent_update outer cwd="${worktree}"`,
+        "outer subagent_update inner",
+      ]);
+    });
+
+    it("reports no cwd in AIR's draft, whose subagent_spawned has no such field", async () => {
+      const { runtime, published, deliver } = cwdRuntime("air");
+      await runtime.reportCwd("worker-1", worktree);
+      await deliver(launch("launch-1", {}));
+      await runtime.taskStarted(
+        { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+        deliver,
+      );
+      await runtime.reportCwd("worker-1", "/elsewhere");
+      expect(published.map(({ update }) => update.sessionUpdate)).toEqual(["subagent_spawned"]);
+      expect(JSON.stringify(published)).not.toContain("cwd");
+    });
+  });
+
   it("serializes concurrent config publications and retries a failed snapshot", async () => {
     const started = deferred();
     const release = deferred();
@@ -1087,8 +1210,8 @@ describe("NativeSubagentRuntime in the RFD form", () => {
         update: {
           sessionUpdate: "subagent_update",
           sessionId: "worker-1",
-          title: "builder (Explore)",
-          description: "Fix the build",
+          title: "builder",
+          description: "Explore",
           capabilities: { cancel: {} },
           state: { state: "running" },
         },
@@ -1297,10 +1420,10 @@ describe("NativeSubagentRuntime in the RFD form", () => {
     expect(published).toEqual([]);
   });
 
-  it("titles a child without a name by its role", async () => {
+  it("titles a child without a name by its task, and describes it by its role", async () => {
     const { published } = await runningWorker();
 
-    expect(published[0]?.update).toMatchObject({ title: "Explore", description: "Fix the build" });
+    expect(published[0]?.update).toMatchObject({ title: "Fix the build", description: "Explore" });
   });
 
   it("keeps the session of an idle child, which a resume runs again", async () => {
@@ -1569,8 +1692,8 @@ describe("NativeSubagentRuntime in the RFD form", () => {
           update: {
             sessionUpdate: "subagent_update",
             sessionId: "echoer-1",
-            title: "echoer (Explore)",
-            description: "Echo a word",
+            title: "echoer",
+            description: "Explore",
             capabilities: { cancel: {} },
             state: { state: "running" },
           },
@@ -1623,8 +1746,8 @@ describe("NativeSubagentRuntime in the RFD form", () => {
       expect(published[0]?.update).toEqual({
         sessionUpdate: "subagent_update",
         sessionId: "coordinator-1",
-        title: "coordinator (general-purpose)",
-        description: "Coordinate",
+        title: "coordinator",
+        description: "general-purpose",
       });
     });
 
@@ -1825,7 +1948,7 @@ describe("NativeSubagentRuntime in the RFD form", () => {
     });
   });
 
-  it("keeps the role in the title when a late frame names the child", async () => {
+  it("titles the child by the name a late frame gives it, and keeps its role", async () => {
     const published: AcpSessionNotification[] = [];
     const runtime = new NativeSubagentRuntime(
       "rfd",
@@ -1842,7 +1965,7 @@ describe("NativeSubagentRuntime in the RFD form", () => {
     );
     await runtime.route(launch("launch-1", { name: "builder" }), async () => {});
 
-    expect(published[0]?.update).toMatchObject({ title: "builder (Explore)" });
+    expect(published[0]?.update).toMatchObject({ title: "builder", description: "Explore" });
   });
 
   it("reports nothing when the parent is cancelled, until the SDK ends the child", async () => {

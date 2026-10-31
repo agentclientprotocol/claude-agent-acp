@@ -107,6 +107,11 @@ export class V2ToolCallMeta {
     return result;
   }
 
+  /** Whether this connection reported the tool call, so the client holds it. */
+  reported(sessionId: string, toolCallId: string): boolean {
+    return this.calls.has(`${sessionId} ${toolCallId}`);
+  }
+
   /** Forgets the tool calls of a session, when it closes. */
   forget(sessionId: string): void {
     for (const key of this.calls.keys()) {

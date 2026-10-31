@@ -1,3 +1,4 @@
+import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import type {
   SessionConfigOption,
   SetSessionConfigOptionRequest,
@@ -24,7 +25,7 @@ export type UltracodeSettingsReport = {
 };
 
 // `Query.getSettings()` exists at runtime (sdk.mjs) but is missing from the
-// SDK's type declarations as of 0.3.310.
+// SDK's type declarations as of 0.3.312.
 type GetSettingsQuery = Query & {
   getSettings?: () => Promise<{
     applied?: { ultracodeAvailable?: unknown; ultracodeRequested?: unknown };
@@ -132,5 +133,8 @@ export function resolveUltracodeEnabled(params: SetSessionConfigOptionRequest): 
   if (typeof value === "boolean") return value;
   if (value === ULTRACODE_ON) return true;
   if (value === ULTRACODE_OFF) return false;
-  throw new Error(`Invalid value for config option ${ULTRACODE_CONFIG_ID}: ${value}`);
+  throw RequestError.invalidParams(
+    undefined,
+    `Invalid value for config option ${ULTRACODE_CONFIG_ID}: ${value}`,
+  );
 }

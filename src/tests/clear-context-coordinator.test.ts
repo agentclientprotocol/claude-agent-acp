@@ -28,6 +28,7 @@ function testSession(overrides: Partial<TestSession> = {}): TestSession {
       },
     },
     models: { currentModelId: "default" },
+    contextWindowSize: 200_000,
     configOptions: [],
     currentAgent: "default",
     fastModeEnabled: false,
@@ -357,6 +358,7 @@ describe("ExitPlanCoordinator", () => {
       ...baseHost,
       sessionUpdate: vi.fn(async () => {}),
       supportsPlanOperations: () => true,
+      isAirClient: () => false,
       destroyReplacement,
       settleCancelledTurn,
       settleFailedTurn: vi.fn(),
@@ -402,6 +404,7 @@ describe("ExitPlanCoordinator", () => {
       ...baseHost,
       sessionUpdate: vi.fn(async () => {}),
       supportsPlanOperations: () => true,
+      isAirClient: () => false,
       destroyReplacement: vi.fn(),
       settleCancelledTurn: vi.fn(),
       settleFailedTurn,
@@ -421,9 +424,14 @@ describe("ExitPlanCoordinator", () => {
   });
 
   it.each([
-    ["publishes the approved plan after the session state, before the fresh context runs", true],
-    ["publishes no plan to a client without plan operations", false],
-  ])("%s", async (_, supportsPlanOperations) => {
+    [
+      "publishes the approved plan after the session state, before the fresh context runs",
+      true,
+      false,
+    ],
+    ["links the approved AIR plan after a context reset", true, true],
+    ["publishes no plan to a client without plan operations", false, false],
+  ])("%s", async (_, supportsPlanOperations, airClient) => {
     const turn: ClearContextTurn = {
       settled: false,
       promptUuid: "00000000-0000-4000-8000-000000000000",
@@ -442,6 +450,7 @@ describe("ExitPlanCoordinator", () => {
         );
       }),
       supportsPlanOperations: () => supportsPlanOperations,
+      isAirClient: () => airClient,
       destroyReplacement: vi.fn(),
       settleCancelledTurn: vi.fn(),
       settleFailedTurn: vi.fn(),
@@ -456,14 +465,32 @@ describe("ExitPlanCoordinator", () => {
     expect(order).toEqual([
       "current_mode_update",
       "config_option_update",
+      "usage_update",
       ...(supportsPlanOperations
         ? [
             "plan_update " +
-              JSON.stringify({ type: "markdown", planId: "plan-mode", content: "Ship it" }),
+              JSON.stringify({
+                type: "markdown",
+                planId: airClient ? "plan-mode:tool-plan" : "plan-mode",
+                content: "Ship it",
+              }),
           ]
         : []),
       "continuation",
     ]);
+    expect(host.sessionUpdate).toHaveBeenCalledWith({
+      sessionId: "public-session",
+      update: { sessionUpdate: "usage_update", used: 0, size: 200_000 },
+    });
+    if (airClient) {
+      expect(host.sessionUpdate).toHaveBeenCalledWith({
+        sessionId: "public-session",
+        update: {
+          sessionUpdate: "plan_update",
+          plan: { type: "markdown", planId: "plan-mode:tool-plan", content: "Ship it" },
+        },
+      });
+    }
   });
 });
 

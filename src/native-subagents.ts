@@ -3,6 +3,8 @@ import {
   type SessionConfigOption,
   type SessionNotification,
 } from "@agentclientprotocol/sdk/unstable";
+import { realpath } from "node:fs/promises";
+import path from "node:path";
 import type { AcpSessionNotification, SubagentForm, SubagentState } from "./acp-subagents.js";
 import { AIR_SUBAGENT_KEY, airExtensionMeta } from "./air-extension.js";
 import { MODEL_CONFIG_ID } from "./session-model.js";
@@ -25,11 +27,14 @@ export type NativeSubagent = {
    * form. It is absent when the adapter has no prompt.
    */
   prompt?: string;
-  /** The RFD form: the parent's label for the child, `subagent_update.title`. */
+  /**
+   * The RFD form: the parent's label for the child, `subagent_update.title`:
+   * its name, else its task.
+   */
   title?: string;
-  /** The RFD form: the child's role, its `subagent_type`, for the title. */
+  /** The RFD form: the child's role, its `subagent_type`. */
   role?: string;
-  /** The RFD form: the child's purpose, `subagent_update.description`. */
+  /** The RFD form: `subagent_update.description`, the child's role. */
   description?: string;
   /**
    * The RFD form: the work state the client holds. The child is reusable, so
@@ -53,14 +58,23 @@ export type NativeSubagent = {
   /** The RFD form: the calls that delegated to the child, whose runs handed back a report. */
   handedBack?: Set<string>;
   announced?: boolean;
+  /**
+   * The RFD form: the `cwd` that the client holds for the child. Undefined or
+   * null while the child inherits its parent's working directory.
+   */
+  reportedCwd?: string | null;
   terminalState?: SubagentState;
   /** Connection-local single-flight state; never serialized on the wire. */
   announcePromise?: Promise<void>;
+  /** Connection-local: serializes the child's `cwd` reports; never serialized on the wire. */
+  cwdPublishing?: Promise<void>;
   /** Connection-local single-flight state; never serialized on the wire. */
   terminalPromise?: Promise<void>;
 };
 
 export type NativeSubagentSession = {
+  /** The working directory of the root session, which a child inherits unless it reports its own. */
+  cwd?: string;
   nativeSubagentsByTaskId?: Map<string, NativeSubagent>;
   nativeSubagentTaskIdByToolUseId?: Map<string, string>;
   nativeSubagentParentByToolUseId?: Map<string, string>;
@@ -130,6 +144,8 @@ export type HistoricalSubagent = {
   launchId: string;
   /** The agent that made that call. None means the root session. */
   parentAgentId?: string;
+  /** Its working directory, when Claude Code placed it elsewhere, e.g. in a worktree. */
+  cwd?: string;
   name?: string;
   agentType?: string;
   description?: string;
@@ -169,6 +185,11 @@ export class NativeSubagentRuntime {
   private readonly identityByToolUse = new Map<string, SubagentIdentity>();
   private readonly controlByToolUse = new Map<string, AcpSessionNotification>();
   private readonly configBySession = new Map<string, ChildConfiguration>();
+  /**
+   * The RFD form: the working directory of each child, by session id, as its
+   * hooks last reported it. A hook can come before the child is announced.
+   */
+  private readonly cwdBySession = new Map<string, string>();
   private readonly childByParentToolUse = new Map<string, NativeSubagent>();
   /**
    * The child session of each tool call that went to a child session. A later
@@ -394,6 +415,83 @@ export class NativeSubagentRuntime {
     });
     // The caller receives the error; later observations must still be able to retry.
     config.publishing = publishing.catch(() => {});
+    await publishing;
+  }
+
+  /**
+   * The RFD form: takes the working directory of the child `agentId`, the
+   * `cwd` of one of its hooks. A child that Claude Code runs in its own
+   * worktree (Agent `isolation: "worktree"`) reports the worktree. The client
+   * gets the `cwd` only when it differs from the parent's, in the
+   * announcement or in a `subagent_update` right after it. Claude Code runs a
+   * child's SubagentStart hook before its first model request, so the `cwd`
+   * reaches the client before the child's first tool call.
+   */
+  async reportCwd(agentId: string, cwd: string): Promise<void> {
+    if (this.form !== "rfd" || agentId === this.rootSessionId || !path.isAbsolute(cwd)) return;
+    const known = this.children.get(agentId) ?? this.childOfSession(agentId);
+    const sessionId = known?.sessionId ?? agentId;
+    if (!known && !this.cwdBySession.has(sessionId)) {
+      const pending = [...this.cwdBySession.keys()].filter((id) => !this.childOfSession(id)).length;
+      if (pending >= MAX_PENDING_PARENTS) {
+        this.logger.log(
+          `Session ${this.rootSessionId}: dropping cwd for unannounced subagent ${agentId}; pending buffer limit reached`,
+        );
+        return;
+      }
+    }
+    this.cwdBySession.set(sessionId, cwd);
+    if (!known) return;
+    // An announcement in flight may have been built without this `cwd`.
+    if (known.announcePromise) await known.announcePromise.catch(() => {});
+    if (known.announced) await this.publishCwd(known);
+  }
+
+  /**
+   * The `cwd` of `child` that the client does not hold yet: its working
+   * directory when that differs from its parent's, `null` when it is back in
+   * the parent's after it reported another, else undefined.
+   */
+  private async unreportedCwd(child: NativeSubagent): Promise<string | null | undefined> {
+    const cwd = this.cwdBySession.get(child.sessionId);
+    if (cwd === undefined) return undefined;
+    const inherited = this.effectiveCwd(child.parentSessionId);
+    if (inherited !== undefined && (await sameDirectory(cwd, inherited))) {
+      return child.reportedCwd ? null : undefined;
+    }
+    return cwd === child.reportedCwd ? undefined : cwd;
+  }
+
+  /**
+   * The working directory of the session `sessionId` as the client holds it:
+   * the root's from session setup, a child's reported `cwd`, else its
+   * parent's.
+   */
+  private effectiveCwd(sessionId: string): string | undefined {
+    const seen = new Set<string>();
+    let child = this.childOfSession(sessionId);
+    while (child && !seen.has(child.sessionId)) {
+      if (child.reportedCwd) return child.reportedCwd;
+      seen.add(child.sessionId);
+      child = this.childOfSession(child.parentSessionId);
+    }
+    return this.session.cwd;
+  }
+
+  /** The RFD form: sends the `cwd` of the announced `child` that the client does not hold. */
+  private async publishCwd(child: NativeSubagent): Promise<void> {
+    if (this.form !== "rfd") return;
+    // Concurrent hooks of one child report the same `cwd` once.
+    const publishing = (child.cwdPublishing ?? Promise.resolve()).then(async () => {
+      const cwd = await this.unreportedCwd(child);
+      if (cwd === undefined) return;
+      await this.publish({
+        sessionId: child.parentSessionId,
+        update: { sessionUpdate: "subagent_update", sessionId: child.sessionId, cwd },
+      });
+      child.reportedCwd = cwd;
+    });
+    child.cwdPublishing = publishing.catch(() => {});
     await publishing;
   }
 
@@ -920,9 +1018,14 @@ export class NativeSubagentRuntime {
         this.childByParentToolUse.set(entry.launchId, child);
       }
       if (child.announced) continue;
+      // A hook of the resumed agent may have reported a newer `cwd`.
+      if (entry.cwd && !this.cwdBySession.has(child.sessionId)) {
+        this.cwdBySession.set(child.sessionId, entry.cwd);
+      }
       if (entry.agentId === agentId) {
         await this.announce(child);
       } else {
+        const cwd = await this.unreportedCwd(child);
         await this.publish({
           sessionId: child.parentSessionId,
           update: {
@@ -930,8 +1033,10 @@ export class NativeSubagentRuntime {
             sessionId: child.sessionId,
             ...(child.title ? { title: child.title } : {}),
             ...(child.description ? { description: child.description } : {}),
+            ...(cwd ? { cwd } : {}),
           },
         });
+        if (cwd) child.reportedCwd = cwd;
         child.announced = true;
       }
       for (const pending of this.takePending(entry.launchId)) await deliver(pending);
@@ -1100,6 +1205,7 @@ export class NativeSubagentRuntime {
   private withdraw(taskId: string, child: NativeSubagent): void {
     this.children.delete(taskId);
     this.configBySession.delete(child.sessionId);
+    this.cwdBySession.delete(child.sessionId);
     if (child.parentToolUseId) {
       this.takePending(child.parentToolUseId);
       this.cleanupControl(child.parentToolUseId);
@@ -1122,12 +1228,16 @@ export class NativeSubagentRuntime {
   }
 
   /**
-   * Announces `child` in the client's form, then its configuration. A runtime
-   * without a form never does.
+   * Announces `child` in the client's form, with its `cwd` in the RFD form,
+   * then its configuration. A runtime without a form never does.
    */
   private async announce(child: NativeSubagent): Promise<void> {
     if (!this.form) return;
-    await announceNativeSubagent(child, this.publish, this.form);
+    const cwd =
+      this.form === "rfd" && !child.announced ? await this.unreportedCwd(child) : undefined;
+    await announceNativeSubagent(child, this.publish, this.form, cwd ?? undefined);
+    // A hook that reported a `cwd` while the announcement was being built.
+    await this.publishCwd(child);
     await this.publishConfiguration(child);
   }
 
@@ -1393,6 +1503,7 @@ export class NativeSubagentRuntime {
     this.identityByToolUse.clear();
     this.controlByToolUse.clear();
     this.configBySession.clear();
+    this.cwdBySession.clear();
     this.childByParentToolUse.clear();
     this.taskFinishPromises.clear();
     this.senderByToolUse.clear();
@@ -1598,6 +1709,7 @@ export async function announceNativeSubagent(
   child: NativeSubagent,
   publish: Publish,
   form: SubagentForm,
+  cwd?: string,
 ): Promise<void> {
   if (child.announced) return;
   if (child.announcePromise) return child.announcePromise;
@@ -1611,10 +1723,12 @@ export async function announceNativeSubagent(
           sessionId: child.sessionId,
           ...(child.title ? { title: child.title } : {}),
           ...(child.description ? { description: child.description } : {}),
+          ...(cwd ? { cwd } : {}),
           capabilities: { cancel: {} },
           state: { state: "running" },
         },
       });
+      if (cwd) child.reportedCwd = cwd;
       child.announced = true;
       // The immediate parent made the Agent/Task call that launched the child.
       if (child.prompt) {
@@ -1746,11 +1860,11 @@ export function linkedSessionMessages(
   return [
     {
       sessionId: senderSessionId,
-      update: { ...message, recipientMessageId: toolUseId } as AcpSessionNotification["update"],
+      update: { ...message, recipientMessageId: toolUseId },
     },
     {
       sessionId: recipientSessionId,
-      update: { ...message, senderMessageId: toolUseId } as AcpSessionNotification["update"],
+      update: { ...message, senderMessageId: toolUseId },
     },
   ];
 }
@@ -1868,26 +1982,22 @@ export function rfdEndState(state: SubagentState, end: TaskEnd | undefined): Wor
 }
 
 /**
- * The RFD form: the parent's labels for a child. The title is the agent's
- * name, with its role after it when both are known, else the role. The
- * description is the task's short description, never the prompt.
+ * The RFD form: the parent's labels for a child. The title is what tells
+ * siblings apart: the agent's name when it has one, else the task's short
+ * description (never the prompt), else its role. The description is the
+ * role, its `subagent_type`, unless the role is already the title.
  */
 export function rfdLabels(
   name: unknown,
   role: unknown,
   description: unknown,
 ): { title?: string; role?: string; description?: string } {
-  const agentName = nonBlankString(name);
   const agentRole = nonBlankString(role);
-  const title =
-    agentName && agentRole && agentName !== agentRole
-      ? `${agentName} (${agentRole})`
-      : (agentName ?? agentRole);
-  const text = nonBlankString(description);
+  const title = nonBlankString(name) ?? nonBlankString(description) ?? agentRole;
   return {
     ...(title ? { title } : {}),
     ...(agentRole ? { role: agentRole } : {}),
-    ...(text ? { description: text } : {}),
+    ...(agentRole && agentRole !== title ? { description: agentRole } : {}),
   };
 }
 
@@ -2155,4 +2265,16 @@ function promptField(prompt: string | undefined): { prompt?: string } {
 
 function nonBlankString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+/**
+ * Whether `left` and `right` are the same directory, also when one is
+ * spelled through a symlink, e.g. `/tmp/project` and `/private/tmp/project`
+ * on macOS. A path that does not exist is compared as written.
+ */
+export async function sameDirectory(left: string, right: string): Promise<boolean> {
+  if (path.resolve(left) === path.resolve(right)) return true;
+  const real = (dir: string) => realpath(dir).catch(() => path.resolve(dir));
+  const [realLeft, realRight] = await Promise.all([real(left), real(right)]);
+  return realLeft === realRight;
 }

@@ -79,7 +79,10 @@ describe("ultracode helpers", () => {
     expect(resolveUltracodeEnabled(request(true))).toBe(true);
     expect(resolveUltracodeEnabled(request(ULTRACODE_OFF))).toBe(false);
     expect(() => resolveUltracodeEnabled(request("maybe"))).toThrow(
-      "Invalid value for config option ultracode: maybe",
+      expect.objectContaining({
+        code: -32602,
+        message: expect.stringContaining("Invalid value for config option ultracode: maybe"),
+      }),
     );
   });
 

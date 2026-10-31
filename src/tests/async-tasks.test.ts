@@ -1221,10 +1221,28 @@ describe("AsyncTaskRuntime", () => {
       return { runtime, published };
     };
 
-    it("never announces a task that a Monitor tool call started", async () => {
+    const updateKinds = (published: AcpSessionNotification[]) =>
+      published.map(({ update }) => update.sessionUpdate);
+    const MONITOR_SPAWN = {
+      sessionUpdate: "async_task_spawned",
+      taskType: "monitor",
+      showInTranscript: false,
+      canStop: false,
+    };
+
+    /**
+     * Scenario:
+     * 1. The SDK starts a `local_bash` task for a Monitor tool call.
+     * 2. The task reports progress, then its notification completes it.
+     * 3. The client asks to stop the task.
+     * Expected:
+     * - The spawn is a monitor with no transcript card and no Stop.
+     * - Progress and the completed state follow.
+     * - `canStop` and `claimStop` are false.
+     */
+    it("publishes a task that a Monitor tool call started as a monitor", async () => {
       const { runtime, published } = monitorRuntime();
 
-      // The SDK reports a Monitor task as a background shell.
       await runtime.taskStarted({
         task_id: "monitor",
         task_type: "local_bash",
@@ -1233,22 +1251,38 @@ describe("AsyncTaskRuntime", () => {
         tool_use_id: "monitor-tool",
       });
       await runtime.taskProgress({ task_id: "monitor", summary: "First line" });
-      await runtime.taskUpdated("monitor", { status: "paused" });
-      await runtime.backgroundTasksChanged([{ task_id: "monitor", task_type: "local_bash" }]);
-      expect(runtime.canStop("monitor")).toBe(false);
-      expect(runtime.claimStop("monitor")).toBe(false);
-      await runtime.taskStopped("monitor");
+      const stoppable = runtime.canStop("monitor");
+      const claimed = runtime.claimStop("monitor");
       await runtime.taskNotification({
         task_id: "monitor",
         status: "completed",
         tool_use_id: "monitor-tool",
       });
-      await runtime.finishAll("stopped");
 
-      expect(published).toEqual([]);
+      expect(published[0]?.update).toMatchObject({
+        ...MONITOR_SPAWN,
+        asyncTaskId: "monitor",
+        toolCallId: "monitor-tool",
+      });
+      expect(updateKinds(published)).toEqual([
+        "async_task_spawned",
+        "async_task_progress",
+        "async_task_state_update",
+      ]);
+      expect(published[2]?.update).toMatchObject({ state: "completed" });
+      expect(stoppable).toBe(false);
+      expect(claimed).toBe(false);
     });
 
-    it("never announces a held task whose tool call id names a Monitor", async () => {
+    /**
+     * Scenario:
+     * 1. A task starts without a tool call id and is held.
+     * 2. A later progress carries the Monitor tool call id.
+     * Expected:
+     * - The task is spawned as a monitor once the id arrives, not before.
+     * - It is not stoppable.
+     */
+    it("spawns a held task as a monitor when its tool call id names a Monitor", async () => {
       const { runtime, published } = monitorRuntime();
 
       await runtime.taskStarted({
@@ -1257,18 +1291,26 @@ describe("AsyncTaskRuntime", () => {
         description: "Watch the logs",
       });
       await runtime.taskProgress({ task_id: "monitor", summary: "First line" });
+      const spawnedBeforeId = published.length;
       await runtime.taskProgress({
         task_id: "monitor",
         summary: "Second line",
         tool_use_id: "monitor-tool",
       });
-      await runtime.releaseHeld();
-      await runtime.taskNotification({ task_id: "monitor", status: "stopped" });
 
-      expect(published).toEqual([]);
+      expect(spawnedBeforeId).toBe(0);
+      expect(published[0]?.update).toMatchObject({ ...MONITOR_SPAWN, toolCallId: "monitor-tool" });
+      expect(runtime.canStop("monitor")).toBe(false);
     });
 
-    it("never announces a held task that a Monitor ends", async () => {
+    /**
+     * Scenario:
+     * 1. A task starts without a tool call id and is held.
+     * 2. A notification with the Monitor tool call id completes it.
+     * Expected:
+     * - The task is spawned as a monitor, then reaches the completed state.
+     */
+    it("spawns a held task that a Monitor ends as a monitor", async () => {
       const { runtime, published } = monitorRuntime();
 
       await runtime.taskStarted({ task_id: "monitor", task_type: "local_workflow" });
@@ -1278,23 +1320,47 @@ describe("AsyncTaskRuntime", () => {
         tool_use_id: "monitor-tool",
       });
 
-      expect(published).toEqual([]);
+      expect(updateKinds(published)).toEqual(["async_task_spawned", "async_task_state_update"]);
+      expect(published[0]?.update).toMatchObject(MONITOR_SPAWN);
+      expect(published[1]?.update).toMatchObject({ state: "completed" });
     });
 
-    it("ignores a local_monitor task without a tool call", async () => {
+    /**
+     * Scenario:
+     * 1. The SDK starts a `local_monitor` task for a Bash tool call.
+     * 2. The SDK reports another `local_monitor` task only in the task level.
+     * 3. The turn ends (`releaseHeld`), which spawns the level-only task without a tool call.
+     * Expected:
+     * - Both tasks are spawned as monitors and neither is stoppable.
+     */
+    it("spawns a local_monitor task as a monitor", async () => {
       const { runtime, published } = monitorRuntime();
 
-      await runtime.backgroundTasksChanged([{ task_id: "level", task_type: "local_monitor" }]);
-      await runtime.taskStarted({ task_id: "level", task_type: "local_monitor" });
-      await runtime.taskStarted({ task_id: "started", task_type: "local_monitor" });
-      await runtime.taskProgress({ task_id: "started", summary: "line" });
+      await runtime.taskStarted({
+        task_id: "started",
+        task_type: "local_monitor",
+        tool_use_id: "bash-tool",
+      });
+      await runtime.backgroundTasksChanged([
+        { task_id: "started", task_type: "local_monitor" },
+        { task_id: "level", task_type: "local_monitor" },
+      ]);
       await runtime.releaseHeld();
-      await runtime.taskNotification({ task_id: "started", status: "completed" });
 
-      expect(published).toEqual([]);
+      const spawns = published.map(({ update }) => update);
+      expect(spawns).toHaveLength(2);
+      expect(spawns[0]).toMatchObject({ ...MONITOR_SPAWN, asyncTaskId: "started" });
+      expect(spawns[1]).toMatchObject({ ...MONITOR_SPAWN, asyncTaskId: "level" });
       expect(runtime.canStop("started")).toBe(false);
+      expect(runtime.canStop("level")).toBe(false);
     });
 
+    /**
+     * Scenario:
+     * 1. The SDK starts a background `local_bash` task for a Bash tool call.
+     * Expected:
+     * - The spawn is a shell that stays in the transcript and can be stopped.
+     */
     it("still announces a task of another tool", async () => {
       const { runtime, published } = monitorRuntime();
 
@@ -1307,6 +1373,11 @@ describe("AsyncTaskRuntime", () => {
       });
 
       expect(published.map(({ update }) => update.sessionUpdate)).toEqual(["async_task_spawned"]);
+      expect(published[0]?.update).toMatchObject({
+        taskType: "shell",
+        showInTranscript: true,
+        canStop: true,
+      });
       expect(runtime.canStop("shell")).toBe(true);
     });
   });

@@ -37,6 +37,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
     ...actual,
     query: harness.mockedQuery,
     getSessionMessages: harness.mockedSessionMessages,
+    getSessionInfo: harness.mockedSessionInfo,
   };
 });
 

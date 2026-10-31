@@ -72,6 +72,13 @@ export class ExitPlanModeReporter implements ToolReporter {
   }
 }
 
+/** EnterPlanMode switches the session to plan mode, so it has the `switch_mode` kind like ExitPlanMode. */
+export class EnterPlanModeReporter implements ToolReporter {
+  toolUse(): ToolUseFacts {
+    return { title: "EnterPlanMode", kind: "switch_mode" };
+  }
+}
+
 /** The plan file of a result: the path of the input, else the `filePath` of the structured result. */
 function resultPlanFile({ toolUse, structured, capabilities }: ToolResultContext) {
   if (!capabilities.air.planFile) return undefined;
@@ -286,14 +293,15 @@ function frontmatterScalar(raw: string): string {
 }
 
 /**
- * The `name:` that the frontmatter of [skillMdPath] declares, or `undefined` when it declares none.
+ * The `name:` that the frontmatter of [skillMdPath] declares, `undefined` when it declares none,
+ * or `null` when the file could not be read.
  *
  * Only the frontmatter block is parsed, so a `name:` further down the body is not a name.
  */
-function declaredSkillName(skillMdPath: string): string | undefined {
+function declaredSkillName(skillMdPath: string): string | null | undefined {
   const head = frontmatterHead(skillMdPath);
   if (head === undefined) {
-    return undefined;
+    return null;
   }
   const lines = head.split(/\r?\n/);
   if (lines[0]?.trim() !== "---") {
@@ -326,13 +334,17 @@ const scannedSkills = new Map<string, ScannedSkill>();
  * old modification time — `git checkout`, `cp -p`, a filesystem whose times have a one-second resolution —
  * still moves the change time, and a name that silently stayed behind resolves to the wrong skill forever.
  */
-function cachedDeclaredName(skillMdPath: string, stats: Stats): string | undefined {
+function cachedDeclaredName(skillMdPath: string, stats: Stats): string | null | undefined {
   const signature = `${stats.mtimeMs}:${stats.ctimeMs}:${stats.size}:${stats.ino}:${stats.dev}`;
   const cached = scannedSkills.get(skillMdPath);
   if (cached?.signature === signature) {
     return cached.declaredName;
   }
   const declaredName = declaredSkillName(skillMdPath);
+  // A transient read error can clear without changing the stat signature, so the next pass must retry it.
+  if (declaredName === null) {
+    return null;
+  }
   if (scannedSkills.size >= MAX_CACHED_SKILLS) {
     scannedSkills.clear();
   }
@@ -375,7 +387,7 @@ function skillsByDeclaredName(containerDir: string, scans?: SkillScanCache): Map
       continue;
     }
     const name = cachedDeclaredName(file, stats);
-    if (name !== undefined && !byName.has(name)) {
+    if (typeof name === "string" && !byName.has(name)) {
       byName.set(name, file);
     }
   }

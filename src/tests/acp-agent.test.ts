@@ -2629,6 +2629,15 @@ describe("synthetic login message (issue #863)", () => {
         content: [{ type: "text", text: "Session expired. Please run /login to sign in again." }],
       }),
     ).toBe(true);
+    // Newer CLI wording that drops "Please".
+    for (const text of [
+      "Not logged in · Run /login",
+      "Login expired · Run /login to sign in again, or re-authenticate your Anthropic profile",
+    ]) {
+      expect(
+        isSyntheticLoginMessage({ ...syntheticLoginApiMessage, content: [{ type: "text", text }] }),
+      ).toBe(true);
+    }
   });
 
   it("isSyntheticLoginMessage does not match real assistant messages", () => {
@@ -2644,6 +2653,19 @@ describe("synthetic login message (issue #863)", () => {
       isSyntheticLoginMessage({
         ...syntheticLoginApiMessage,
         content: [{ type: "text", text: "API Error: 500 Internal Server Error" }],
+      }),
+    ).toBe(false);
+    // Usage-limit banners can mention /login (to switch accounts) but are
+    // handled as usage limits, not as a sign-out.
+    expect(
+      isSyntheticLoginMessage({
+        ...syntheticLoginApiMessage,
+        content: [
+          {
+            type: "text",
+            text: "You've hit your limit · resets 5pm · run /login to switch to an API usage-billed account.",
+          },
+        ],
       }),
     ).toBe(false);
     expect(isSyntheticLoginMessage(undefined)).toBe(false);
@@ -2980,7 +3002,16 @@ describe("task notification replay", () => {
     });
   });
 
-  it("sends nothing for a task that a Monitor tool call started", async () => {
+  /**
+   * Scenario:
+   * 1. A replayed transcript has a Monitor tool call that started a background task.
+   * 2. The task notification completes it.
+   * Expected:
+   * - The task spawn is a monitor with no transcript card and no Stop.
+   * - The task then reaches the completed state.
+   * - The Monitor tool call itself stays in the transcript.
+   */
+  it("replays a task that a Monitor tool call started as a monitor", async () => {
     const monitorLaunch = record({
       ...bashLaunch[1],
       message: {
@@ -3002,7 +3033,18 @@ describe("task notification replay", () => {
       notification("completed"),
     ]);
 
-    expect(asyncTaskUpdates(updates)).toEqual([]);
+    const taskUpdates = asyncTaskUpdates(updates);
+    expect(taskUpdates[0]).toMatchObject({
+      sessionUpdate: "async_task_spawned",
+      taskType: "monitor",
+      showInTranscript: false,
+      canStop: false,
+      toolCallId: "toolu_bash",
+    });
+    expect(taskUpdates.at(-1)).toMatchObject({
+      sessionUpdate: "async_task_state_update",
+      state: "completed",
+    });
     // The Monitor tool call itself stays in the transcript.
     expect(
       updates.some(
@@ -3506,9 +3548,18 @@ describe("session/list", () => {
     expect(second.sessions.map((session) => session.sessionId)).toEqual(["session-1000"]);
     expect(second.nextCursor).toBeUndefined();
     expect(vi.mocked(listSessions).mock.calls).toEqual([
-      [{ dir: "/workspace", limit: 1001, offset: 0 }],
-      [{ dir: "/workspace", limit: 1001, offset: 1000 }],
+      [{ dir: "/workspace", includeWorktrees: false, limit: 1001, offset: 0 }],
+      [{ dir: "/workspace", includeWorktrees: false, limit: 1001, offset: 1000 }],
     ]);
+  });
+
+  it("rejects a relative cwd", async () => {
+    vi.mocked(listSessions).mockClear();
+    await expect(agent().listSessions({ cwd: "workspace" })).rejects.toMatchObject({
+      code: -32602,
+      data: { cwd: "workspace" },
+    });
+    expect(listSessions).not.toHaveBeenCalled();
   });
 
   it("rejects a cursor that it did not issue", async () => {
@@ -3964,7 +4015,8 @@ describe("subagent transcript replay", () => {
               return [
                 ...response,
                 `${on} subagent_update ${u.sessionId} ${JSON.stringify(u.state)}` +
-                  (u.capabilities ? ` capabilities=${JSON.stringify(u.capabilities)}` : ""),
+                  (u.capabilities ? ` capabilities=${JSON.stringify(u.capabilities)}` : "") +
+                  ("cwd" in u ? ` cwd=${JSON.stringify(u.cwd)}` : ""),
               ];
             case "session_message": {
               const references = [
@@ -4003,6 +4055,51 @@ describe("subagent transcript replay", () => {
         await rm(configDir, { recursive: true, force: true });
       }
     }
+
+    it("announces a worktree child with its recorded cwd, and clears it when the worktree is gone", async () => {
+      const worktree = "/tmp/proj/.claude/worktrees/agent-wt1";
+      const trace = await replayRfd(
+        [
+          user("u1", "Go"),
+          assistant("a1", [
+            toolUse("toolu_wt", "Agent", { description: "Isolated", prompt: "Work apart" }),
+            toolUse("toolu_plain", "Agent", { description: "Shared", prompt: "Work here" }),
+          ]),
+          user("u2", [toolResult("toolu_wt", "Done."), toolResult("toolu_plain", "Done.")]),
+        ],
+        {
+          wt1: {
+            meta: {
+              agentType: "general-purpose",
+              toolUseId: "toolu_wt",
+              worktreePath: worktree,
+              spawnedWithWorktree: true,
+            },
+            records: [
+              user("w1", "Work apart", { cwd: worktree }),
+              assistant("w2", [{ type: "text", text: "Done." }], { cwd: worktree }),
+            ],
+          },
+          plain1: {
+            meta: { agentType: "general-purpose", toolUseId: "toolu_plain" },
+            records: [user("p1", "Work here"), assistant("p2", [{ type: "text", text: "Done." }])],
+          },
+        },
+        undefined,
+        { live: () => undefined },
+        { load: true },
+      );
+
+      expect(trace.filter((line) => line.includes(" subagent_update "))).toEqual([
+        `root subagent_update wt1 {"state":"running"} cwd="${worktree}"`,
+        'root subagent_update plain1 {"state":"running"}',
+        'root subagent_update plain1 {"state":"idle","stopReason":"end_turn"}',
+        'root subagent_update wt1 {"state":"idle","stopReason":"end_turn"}',
+        // After the response: the worktree no longer exists.
+        'root subagent_update wt1 {"state":"idle","stopReason":"end_turn"} cwd=null',
+        'root subagent_update plain1 {"state":"idle","stopReason":"end_turn"}',
+      ]);
+    });
 
     it("replays a fork child without the launching message and boilerplate it inherited", async () => {
       // A `subagent_type: "fork"` transcript starts with a copy of the
@@ -4674,6 +4771,58 @@ describe("escape markdown", () => {
   });
 });
 
+describe("request validation", () => {
+  function agent() {
+    return new ClaudeAcpAgent({ sessionUpdate: async () => {} } as unknown as AcpClient, {
+      log: () => {},
+      error: () => {},
+    });
+  }
+
+  it("rejects a session/new with a relative additional directory", async () => {
+    await expect(
+      agent().newSession({ cwd: os.tmpdir(), mcpServers: [], additionalDirectories: ["extra"] }),
+    ).rejects.toMatchObject({ code: -32602, data: { additionalDirectories: ["extra"] } });
+  });
+
+  it("rejects authenticate with an unknown method id", async () => {
+    await expect(agent().authenticate({ methodId: "unknown-method" })).rejects.toMatchObject({
+      code: -32602,
+      data: { methodId: "unknown-method" },
+    });
+  });
+
+  it("rejects a v1 prompt with audio before it looks up the session", async () => {
+    // An unknown session would fail with -32002 if the check ran later.
+    await expect(
+      agent().prompt({
+        sessionId: "unknown-session",
+        prompt: [
+          { type: "text", text: "listen" },
+          { type: "audio", data: "AAAA", mimeType: "audio/wav" },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: -32602, data: { type: "audio" } });
+  });
+
+  it("drops slash commands whose name has whitespace, and repeats of a name", async () => {
+    const a = agent();
+    const supportedCommands = async () => [
+      { name: "review", description: "first" },
+      { name: "review", description: "second" },
+      { name: "my command", description: "spaced" },
+      { name: "compact", description: "Compact the conversation" },
+    ];
+    a.sessions["test-session"] = mockSessionState({ query: { supportedCommands } }, a) as any;
+    const commands = await a.availableCommands("test-session");
+    expect(commands.map((command) => [command.name, command.description])).toEqual([
+      ["review", "first"],
+      ["compact", "Compact the conversation"],
+      ["mcp", expect.any(String)],
+    ]);
+  });
+});
+
 describe("prompt conversion", () => {
   it("should not change built-in slash commands", () => {
     const message = promptToClaude({
@@ -4708,6 +4857,77 @@ describe("prompt conversion", () => {
         text: "/server:name (MCP) args",
         type: "text",
       },
+    ]);
+  });
+
+  it("rewrites an MCP slash command with multi-line input, in the first text block only", () => {
+    const message = promptToClaude({
+      sessionId: "test",
+      prompt: [
+        { type: "resource_link", uri: "file:///work/a.ts", name: "a.ts" },
+        { type: "text", text: "/mcp:server:name first line\nsecond line" },
+        { type: "text", text: "/mcp:server:other args" },
+      ],
+    });
+    expect(message.message.content).toEqual([
+      { type: "text", text: "[@a.ts](file:///work/a.ts)" },
+      { type: "text", text: "/server:name (MCP) first line\nsecond line" },
+      { type: "text", text: "/mcp:server:other args" },
+    ]);
+  });
+
+  it("sends image, PDF and text blob resources to Claude, and skips other blobs", () => {
+    const blob = (uri: string, mimeType: string, data: string) => ({
+      type: "resource" as const,
+      resource: { uri, mimeType, blob: data },
+    });
+    const message = promptToClaude({
+      sessionId: "test",
+      prompt: [
+        blob("file:///work/shot.png", "image/png", "iVBORw0K"),
+        blob("file:///work/spec.pdf", "application/pdf", "JVBERi0x"),
+        blob("file:///work/notes.md", "text/markdown; charset=utf-8", "IyBOb3Rlcw=="),
+        blob("file:///work/data.json", "application/json", "eyJhIjoxfQ=="),
+        blob("file:///work/archive.zip", "application/zip", "UEsDBA=="),
+      ],
+    });
+    expect(message.message.content).toEqual([
+      { type: "text", text: "[@shot.png](file:///work/shot.png)" },
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0K" } },
+      { type: "text", text: "[@spec.pdf](file:///work/spec.pdf)" },
+      {
+        type: "document",
+        source: { type: "base64", media_type: "application/pdf", data: "JVBERi0x" },
+      },
+      { type: "text", text: "[@notes.md](file:///work/notes.md)" },
+      { type: "text", text: "[@data.json](file:///work/data.json)" },
+      { type: "text", text: '\n<context ref="file:///work/notes.md">\n# Notes\n</context>' },
+      { type: "text", text: '\n<context ref="file:///work/data.json">\n{"a":1}\n</context>' },
+    ]);
+  });
+
+  it("reads image/jpg as JPEG and decodes text blobs with their charset", () => {
+    const blob = (uri: string, mimeType: string, data: string) => ({
+      type: "resource" as const,
+      resource: { uri, mimeType, blob: data },
+    });
+    const message = promptToClaude({
+      sessionId: "test",
+      prompt: [
+        blob("file:///work/shot.jpg", "image/jpg", "/9j/4AAQ"),
+        // "café" in ISO-8859-1: 63 61 66 e9.
+        blob("file:///work/menu.csv", "text/csv; charset=ISO-8859-1", "Y2Fm6Q=="),
+        // "hi" in UTF-8 with a byte order mark: ef bb bf 68 69.
+        blob("file:///work/bom.txt", "text/plain", "77u/aGk="),
+      ],
+    });
+    expect(message.message.content).toEqual([
+      { type: "text", text: "[@shot.jpg](file:///work/shot.jpg)" },
+      { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "/9j/4AAQ" } },
+      { type: "text", text: "[@menu.csv](file:///work/menu.csv)" },
+      { type: "text", text: "[@bom.txt](file:///work/bom.txt)" },
+      { type: "text", text: '\n<context ref="file:///work/menu.csv">\ncafé\n</context>' },
+      { type: "text", text: '\n<context ref="file:///work/bom.txt">\nhi\n</context>' },
     ]);
   });
 });
@@ -5017,10 +5237,11 @@ describe("permission request cancellation", () => {
     // Let canUseTool reach the awaited requestPermission before cancelling.
     await Promise.resolve();
 
-    // The tool-call signal is threaded through as the cancellation signal.
-    expect(receivedSignal).toBe(controller.signal);
+    // The cancellation signal follows the tool-call signal.
+    expect(receivedSignal?.aborted).toBe(false);
 
     controller.abort();
+    expect(receivedSignal?.aborted).toBe(true);
 
     await expect(pending).rejects.toThrow("Tool use aborted");
   });
@@ -5044,6 +5265,79 @@ describe("permission request cancellation", () => {
     controller.abort();
 
     await expect(pending).rejects.toThrow("Tool use aborted");
+  });
+
+  describe("a cancelled outcome", () => {
+    function setup(options: { v2?: boolean } = {}) {
+      const mockClient = {
+        sessionUpdate: async () => {},
+        requestPermission: async (): Promise<RequestPermissionResponse> => ({
+          outcome: { outcome: "cancelled" },
+        }),
+      } as unknown as AcpClient;
+      const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} }, options);
+      const session = injectSession(agent, "session-1");
+      session.emittedToolCalls.add("tool-1");
+      const ask = (agentID?: string) =>
+        agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+          signal: new AbortController().signal,
+          suggestions: [],
+          toolUseID: "tool-1",
+          ...(agentID ? { agentID } : {}),
+        } as any);
+      return { session, ask };
+    }
+
+    it("aborts the tool use of foreground work", async () => {
+      const { session, ask } = setup();
+      // A subagent that runs in the foreground blocks the turn like the main thread.
+      session.liveBackgroundTasks.set("agent-fg", { isSubagent: true });
+
+      await expect(ask()).rejects.toThrow("Tool use aborted");
+      await expect(ask("agent-fg")).rejects.toThrow("Tool use aborted");
+    });
+
+    it("denies the tool use of foreground work on v2 without a session/cancel", async () => {
+      // On v2 the client also answers `cancelled` when the user dismissed the
+      // prompt or its policy declined it. The turn goes on without the tool.
+      const { session, ask } = setup({ v2: true });
+      session.liveBackgroundTasks.set("agent-fg", { isSubagent: true });
+
+      for (const agentID of [undefined, "agent-fg"]) {
+        await expect(ask(agentID)).resolves.toEqual({
+          behavior: "deny",
+          message: "User refused permission to run tool",
+          toolUseID: "tool-1",
+          decisionClassification: "user_reject",
+        });
+      }
+    });
+
+    it("aborts the tool use of foreground work on v2 during a session/cancel", async () => {
+      const { session, ask } = setup({ v2: true });
+      session.cancelled = true;
+
+      await expect(ask()).rejects.toThrow("Tool use aborted");
+    });
+
+    it("denies the tool use of a background subagent", async () => {
+      const { session, ask } = setup();
+      session.liveBackgroundTasks.set("agent-bg", { isSubagent: true, backgrounded: true });
+      // A subagent that a background subagent started is background work too.
+      session.liveBackgroundTasks.set("agent-nested", {
+        isSubagent: true,
+        parentTaskId: "agent-bg",
+      });
+
+      for (const agentID of ["agent-bg", "agent-nested"]) {
+        await expect(ask(agentID)).resolves.toEqual({
+          behavior: "deny",
+          message: "User refused permission to run tool",
+          toolUseID: "tool-1",
+          decisionClassification: "user_reject",
+        });
+      }
+    });
   });
 
   /** The requests to the client that are elicitations, and how each ends when its signal aborts. */
@@ -5118,14 +5412,74 @@ describe("permission request cancellation", () => {
       const controller = new AbortController();
       const pending = start(agent, controller.signal);
       await vi.waitFor(() => expect(createElicitation).toHaveBeenCalledOnce());
-      // The client was asked to cancel the request, and ignores that.
-      expect(createElicitation.mock.calls[0]).toEqual([expect.anything(), controller.signal]);
+      const [, requestSignal] = createElicitation.mock.calls[0] as unknown as [
+        unknown,
+        AbortSignal,
+      ];
       controller.abort();
+      // The client was asked to cancel the request, and ignores that.
+      expect(requestSignal.aborted).toBe(true);
 
       await aborted(pending);
       expect(session.openUserInputs?.size ?? 0).toBe(0);
     },
   );
+
+  it.each(elicitations)(
+    "cancels $name before session/close responds",
+    async ({ start, aborted }) => {
+      const events: string[] = [];
+      const createElicitation = vi.fn(
+        (_params: unknown, signal: AbortSignal) =>
+          new Promise<CreateElicitationResponse>(() => {
+            signal.addEventListener("abort", () => events.push("cancel_request"), { once: true });
+          }),
+      );
+      const mockClient = {
+        sessionUpdate: async () => {},
+        createElicitation,
+      } as unknown as AcpClient;
+      const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+      await initializeClient(agent, { elicitation: { form: {}, url: {} } });
+      const session = injectSession(agent, "session-1");
+      session.emittedToolCalls.add("tool-1");
+
+      // Claude Code's own signal for the callback never aborts here.
+      const pending = start(agent, new AbortController().signal);
+      await vi.waitFor(() => expect(createElicitation).toHaveBeenCalledOnce());
+      await agent.closeSession({ sessionId: "session-1" });
+      events.push("closed");
+
+      expect(events).toEqual(["cancel_request", "closed"]);
+      await aborted(pending);
+    },
+  );
+
+  it("cancels a permission request before session/close responds", async () => {
+    const events: string[] = [];
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: (_params: RequestPermissionRequest, signal?: AbortSignal) =>
+        new Promise<RequestPermissionResponse>(() => {
+          signal?.addEventListener("abort", () => events.push("cancel_request"), { once: true });
+        }),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const session = injectSession(agent, "session-1");
+    session.emittedToolCalls.add("tool-1");
+
+    const pending = agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "tool-1",
+    } as any);
+    await vi.waitFor(() => expect(session.openUserInputs?.size).toBe(1));
+    await agent.closeSession({ sessionId: "session-1" });
+    events.push("closed");
+
+    expect(events).toEqual(["cancel_request", "closed"]);
+    await expect(pending).rejects.toThrow("Tool use aborted");
+  });
 
   it("observes a client rejection when the signal aborts during request creation", async () => {
     const controller = new AbortController();
@@ -7607,7 +7961,7 @@ describe("subagent permission attribution (issue #851)", () => {
           configId: "model",
           value: "fallback-model",
         }),
-      ).rejects.toThrow("Session not found");
+      ).rejects.toMatchObject({ code: -32002, data: { sessionId: "agent-42" } });
     });
 
     it("announces the child as running, then sends it the prompt as a message", async () => {
@@ -7622,8 +7976,8 @@ describe("subagent permission attribution (issue #851)", () => {
           update: {
             sessionUpdate: "subagent_update",
             sessionId: "agent-42",
-            title: "Explore",
-            description: "Investigate",
+            title: "Investigate",
+            description: "Explore",
             capabilities: { cancel: {} },
             state: { state: "running" },
           },
@@ -8177,8 +8531,8 @@ describe("subagent permission attribution (issue #851)", () => {
             update: {
               sessionUpdate: "subagent_update",
               sessionId: "agent-7",
-              title: "echoer (Explore)",
-              description: "Echo a word",
+              title: "echoer",
+              description: "Explore",
               capabilities: { cancel: {} },
               state: { state: "running" },
             },
@@ -9731,7 +10085,18 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(backgrounded("child-cat")).toBe(false);
   });
 
-  it("hides the async task of a Monitor tool call and keeps the tool call", async () => {
+  /**
+   * Scenario:
+   * 1. The model calls Monitor twice; the SDK reports both tasks as `local_bash`.
+   * 2. The first task has its tool call id at start, the second only in a later progress.
+   * 3. The first task completes; the client asks to stop the second.
+   * Expected:
+   * - Both tasks are spawned as monitors with no transcript card and no Stop.
+   * - The first task reaches the completed state.
+   * - The stop request returns `stopped: false`.
+   * - Both Monitor tool calls stay in the transcript.
+   */
+  it("publishes the async task of a Monitor tool call as a monitor and keeps the tool call", async () => {
     const updates: AcpSessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
       {
@@ -9835,9 +10200,25 @@ describe("subagent permission attribution (issue #851)", () => {
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
 
-    expect(updates.filter(({ update }) => update.sessionUpdate.startsWith("async_task_"))).toEqual(
-      [],
-    );
+    const taskUpdates = updates
+      .map(({ update }) => update)
+      .filter((update) => update.sessionUpdate.startsWith("async_task_"));
+    const spawns = taskUpdates.filter((update) => update.sessionUpdate === "async_task_spawned");
+    expect(spawns.map((update: any) => [update.asyncTaskId, update.toolCallId])).toEqual([
+      ["mon-a", "monitor-a"],
+      ["mon-b", "monitor-b"],
+    ]);
+    for (const spawn of spawns) {
+      expect(spawn).toMatchObject({ taskType: "monitor", showInTranscript: false, canStop: false });
+    }
+    expect(
+      taskUpdates.some(
+        (update: any) =>
+          update.sessionUpdate === "async_task_state_update" &&
+          update.asyncTaskId === "mon-a" &&
+          update.state === "completed",
+      ),
+    ).toBe(true);
     await expect(
       agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: "mon-b" }),
     ).resolves.toEqual({ stopped: false });
@@ -10020,6 +10401,15 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(bashUpdate?._meta ?? {}).not.toHaveProperty("jetbrains");
   });
 
+  /**
+   * Scenario:
+   * 1. A subagent starts Bash tasks and a Monitor task; the root session starts one Bash task.
+   * 2. The client stops a Bash task and the Monitor task.
+   * Expected:
+   * - Subagent tasks, including the monitor, go to the subagent session; the root task stays in the root.
+   * - The monitor is spawned with no transcript card and no Stop.
+   * - Only the Bash task is stopped; the Monitor stop returns `stopped: false`.
+   */
   it("sends the background tasks of a subagent to its session and keeps a root task in the root", async () => {
     const updates: AcpSessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
@@ -10155,7 +10545,7 @@ describe("subagent permission attribution (issue #851)", () => {
     await expect(
       agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: "watch-child" }),
     ).resolves.toEqual({ stopped: true });
-    // The client never sees a Monitor task, so it cannot stop it.
+    // A Monitor task is published with canStop false, so the stop request is refused.
     await expect(
       agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: "monitor-child" }),
     ).resolves.toEqual({ stopped: false });
@@ -10172,6 +10562,7 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(lifecycle).toEqual([
       ["agent-1", "async_task_spawned", "shell-child", undefined],
       ["agent-1", "async_task_spawned", "watch-child", undefined],
+      ["agent-1", "async_task_spawned", "monitor-child", undefined],
       ["agent-1", "async_task_spawned", "shell-late", undefined],
       ["test-session", "async_task_spawned", "shell-root", undefined],
       ["agent-1", "async_task_state_update", "shell-child", "completed"],
@@ -10181,6 +10572,15 @@ describe("subagent permission attribution (issue #851)", () => {
       ["agent-1", "async_task_spawned", "shell-held", undefined],
       ["agent-1", "async_task_state_update", "shell-held", "completed"],
     ]);
+    const monitorSpawn = updates.find(
+      ({ update }) =>
+        update.sessionUpdate === "async_task_spawned" && update.asyncTaskId === "monitor-child",
+    )?.update;
+    expect(monitorSpawn).toMatchObject({
+      taskType: "monitor",
+      showInTranscript: false,
+      canStop: false,
+    });
     // The stop acknowledgement goes to the transcript that holds the task.
     const stopAcknowledgement = updates.find(
       ({ update }) =>
@@ -11929,6 +12329,41 @@ describe("stop reason propagation", () => {
     expect(logged.join("\n")).not.toContain("cannot fail active turn");
   });
 
+  it("rejects an expired login the CLI reports as invalid_request with authRequired", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await initializeClient(agent, {});
+    // An expired token with no refresh token: the CLI tags this synthetic
+    // message `invalid_request`, not `authentication_failed`.
+    const text =
+      "Login expired · Run /login to sign in again, or re-authenticate your Anthropic profile";
+    const loginExpired = createAssistantError("invalid_request");
+    loginExpired.message.model = "<synthetic>";
+    loginExpired.message.content = [{ type: "text", text, citations: null }] as any;
+    injectSession(agent, [
+      loginExpired,
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: text,
+      }),
+    ]);
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
+    ).rejects.toMatchObject({ code: RequestError.authRequired().code });
+    await agent.sessions["test-session"]?.consumer;
+    expect(JSON.stringify(updates)).not.toContain("/login");
+  });
+
   it("does not treat a successful answer mentioning /login as auth_required", async () => {
     const updates: SessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
@@ -13031,7 +13466,13 @@ describe("model refusal fallback handling", () => {
     // model-dependent bookkeeping doesn't keep advertising the refused model.
     expect(session.models.currentModelId).toBe("claude-mystery-9");
     const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
-    expect(updates.some((u) => u.sessionUpdate === "config_option_update")).toBe(true);
+    const configUpdate = updates.find((u) => u.sessionUpdate === "config_option_update");
+    // ACP requires currentValue to be one of the options, so the raw id is listed.
+    const modelOption = configUpdate.configOptions.find((o: any) => o.id === "model");
+    expect(modelOption.currentValue).toBe("claude-mystery-9");
+    expect(modelOption.options).toContainEqual(
+      expect.objectContaining({ value: "claude-mystery-9", name: "claude-mystery-9" }),
+    );
   });
 
   it("skips the config update when the fallback equals the tracked model", async () => {
@@ -13251,6 +13692,146 @@ describe("model refusal fallback handling", () => {
           u.content.text.includes("Background task declined."),
       ),
     ).toBe(false);
+  });
+});
+
+describe("MCP server startup failures", () => {
+  function setup(mcpServersStatus: { name: string; status: string; source?: string }[]) {
+    const sessionUpdate = vi.fn(async () => {});
+    const agent = new ClaudeAcpAgent({ sessionUpdate } as unknown as AcpClient, {
+      log: () => {},
+      error: () => {},
+    });
+    const init = {
+      type: "system",
+      subtype: "init",
+      session_id: "test-session",
+      mcp_servers: mcpServersStatus,
+    };
+    async function* generator(input: Pushable<any>) {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield {
+        type: "user",
+        message: userMessage.message,
+        parent_tool_use_id: null,
+        uuid: userMessage.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+      // init re-emits on every turn with the same statuses.
+      yield init;
+      yield init;
+      yield {
+        type: "result",
+        subtype: "success",
+        stop_reason: null,
+        is_error: false,
+        result: "",
+        errors: [],
+        duration_ms: 0,
+        duration_api_ms: 0,
+        num_turns: 1,
+        total_cost_usd: 0,
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+        modelUsage: {},
+        permission_denials: [],
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+    injectGeneratorSession(agent, generator, {
+      creationParams: {
+        cwd: "/tmp",
+        mcpServers: [
+          { name: "client-fs", command: "fs-server", args: [], env: [] },
+          { name: "client-api", type: "http", url: "https://example.com/mcp", headers: [] },
+        ],
+      },
+    });
+    const updates = () =>
+      sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
+    return { agent, updates };
+  }
+
+  it("sends one notice per failed client-provided server and ignores settings servers", async () => {
+    const { agent, updates } = setup([
+      { name: "client-fs", status: "failed", source: "dynamic" },
+      { name: "client-api", status: "connected", source: "dynamic" },
+      { name: "from-settings", status: "failed", source: "user" },
+    ]);
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { session: { notices: {} } },
+    });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    expect(updates().filter((u) => u.sessionUpdate === "notice")).toEqual([
+      {
+        sessionUpdate: "notice",
+        severity: "warning",
+        title: 'MCP server "client-fs" failed to start',
+        description: "Its tools are unavailable in this session. Run /mcp for the error.",
+      },
+    ]);
+  });
+
+  it("reports a needs-auth server only when the client can't run OAuth", async () => {
+    const withoutUrlElicitation = setup([{ name: "client-api", status: "needs-auth" }]);
+    await withoutUrlElicitation.agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { session: { notices: {} } },
+    });
+    await withoutUrlElicitation.agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "hi" }],
+    });
+    expect(withoutUrlElicitation.updates().filter((u) => u.sessionUpdate === "notice")).toEqual([
+      {
+        sessionUpdate: "notice",
+        severity: "info",
+        title: 'MCP server "client-api" needs authentication',
+        description: "Its tools are unavailable until the server is authenticated.",
+      },
+    ]);
+
+    const withUrlElicitation = setup([{ name: "client-api", status: "needs-auth" }]);
+    // The OAuth flow also needs the query's `mcpAuthenticate`.
+    (withUrlElicitation.agent as any).sessions["test-session"].query.mcpAuthenticate = vi.fn(
+      async () => ({}),
+    );
+    await withUrlElicitation.agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { session: { notices: {} }, elicitation: { url: {} } },
+    });
+    await withUrlElicitation.agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "hi" }],
+    });
+    expect(withUrlElicitation.updates().filter((u) => u.sessionUpdate === "notice")).toEqual([]);
+  });
+
+  it("falls back to a transcript line without the notices capability", async () => {
+    const { agent, updates } = setup([{ name: "client-fs", status: "failed" }]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    const lines = updates().filter(
+      (u) =>
+        u.sessionUpdate === "agent_message_chunk" &&
+        u._meta?.claudeCode?.kind === "mcpServerStatus",
+    );
+    expect(lines).toHaveLength(1);
+    expect(lines[0].content.text).toBe(
+      '**MCP server "client-fs" failed to start:** Its tools are unavailable in this session. Run /mcp for the error.',
+    );
   });
 });
 
@@ -13524,6 +14105,374 @@ describe("skill commands in available_commands_update", () => {
   });
 });
 
+describe("skill files from getContextUsage in available_commands_update", () => {
+  let cwd: string;
+
+  beforeEach(async () => {
+    cwd = await mkdtemp(path.join(os.tmpdir(), "acp-skill-files-"));
+  });
+
+  afterEach(async () => {
+    await rm(cwd, { recursive: true, force: true });
+  });
+
+  const skillEntry = (entry: Record<string, unknown>) => ({
+    skills: { skillFrontmatter: [entry] },
+  });
+
+  /** Lets the background skill file reads and their updates finish. */
+  const flush = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+  /** One turn that emits `inits` init frames, then `changes` commands_changed frames for
+   *  `commands`. `getContextUsage` is put on the query only when given. */
+  async function runTurn(options: {
+    capabilities: Record<string, unknown>;
+    commands: Array<Record<string, unknown>>;
+    getContextUsage?: ReturnType<typeof vi.fn>;
+    inits?: number;
+    changes?: number;
+  }) {
+    const sessionUpdate = vi.fn(async () => {});
+    const logged: string[] = [];
+    const agent = new ClaudeAcpAgent({ sessionUpdate } as unknown as AcpClient, {
+      log: () => {},
+      error: (...args: unknown[]) => logged.push(args.join(" ")),
+    });
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: options.capabilities });
+    async function* generator(input: Pushable<any>) {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield {
+        type: "user",
+        message: userMessage.message,
+        parent_tool_use_id: null,
+        uuid: userMessage.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+      for (let i = 0; i < (options.inits ?? 1); i++) {
+        yield { type: "system", subtype: "init", session_id: "test-session" };
+      }
+      for (let i = 0; i < (options.changes ?? 0); i++) {
+        yield {
+          type: "system",
+          subtype: "commands_changed",
+          session_id: "test-session",
+          commands: options.commands,
+        };
+      }
+      yield {
+        type: "result",
+        subtype: "success",
+        stop_reason: null,
+        is_error: false,
+        result: "",
+        errors: [],
+        duration_ms: 0,
+        duration_api_ms: 0,
+        num_turns: 1,
+        total_cost_usd: 0,
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+        modelUsage: {},
+        permission_denials: [],
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+    injectGeneratorSession(agent, generator, { cwd });
+    Object.assign(agent.sessions["test-session"].query, {
+      supportedCommands: vi.fn(async () => options.commands),
+      ...(options.getContextUsage ? { getContextUsage: options.getContextUsage } : {}),
+    });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+    await flush();
+
+    const commandUpdates = () =>
+      sessionUpdate.mock.calls
+        .map((c: any[]) => (c[0] as { update: any }).update)
+        .filter((u) => u.sessionUpdate === "available_commands_update");
+    return { commandUpdates, logged };
+  }
+
+  /** The `_meta` of the command `name` in the last available_commands_update. */
+  function lastMeta(commandUpdates: () => any[], name: string) {
+    const updates = commandUpdates();
+    return updates[updates.length - 1].availableCommands.find((c: any) => c.name === name)?._meta;
+  }
+
+  /** The air `_meta` of a skill, with a path when there is one. */
+  const skillMeta = (skillPath?: string) => ({
+    jetbrains: { air: { version: 1, kind: "skill", ...(skillPath ? { skillPath } : {}) } },
+  });
+
+  /**
+   * Scenario:
+   * 1. An AIR session lists the command `plug:pskill`.
+   * 2. getContextUsage reports it with source "plugin" and a path in the plugin directory.
+   * 3. The first init triggers the read.
+   * Expected:
+   * - The last update marks `plug:pskill` as a skill with that path.
+   */
+  it("takes the path of a plugin skill from getContextUsage", async () => {
+    const pluginSkill = "/plugins/plug/skills/pskill/SKILL.md";
+    const getContextUsage = vi.fn(async () =>
+      skillEntry({ name: "plug:pskill", source: "plugin", pluginName: "plug", path: pluginSkill }),
+    );
+
+    const { commandUpdates } = await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [{ name: "plug:pskill", description: "Plugin skill", argumentHint: "" }],
+      getContextUsage,
+    });
+
+    expect(lastMeta(commandUpdates, "plug:pskill")).toEqual(skillMeta(pluginSkill));
+  });
+
+  /**
+   * Scenario:
+   * 1. An AIR session lists the prompt command `deploy`.
+   * 2. getContextUsage reports it with a `.claude/commands/deploy.md` path.
+   * 3. commands_changed sends the command list.
+   * Expected:
+   * - `deploy` has no `_meta`: a prompt command is no skill.
+   */
+  it("does not mark a prompt command that getContextUsage lists with a .md path", async () => {
+    const getContextUsage = vi.fn(async () =>
+      skillEntry({
+        name: "deploy",
+        source: "projectSettings",
+        path: "/proj/.claude/commands/deploy.md",
+      }),
+    );
+
+    const { commandUpdates } = await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [{ name: "deploy", description: "Deploy", argumentHint: "" }],
+      getContextUsage,
+      changes: 1,
+    });
+
+    expect(lastMeta(commandUpdates, "deploy")).toBeUndefined();
+  });
+
+  /**
+   * Scenario:
+   * 1. An AIR session lists the command `nested`.
+   * 2. getContextUsage lists no skills on the first read (init) and the nested one on the second.
+   * 3. commands_changed arrives after the first read.
+   * Expected:
+   * - Two reads happened.
+   * - The first update, from commands_changed, has no `_meta` on `nested`.
+   * - The last update marks `nested` with the path from the second read.
+   */
+  it("gives a nested skill reported after commands_changed its path", async () => {
+    const nestedSkill = "/proj/sub/.claude/skills/nested/SKILL.md";
+    const getContextUsage = vi
+      .fn()
+      .mockResolvedValueOnce({ skills: { skillFrontmatter: [] } })
+      .mockResolvedValue(
+        skillEntry({ name: "nested", source: "projectSettings", path: nestedSkill }),
+      );
+
+    const { commandUpdates } = await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [{ name: "nested", description: "Nested skill", argumentHint: "" }],
+      getContextUsage,
+      changes: 1,
+    });
+
+    expect(getContextUsage).toHaveBeenCalledTimes(2);
+    expect(commandUpdates()[0].availableCommands[0]._meta).toBeUndefined();
+    expect(lastMeta(commandUpdates, "nested")).toEqual(skillMeta(nestedSkill));
+  });
+
+  /**
+   * Scenario:
+   * 1. An AIR session lists the builtin commands `simplify` and `compact`.
+   * 2. getContextUsage reports `simplify` with source "built-in" and no path; `compact` is absent.
+   * Expected:
+   * - `simplify` has kind "skill" and no skillPath.
+   * - `compact` has no `_meta`.
+   */
+  it("marks a built-in skill with the kind only and leaves compact unmarked", async () => {
+    const getContextUsage = vi.fn(async () => skillEntry({ name: "simplify", source: "built-in" }));
+
+    const { commandUpdates } = await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [
+        { name: "simplify", description: "Simplify", argumentHint: "", builtin: true },
+        { name: "compact", description: "Compact", argumentHint: "", builtin: true },
+      ],
+      getContextUsage,
+    });
+
+    expect(lastMeta(commandUpdates, "simplify")).toEqual(skillMeta());
+    expect(lastMeta(commandUpdates, "compact")).toBeUndefined();
+  });
+
+  /**
+   * Scenario:
+   * 1. cwd/.claude/skills/review/SKILL.md exists.
+   * 2. An AIR session lists `review`; getContextUsage reports no skills.
+   * Expected:
+   * - `review` is marked as a skill with the path found in cwd/.claude/skills.
+   */
+  it("looks up a command that getContextUsage does not list on disk", async () => {
+    const reviewSkill = path.join(cwd, ".claude", "skills", "review", "SKILL.md");
+    await mkdir(path.dirname(reviewSkill), { recursive: true });
+    await writeFile(reviewSkill, "# review\n");
+    const getContextUsage = vi.fn(async () => ({ skills: { skillFrontmatter: [] } }));
+
+    const { commandUpdates } = await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [{ name: "review", description: "Review", argumentHint: "" }],
+      getContextUsage,
+      changes: 1,
+    });
+
+    expect(lastMeta(commandUpdates, "review")).toEqual(skillMeta(reviewSkill));
+  });
+
+  /**
+   * Scenario:
+   * 1. cwd/.claude/skills/review/SKILL.md exists.
+   * 2. The query has no getContextUsage.
+   * 3. An AIR session gets a commands_changed.
+   * Expected:
+   * - `review` still gets its path from the disk lookup.
+   * - No error is logged.
+   */
+  it("lists the commands as before when getContextUsage is missing", async () => {
+    const reviewSkill = path.join(cwd, ".claude", "skills", "review", "SKILL.md");
+    await mkdir(path.dirname(reviewSkill), { recursive: true });
+    await writeFile(reviewSkill, "# review\n");
+
+    const { commandUpdates, logged } = await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [{ name: "review", description: "Review", argumentHint: "" }],
+      changes: 1,
+    });
+
+    expect(lastMeta(commandUpdates, "review")).toEqual(skillMeta(reviewSkill));
+    expect(logged.filter((line) => line.includes("skill files"))).toEqual([]);
+  });
+
+  /**
+   * Scenario:
+   * 1. cwd/.claude/skills/review/SKILL.md exists.
+   * 2. getContextUsage rejects.
+   * 3. An AIR session gets a commands_changed.
+   * Expected:
+   * - The prompt completes.
+   * - The error is logged.
+   * - `review` still gets its path from the disk lookup.
+   */
+  it("logs a failing getContextUsage and keeps the turn going", async () => {
+    const reviewSkill = path.join(cwd, ".claude", "skills", "review", "SKILL.md");
+    await mkdir(path.dirname(reviewSkill), { recursive: true });
+    await writeFile(reviewSkill, "# review\n");
+    const getContextUsage = vi.fn(async () => {
+      throw new Error("control request failed");
+    });
+
+    const { commandUpdates, logged } = await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [{ name: "review", description: "Review", argumentHint: "" }],
+      getContextUsage,
+      changes: 1,
+    });
+
+    expect(logged.some((line) => line.includes("control request failed"))).toBe(true);
+    expect(lastMeta(commandUpdates, "review")).toEqual(skillMeta(reviewSkill));
+  });
+
+  /**
+   * Scenario:
+   * 1. A client without the AIR capability runs a turn with init and commands_changed.
+   * Expected:
+   * - getContextUsage is not called.
+   * - No command has `_meta`.
+   */
+  it("does not call getContextUsage for a client that is not AIR", async () => {
+    const getContextUsage = vi.fn(async () =>
+      skillEntry({ name: "review", source: "projectSettings", path: "/x/SKILL.md" }),
+    );
+
+    const { commandUpdates } = await runTurn({
+      capabilities: {},
+      commands: [{ name: "review", description: "Review", argumentHint: "" }],
+      getContextUsage,
+      changes: 1,
+    });
+
+    expect(getContextUsage).not.toHaveBeenCalled();
+    const metas = commandUpdates().flatMap((u) => u.availableCommands.map((c: any) => c._meta));
+    expect(metas.every((meta) => meta === undefined)).toBe(true);
+  });
+
+  /**
+   * Scenario:
+   * 1. An AIR session gets three init frames and then one commands_changed.
+   * 2. Every getContextUsage read returns the same skill list.
+   * Expected:
+   * - Two updates: the one for commands_changed and the one for the first read.
+   * - getContextUsage ran exactly twice: once for init, once for commands_changed.
+   */
+  it("sends no extra update for an identical result and reads once for repeated inits", async () => {
+    const getContextUsage = vi.fn(async () =>
+      skillEntry({ name: "review", source: "projectSettings", path: "/p/review/SKILL.md" }),
+    );
+
+    const { commandUpdates } = await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [{ name: "review", description: "Review", argumentHint: "" }],
+      getContextUsage,
+      inits: 3,
+      changes: 1,
+    });
+
+    expect(commandUpdates()).toHaveLength(2);
+    expect(getContextUsage).toHaveBeenCalledTimes(2);
+  });
+
+  /**
+   * Scenario:
+   * 1. The first getContextUsage call stays pending.
+   * 2. An AIR session gets an init and two commands_changed meanwhile.
+   * 3. The pending call then resolves.
+   * Expected:
+   * - Only one call is made while the first is pending.
+   * - After it resolves, exactly one more call is made.
+   */
+  it("coalesces triggers during a running read into one more read", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const getContextUsage = vi.fn(async () => {
+      if (getContextUsage.mock.calls.length === 1) await gate;
+      return { skills: { skillFrontmatter: [] } };
+    });
+
+    await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [{ name: "review", description: "Review", argumentHint: "" }],
+      getContextUsage,
+      changes: 2,
+    });
+    expect(getContextUsage).toHaveBeenCalledTimes(1);
+
+    release();
+
+    await vi.waitFor(() => expect(getContextUsage).toHaveBeenCalledTimes(2));
+  });
+});
+
 describe("logout", () => {
   function createMockAgent() {
     const mockClient = {
@@ -13646,6 +14595,8 @@ describe("session/fork", () => {
       { sessionUpdate: async (n: SessionNotification) => updates.push(n) } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
+    // The scripted sessions run in a cwd that does not exist here.
+    vi.spyOn(agent as any, "validateCwd").mockResolvedValue(undefined);
     const createSession = vi
       .spyOn(agent as any, "createSession")
       .mockImplementation(async (params: any, options: any) => {
@@ -13742,6 +14693,35 @@ describe("session/fork", () => {
     ).rejects.toThrow("Claude Code did not start");
   });
 
+  it("rejects a bad cwd or a relative additional directory before copying the transcript", async () => {
+    const { agent, createSession } = forkingAgent();
+    (agent as any).validateCwd.mockRestore();
+    const missing = path.join(os.tmpdir(), `missing-${randomUUID()}`);
+
+    for (const params of [
+      { cwd: "workspace" },
+      { cwd: missing },
+      { cwd: os.tmpdir(), additionalDirectories: ["extra"] },
+    ]) {
+      await expect(
+        agent.unstable_forkSession({ sessionId: "source-id", mcpServers: [], ...params }),
+      ).rejects.toMatchObject({ code: -32602 });
+    }
+    expect(forkSession).not.toHaveBeenCalled();
+    expect(createSession).not.toHaveBeenCalled();
+  });
+
+  it("reports an unknown source session as not found", async () => {
+    const { agent, createSession } = forkingAgent();
+    // What the Claude SDK `forkSession` throws for a session without a transcript.
+    vi.mocked(forkSession).mockRejectedValueOnce(new Error("Session source-id not found"));
+
+    await expect(
+      agent.unstable_forkSession({ sessionId: "source-id", cwd: "/workspace", mcpServers: [] }),
+    ).rejects.toMatchObject({ code: -32002, data: { sessionId: "source-id" } });
+    expect(createSession).not.toHaveBeenCalled();
+  });
+
   it("forks the latest turn in the requested workspace", async () => {
     const { agent, createSession } = forkingAgent();
     vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "fork-id" });
@@ -13754,7 +14734,7 @@ describe("session/fork", () => {
     });
 
     expect(response.sessionId).toBe("fork-id");
-    expect(forkSession).toHaveBeenCalledWith("source-id", { dir: "/workspace" });
+    expect(forkSession).toHaveBeenCalledWith("source-id");
     expect(createSession).toHaveBeenCalledWith(
       expect.objectContaining({ cwd: "/workspace", additionalDirectories: ["/workspace/extra"] }),
       expect.objectContaining({ resume: "fork-id" }),
@@ -13798,10 +14778,9 @@ describe("session/fork", () => {
     });
 
     expect(response.sessionId).toBe("fork-id");
-    expect(getSessionMessages).toHaveBeenCalledWith("source-id", { dir: "/workspace" });
+    expect(getSessionMessages).toHaveBeenCalledWith("source-id");
     expect(importSessionToStore).not.toHaveBeenCalled();
     expect(forkSession).toHaveBeenCalledWith("source-id", {
-      dir: "/workspace",
       upToMessageId: "assistant-uuid",
     });
   });
@@ -13926,11 +14905,9 @@ describe("session/fork", () => {
 
     expect(response.sessionId).toBe("fork-id");
     expect(importSessionToStore).toHaveBeenLastCalledWith("source-id", expect.any(Object), {
-      dir: "/workspace",
       includeSubagents: false,
     });
     expect(forkSession).toHaveBeenLastCalledWith("source-id", {
-      dir: "/workspace",
       upToMessageId: "inactive-assistant-uuid",
     });
   });
@@ -14231,7 +15208,10 @@ describe("getOrCreateSession param change detection", () => {
     const mockClient = {
       sessionUpdate: async () => {},
     } as unknown as AcpClient;
-    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    // The injected sessions run in cwds that do not exist here, such as "/test".
+    vi.spyOn(agent as any, "validateCwd").mockResolvedValue(undefined);
+    return agent;
   }
 
   function injectSession(
@@ -14347,6 +15327,32 @@ describe("getOrCreateSession param change detection", () => {
     );
   });
 
+  it("keeps the live session when a resume or load names a bad cwd or additional directory", async () => {
+    const agent = createMockAgent();
+    (agent as any).validateCwd.mockRestore();
+    const session = injectSession(agent, "s1", { cwd: "/old" });
+    const createSessionSpy = vi.spyOn(agent as any, "createSession");
+    const missing = path.join(os.tmpdir(), `missing-${randomUUID()}`);
+
+    for (const params of [
+      { cwd: "relative" },
+      { cwd: missing },
+      { cwd: os.tmpdir(), additionalDirectories: ["extra"] },
+    ]) {
+      await expect(
+        agent.resumeSession({ sessionId: "s1", mcpServers: [], ...params }),
+      ).rejects.toMatchObject({ code: -32602 });
+    }
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([]);
+    await expect(
+      agent.loadSession({ sessionId: "s1", cwd: missing, mcpServers: [] }),
+    ).rejects.toMatchObject({ code: -32602 });
+
+    expect(agent.sessions["s1"]).toBe(session);
+    expect(session.abortController.signal.aborted).toBe(false);
+    expect(createSessionSpy).not.toHaveBeenCalled();
+  });
+
   // Claude Code writes the conversation at the first prompt, so a live session
   // that was never prompted has nothing to resume.
   it("starts a fresh query under the same id for a live session that was never prompted", async () => {
@@ -14354,7 +15360,7 @@ describe("getOrCreateSession param change detection", () => {
     injectSession(agent, "s1", { cwd: "/project" });
     const createSessionSpy = vi
       .spyOn(agent as any, "createSession")
-      .mockRejectedValueOnce(RequestError.resourceNotFound("s1"))
+      .mockRejectedValueOnce(RequestError.sessionNotFound("s1"))
       .mockResolvedValueOnce({ sessionId: "s1", modes: undefined, configOptions: [] });
 
     await expect(
@@ -14384,11 +15390,11 @@ describe("getOrCreateSession param change detection", () => {
     const agent = createMockAgent();
     const createSessionSpy = vi
       .spyOn(agent as any, "createSession")
-      .mockRejectedValue(RequestError.resourceNotFound("s1"));
+      .mockRejectedValue(RequestError.sessionNotFound("s1"));
 
     await expect(
       agent.resumeSession({ sessionId: "s1", cwd: "/project", mcpServers: [] }),
-    ).rejects.toMatchObject({ code: RequestError.resourceNotFound().code });
+    ).rejects.toMatchObject({ code: -32002, data: { sessionId: "s1" } });
 
     expect(createSessionSpy).toHaveBeenCalledTimes(1);
   });
@@ -19275,6 +20281,72 @@ describe("post-error recovery", () => {
     await agent.sessions["test-session"]?.consumer;
   });
 
+  it("does not cancel a prompt received while the cancel awaits", async () => {
+    // Turn 1 runs and turn 2 is queued when the cancel arrives. Turn 3 arrives
+    // while the cancel awaits `contextCompaction.interrupt()`: ACP v2 cancels
+    // only prompts received before `session/cancel`, so turn 3 must run.
+    const agent = createMockAgent();
+    let releaseInterrupt!: () => void;
+    const interruptGate = new Promise<void>((resolve) => (releaseInterrupt = resolve));
+    let releaseStream!: () => void;
+    const streamGate = new Promise<void>((resolve) => (releaseStream = resolve));
+    const orphanResult = createResultMessage({
+      subtype: "success",
+      stop_reason: "end_turn",
+      is_error: false,
+    });
+    injectGeneratorSession(
+      agent,
+      (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const u1 = await iter.next();
+          yield userEcho(u1.value); // turn 1 active
+          await iter.next(); // turn 2, queued before the cancel
+          const u3 = await iter.next(); // turn 3, queued during the cancel
+          await streamGate;
+          yield { type: "system", subtype: "session_state_changed", state: "idle" }; // turn 1 cancelled
+          yield orphanResult; // turn 2's result, skipped as an orphan
+          yield userEcho(u3.value);
+          yield createResultMessage({
+            subtype: "success",
+            stop_reason: "end_turn",
+            is_error: false,
+          });
+          yield { type: "system", subtype: "session_state_changed", state: "idle" };
+        }
+        return messageGenerator();
+      },
+      { contextCompaction: { interrupt: () => interruptGate } },
+    );
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    await waitFor(() => (agent.sessions["test-session"]?.turnQueue?.length ?? 0) >= 2);
+
+    const cancel = agent.cancel({ sessionId: "test-session" });
+    const third = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "third" }],
+    });
+    await waitFor(() => (agent.sessions["test-session"]?.turnQueue?.length ?? 0) >= 3);
+    releaseInterrupt();
+    await cancel;
+    releaseStream();
+
+    await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+    await expect(second).resolves.toEqual({ stopReason: "cancelled" });
+    await expect(third).resolves.toMatchObject({ stopReason: "end_turn" });
+    await agent.sessions["test-session"]?.consumer;
+  });
+
   it("drains the orphan count, then promotes a no-echo /compact while still cancelled", async () => {
     // The case that ONLY the orphan-count gate handles (the old `!cancelled`
     // gate would hang it): cancel removes a queued turn (count=1), its orphan
@@ -21132,7 +22204,7 @@ describe("output after a cancel", () => {
     expect(texts).toEqual(["Starting the build.", "The build", " passed."]);
   });
 
-  it("drops the answer to a prompt sent while the cancel was still in progress", async () => {
+  it("answers a prompt sent while the cancel was still in progress", async () => {
     const interrupting = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     const cancelDone = Promise.withResolvers<void>();
@@ -21181,14 +22253,20 @@ describe("output after a cancel", () => {
     await cancelling;
     cancelDone.resolve();
 
+    // The cancel covers only the prompts received before it.
     await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
-    await expect(second).resolves.toEqual({ stopReason: "cancelled" });
+    await expect(second).resolves.toMatchObject({ stopReason: "end_turn" });
     await consumer;
-    expect(texts).toEqual(["Starting the build.", "The build", " passed."]);
+    expect(texts).toEqual([
+      "Starting the build.",
+      "Here is the second answer.",
+      "The build",
+      " passed.",
+    ]);
     expect(session.lastTurnFailed).not.toBe(true);
   });
 
-  it("drops the answer to a prompt sent during the cancel whose request comes before the cancel abandons it", async () => {
+  it("answers a prompt sent during the cancel that Claude Code takes before the cancel ends", async () => {
     const interrupting = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     const requested = Promise.withResolvers<void>();
@@ -21241,10 +22319,16 @@ describe("output after a cancel", () => {
     await cancelling;
     swept.resolve();
 
+    // The cancel covers only the prompts received before it.
     await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
-    await expect(second).resolves.toEqual({ stopReason: "cancelled" });
+    await expect(second).resolves.toMatchObject({ stopReason: "end_turn" });
     await consumer;
-    expect(texts).toEqual(["Starting the build.", "The build", " passed."]);
+    expect(texts).toEqual([
+      "Starting the build.",
+      "Here is the second answer.",
+      "The build",
+      " passed.",
+    ]);
   });
 
   it("keeps the prompts an earlier cancel stopped when the user cancels again", async () => {
@@ -25140,7 +26224,7 @@ describe("turn steering (_session/steering)", () => {
     const agent = createMockAgent();
     await expect(
       agent.steer({ sessionId: "missing", prompt: [{ type: "text", text: "hi" }] }),
-    ).rejects.toThrow("Session not found");
+    ).rejects.toMatchObject({ code: -32002, data: { sessionId: "missing" } });
   });
 
   it("rejects when the query stream has already closed", async () => {

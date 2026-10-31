@@ -321,6 +321,61 @@ describe("createSession options merging", () => {
     ).toBe(true);
   });
 
+  it("reports a worktree child's cwd from its SubagentStart hook, and none for a child in the session's cwd", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const client = createMockClient();
+    client.sessionUpdate = async (notification) => {
+      updates.push(notification);
+    };
+    const observedAgent = new ClaudeAcpAgent(client);
+    await observedAgent.initialize({ protocolVersion: 1, clientCapabilities: { subagents: {} } });
+    const { sessionId } = await observedAgent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    const session = observedAgent.sessions[sessionId]!;
+    const runtime = (session.nativeSubagentRuntime = new NativeSubagentRuntime(
+      "rfd",
+      sessionId,
+      session,
+      (notification) => client.sessionUpdate(notification),
+      { log: () => {} },
+    ));
+    const subagentStart = async (agentId: string, cwd: string) => {
+      const matcher = capturedOptions!.hooks!.SubagentStart!.find((matcher) => !matcher.matcher);
+      for (const hook of matcher!.hooks) {
+        await hook(
+          {
+            hook_event_name: "SubagentStart",
+            session_id: sessionId,
+            cwd,
+            transcript_path: "/tmp/transcript",
+            agent_id: agentId,
+            agent_type: "general-purpose",
+          },
+          undefined,
+          { signal: new AbortController().signal },
+        );
+      }
+    };
+    const worktree = path.join(process.cwd(), ".claude", "worktrees", "agent-isolated");
+    await subagentStart("isolated", worktree);
+    await subagentStart("shared", process.cwd());
+    await runtime.taskStarted(
+      { taskId: "isolated", subagentType: "general-purpose" },
+      async () => {},
+    );
+    await runtime.taskStarted(
+      { taskId: "shared", subagentType: "general-purpose" },
+      async () => {},
+    );
+    const announcements = updates.flatMap(({ update }) =>
+      update.sessionUpdate === "subagent_update" ? [update] : [],
+    );
+    expect(announcements).toMatchObject([
+      { sessionId: "isolated", cwd: worktree },
+      { sessionId: "shared" },
+    ]);
+    expect(announcements[1]).not.toHaveProperty("cwd");
+  });
+
   it("reports an AIR child's model switch under its current generation", async () => {
     const updates: AcpSessionNotification[] = [];
     const client = createMockClient();
@@ -1254,6 +1309,66 @@ describe("createSession options merging", () => {
     });
   });
 
+  describe("thinking display from CLAUDE_CODE_THINKING_DISPLAY", () => {
+    let originalMaxThinking: string | undefined;
+    let originalDisplay: string | undefined;
+
+    beforeEach(() => {
+      originalMaxThinking = process.env.MAX_THINKING_TOKENS;
+      originalDisplay = process.env.CLAUDE_CODE_THINKING_DISPLAY;
+      delete process.env.MAX_THINKING_TOKENS;
+      delete process.env.CLAUDE_CODE_THINKING_DISPLAY;
+    });
+
+    afterEach(() => {
+      if (originalMaxThinking !== undefined) {
+        process.env.MAX_THINKING_TOKENS = originalMaxThinking;
+      } else {
+        delete process.env.MAX_THINKING_TOKENS;
+      }
+      if (originalDisplay !== undefined) {
+        process.env.CLAUDE_CODE_THINKING_DISPLAY = originalDisplay;
+      } else {
+        delete process.env.CLAUDE_CODE_THINKING_DISPLAY;
+      }
+    });
+
+    it("becomes explicit adaptive thinking when only display is set", async () => {
+      process.env.CLAUDE_CODE_THINKING_DISPLAY = "omitted";
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(capturedOptions!.thinking).toEqual({ type: "adaptive", display: "omitted" });
+    });
+
+    it("attaches display to a fixed thinking budget", async () => {
+      process.env.MAX_THINKING_TOKENS = "12000";
+      process.env.CLAUDE_CODE_THINKING_DISPLAY = "summarized";
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(capturedOptions!.thinking).toEqual({
+        type: "enabled",
+        budgetTokens: 12000,
+        display: "summarized",
+      });
+    });
+
+    it("has no effect when thinking is disabled", async () => {
+      process.env.MAX_THINKING_TOKENS = "0";
+      process.env.CLAUDE_CODE_THINKING_DISPLAY = "summarized";
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(capturedOptions!.thinking).toEqual({ type: "disabled" });
+    });
+
+    it("ignores an invalid value", async () => {
+      process.env.CLAUDE_CODE_THINKING_DISPLAY = "verbose";
+      const errorSpy = vi.fn();
+      (agent as any).logger = { log: () => {}, error: errorSpy };
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(capturedOptions!.thinking).toBeUndefined();
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("CLAUDE_CODE_THINKING_DISPLAY"),
+      );
+    });
+  });
+
   describe("cwd validation", () => {
     it("rejects a relative cwd with invalidParams", async () => {
       await expect(
@@ -2000,7 +2115,7 @@ describe("createSession options merging", () => {
 
       await expect(
         loadAgent.loadSession({ sessionId: "replay-probe", cwd: process.cwd(), mcpServers: [] }),
-      ).rejects.toMatchObject({ code: RequestError.resourceNotFound().code });
+      ).rejects.toMatchObject({ code: -32002, data: { sessionId: "replay-probe" } });
       expect(updates).toEqual([]);
       expect((loadAgent as any).sessions["replay-probe"]).toBeUndefined();
     });
@@ -2022,7 +2137,8 @@ describe("createSession options merging", () => {
         mcpServers: [],
       });
       const failed = expect(loading).rejects.toMatchObject({
-        code: RequestError.resourceNotFound().code,
+        code: -32002,
+        data: { sessionId: "replay-probe" },
       });
 
       failInit();

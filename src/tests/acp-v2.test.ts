@@ -13,6 +13,7 @@ import * as v1 from "@agentclientprotocol/sdk/unstable";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import {
   forkSession,
+  getSessionInfo,
   getSessionMessages,
   type Options,
   type SDKUserMessage,
@@ -27,6 +28,7 @@ import { v1PermissionResponse, v2PermissionRequest } from "../v2/permission.js";
 import { v1PromptRequest } from "../v2/prompt.js";
 import { V2Terminals } from "../v2/terminal.js";
 import { V2ToolCallMeta } from "../v2/tool-call-meta.js";
+import { v2RestartedToolCall } from "../v2/tool-call.js";
 import { v2ChildStateUpdate, v2SessionUpdate } from "../v2/session-update.js";
 import {
   v1ForkSessionRequest,
@@ -59,6 +61,9 @@ const sdk = vi.hoisted(() => ({
   /** The query is closed, as `session/close` closes it. */
   close: (): void => {},
   mcpServerStatus: async (): Promise<Array<{ name: string; status: string }>> => [],
+  supportedCommands: async (): Promise<
+    Array<{ name: string; description: string; argumentHint: string }>
+  > => [{ name: "review", description: "Review a change", argumentHint: "<pull request>" }],
   mcpAuthenticate: async (
     _serverName: string,
   ): Promise<{ authUrl?: string; requiresUserAction: boolean; callbackExpected: boolean }> => ({
@@ -91,9 +96,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
             },
           ],
         }),
-        supportedCommands: async () => [
-          { name: "review", description: "Review a change", argumentHint: "<pull request>" },
-        ],
+        supportedCommands: () => sdk.supportedCommands(),
         mcpServerStatus: () => sdk.mcpServerStatus(),
         mcpAuthenticate: (serverName: string) => sdk.mcpAuthenticate(serverName),
         interrupt: () => sdk.interrupt(),
@@ -111,6 +114,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
       },
     ]),
     getSessionMessages: vi.fn(async () => []),
+    getSessionInfo: vi.fn(async () => undefined),
     forkSession: vi.fn(async () => ({ sessionId: "99999999-8888-4777-8666-555555555555" })),
     deleteSession: vi.fn(async () => {}),
   };
@@ -152,14 +156,15 @@ beforeEach(async () => {
 afterEach(async () => {
   await Promise.all(agents.splice(0).map((agent) => agent.dispose()));
   execFileSpy.mockReset();
+  vi.mocked(getSessionInfo).mockReset();
   vi.unstubAllEnvs();
   await rm(tempDir, { recursive: true, force: true, maxRetries: 10 });
 });
 
 /** Connects a fresh router to a client, and returns the client end of the stream. */
 function connectRouter(protocols?: AcpProtocols): v2.Stream {
-  const toAgent = new TransformStream<v2.AnyWireMessage, v2.AnyWireMessage>();
-  const toClient = new TransformStream<v2.AnyWireMessage, v2.AnyWireMessage>();
+  const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
+  const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
   acpProtocolRouter(undefined, (agent) => agents.push(agent), protocols).connect({
     readable: toAgent.readable,
     writable: toClient.writable,
@@ -317,6 +322,23 @@ describe("ACP protocol routing", () => {
     }
   });
 
+  it("does not advertise the AIR async tasks and goal extensions to a v2 AIR client", async () => {
+    const { app, authUpdate } = v2Client();
+    const response = await app.connectWith(connectRouter(), async (agent) => {
+      const response = await initializeV2(agent, {
+        _meta: { jetbrains: { air: { version: 1, capabilities: [] } } },
+      });
+      await authUpdate(1);
+      return response;
+    });
+
+    // The v2 app registers neither `_session/async_task/stop` nor `_session/goal`.
+    const air = (response._meta as any)?.jetbrains?.air;
+    expect(air.capabilities).toContain("sessionFailure");
+    expect(air.capabilities).not.toContain("asyncTasks");
+    expect(air).not.toHaveProperty("goal");
+  });
+
   it("negotiates a v2 client down to v1 when limited to v1", async () => {
     // On the raw stream, since the v2 client app cannot read the v1 response
     // that a real client would switch to v1 on.
@@ -329,11 +351,11 @@ describe("ACP protocol routing", () => {
       params: { protocolVersion: v2.PROTOCOL_VERSION, info: V2_CLIENT_INFO, capabilities: {} },
     });
     const reader = stream.readable.getReader();
-    let response: v2.AnyWireMessage | undefined;
+    let response: v2.AnyMessage | undefined;
     while (!response) {
       const { value, done } = await reader.read();
       if (done) break;
-      if (!Array.isArray(value) && "id" in value && value.id === 1) response = value;
+      if ("id" in value && value.id === 1) response = value;
     }
     await writer.close();
 
@@ -367,11 +389,13 @@ describe("ACP protocol routing", () => {
 /** The commands of every session of the mocked SDK, in v2 form. */
 const SESSION_COMMANDS: v2.AvailableCommand[] = [
   {
+    type: "command",
     name: "review",
     description: "Review a change",
     input: { type: "text", hint: "<pull request>" },
   },
   {
+    type: "command",
     name: "mcp",
     description: "Show the MCP servers and their status, or reconnect, enable, or disable a server",
     input: { type: "text", hint: "[reconnect|enable|disable [<server>|all]]" },
@@ -435,6 +459,28 @@ describe("ACP v2 sessions", () => {
     expect(client.updates("available_commands_update")).toEqual([]);
   });
 
+  it("sends the commands in an update after the response when reading them for it fails", async () => {
+    let commandsRead = 0;
+    const commands = sdkDefaults.supportedCommands;
+    sdk.supportedCommands = async () => {
+      // The first read is the response's; the second is the update's.
+      if (++commandsRead === 1) throw new Error("control request failed");
+      return commands();
+    };
+    const client = v2Client();
+    const response = await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const response = await agent.request(v2.methods.agent.session.new, { cwd });
+      await vi.waitFor(() => expect(client.updates("available_commands_update")).toHaveLength(1));
+      return response;
+    });
+
+    expect(response).not.toHaveProperty("availableCommands");
+    expect(client.updates("available_commands_update")).toEqual([
+      { sessionUpdate: "available_commands_update", availableCommands: SESSION_COMMANDS },
+    ]);
+  });
+
   it("rejects an MCP transport that v1 cannot express", async () => {
     const { app, authUpdate } = v2Client();
     await app.connectWith(connectRouter(), async (agent) => {
@@ -448,6 +494,54 @@ describe("ACP v2 sessions", () => {
       await authUpdate(1);
     });
     expect(sdk.queryOptions).toHaveLength(0);
+  });
+
+  it("rejects an MCP-over-ACP server, which the agent does not advertise", async () => {
+    const { app, authUpdate } = v2Client();
+    await app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      await expect(
+        agent.request(v2.methods.agent.session.new, {
+          cwd,
+          mcpServers: [{ type: "acp", name: "tools", serverId: "server-1" }],
+        }),
+      ).rejects.toMatchObject({ code: -32602, data: { type: "acp" } });
+      await authUpdate(1);
+    });
+    expect(sdk.queryOptions).toHaveLength(0);
+  });
+
+  it("rejects two MCP servers with the same name in new, resume, and fork", async () => {
+    const { app, authUpdate } = v2Client();
+    const mcpServers: v2.McpServer[] = [
+      { type: "stdio", name: "files", command: "/usr/local/bin/mcp-files" },
+      { type: "http", name: "files", url: "https://mcp.example.com/mcp" },
+    ];
+    const duplicate = { code: -32602, data: { name: "files" } };
+    await app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      await expect(
+        agent.request(v2.methods.agent.session.new, { cwd, mcpServers }),
+      ).rejects.toMatchObject(duplicate);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await expect(
+        agent.request(v2.methods.agent.session.resume, { sessionId, cwd, mcpServers }),
+      ).rejects.toMatchObject(duplicate);
+      await expect(
+        agent.request(v2.methods.agent.session.resume, {
+          sessionId,
+          cwd,
+          mcpServers,
+          replayFrom: { type: "start" },
+        }),
+      ).rejects.toMatchObject(duplicate);
+      await expect(
+        agent.request(v2.methods.agent.session.fork, { sessionId, cwd, mcpServers }),
+      ).rejects.toMatchObject(duplicate);
+      await authUpdate(1);
+    });
+    // Only the session without MCP servers started.
+    expect(sdk.queryOptions).toHaveLength(1);
   });
 
   it("lists, resumes, closes, and deletes sessions", async () => {
@@ -489,21 +583,48 @@ describe("ACP v2 sessions", () => {
 
   it("sets a config option with a v2 value and reports modes only as config options", async () => {
     const client = v2Client();
-    const response = await client.app.connectWith(connectRouter(), async (agent) => {
-      await initializeV2(agent);
-      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
-      const response = await agent.request(v2.methods.agent.session.setConfigOption, {
-        sessionId,
-        configId: "mode",
-        type: "id",
-        value: "plan",
-      });
-      await client.authUpdate(1);
-      return response;
-    });
+    const { response, updatesBeforeResponse } = await client.app.connectWith(
+      connectRouter(),
+      async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        const response = await agent.request(v2.methods.agent.session.setConfigOption, {
+          sessionId,
+          configId: "mode",
+          type: "id",
+          value: "plan",
+        });
+        const updatesBeforeResponse = client.updates("config_option_update");
+        await client.authUpdate(1);
+        return { response, updatesBeforeResponse };
+      },
+    );
 
     expect(response.configOptions[0]).toMatchObject({ configId: "mode", currentValue: "plan" });
     expect(client.updates("current_mode_update")).toEqual([]);
+    // The client also gets the change as an update, before the response.
+    expect(updatesBeforeResponse).toEqual([
+      { sessionUpdate: "config_option_update", configOptions: response.configOptions },
+    ]);
+  });
+
+  it("sends no config_option_update when setting a config option fails", async () => {
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await expect(
+        agent.request(v2.methods.agent.session.setConfigOption, {
+          sessionId,
+          configId: "mode",
+          type: "id",
+          value: "no-such-mode",
+        }),
+      ).rejects.toThrow();
+      await client.authUpdate(1);
+    });
+
+    expect(client.updates("config_option_update")).toEqual([]);
   });
 
   it("tells the agent that a v2 client takes notices and compaction updates", async () => {
@@ -551,6 +672,39 @@ describe("ACP v2 sessions", () => {
     expect(client.completedElicitations).toEqual([
       { elicitationId: (client.elicitations[0] as { elicitationId: string }).elicitationId },
     ]);
+  });
+
+  it("sends the URL elicitation of MCP OAuth only after the session/new response", async () => {
+    sdk.mcpServerStatus = async () => [{ name: "linear", status: "needs-auth" }];
+    sdk.mcpAuthenticate = async () => ({
+      authUrl: "https://example.com/oauth/authorize",
+      requiresUserAction: true,
+      callbackExpected: true,
+    });
+    // Reading the commands for the response takes longer than starting OAuth.
+    const commands = sdkDefaults.supportedCommands;
+    sdk.supportedCommands = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return commands();
+    };
+    const events: string[] = [];
+    const client = v2Client({
+      answerElicitation: () => {
+        events.push("elicitation");
+        return { action: "decline" };
+      },
+    });
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent, { elicitation: { url: {} } });
+      await agent.request(v2.methods.agent.session.new, {
+        cwd,
+        mcpServers: [{ type: "http", name: "linear", url: "https://mcp.linear.app/mcp" }],
+      });
+      events.push("response");
+      await vi.waitFor(() => expect(events).toContain("elicitation"));
+    });
+
+    expect(events).toEqual(["response", "elicitation"]);
   });
 });
 
@@ -813,6 +967,71 @@ describe("ACP v2 prompts", () => {
     ]);
   });
 
+  it("answers an MCP server's elicitation with cancel when the client cannot render it", async () => {
+    let answer: unknown;
+    scriptTurns(async function* (options) {
+      answer = await options.onElicitation!(
+        {
+          serverName: "linear",
+          message: "Which team?",
+          mode: "form",
+          requestedSchema: { type: "object", properties: { team: { type: "string" } } },
+        },
+        { signal: new AbortController().signal } as Parameters<
+          NonNullable<Options["onElicitation"]>
+        >[1],
+      );
+      yield assistantText(options, "No answer.");
+      yield result(options);
+    });
+    // The client rejects a form it cannot render with -32602.
+    const client = v2Client({
+      answerElicitation: () => {
+        throw v1.RequestError.invalidParams(undefined, "Cannot render this form");
+      },
+    });
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent, { elicitation: { form: {} } });
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+    });
+
+    expect(client.elicitations).toHaveLength(1);
+    // The user never saw the form, so the MCP server is not told they declined.
+    expect(answer).toEqual({ action: "cancel" });
+  });
+
+  it("answers an MCP server's URL elicitation with cancel when the client supports only forms", async () => {
+    let answer: unknown;
+    scriptTurns(async function* (options) {
+      answer = await options.onElicitation!(
+        {
+          serverName: "linear",
+          message: "Sign in",
+          mode: "url",
+          url: "https://linear.app/oauth",
+          elicitationId: "e1",
+        },
+        { signal: new AbortController().signal } as Parameters<
+          NonNullable<Options["onElicitation"]>
+        >[1],
+      );
+      yield assistantText(options, "No answer.");
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent, { elicitation: { form: {} } });
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+    });
+
+    expect(client.elicitations).toHaveLength(0);
+    expect(answer).toEqual({ action: "cancel" });
+  });
+
   it("does not report the next turn as waiting for a question that its client never settled", async () => {
     // Claude Code's interrupt withdraws the question. The client holds it and
     // ignores $/cancel_request, so only the agent can stop waiting for it.
@@ -880,7 +1099,7 @@ describe("ACP v2 prompts", () => {
     const decisions: unknown[] = [];
     scriptTurns(async function* (options) {
       // Claude Code asks about each Bash tool use, then returns its result.
-      for (const toolUseID of ["toolu_allow", "toolu_reject", "toolu_custom"]) {
+      for (const toolUseID of ["toolu_allow", "toolu_reject", "toolu_dismissed", "toolu_custom"]) {
         yield {
           type: "assistant",
           message: {
@@ -928,6 +1147,9 @@ describe("ACP v2 prompts", () => {
     const answers: v2.RequestPermissionResponse[] = [
       { outcome: { outcome: "selected", optionId: "allow-once" } },
       { outcome: { outcome: "selected", optionId: "reject" } },
+      // Without a session/cancel, `cancelled` means that the user dismissed
+      // the prompt or the client declined it by policy.
+      { outcome: { outcome: "cancelled" } },
       // The draft says an outcome that the agent does not know is no approval.
       { outcome: { outcome: "_later" } },
     ];
@@ -948,13 +1170,21 @@ describe("ACP v2 prompts", () => {
         { optionId: "reject", kind: "reject_once" },
       ],
     });
+    const refused = {
+      behavior: "deny",
+      message: "User refused permission to run tool",
+      decisionClassification: "user_reject",
+    };
     expect(decisions).toEqual([
       expect.objectContaining({ behavior: "allow" }),
       expect.objectContaining({ behavior: "deny" }),
-      "Tool use aborted",
+      expect.objectContaining({ ...refused, toolUseID: "toolu_dismissed" }),
+      expect.objectContaining({ ...refused, toolUseID: "toolu_custom" }),
     ]);
     expect(turnTrace(client.sessionUpdates)).toEqual([
       "user_message",
+      "running",
+      "requires_action",
       "running",
       "requires_action",
       "running",
@@ -966,8 +1196,9 @@ describe("ACP v2 prompts", () => {
     ]);
   });
 
-  it("forks a session into one that the client can prompt at once", async () => {
+  it.each(["same", "different"])("forks a promptable session in the %s cwd", async (dir) => {
     const forkId = "99999999-8888-4777-8666-555555555555";
+    const forkCwd = dir === "same" ? cwd : await mkdtemp(path.join(tempDir, "fork-"));
     const echoed = scriptTurns(async function* (options) {
       yield assistantText(options, "Forked.");
       yield result(options);
@@ -978,17 +1209,18 @@ describe("ACP v2 prompts", () => {
       const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
       const fork = await agent.request(v2.methods.agent.session.fork, {
         sessionId,
-        cwd,
+        cwd: forkCwd,
         mcpServers: [{ type: "http", name: "linear", url: "https://mcp.linear.app/mcp" }],
       });
 
       expect(fork.sessionId).toBe(forkId);
       expect(fork.configOptions?.map((option) => option.configId)).toContain("mode");
-      expect(forkSession).toHaveBeenCalledWith(sessionId, { dir: cwd });
+      expect(forkSession).toHaveBeenCalledWith(sessionId);
       // The fork runs as its own Claude Code session, resumed from the copied
       // transcript, with the MCP servers of the fork request.
       const forkQuery = sdk.queryOptions.at(-1)!;
       expect(forkQuery.resume).toBe(forkId);
+      expect(forkQuery.cwd).toBe(forkCwd);
       expect(Object.keys(forkQuery.mcpServers ?? {})).toContain("linear");
 
       // No session/resume needed before the first prompt.
@@ -1047,6 +1279,13 @@ describe("ACP v2 prompts", () => {
     expect(client.updates("tool_call_update")).toContainEqual(
       expect.objectContaining({ toolCallId: "toolu_w", title: "Write a.ts", content: [] }),
     );
+    // The client may hold the tool call from before the replay, so the replayed
+    // start resets what it leaves out.
+    expect(client.updates("tool_call_update")[0]).toMatchObject({
+      toolCallId: "toolu_w",
+      rawOutput: null,
+      _meta: null,
+    });
   });
 
   it("replays a subagent's history to its own session, and clears each replayed message there first", async () => {
@@ -1415,6 +1654,59 @@ describe("ACP v2 prompts", () => {
       expect(
         client.sessionUpdates.slice(afterReplay).map(({ update }) => update.sessionUpdate),
       ).not.toContain("agent_message");
+      await client.authUpdate(1);
+    });
+  });
+
+  it("sends the current session info after the replay and before the resume response", async () => {
+    scriptTurns(async function* (options) {
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+
+      vi.mocked(getSessionInfo).mockResolvedValue({
+        sessionId,
+        summary: "Say hi",
+        lastModified: Date.UTC(2026, 9, 2),
+      } as Awaited<ReturnType<typeof getSessionInfo>>);
+      const info = {
+        sessionUpdate: "session_info_update",
+        title: "Say hi",
+        updatedAt: "2026-10-02T00:00:00.000Z",
+      };
+
+      // Without a replay, and again although the client was already sent it.
+      for (let i = 0; i < 2; i++) {
+        const before = client.sessionUpdates.length;
+        await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+        expect(client.sessionUpdates.slice(before).map(({ update }) => update)).toEqual([
+          info,
+          { sessionUpdate: "state_update", state: "idle" },
+        ]);
+      }
+
+      // With a replay, after the replayed history.
+      vi.mocked(getSessionMessages).mockResolvedValueOnce([
+        transcriptEntry("assistant", randomUUID(), {
+          id: "msg_answer",
+          role: "assistant",
+          content: text("Hello!"),
+        }),
+      ] as unknown as Awaited<ReturnType<typeof getSessionMessages>>);
+      const before = client.sessionUpdates.length;
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+      expect(client.sessionUpdates.slice(before).map(({ update }) => update.sessionUpdate)).toEqual(
+        ["agent_message", "agent_message_chunk", "session_info_update", "state_update"],
+      );
       await client.authUpdate(1);
     });
   });
@@ -4973,9 +5265,12 @@ describe("ACP v2 session translation", () => {
       sessionId: "agent-1",
       title: "Explore",
       description: "Look around",
+      cwd: "/project/.claude/worktrees/agent-1",
       state: { state: "running" as const },
     };
     expect(v2SessionUpdate(announcement)).toEqual(announcement);
+    const cleared = { sessionUpdate: "subagent_update" as const, sessionId: "agent-1", cwd: null };
+    expect(v2SessionUpdate(cleared)).toEqual(cleared);
     const message = {
       sessionUpdate: "session_message" as const,
       messageId: "toolu_agent",
@@ -5396,6 +5691,41 @@ describe("ACP v2 session translation", () => {
     });
   });
 
+  it("resets the fields that a restarted tool call leaves out", () => {
+    expect(
+      v2RestartedToolCall({
+        sessionUpdate: "tool_call",
+        toolCallId: "t",
+        title: "ls",
+        kind: "execute",
+        rawInput: { command: "ls" },
+      }),
+    ).toEqual({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "t",
+      title: "ls",
+      kind: "execute",
+      rawInput: { command: "ls" },
+      name: null,
+      status: null,
+      content: null,
+      locations: null,
+      rawOutput: null,
+    });
+    // A `_meta: null` from `V2ToolCallMeta` clears the client's `_meta`, so it
+    // stays, where the v2 form of a v1 report drops `null` fields.
+    expect(
+      v2RestartedToolCall({
+        sessionUpdate: "tool_call",
+        toolCallId: "t",
+        title: "ls",
+        status: "pending",
+        content: [],
+        _meta: null,
+      }),
+    ).toMatchObject({ status: "pending", content: [], locations: null, _meta: null });
+  });
+
   it("fails on a v1 diff, and passes a display terminal as it is", () => {
     const update = (content: v1.ToolCallContent) =>
       v2SessionUpdate({ sessionUpdate: "tool_call_update", toolCallId: "t", content: [content] });
@@ -5418,6 +5748,38 @@ describe("ACP v2 session translation", () => {
     // Only unknown roles: no audience, rather than an audience of nobody.
     expect(prompt(["_robot"])).toEqual({ priority: 1 });
     expect(prompt([])).toEqual({ audience: [], priority: 1 });
+  });
+
+  it("rejects audio prompt content, which the agent does not advertise", () => {
+    expect(() =>
+      v1PromptRequest({
+        sessionId: "s",
+        prompt: [{ type: "audio", data: "AAAA", mimeType: "audio/wav" }],
+      }),
+    ).toThrow(expect.objectContaining({ code: -32602, data: { type: "audio" } }));
+  });
+
+  it("rejects an empty prompt", () => {
+    expect(() => v1PromptRequest({ sessionId: "s", prompt: [] })).toThrow(
+      expect.objectContaining({ code: -32602, data: { prompt: [] } }),
+    );
+  });
+
+  it("rejects an embedded blob that Claude cannot read, and passes one it can", () => {
+    const prompt = (mimeType?: string) =>
+      v1PromptRequest({
+        sessionId: "s",
+        prompt: [{ type: "resource", resource: { uri: "file:///work/a", blob: "AAAA", mimeType } }],
+      }).prompt[0];
+    expect(prompt("application/pdf")).toEqual({
+      type: "resource",
+      resource: { uri: "file:///work/a", blob: "AAAA", mimeType: "application/pdf" },
+    });
+    expect(() => prompt("application/zip")).toThrow(
+      "Embedded blob resources of type application/zip are not supported",
+    );
+    expect(() => prompt("application/zip")).toThrow(expect.objectContaining({ code: -32602 }));
+    expect(() => prompt()).toThrow("Embedded blob resources of type unknown are not supported");
   });
 
   it("fails on a message chunk without a messageId, which v2 requires", () => {
