@@ -18,7 +18,7 @@ import {
   type Options,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { ClaudeAcpAgent } from "../acp-agent.js";
+import type { ClaudeAcpAgent, SteerResponse } from "../acp-agent.js";
 import type { AuthStatusUpdateNotification } from "../auth-status.js";
 import { clientSupportsCompactionUpdates } from "../context-compaction.js";
 import { v2DiffContent } from "../diff.js";
@@ -312,8 +312,8 @@ describe("ACP protocol routing", () => {
       systemPrompt: { mode: { override: {} } },
     });
     expect(response.capabilities?.providers).toEqual({});
-    // Not `_session/steering`, which v1 advertises in the top-level `_meta`.
-    expect(response._meta?.steering).toBeUndefined();
+    // `_session/steering`, advertised in the top-level `_meta` as v1 does.
+    expect(response._meta?.steering).toEqual({ supported: true });
     expect(response.authMethods?.length).toBeGreaterThan(0);
     for (const method of response.authMethods ?? []) {
       expect(method).not.toHaveProperty("id");
@@ -2657,6 +2657,96 @@ describe("ACP v2 prompts", () => {
       await authUpdate(1);
     });
     expect(echoed).toEqual([]);
+  });
+});
+
+// The `_session/steering` extension on the v2 surface, as v1 serves it.
+describe("ACP v2 steering (_session/steering)", () => {
+  it("delivers a steer into the running turn, ahead of the queue", async () => {
+    const steered = Promise.withResolvers<{ text: string; priority: unknown }>();
+    sdk.run = async function* (prompts, options) {
+      const input = prompts[Symbol.asyncIterator]();
+      const { value: prompt } = await input.next();
+      yield {
+        type: "user",
+        message: prompt.message,
+        parent_tool_use_id: null,
+        uuid: prompt.uuid,
+        session_id: options.sessionId,
+        isReplay: true,
+      };
+      yield assistantText(options, "Working on it.", "msg_first");
+      // Claude Code takes the steer in while the turn runs, and answers it.
+      const { value: steer } = await input.next();
+      const content = steer.message.content as { type: string; text: string }[];
+      steered.resolve({ text: content[0].text, priority: steer.priority });
+      yield {
+        type: "user",
+        message: steer.message,
+        parent_tool_use_id: null,
+        uuid: steer.uuid,
+        session_id: options.sessionId,
+        isReplay: true,
+      };
+      yield assistantText(options, "Also X, then.", "msg_steered");
+      yield result(options);
+      yield idleState(options);
+      while (!(await input.next()).done);
+    };
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("build it") });
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates)).toEqual([
+          "user_message",
+          "running",
+          "agent_message_chunk",
+        ]),
+      );
+
+      const response = await agent.request<SteerResponse>("_session/steering", {
+        sessionId,
+        prompt: text("also X"),
+      });
+      expect(response).toEqual({ outcome: "injected" });
+
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates)).toEqual([
+          "user_message",
+          "running",
+          "agent_message_chunk",
+          "agent_message_chunk",
+          "idle end_turn",
+        ]),
+      );
+      await client.authUpdate(1);
+    });
+
+    // The steer reached Claude Code as a message of the running turn, pre-empting it.
+    await expect(steered.promise).resolves.toEqual({ text: "also X", priority: "now" });
+    expect(client.updates("agent_message_chunk").map((chunk) => chunk.messageId)).toEqual([
+      "msg_first",
+      "msg_steered",
+    ]);
+  });
+
+  it("leaves an idle session to a prompt when the client asks for promptRequired", async () => {
+    scriptTurns();
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const response = await agent.request<SteerResponse>("_session/steering", {
+        sessionId,
+        prompt: text("also X"),
+        _meta: { steering: { idleBehavior: "promptRequired" } },
+      });
+      expect(response).toEqual({ outcome: "promptRequired", reason: "noRunningTurn" });
+      await client.authUpdate(1);
+    });
+    expect(turnTrace(client.sessionUpdates)).toEqual([]);
   });
 });
 

@@ -682,7 +682,7 @@ const TURN_NO_RESULT_MESSAGE =
  *  than queued as a separate `session/prompt`. Named `_session/steering` per the
  *  agreed ACP steering wire protocol; advertised to clients via the top-level
  *  `InitializeResponse._meta.steering.supported`. */
-const STEER_METHOD = "_session/steering";
+export const STEER_METHOD = "_session/steering";
 
 /** Stops one Claude background task without cancelling the parent prompt turn. */
 const ASYNC_TASK_STOP_METHOD = "_session/async_task/stop";
@@ -756,7 +756,7 @@ export type SteerResponse =
 /** Validate raw JSON-RPC params into a {@link SteerRequest}. Kept minimal — the
  *  content blocks are handed to `promptToClaude`, which tolerates unknown block
  *  types — but `sessionId` and a non-empty `prompt` array are required. */
-function parseSteerRequest(params: unknown): SteerRequest {
+export function parseSteerRequest(params: unknown): SteerRequest {
   if (!params || typeof params !== "object") {
     throw RequestError.invalidParams(undefined, "steer params must be an object");
   }

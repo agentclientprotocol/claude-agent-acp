@@ -15,7 +15,15 @@ import type {
   RequestPermissionResponse,
 } from "@agentclientprotocol/sdk/unstable";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
-import { ClaudeAcpAgent, type AcpClient, type Logger } from "../acp-agent.js";
+import {
+  ClaudeAcpAgent,
+  STEER_METHOD,
+  parseSteerRequest,
+  type AcpClient,
+  type Logger,
+  type SteerRequest,
+  type SteerResponse,
+} from "../acp-agent.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import type { AcpPermissionRequest } from "../permissions/presentation.js";
 import { v1InitializeRequest, v2InitializeResponse } from "./initialize.js";
@@ -51,7 +59,7 @@ export function v2AgentApp(
 ): v2.AgentApp {
   let agent!: ClaudeAcpAgent;
   let client!: V2ClientConnection;
-  return v2
+  const app = v2
     .agent({ name: "claude-code-acp" })
     .onConnect((connection) => {
       client = new V2ClientConnection(connection.client, logger ?? console);
@@ -156,6 +164,14 @@ export function v2AgentApp(
       }),
     )
     .onNotification(v2.methods.agent.session.cancel, ({ params }) => agent.cancel(params));
+  // The `_session/steering` extension, as v1 serves it: a message for the
+  // running turn, delivered to Claude Code mid-turn. Its response is the same,
+  // and the v2 `initialize` response advertises it as `_meta.steering`.
+  return app.onRequest<SteerRequest, SteerResponse>(
+    STEER_METHOD,
+    { parse: parseSteerRequest },
+    ({ params }) => agent.steer(params),
+  );
 }
 
 /** The `state_update` that reports `state` as the current foreground state. */
