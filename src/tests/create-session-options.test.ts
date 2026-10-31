@@ -2243,10 +2243,18 @@ describe("createSession options merging", () => {
         await loadAgent
           .loadSession({ sessionId: "replay-probe", cwd: process.cwd(), mcpServers: [] })
           .then(() => (atResponse = kinds(updates)));
-        // `afterSetupResponse` sends the commands after the response.
-        await vi.waitFor(() => expect(kinds(updates)).toContain("available_commands_update"));
+        // Drain post-response work and ensure it does not resend the commands.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(kinds(updates).filter((kind) => kind === "available_commands_update")).toHaveLength(
+          1,
+        );
 
-        expect(atResponse).toEqual(["user_message_chunk", "user_message_chunk", "end"]);
+        expect(atResponse).toEqual([
+          "user_message_chunk",
+          "user_message_chunk",
+          "end",
+          "available_commands_update",
+        ]);
         expect(updates.filter(isEnd)).toHaveLength(1);
         const end = updates.find(isEnd)!;
         expect(end.sessionId).toBe("replay-probe");
@@ -2344,7 +2352,7 @@ describe("createSession options merging", () => {
           .loadSession({ sessionId: "replay-probe", cwd: process.cwd(), mcpServers: [] })
           .then(() => (atResponse = kinds(updates)));
 
-        expect(atResponse).toEqual(["end"]);
+        expect(atResponse).toEqual(["end", "available_commands_update"]);
       });
 
       it("sends the end event after the replay of a session that is already live", async () => {
@@ -2360,7 +2368,12 @@ describe("createSession options merging", () => {
           .loadSession({ sessionId, cwd: process.cwd(), mcpServers: [] })
           .then(() => (atResponse = kinds(updates)));
 
-        expect(atResponse).toEqual(["user_message_chunk", "user_message_chunk", "end"]);
+        expect(atResponse).toEqual([
+          "user_message_chunk",
+          "user_message_chunk",
+          "end",
+          "available_commands_update",
+        ]);
       });
 
       it("sends no end event when the CLI start fails part way through the replay", async () => {

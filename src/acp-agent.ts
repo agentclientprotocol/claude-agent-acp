@@ -3281,8 +3281,9 @@ export class ClaudeAcpAgent {
     }
     timing.phase("replay");
 
-    // After the replay, so the commands do not interleave with the history.
-    this.afterSetupResponse(params.sessionId, params.mcpServers ?? []);
+    // v2 includes commands in the response; older clients need the update before it.
+    if (!this.v2) await this.sendAvailableCommandsUpdate(params.sessionId);
+    this.afterSetupResponse(params.sessionId, params.mcpServers ?? [], true);
 
     return result;
   }
@@ -11194,10 +11195,14 @@ export class ClaudeAcpAgent {
    * authentication. On v2 the setup handlers of `src/v2/agent.ts` do this
    * work once they have sent their response, so it does nothing here.
    */
-  private afterSetupResponse(sessionId: string, mcpServers: McpServer[]): void {
+  private afterSetupResponse(
+    sessionId: string,
+    mcpServers: McpServer[],
+    commandsAlreadySent = false,
+  ): void {
     if (this.v2) return;
     setTimeout(() => {
-      this.sendAvailableCommandsUpdate(sessionId);
+      if (!commandsAlreadySent) this.sendAvailableCommandsUpdate(sessionId);
       void this.publishCurrentSubagentStates(sessionId);
       startMcpAuthentication(this, sessionId, mcpServers);
     }, 0);

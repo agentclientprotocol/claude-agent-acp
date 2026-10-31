@@ -404,7 +404,13 @@ export async function deleteSessionIfStored(
   try {
     await deleteSession(sessionId);
   } catch (error) {
-    if (isSdkNotFound(error)) return;
+    if (
+      error instanceof Error &&
+      (error.message === `Session ${sessionId} not found in any project directory` ||
+        error.message.startsWith(`Session ${sessionId} not found in project directory for `))
+    ) {
+      return;
+    }
     throw error;
   }
 }
