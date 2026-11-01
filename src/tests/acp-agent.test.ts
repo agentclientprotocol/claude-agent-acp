@@ -22,6 +22,7 @@ import {
   WriteTextFileResponse,
 } from "@agentclientprotocol/sdk/unstable";
 import type { AcpSessionNotification } from "../acp-subagents.js";
+import { AsyncTaskRuntime } from "../async-tasks.js";
 import { NativeSubagentRuntime } from "../native-subagents.js";
 import { nodeToWebWritable, nodeToWebReadable } from "../utils.js";
 import {
@@ -116,6 +117,56 @@ import type {
   BetaCodeExecutionToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { validateRecorded } from "./acp-scenarios/schema.js";
+
+describe("async task output", () => {
+  it("reads a shell task's output tail and rejects unknown or non-shell IDs", async () => {
+    const agent = new ClaudeAcpAgent({ sessionUpdate: async () => {} } as unknown as AcpClient, {
+      log: () => {},
+      error: () => {},
+    });
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { _meta: { asyncTaskDetails: { output: true } } },
+    });
+    const runtime = new AsyncTaskRuntime(true, "test-session", async () => {});
+    await runtime.taskStarted({
+      task_id: "shell",
+      task_type: "local_bash",
+      is_backgrounded: true,
+      tool_use_id: "bash-tool",
+    });
+    await runtime.taskStarted({
+      task_id: "workflow",
+      task_type: "local_workflow",
+      tool_use_id: "workflow-tool",
+    });
+    const request = vi.fn().mockResolvedValue({ response: { output: "a".repeat(9000) } });
+    agent.sessions["test-session"] = mockSessionState({
+      asyncTaskRuntime: runtime,
+      query: { request } as any,
+    });
+    const result = await agent.asyncTaskOutput({ sessionId: "test-session", asyncTaskId: "shell" });
+    expect(Buffer.byteLength(result.output)).toBe(8192);
+    expect(request).toHaveBeenCalledWith({ subtype: "get_task_output", task_id: "shell" });
+    await expect(
+      agent.asyncTaskOutput({ sessionId: "test-session", asyncTaskId: "missing" }),
+    ).rejects.toMatchObject({ code: -32602 });
+    await expect(
+      agent.asyncTaskOutput({ sessionId: "test-session", asyncTaskId: "workflow" }),
+    ).rejects.toMatchObject({ code: -32602 });
+  });
+
+  it("requires the output capability", async () => {
+    const agent = new ClaudeAcpAgent({ sessionUpdate: async () => {} } as unknown as AcpClient, {
+      log: () => {},
+      error: () => {},
+    });
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    await expect(
+      agent.asyncTaskOutput({ sessionId: "missing", asyncTaskId: "shell" }),
+    ).rejects.toMatchObject({ code: -32602 });
+  });
+});
 
 /** The capabilities of an AIR client. Only AIR gets the AIR extensions of
  *  `docs/air-extensions.md`. */
@@ -30702,5 +30753,25 @@ describe("permission_denied", () => {
     );
 
     expect(denials(updates)).toHaveLength(1);
+  });
+});
+
+describe("asyncTaskDetails negotiation", () => {
+  function agent() {
+    return new ClaudeAcpAgent({ sessionUpdate: async () => {} } as unknown as AcpClient, {
+      log: () => {},
+      error: () => {},
+    });
+  }
+
+  it("advertises output only to a client that asks for it", async () => {
+    const asked = await agent().initialize({
+      protocolVersion: 1,
+      clientCapabilities: { _meta: { asyncTaskDetails: { output: true } } },
+    });
+    expect(asked._meta?.asyncTaskDetails).toEqual({ output: true });
+
+    const silent = await agent().initialize({ protocolVersion: 1, clientCapabilities: {} });
+    expect(silent._meta).not.toHaveProperty("asyncTaskDetails");
   });
 });

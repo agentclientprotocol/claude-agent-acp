@@ -1035,6 +1035,13 @@ The adapter calls the SDK `stopTask`, publishes `stopped`, and returns `{ "stopp
 It also adds one `Task stopped by user: <name>.` line to the transcript.
 It returns `{ "stopped": false }` for an unknown, finished, or already stopping task.
 
+### Task output
+
+A client requests `initialize.clientCapabilities._meta.asyncTaskDetails.output: true` to read the end of a background shell or Monitor task's output without starting a model turn.
+It sends `_session/async_task/output` with `{ "sessionId": "session-1", "asyncTaskId": "task-1" }` and receives `{ "output": "..." }`.
+The response contains at most the last 8 KiB of output; it works while the task runs and after it ends.
+An unknown ID or an ID of another task type receives `invalidParams`.
+
 ## Agent file-change report
 
 Standard ACP describes a change from one tool call. It has no complete file list for one prompt turn.

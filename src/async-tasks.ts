@@ -510,6 +510,16 @@ export class AsyncTaskRuntime {
     return this.tasks.get(taskId)?.autonomousTurn === true;
   }
 
+  /** Only an announced shell or Monitor task belongs to the SDK output control. */
+  canReadOutput(taskId: string, monitors: boolean): boolean {
+    const task = this.tasks.get(taskId);
+    return (
+      task?.announced === true &&
+      !task.ignored &&
+      (task.taskType === "shell" || (monitors && task.monitor))
+    );
+  }
+
   /** Whether a task of the tool call went to the background, so the client gets it. */
   isBackgroundedToolCall(toolCallId: string): boolean {
     for (const task of this.tasks.values()) {
