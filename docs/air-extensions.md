@@ -958,11 +958,9 @@ Claude can run work in the background, for example a backgrounded Bash command o
 The adapter publishes that work as async tasks when the client declares `asyncTasks`.
 Without the capability, the adapter sends no async task update.
 A subagent task (`local_agent`) is not an async task. Native subagent sessions report it.
-A task that a `Monitor` tool call started is not an async task either.
-Monitor streams its output to the model only, so the client gets nothing for it.
-The SDK reports such a task as `local_bash`, so the adapter finds it by the tool of its tool call.
+The adapter reports both `local_monitor` tasks and tasks started by a `Monitor` tool call with `taskType: "monitor"`, `showInTranscript: false`, and `canStop: false` by default.
+A client that sets `initialize.clientCapabilities._meta.asyncTaskDetails.monitors: true` can stop those tasks; their spawn announces `canStop: true`.
 The `Monitor` tool call stays in the transcript.
-The adapter also ignores a `local_monitor` task.
 A task that a subagent tool call started goes to the subagent session.
 Its spawn, progress and state updates go there also after the subagent finished.
 
@@ -1031,7 +1029,7 @@ The client sends `_session/async_task/stop`:
 { "sessionId": "session-1", "asyncTaskId": "task-1" }
 ```
 
-The adapter calls the SDK `stopTask`, publishes `stopped`, and returns `{ "stopped": true }`.
+The adapter calls the SDK `stopTask` for shells and negotiated monitors, publishes `stopped`, and returns `{ "stopped": true }`.
 It also adds one `Task stopped by user: <name>.` line to the transcript.
 It returns `{ "stopped": false }` for an unknown, finished, or already stopping task.
 
