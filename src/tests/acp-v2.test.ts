@@ -1428,9 +1428,9 @@ describe("ACP v2 prompts", () => {
         messageId: "msg_child",
         content: text("Child report.")[0],
       }),
-      { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn" },
+      { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn", background: [] },
       { sessionUpdate: "response" },
-      { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn" },
+      { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn", background: [] },
     ]);
     // The current state on the parent grants nothing: the child cannot run again here.
     expect(
@@ -1622,7 +1622,7 @@ describe("ACP v2 prompts", () => {
           summary: text("1. Primary Request and Intent:\n   Count upward."),
         },
         { sessionUpdate: "agent_message", messageId: "msg_after", content: [] },
-        { sessionUpdate: "state_update", state: "idle" },
+        { sessionUpdate: "state_update", state: "idle", background: [] },
       ]);
       await client.authUpdate(1);
     });
@@ -1676,7 +1676,7 @@ describe("ACP v2 prompts", () => {
           content: text("Hello!")[0],
         },
         // The current foreground state, after the replay and before the response.
-        { sessionUpdate: "state_update", state: "idle" },
+        { sessionUpdate: "state_update", state: "idle", background: [] },
       ]);
 
       // Live chunks after the replay get no clear.
@@ -1720,7 +1720,7 @@ describe("ACP v2 prompts", () => {
         await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
         expect(client.sessionUpdates.slice(before).map(({ update }) => update)).toEqual([
           info,
-          { sessionUpdate: "state_update", state: "idle" },
+          { sessionUpdate: "state_update", state: "idle", background: [] },
         ]);
       }
 
@@ -1761,7 +1761,7 @@ describe("ACP v2 prompts", () => {
       const before = client.sessionUpdates.length;
       await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
       expect(client.sessionUpdates.slice(before).map(({ update }) => update)).toEqual([
-        { sessionUpdate: "state_update", state: "running" },
+        { sessionUpdate: "state_update", state: "running", background: [] },
       ]);
 
       answer.resolve();
@@ -2540,6 +2540,7 @@ describe("ACP v2 prompts", () => {
       state: "idle",
       stopReason: "error",
       error: expect.objectContaining({ code: v1Error.code, message: v1Error.message }),
+      background: [],
     });
   });
 
@@ -4233,6 +4234,264 @@ describe("ACP v2 requests that subagents make", () => {
       state: "idle",
       stopReason: "error",
       error: { code: -32603, message: "The model is overloaded" },
+      background: [],
+    });
+  });
+
+  describe("background work", () => {
+    /** Claude Code's live background task set. */
+    const level = (options: Options, tasks: Array<Record<string, unknown>>) => ({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: tasks.map((fields) => ({ description: "Explore the project", ...fields })),
+      uuid: randomUUID(),
+      session_id: options.sessionId,
+    });
+    const agent1 = { task_id: "agent-1", task_type: "local_agent", subagent_type: "Explore" };
+    /** The root starts the subagent `agent-1` in the background. */
+    const agentUse = (options: Options) => ({
+      type: "assistant",
+      message: {
+        id: "msg_agent",
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [
+          {
+            type: "tool_use",
+            id: "toolu_agent-1",
+            name: "Agent",
+            input: {
+              description: "Explore the project",
+              prompt: "Look around",
+              run_in_background: true,
+            },
+          },
+        ],
+        stop_reason: "tool_use",
+        stop_sequence: null,
+        usage: { input_tokens: 3, output_tokens: 2 },
+      },
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: options.sessionId,
+    });
+    const taskEnd = (options: Options, taskId: string, toolUseId: string) => ({
+      type: "system",
+      subtype: "task_notification",
+      task_id: taskId,
+      tool_use_id: toolUseId,
+      status: "completed",
+      output_file: `/tmp/tasks/${taskId}.output`,
+      summary: "Done",
+      uuid: randomUUID(),
+      session_id: options.sessionId,
+    });
+
+    /** The states of each session with their lists, and the subagent's mirrored states. */
+    const trace = (client: ReturnType<typeof v2Client>, root: string) =>
+      client.sessionUpdates.flatMap(({ sessionId, update }) => {
+        if (update.sessionUpdate === "subagent_update") {
+          return [`subagent ${(update.state as { state?: string } | undefined)?.state ?? ""}`];
+        }
+        if (update.sessionUpdate === "terminal_update" && update.exitStatus) {
+          return [`${sessionId} exit`];
+        }
+        if (update.sessionUpdate !== "state_update") return [];
+        const { background } = update as { background?: v2.BackgroundWork[] };
+        const items = background?.map((item) =>
+          "sessionId" in item
+            ? String(item.sessionId)
+            : "terminalId" in item
+              ? String(item.terminalId)
+              : "",
+        );
+        return [`${sessionId === root ? "root" : sessionId} ${update.state} [${items ?? "none"}]`];
+      });
+
+    /** Prompts once, and runs `during` once the trace holds `until`. */
+    async function promptUntil(
+      until: string,
+      during: (
+        agent: v2.ClientContext,
+        root: string,
+        client: ReturnType<typeof v2Client>,
+      ) => Promise<unknown> = async () => {},
+    ) {
+      const client = v2Client();
+      let root = "";
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        ({ sessionId: root } = await agent.request(v2.methods.agent.session.new, { cwd }));
+        await agent.request(v2.methods.agent.session.prompt, {
+          sessionId: root,
+          prompt: text("hi"),
+        });
+        await vi.waitFor(() => expect(trace(client, root)).toContain(until));
+        await during(agent, root, client);
+      });
+      return { client, root };
+    }
+
+    it("lists a background subagent's session in the root's list until it reports idle", async () => {
+      scriptTurns(async function* (options) {
+        yield agentUse(options);
+        yield level(options, [agent1]);
+        yield taskStarted(options, "agent-1", { prompt: "Look around", is_backgrounded: true });
+        yield result(options);
+        yield idleState(options);
+        yield taskEnd(options, "agent-1", "toolu_agent-1");
+        // The level that drops the subagent can come later: the SDK leaves its
+        // order against the task's end open. The child's idle drops it already.
+      });
+      const { client, root } = await promptUntil("root idle []");
+
+      // The child's own idle comes before the list that drops it. The child
+      // reports its own list, which is empty.
+      expect(trace(client, root)).toEqual([
+        "root running []",
+        "subagent running",
+        "agent-1 running []",
+        "root running [agent-1]",
+        "root idle [agent-1]",
+        "subagent idle",
+        "agent-1 idle []",
+        "root idle []",
+      ]);
+    });
+
+    it("keeps an idle subagent listed while its own command runs in the background", async () => {
+      const childMessage = (options: Options, message: Record<string, unknown>) => ({
+        ...message,
+        parent_tool_use_id: "toolu_agent-1",
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      });
+      const bash = { task_id: "bg1", task_type: "local_bash", parent_task_id: "agent-1" };
+      scriptTurns(async function* (options) {
+        yield agentUse(options);
+        yield level(options, [agent1]);
+        yield taskStarted(options, "agent-1", { prompt: "Look around", is_backgrounded: true });
+        yield result(options);
+        yield idleState(options);
+        // The subagent runs a command in the background, and finishes.
+        yield childMessage(options, {
+          type: "assistant",
+          message: {
+            id: "msg_child_bash",
+            type: "message",
+            role: "assistant",
+            model: "claude-sonnet-4-6",
+            content: [
+              {
+                type: "tool_use",
+                id: "toolu_bg",
+                name: "Bash",
+                input: { command: "make test", run_in_background: true },
+              },
+            ],
+            stop_reason: "tool_use",
+            stop_sequence: null,
+            usage: { input_tokens: 1, output_tokens: 1 },
+          },
+        });
+        yield level(options, [agent1, bash]);
+        yield {
+          type: "system",
+          subtype: "task_started",
+          task_id: "bg1",
+          task_type: "local_bash",
+          description: "make test",
+          tool_use_id: "toolu_bg",
+          parent_task_id: "agent-1",
+          is_backgrounded: true,
+          uuid: randomUUID(),
+          session_id: options.sessionId,
+        };
+        yield childMessage(options, {
+          type: "user",
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_bg",
+                content: "Command running in background with ID: bg1.",
+              },
+            ],
+          },
+          tool_use_result: {
+            stdout: "",
+            stderr: "",
+            interrupted: false,
+            isImage: false,
+            backgroundTaskId: "bg1",
+          },
+        });
+        yield taskEnd(options, "agent-1", "toolu_agent-1");
+        yield level(options, [bash]);
+        // The command ends later.
+        yield taskEnd(options, "bg1", "toolu_bg");
+        yield level(options, []);
+      });
+      const { client, root } = await promptUntil("root idle []");
+
+      expect(trace(client, root).slice(5)).toEqual([
+        "subagent running",
+        "agent-1 running [toolu_bg]",
+        "subagent idle",
+        "agent-1 idle [toolu_bg]",
+        "agent-1 exit",
+        "subagent idle",
+        "agent-1 idle []",
+        "root idle []",
+      ]);
+      expect(trace(client, root).slice(0, 5)).toEqual([
+        "root running []",
+        "subagent running",
+        "agent-1 running []",
+        "root running [agent-1]",
+        "root idle [agent-1]",
+      ]);
+    });
+
+    it("sends the current state of each listed subagent before the state snapshot of session/resume", async () => {
+      scriptTurns(async function* (options) {
+        yield agentUse(options);
+        yield level(options, [agent1]);
+        yield taskStarted(options, "agent-1", { prompt: "Look around", is_backgrounded: true });
+        yield result(options);
+        yield idleState(options);
+      });
+      let resumed: v2.UpdateSessionNotification[] = [];
+      await promptUntil("root idle [agent-1]", async (agent, root, client) => {
+        const before = client.sessionUpdates.length;
+        await agent.request(v2.methods.agent.session.resume, { sessionId: root, cwd });
+        resumed = client.sessionUpdates.slice(before);
+      });
+
+      expect(resumed.map(({ update }) => update)).toEqual([
+        {
+          sessionUpdate: "subagent_update",
+          sessionId: "agent-1",
+          title: "Explore the project",
+          description: "Explore",
+          capabilities: { cancel: {} },
+          state: { state: "running", background: [] },
+        },
+        // The child's own stream gets its state too, as for every subagent_update.
+        { sessionUpdate: "state_update", state: "running", background: [] },
+        {
+          sessionUpdate: "state_update",
+          state: "idle",
+          background: [{ type: "subagent", sessionId: "agent-1" }],
+        },
+      ]);
+      expect(resumed.map(({ sessionId }) => sessionId)).toEqual([
+        expect.not.stringMatching(/^agent-1$/),
+        "agent-1",
+        expect.not.stringMatching(/^agent-1$/),
+      ]);
     });
   });
 
@@ -4328,7 +4587,7 @@ describe("ACP v2 requests that subagents make", () => {
     expect(subagentUpdates.at(-1)).toEqual({
       sessionUpdate: "subagent_update",
       sessionId: "agent-1",
-      state: { state: "idle", stopReason: "cancelled" },
+      state: { state: "idle", stopReason: "cancelled", background: [] },
     });
     expect(
       client.sessionUpdates
@@ -4338,8 +4597,8 @@ describe("ACP v2 requests that subagents make", () => {
         )
         .map(({ update }) => update),
     ).toEqual([
-      { sessionUpdate: "state_update", state: "running" },
-      { sessionUpdate: "state_update", state: "idle", stopReason: "cancelled" },
+      { sessionUpdate: "state_update", state: "running", background: [] },
+      { sessionUpdate: "state_update", state: "idle", stopReason: "cancelled", background: [] },
     ]);
     // The turn goes on, and ends as Claude Code ends it.
     expect(turnTrace(client.sessionUpdates).at(-1)).toBe("idle end_turn");
@@ -5228,6 +5487,295 @@ describe("ACP v2 terminal of a command in the background", () => {
     const trace = terminalTrace(client);
     expect(trace.filter((entry) => entry === "exit")).toHaveLength(1);
     expect(trace.indexOf("exit")).toBeLessThan(trace.indexOf("idle end_turn"));
+  });
+
+  describe("background work", () => {
+    /** Claude Code's live background task set. A task joins it before its
+     *  `task_started`, and leaves it after its `task_notification`. */
+    const level = (options: Options, tasks: Array<Record<string, unknown>>) => ({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: tasks.map((fields) => ({
+        task_id: "bg1",
+        task_type: "local_bash",
+        description: "make test",
+        ...fields,
+      })),
+      uuid: randomUUID(),
+      session_id: options.sessionId,
+    });
+
+    /** The session's states with their `background` lists, and the terminal
+     *  updates that change whether it can be cancelled or end it. */
+    const backgroundTrace = (client: ReturnType<typeof v2Client>) =>
+      client.sessionUpdates.flatMap(({ update }) => {
+        if (update.sessionUpdate === "terminal_update") {
+          if (update.exitStatus) return [update.capabilities === null ? "exit, no cancel" : "exit"];
+          const capabilities = update.capabilities as { cancel?: unknown } | null | undefined;
+          return capabilities?.cancel ? ["cancel"] : [];
+        }
+        if (update.sessionUpdate !== "state_update") return [];
+        const stopReason =
+          "stopReason" in update && update.stopReason ? ` ${update.stopReason}` : "";
+        const { background } = update as { background?: v2.BackgroundWork[] | null };
+        const items = (background ?? []).map((item) =>
+          "terminalId" in item ? String(item.terminalId) : String(item.type),
+        );
+        return [`${update.state}${stopReason} [${items.join(",")}]`];
+      });
+
+    /** Prompts once, and runs `during` once the trace holds `until`. */
+    async function promptUntil(
+      until: string,
+      during: (
+        agent: v2.ClientContext,
+        sessionId: string,
+        client: ReturnType<typeof v2Client>,
+      ) => Promise<unknown> = async () => {},
+    ) {
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+        await vi.waitFor(() => expect(backgroundTrace(client)).toContain(until));
+        await during(agent, sessionId, client);
+      });
+      return client;
+    }
+
+    it("lists the terminal from the Bash result until the command's task ends, and lets the client cancel it meanwhile", async () => {
+      scriptTurns(async function* (options) {
+        yield level(options, [{}]);
+        yield taskStarted(options);
+        yield bashUse(options);
+        yield backgrounded(options);
+        yield result(options);
+        yield idleState(options);
+        yield* taskEnded(options);
+        yield level(options, []);
+        yield assistantText(options, "The tests failed.", "msg_followup");
+        yield result(options, { origin: { kind: "task-notification" } });
+        yield idleState(options);
+      });
+      const client = await promptUntil("idle end_turn []");
+
+      // The terminal can be cancelled before a list names it, and no longer
+      // once it exits, before the list drops it. A repeated state has no stop
+      // reason.
+      expect(backgroundTrace(client)).toEqual([
+        "running []",
+        "cancel",
+        "running [toolu_bg]",
+        "idle end_turn [toolu_bg]",
+        "exit, no cancel",
+        "idle []",
+        "running []",
+        "idle end_turn []",
+      ]);
+    });
+
+    it("ends the terminal before the list drops it when Claude Code reports no end for its task", async () => {
+      scriptTurns(async function* (options) {
+        yield level(options, [{}]);
+        yield taskStarted(options);
+        yield bashUse(options);
+        yield backgrounded(options);
+        yield result(options);
+        yield idleState(options);
+        yield level(options, []);
+      });
+      const client = await promptUntil("idle []");
+
+      expect(backgroundTrace(client).slice(-3)).toEqual([
+        "idle end_turn [toolu_bg]",
+        "exit, no cancel",
+        "idle []",
+      ]);
+    });
+
+    it("ends the listed terminals when the query ends, as its background tasks end with it", async () => {
+      scriptTurns(async function* (options) {
+        yield level(options, [{}]);
+        yield taskStarted(options);
+        yield bashUse(options);
+        yield backgrounded(options);
+        yield result(options);
+        yield idleState(options);
+        throw new Error("The Claude Code process exited");
+      });
+      const client = await promptUntil("idle []");
+
+      expect(backgroundTrace(client).slice(-3)).toEqual([
+        "idle end_turn [toolu_bg]",
+        "exit, no cancel",
+        "idle []",
+      ]);
+    });
+
+    it("reports no list when the session's interrupt would stop background tasks", async () => {
+      scriptTurns(async function* (options) {
+        yield level(options, [{}]);
+        yield taskStarted(options);
+        yield bashUse(options);
+        yield backgrounded(options);
+        yield result(options);
+        yield idleState(options);
+      });
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        // Without the declaration, Claude Code's interrupt kills background
+        // tasks, so session/cancel could not leave listed work running.
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, {
+          cwd,
+          _meta: { claudeCode: { options: { perTaskStopAffordance: false } } },
+        });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+        await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+        await expect(
+          agent.request(v2.methods.agent.terminal.cancel, { sessionId, terminalId: "toolu_bg" }),
+        ).rejects.toMatchObject({ code: -32602 });
+      });
+
+      expect(sdk.queryOptions.at(-1)?.perTaskStopAffordance).toBe(false);
+      expect(client.updates("state_update").filter((update) => "background" in update)).toEqual([]);
+      expect(backgroundTrace(client)).not.toContain("cancel");
+    });
+
+    it("leaves out a task that Claude Code marks ambient", async () => {
+      scriptTurns(async function* (options) {
+        yield level(options, [{ ambient: true }]);
+        yield taskStarted(options);
+        yield bashUse(options);
+        yield backgrounded(options);
+        yield result(options);
+        yield idleState(options);
+      });
+      const client = await promptUntil("idle end_turn []");
+
+      expect(backgroundTrace(client)).toEqual(["running []", "idle end_turn []"]);
+    });
+
+    it("stops the command's task on terminal/cancel, and rejects a terminal that is not listed", async () => {
+      const stopped = Promise.withResolvers<string>();
+      sdk.stopTask = async (taskId) => stopped.resolve(taskId);
+      scriptTurns(async function* (options) {
+        yield level(options, [{}]);
+        yield taskStarted(options);
+        yield bashUse(options);
+        yield backgrounded(options);
+        yield result(options);
+        yield idleState(options);
+        await stopped.promise;
+        yield taskEvent(options, "task_notification", {
+          tool_use_id: "toolu_bg",
+          status: "stopped",
+          output_file: "/tmp/tasks/bg1.output",
+          summary: "Stopped",
+        });
+        yield level(options, []);
+      });
+      let rejected: unknown;
+      const client = await promptUntil(
+        "idle end_turn [toolu_bg]",
+        async (agent, sessionId, client) => {
+          await expect(
+            agent.request(v2.methods.agent.terminal.cancel, { sessionId, terminalId: "toolu_bg" }),
+          ).resolves.toEqual({});
+          expect(await stopped.promise).toBe("bg1");
+          await vi.waitFor(() => expect(backgroundTrace(client)).toContain("idle []"));
+          rejected = await agent
+            .request(v2.methods.agent.terminal.cancel, { sessionId, terminalId: "toolu_bg" })
+            .catch((error: unknown) => error);
+        },
+      );
+
+      // The response does not wait for the command to stop: its exit follows.
+      expect(backgroundTrace(client).slice(-2)).toEqual(["exit, no cancel", "idle []"]);
+      expect(rejected).toMatchObject({ code: -32602 });
+    });
+
+    it("lists another task, such as a Monitor, as a _claude/task item", async () => {
+      scriptTurns(async function* (options) {
+        yield level(options, [
+          { task_id: "mon1", task_type: "local_monitor", description: "Watch the logs" },
+        ]);
+        yield result(options);
+        yield idleState(options);
+      });
+      const client = await promptUntil("idle end_turn [_claude/task]");
+
+      expect(backgroundTrace(client)).toEqual([
+        "running []",
+        "running [_claude/task]",
+        "idle end_turn [_claude/task]",
+      ]);
+      expect(client.updates("state_update").at(-1)).toMatchObject({
+        background: [{ type: "_claude/task", taskId: "mon1", description: "Watch the logs" }],
+      });
+    });
+
+    it("rejects terminal/cancel with -32602 when the command ends before Claude Code stops it", async () => {
+      const ended = Promise.withResolvers<void>();
+      scriptTurns(async function* (options) {
+        yield level(options, [{}]);
+        yield taskStarted(options);
+        yield bashUse(options);
+        yield backgrounded(options);
+        yield result(options);
+        yield idleState(options);
+        await ended.promise;
+        yield* taskEnded(options);
+        yield level(options, []);
+      });
+      let rejected: unknown;
+      await promptUntil("idle end_turn [toolu_bg]", async (agent, sessionId, client) => {
+        // The command ends while Claude Code handles the stop, which then
+        // finds no task.
+        sdk.stopTask = async () => {
+          ended.resolve();
+          await vi.waitFor(() => expect(backgroundTrace(client)).toContain("idle []"));
+          throw new Error("No task bg1");
+        };
+        rejected = await agent
+          .request(v2.methods.agent.terminal.cancel, { sessionId, terminalId: "toolu_bg" })
+          .catch((error: unknown) => error);
+      });
+
+      expect(rejected).toMatchObject({ code: -32602 });
+    });
+
+    it("sends each listed terminal's current state before the state snapshot of session/resume", async () => {
+      scriptTurns(async function* (options) {
+        yield level(options, [{}]);
+        yield taskStarted(options);
+        yield bashUse(options);
+        yield backgrounded(options);
+        yield result(options);
+        yield idleState(options);
+      });
+      let resumed: v2.SessionUpdate[] = [];
+      await promptUntil("idle end_turn [toolu_bg]", async (agent, sessionId, client) => {
+        const before = client.sessionUpdates.length;
+        await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+        resumed = client.sessionUpdates.slice(before).map(({ update }) => update);
+      });
+
+      expect(resumed).toEqual([
+        {
+          sessionUpdate: "terminal_update",
+          terminalId: "toolu_bg",
+          command: "make test",
+          capabilities: { cancel: {} },
+        },
+        {
+          sessionUpdate: "state_update",
+          state: "idle",
+          background: [{ type: "terminal", terminalId: "toolu_bg" }],
+        },
+      ]);
+    });
   });
 });
 
