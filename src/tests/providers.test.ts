@@ -797,9 +797,49 @@ describe("providers", () => {
       );
     });
 
-    it("offers no model when the listing succeeds but matches none", async () => {
+    it.each([{ listedModels: [] }, { listedModels: ["gpt-5"] }])(
+      "rejects incompatible provider models $listedModels and recovers after a switch",
+      async ({ listedModels }) => {
+        const [agent, mockQuery] = await createAgentMock();
+        const setModel = mockQueryWithModels(mockQuery);
+        stubListing(listedModels);
+        await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+        await agent.unstable_setProvider({
+          providerId: "main",
+          apiType: "anthropic",
+          baseUrl: "https://gateway.example",
+        });
+
+        await expect(
+          agent.newSession({ cwd: process.cwd(), mcpServers: [] }),
+        ).rejects.toMatchObject({
+          code: -32603,
+          message: expect.stringContaining(
+            "The selected provider offers no compatible Claude models.",
+          ),
+          data: { providerId: "main" },
+        });
+
+        expect(Object.keys(agent.sessions)).toEqual([]);
+        const rejectedQuery = mockQuery.mock.results.at(-1)!.value;
+        expect(rejectedQuery.close).toHaveBeenCalledOnce();
+        expect(setModel).not.toHaveBeenCalled();
+
+        stubListing(["claude-sonnet-5"]);
+        await agent.unstable_setProvider({
+          providerId: "main",
+          apiType: "anthropic",
+          baseUrl: "https://compatible-provider.example",
+        });
+        const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+        expect(modelOptionValues(response)).toEqual(["sonnet"]);
+        expect(agent.sessions[response.sessionId]).toBeDefined();
+      },
+    );
+
+    it("preserves an empty SDK catalog when the provider has an authoritative listing", async () => {
       const [agent, mockQuery] = await createAgentMock();
-      const setModel = mockQueryWithModels(mockQuery);
+      mockQueryWithModels(mockQuery, []);
       stubListing(["gpt-5"]);
       await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
       await agent.unstable_setProvider({
@@ -811,7 +851,49 @@ describe("providers", () => {
       const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
       expect(response.configOptions?.find((o: any) => o.id === "model")).toBeUndefined();
-      expect(setModel).not.toHaveBeenCalled();
+      expect(agent.sessions[response.sessionId]).toBeDefined();
+    });
+
+    it.each([
+      { name: "alias-only", models: GATEWAY_MODELS.map(({ resolvedModel: _, ...model }) => model) },
+      {
+        name: "mixed",
+        models: [GATEWAY_MODELS[0], { value: "custom", displayName: "Custom", description: "" }],
+      },
+    ])("preserves a $name SDK catalog with unresolved model identities", async ({ models }) => {
+      const [agent, mockQuery] = await createAgentMock();
+      mockQueryWithModels(mockQuery, models);
+      stubListing(["claude-sonnet-5"]);
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      await agent.unstable_setProvider({
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gateway.example",
+      });
+
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(agent.sessions[response.sessionId]).toBeDefined();
+    });
+
+    it("preserves an empty SDK catalog with configured model choices", async () => {
+      const [agent, mockQuery] = await createAgentMock();
+      mockQueryWithModels(mockQuery, []);
+      stubListing(["gpt-5"]);
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      await agent.unstable_setProvider({
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gateway.example",
+      });
+
+      const response = await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { claudeCode: { options: { settings: { availableModels: ["sonnet"] } } } },
+      });
+
+      expect(agent.sessions[response.sessionId]).toBeDefined();
     });
 
     it("sets a gateway that has no listing and narrows nothing", async () => {
