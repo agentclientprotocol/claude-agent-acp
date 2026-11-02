@@ -30,6 +30,9 @@ function withBackground(state: v2.StateUpdate, background: BackgroundItem[]): v2
   return { ...state, background } as v2.StateUpdate;
 }
 
+/** The final tool call statuses. */
+const FINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+
 export class V2Background {
   /**
    * The latest list of each session that reports one, whether a state of the
@@ -39,6 +42,13 @@ export class V2Background {
     string,
     { items: BackgroundItem[]; reported: boolean; parent?: string }
   >();
+
+  /**
+   * The tool calls that advertise `cancel`, by session and tool call. Like a
+   * terminal's (see `V2Terminals.advertiseCancel`), the capability goes with
+   * the final status.
+   */
+  private readonly cancellableToolCalls = new Set<string>();
 
   constructor(private readonly terminals: V2Terminals) {}
 
@@ -50,6 +60,14 @@ export class V2Background {
    */
   stamp(notification: v2.UpdateSessionNotification): v2.UpdateSessionNotification {
     const { sessionId, update } = notification;
+    if (
+      update.sessionUpdate === "tool_call_update" &&
+      FINAL_STATUSES.has(String(update.status)) &&
+      this.cancellableToolCalls.delete(`${sessionId} ${update.toolCallId}`)
+    ) {
+      // A tool call that reached its final status can no longer be cancelled.
+      return { ...notification, update: { ...update, capabilities: null } };
+    }
     if (update.sessionUpdate === "state_update") {
       const session = this.sessions.get(sessionId);
       if (!session) return notification;
@@ -76,9 +94,10 @@ export class V2Background {
   /**
    * Records the new list of a session, and returns the updates that report it:
    *
-   * - For each terminal that the list adds, a `terminal_update` that lets the
-   *   client cancel it. It also comes before the first list that names the
-   *   terminal, as v2 requires: the terminal's own updates came earlier.
+   * - For each terminal or tool call that the list adds, a `terminal_update`
+   *   or `tool_call_update` that lets the client cancel it. It comes before
+   *   the first list that names it, as v2 requires of an announcement: its
+   *   own updates came earlier.
    * - Once a state of the session carried a list, the state again with the
    *   new list, without a stop reason: a repeated `idle` is no new
    *   completion. A subagent's goes to its parent's mirror first, as its
@@ -93,14 +112,10 @@ export class V2Background {
       reported: session?.reported ?? false,
       parent: parentSessionId ?? session?.parent,
     });
-    const known = new Set(
-      (session?.items ?? []).flatMap((item) => (item.type === "terminal" ? [item.terminalId] : [])),
+    const known = new Set((session?.items ?? []).map((item) => JSON.stringify(item)));
+    const updates: v2.UpdateSessionNotification[] = items.flatMap((item) =>
+      known.has(JSON.stringify(item)) ? [] : this.advertiseCancel(sessionId, item, false),
     );
-    const updates: v2.UpdateSessionNotification[] = items.flatMap((item) => {
-      if (item.type !== "terminal" || known.has(item.terminalId)) return [];
-      const update = this.terminals.advertiseCancel(sessionId, item.terminalId);
-      return update ? [{ sessionId, update }] : [];
-    });
     if (session?.reported && state && !unchanged) {
       if (parentSessionId) {
         updates.push({
@@ -115,15 +130,53 @@ export class V2Background {
 
   /**
    * The current `terminal_update` of each terminal that the session
-   * `sessionId` lists. v2 requires it before the state snapshot of
-   * `session/resume`, as a replay may not have delivered it.
+   * `sessionId` lists, and the `cancel` capability of each tool call that it
+   * lists, whose other fields the agent sends (see
+   * `ClaudeAcpAgent.publishBackgroundToolCalls`). v2 requires them before the
+   * state snapshot of `session/resume`, as a replay may not have delivered
+   * them.
    */
-  currentTerminals(sessionId: string): v2.UpdateSessionNotification[] {
-    return (this.sessions.get(sessionId)?.items ?? []).flatMap((item) => {
-      if (item.type !== "terminal") return [];
-      const update = this.terminals.advertiseCancel(sessionId, item.terminalId, true);
+  currentItems(sessionId: string): v2.UpdateSessionNotification[] {
+    return (this.sessions.get(sessionId)?.items ?? []).flatMap((item) =>
+      this.advertiseCancel(sessionId, item, true),
+    );
+  }
+
+  /** The tool calls that the session `sessionId` lists. */
+  listedToolCalls(sessionId: string): string[] {
+    return (this.sessions.get(sessionId)?.items ?? []).flatMap((item) =>
+      item.type === "tool_call" ? [item.toolCallId] : [],
+    );
+  }
+
+  /**
+   * The update that lets the client cancel the listed terminal or tool call
+   * `item`, unless it advertises that already. `again` sends it anyway, as
+   * the item's current state.
+   */
+  private advertiseCancel(
+    sessionId: string,
+    item: BackgroundItem,
+    again: boolean,
+  ): v2.UpdateSessionNotification[] {
+    if (item.type === "terminal") {
+      const update = this.terminals.advertiseCancel(sessionId, item.terminalId, again);
       return update ? [{ sessionId, update }] : [];
-    });
+    }
+    if (item.type !== "tool_call") return [];
+    const key = `${sessionId} ${item.toolCallId}`;
+    if (this.cancellableToolCalls.has(key) && !again) return [];
+    this.cancellableToolCalls.add(key);
+    return [
+      {
+        sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: item.toolCallId,
+          capabilities: { cancel: {} },
+        },
+      },
+    ];
   }
 
   /** The subagent sessions that the session `sessionId` lists. */
@@ -136,6 +189,9 @@ export class V2Background {
   /** Forgets the list of a session, and those of its subagent sessions. */
   forget(sessionId: string): void {
     this.sessions.delete(sessionId);
+    for (const key of this.cancellableToolCalls) {
+      if (key.startsWith(`${sessionId} `)) this.cancellableToolCalls.delete(key);
+    }
     for (const [child, { parent }] of this.sessions) {
       if (parent === sessionId) this.forget(child);
     }

@@ -168,11 +168,17 @@ import {
   backgroundLevel,
   type BackgroundLevel,
   type BackgroundSink,
+  backgroundToolCallPause,
+  backgroundToolCallStates,
+  type BackgroundTaskEnd,
+  type BackgroundToolCall,
   BackgroundWorkReporter,
-  cancelBackgroundTerminal,
-  droppedTerminalTasks,
+  cancelBackgroundWork,
+  droppedTasks,
   endBackgroundWork,
+  registerBackgroundToolCalls,
   takeBackgroundTerminalExit,
+  takeBackgroundToolCallEnd,
 } from "./background-work.js";
 import {
   AUTH_STATUS_PROBE_TIMEOUT_MS,
@@ -312,7 +318,11 @@ import {
   unregisterHookCallback,
 } from "./tools.js";
 import { previewPatchContent } from "./diff.js";
-import { backgroundedBashToolCall, withRunningTerminal } from "./tool-calls/background.js";
+import {
+  backgroundedBashToolCall,
+  withRunningTerminal,
+  withRunningToolCall,
+} from "./tool-calls/background.js";
 import { ChangedMetaFilter } from "./tool-calls/changed-meta-filter.js";
 import { ToolCallFieldTracker } from "./tool-calls/field-tracker.js";
 import { ClientCapabilities as ToolCallClientCapabilities } from "./tool-calls/client-capabilities.js";
@@ -1465,7 +1475,9 @@ export type Session = {
    *  `perTaskStopAffordance`: then it spares both, and the client is expected
    *  to stop each one itself. A client that can cancel one subagent gets the
    *  declaration, but it has no control for a workflow unless it is AIR with
-   *  `asyncTasks` (`_session/async_task/stop`). So for such a client the
+   *  `asyncTasks` (`_session/async_task/stop`), or gets the session's
+   *  background work (`reportsBackground`, with `tool_call/cancel`), which
+   *  `session/cancel` must leave running. So for any other such client the
    *  adapter stops the workflows after the interrupt, as the interrupt did
    *  before. */
   stopsWorkflowsOnCancel?: boolean;
@@ -1476,6 +1488,11 @@ export type Session = {
    *  `withRunningTerminal`). Only for a client that renders terminals and is
    *  not AIR, which shows the command through its async tasks. */
   backgroundTerminals?: Map<string, { toolCallId: string; parentToolUseId?: string }>;
+  /** The tool calls whose tasks went on in the background and still run, by
+   *  task id: a Monitor, a Workflow, or a backgrounded MCP call. The tool call
+   *  stays `in_progress` (or `paused`) after its result, until its task ends
+   *  (see `withRunningToolCall`). Only while `reportsBackground`. */
+  backgroundToolCalls?: Map<string, BackgroundToolCall>;
   /** Whether the client gets the session's background work (see
    *  `background-work.ts`). Only when Claude Code's interrupt spares
    *  background tasks, as `perTaskStopAffordance` makes it. */
@@ -5400,11 +5417,15 @@ export class ClaudeAcpAgent {
       this.syncAwaitingUser(params.sessionId, session);
     };
 
-    /** Ends the display terminal of a command that went to the background, once
-     *  its task ends (see `Session.backgroundTerminals`). */
-    const endBackgroundTerminal = async (taskId: string) => {
+    /** Ends the display terminal of a command that went to the background, and
+     *  gives a tool call whose task went on in the background its final
+     *  status, once the task ends (see `Session.backgroundTerminals` and
+     *  `Session.backgroundToolCalls`). */
+    const endBackgroundTask = async (taskId: string, end: BackgroundTaskEnd) => {
       const exit = takeBackgroundTerminalExit(session, params.sessionId, taskId);
       if (exit) await sendUpdate(exit);
+      const toolCallEnd = takeBackgroundToolCallEnd(session, params.sessionId, taskId, end);
+      if (toolCallEnd) await sendUpdate(toolCallEnd);
     };
 
     /** Settles a task. Its request may still be open, and an agent without a
@@ -6856,7 +6877,7 @@ export class ClaudeAcpAgent {
                   streamedBlocksByParent.delete(message.tool_use_id);
                   droppedStreams.delete(message.tool_use_id);
                 }
-                await endBackgroundTerminal(message.task_id);
+                await endBackgroundTask(message.task_id, message.status);
                 if (message.status === "stopped") {
                   await closeStoppedSubagentToolCalls(message.tool_use_id);
                 }
@@ -6901,15 +6922,33 @@ export class ClaudeAcpAgent {
                     streamedBlocksByParent.delete(parentToolUseId);
                     droppedStreams.delete(parentToolUseId);
                   }
-                  await endBackgroundTerminal(message.task_id);
+                  await endBackgroundTask(
+                    message.task_id,
+                    message.patch.status === "killed" ? "stopped" : message.patch.status,
+                  );
                   if (message.patch.status === "killed") {
                     await closeStoppedSubagentToolCalls(parentToolUseId);
                   }
                   settleLiveTask(message.task_id);
+                } else if (message.patch.status === "paused") {
+                  const pause = backgroundToolCallPause(
+                    session,
+                    params.sessionId,
+                    message.task_id,
+                    true,
+                  );
+                  if (pause) await sendUpdate(pause);
                 } else if (
                   message.patch.status === "running" ||
                   message.patch.status === "pending"
                 ) {
+                  const resume = backgroundToolCallPause(
+                    session,
+                    params.sessionId,
+                    message.task_id,
+                    false,
+                  );
+                  if (resume) await sendUpdate(resume);
                   // The SDK can resume a finished subagent under the same
                   // agent id without a new task_started.
                   resumeLiveTask(message.task_id);
@@ -7081,8 +7120,8 @@ export class ClaudeAcpAgent {
                 await asyncTasks.backgroundTasksChanged(message.tasks);
                 if (session.reportsBackground) {
                   const level = backgroundLevel(message.tasks);
-                  for (const taskId of droppedTerminalTasks(session, level)) {
-                    await endBackgroundTerminal(taskId);
+                  for (const taskId of droppedTasks(session, level)) {
+                    await endBackgroundTask(taskId, undefined);
                   }
                   session.backgroundLevel = level;
                 }
@@ -8488,6 +8527,7 @@ export class ClaudeAcpAgent {
             const acceptedPlanToolUseId = observeExitPlanToolResults(message, content, session);
             let backgroundedToolCalls: ReadonlySet<string> = new Set();
             let runningTerminal: string | undefined;
+            let runningToolCalls: ReadonlySet<string> = new Set();
             if (message.type === "user") {
               rememberResolvedToolNames(session, content);
               recordSubagentFileEdits(
@@ -8520,6 +8560,13 @@ export class ClaudeAcpAgent {
                     : {}),
                 });
               }
+              runningToolCalls = registerBackgroundToolCalls(
+                session,
+                content,
+                toolUseResult,
+                session.toolUseCache,
+                message.parent_tool_use_id,
+              );
               await asyncTasks.toolResults(content);
               backgroundedToolCalls = backgroundedBashToolCallIds(
                 content,
@@ -8582,13 +8629,16 @@ export class ClaudeAcpAgent {
               // (e.g. a subagent image) carry the stamped parentToolUseId
               // meta and are excluded there.
               await sendUpdate(
-                withRunningTerminal(
-                  backgroundedBashToolCall(
-                    acceptedPlanToolResult(notification, acceptedPlanToolUseId),
-                    backgroundedToolCalls,
-                    asyncTasks.enabled,
+                withRunningToolCall(
+                  withRunningTerminal(
+                    backgroundedBashToolCall(
+                      acceptedPlanToolResult(notification, acceptedPlanToolUseId),
+                      backgroundedToolCalls,
+                      asyncTasks.enabled,
+                    ),
+                    runningTerminal,
                   ),
-                  runningTerminal,
+                  runningToolCalls,
                 ),
               );
             }
@@ -9417,9 +9467,37 @@ export class ClaudeAcpAgent {
   }
 
   /** Stops a command running in the background (v2 `terminal/cancel`, see
-   *  {@link cancelBackgroundTerminal}). */
+   *  {@link cancelBackgroundWork}). */
   cancelBackgroundTerminal(params: { sessionId: string; terminalId: string }): Promise<void> {
-    return cancelBackgroundTerminal(this.sessions, params.sessionId, params.terminalId);
+    return cancelBackgroundWork(this.sessions, params.sessionId, {
+      terminalId: params.terminalId,
+    });
+  }
+
+  /** Stops the task of a tool call running in the background (v2
+   *  `tool_call/cancel`, see {@link cancelBackgroundWork}). */
+  cancelBackgroundToolCall(params: { sessionId: string; toolCallId: string }): Promise<void> {
+    return cancelBackgroundWork(this.sessions, params.sessionId, {
+      toolCallId: params.toolCallId,
+    });
+  }
+
+  /** Sends the current state of each tool call in `toolCallIds` that the root
+   *  session `sessionId` runs in the background: the call as its tool use
+   *  shows it, with its status now. v2 requires it for each tool call that a
+   *  `session/resume` snapshot lists. A failure is logged, as for
+   *  {@link publishLiveSubagents}. */
+  async publishBackgroundToolCalls(sessionId: string, toolCallIds: string[]): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) return;
+    const renderer = new AcpToolCallRenderer(this.toolCallCapabilities);
+    try {
+      for (const update of backgroundToolCallStates(session, sessionId, toolCallIds, renderer)) {
+        await this.client.sessionUpdate(update);
+      }
+    } catch (error) {
+      this.logger.error(`Session ${sessionId}: failed to send background tool calls:`, error);
+    }
   }
 
   /** Sends the current `subagent_update` of each live subagent session in
@@ -12651,6 +12729,7 @@ export class ClaudeAcpAgent {
         reportsBackground: this.backgroundWork.enabled && options.perTaskStopAffordance === true,
         stopsWorkflowsOnCancel:
           options.perTaskStopAffordance === true &&
+          !this.backgroundWork.enabled &&
           !clientSupportsAsyncTasks(this.clientCapabilities),
         nativeSubagentsByTaskId: new Map(),
         nativeSubagentTaskIdByToolUseId: new Map(),

@@ -14,9 +14,13 @@
  *   Bash tool result until its task ends (`Session.backgroundTerminals`).
  * - A detached subagent: its child session, in its parent's list, while it
  *   works, and while it is idle with background work of its own.
- * - Any other task, such as a `Monitor` or a `Workflow`: a `_claude/task`
- *   item with the task's id and description. Its tool call ended at its tool
- *   result, so it cannot be listed as a tool call.
+ * - A task that a tool call started, such as a `Monitor`, a `Workflow` or a
+ *   backgrounded MCP call: that tool call, kept `in_progress` (or `paused`)
+ *   from its tool result until its task ends (`Session.backgroundToolCalls`).
+ * - Any other task, once its `task_started` came and the tool call that
+ *   started it, if any, returned: a `_claude/task` item with the task's id
+ *   and description. For example, a task whose tool call ended before the
+ *   task joined the level.
  *
  * Only a session whose interrupt spares background tasks reports its lists
  * (`Session.reportsBackground`): `session/cancel` must leave listed work
@@ -25,12 +29,27 @@
 import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import type { AcpSessionNotification } from "./acp-subagents.js";
 import type { NativeSubagent } from "./native-subagents.js";
+import { type AcpToolCallRenderer, V2_CANCELLED, V2_PAUSED } from "./tool-calls/renderer.js";
 
 /** An item of a `background` list. */
 export type BackgroundItem =
   | { type: "terminal"; terminalId: string }
+  | { type: "tool_call"; toolCallId: string }
   | { type: "subagent"; sessionId: string }
   | { type: "_claude/task"; taskId: string; description: string };
+
+/** A tool call whose task runs on in the background (see `Session.backgroundToolCalls`). */
+export interface BackgroundToolCall {
+  toolCallId: string;
+  /** The tool use of the call, which Claude Code no longer caches after its result. */
+  toolUse: { name: string; input: unknown };
+  /** The subagent tool call that made the call, if any. */
+  parentToolUseId?: string;
+  paused?: boolean;
+}
+
+/** How a background task ended, as Claude Code reports it. Undefined when it did not say. */
+export type BackgroundTaskEnd = "completed" | "failed" | "stopped" | undefined;
 
 /** The live background task set of `background_tasks_changed`, by task id. */
 export type BackgroundLevel = Map<
@@ -64,8 +83,75 @@ export interface BackgroundWorkSession {
   reportsBackground?: boolean;
   backgroundLevel?: BackgroundLevel;
   backgroundTerminals?: Map<string, { toolCallId: string; parentToolUseId?: string }>;
+  backgroundToolCalls?: Map<string, BackgroundToolCall>;
   nativeSubagentsByTaskId?: Map<string, NativeSubagent>;
+  liveBackgroundTasks?: Map<string, { parentToolUseId?: string; isSubagent: boolean }>;
+  /** The tool uses whose result has not come yet, by id. */
+  toolUseCache?: Record<string, unknown>;
   query: { stopTask(taskId: string): Promise<void> };
+}
+
+/** The tools whose structured result names the task that the call started. */
+const TASK_TOOLS = new Set(["Monitor", "Workflow"]);
+
+/**
+ * Registers each tool call of a tool result message whose task goes on in
+ * the background: a `Monitor` or `Workflow` call, whose structured result
+ * names its task, or a call that a live task names as its tool use, such as
+ * a backgrounded MCP call. The task must be in the level: one that ended
+ * already, or that Claude Code marks `ambient`, leaves its call as it is.
+ * Returns the ids of the calls, whose result then reports `in_progress` (see
+ * `withRunningToolCall`).
+ */
+export function registerBackgroundToolCalls(
+  session: BackgroundWorkSession,
+  content: unknown,
+  toolUseResult: unknown,
+  toolUses: Record<string, { name: string; input: unknown }>,
+  parentToolUseId: string | null,
+): Set<string> {
+  const registered = new Set<string>();
+  if (!session.reportsBackground || !Array.isArray(content)) return registered;
+  const results = content.filter(
+    (block): block is { type: "tool_result"; tool_use_id: string; is_error?: boolean } =>
+      typeof block === "object" &&
+      block !== null &&
+      block.type === "tool_result" &&
+      typeof block.tool_use_id === "string" &&
+      block.is_error !== true,
+  );
+  const structuredTaskId =
+    results.length === 1 &&
+    typeof toolUseResult === "object" &&
+    toolUseResult !== null &&
+    typeof (toolUseResult as { taskId?: unknown }).taskId === "string"
+      ? (toolUseResult as { taskId: string }).taskId
+      : undefined;
+  for (const { tool_use_id: toolCallId } of results) {
+    const toolUse = toolUses[toolCallId];
+    if (!toolUse) continue;
+    const taskId =
+      (TASK_TOOLS.has(toolUse.name) ? structuredTaskId : undefined) ??
+      [...(session.liveBackgroundTasks ?? [])].find(
+        ([, task]) => task.parentToolUseId === toolCallId && !task.isSubagent,
+      )?.[0];
+    const task = taskId === undefined ? undefined : session.backgroundLevel?.get(taskId);
+    if (
+      !task ||
+      task.ambient ||
+      task.taskType === "local_bash" ||
+      task.taskType === "local_agent"
+    ) {
+      continue;
+    }
+    (session.backgroundToolCalls ??= new Map()).set(taskId!, {
+      toolCallId,
+      toolUse,
+      ...(parentToolUseId ? { parentToolUseId } : {}),
+    });
+    registered.add(toolCallId);
+  }
+  return registered;
 }
 
 /** The level of a `background_tasks_changed` payload. */
@@ -118,18 +204,32 @@ export function backgroundLists(
   const level: BackgroundLevel = session.backgroundLevel ?? new Map();
   for (const [taskId, task] of level) {
     if (task.ambient) continue;
+    // A subagent's command or tool call runs on the child's stream.
+    const ownerOf = (parentToolUseId: string | undefined) =>
+      parentToolUseId ? childByToolUse.get(parentToolUseId)?.sessionId : rootSessionId;
     const terminal = session.backgroundTerminals?.get(taskId);
     if (terminal) {
-      // A subagent's command runs on the child's stream.
-      const owner = terminal.parentToolUseId
-        ? childByToolUse.get(terminal.parentToolUseId)?.sessionId
-        : rootSessionId;
+      const owner = ownerOf(terminal.parentToolUseId);
       if (owner) lists.get(owner)!.push({ type: "terminal", terminalId: terminal.toolCallId });
+      continue;
+    }
+    const toolCall = session.backgroundToolCalls?.get(taskId);
+    if (toolCall) {
+      const owner = ownerOf(toolCall.parentToolUseId);
+      if (owner) lists.get(owner)!.push({ type: "tool_call", toolCallId: toolCall.toolCallId });
       continue;
     }
     // A command without a terminal yet is one that foreground work waits on.
     // A subagent is listed below, as its session.
     if (task.taskType === "local_bash" || task.taskType === "local_agent") continue;
+    // A task joins the level before its `task_started`, and before the tool
+    // call that starts it returns. Until both, the task is unknown or part of
+    // that tool call, which the foreground work waits on. Claude Code drops a
+    // tool use from its cache at the tool's result.
+    const live = session.liveBackgroundTasks?.get(taskId);
+    if (!live || (live.parentToolUseId && session.toolUseCache?.[live.parentToolUseId])) {
+      continue;
+    }
     const parent = task.parentTaskId ? childByTask.get(task.parentTaskId) : undefined;
     lists
       .get(parent?.sessionId ?? rootSessionId)!
@@ -166,18 +266,18 @@ export function backgroundLists(
 }
 
 /**
- * The tasks of the terminals that `level` does not hold: Claude Code no
- * longer runs them, so their terminals exit before a list drops them, as v2
- * requires. A terminal is registered at its Bash result, after its task
- * joined the level, so a later level without the task means that it ended.
- * Claude Code usually sends a task's end before that level, which ends the
- * terminal first, but the SDK does not promise that order.
+ * The tasks of the terminals and tool calls that `level` does not hold:
+ * Claude Code no longer runs them, so they end before a list drops them, as
+ * v2 requires. A terminal or tool call is registered at its tool result,
+ * after its task joined the level, so a later level without the task means
+ * that it ended. Claude Code usually sends a task's end before that level,
+ * which ends them first, but the SDK does not promise that order.
  */
-export function droppedTerminalTasks(
-  session: BackgroundWorkSession,
-  level: BackgroundLevel,
-): string[] {
-  return [...(session.backgroundTerminals?.keys() ?? [])].filter((taskId) => !level.has(taskId));
+export function droppedTasks(session: BackgroundWorkSession, level: BackgroundLevel): string[] {
+  return [
+    ...(session.backgroundTerminals?.keys() ?? []),
+    ...(session.backgroundToolCalls?.keys() ?? []),
+  ].filter((taskId) => !level.has(taskId));
 }
 
 /**
@@ -211,11 +311,95 @@ export function takeBackgroundTerminalExit(
 }
 
 /**
+ * Removes the background tool call of the task `taskId` of the session
+ * `sessionId`, and returns the update that gives it its final status, or
+ * undefined when the task has no such call. A task that Claude Code stopped
+ * is `cancelled`. One that ended without saying how, such as one that the
+ * level dropped, is `completed`: it no longer runs, and reported no failure.
+ */
+export function takeBackgroundToolCallEnd(
+  session: BackgroundWorkSession,
+  sessionId: string,
+  taskId: string,
+  end: BackgroundTaskEnd,
+): AcpSessionNotification | undefined {
+  const toolCall = session.backgroundToolCalls?.get(taskId);
+  if (!toolCall) return undefined;
+  session.backgroundToolCalls!.delete(taskId);
+  return toolCallStatusUpdate(
+    sessionId,
+    toolCall,
+    end === "stopped" ? V2_CANCELLED : end === "failed" ? "failed" : "completed",
+  );
+}
+
+/**
+ * The update that reports the background tool call of the task `taskId` as
+ * `paused`, or as `in_progress` again, when `paused` changes it. Claude Code
+ * pauses a workflow this way.
+ */
+export function backgroundToolCallPause(
+  session: BackgroundWorkSession,
+  sessionId: string,
+  taskId: string,
+  paused: boolean,
+): AcpSessionNotification | undefined {
+  const toolCall = session.backgroundToolCalls?.get(taskId);
+  if (!toolCall || (toolCall.paused ?? false) === paused) return undefined;
+  toolCall.paused = paused;
+  return toolCallStatusUpdate(sessionId, toolCall, paused ? V2_PAUSED : "in_progress");
+}
+
+/**
+ * The current state of each background tool call in `toolCallIds` of the
+ * root session `sessionId`: the call as `renderer` shows its tool use, with
+ * its status now (see `ClaudeAcpAgent.publishBackgroundToolCalls`).
+ */
+export function backgroundToolCallStates(
+  session: BackgroundWorkSession & { cwd: string },
+  sessionId: string,
+  toolCallIds: string[],
+  renderer: AcpToolCallRenderer,
+): AcpSessionNotification[] {
+  return [...(session.backgroundToolCalls?.values() ?? [])]
+    .filter((toolCall) => toolCallIds.includes(toolCall.toolCallId))
+    .map((toolCall) => {
+      const update = renderer.toolCall(
+        { id: toolCall.toolCallId, ...toolCall.toolUse },
+        { cwd: session.cwd },
+      );
+      const status = toolCall.paused ? V2_PAUSED : "in_progress";
+      return { sessionId, update: { ...update, status } as AcpSessionNotification["update"] };
+    });
+}
+
+function toolCallStatusUpdate(
+  sessionId: string,
+  toolCall: BackgroundToolCall,
+  status: NonNullable<
+    Extract<AcpSessionNotification["update"], { sessionUpdate: "tool_call_update" }>["status"]
+  >,
+): AcpSessionNotification {
+  return {
+    sessionId,
+    update: {
+      sessionUpdate: "tool_call_update",
+      toolCallId: toolCall.toolCallId,
+      status,
+      ...(toolCall.parentToolUseId
+        ? { _meta: { claudeCode: { parentToolUseId: toolCall.parentToolUseId } } }
+        : {}),
+    },
+  };
+}
+
+/**
  * Ends the background work of a session whose query closed: Claude Code's
  * background tasks end with its process. Returns the updates that exit the
- * root session's terminals, and empties the level, so the next lists are
- * empty. A subagent's command is left as it was: its terminal is on the
- * child's stream, which the closed query's routing owned.
+ * root session's terminals and cancel its tool calls, and empties the level,
+ * so the next lists are empty. A subagent's command or tool call is left as
+ * it was: it is on the child's stream, which the closed query's routing
+ * owned.
  */
 export function endBackgroundWork(
   session: BackgroundWorkSession,
@@ -228,42 +412,56 @@ export function endBackgroundWork(
       : takeBackgroundTerminalExit(session, sessionId, taskId);
     return exit ? [exit] : [];
   });
+  const ends = [...(session.backgroundToolCalls ?? [])].flatMap(([taskId, toolCall]) => {
+    const end = toolCall.parentToolUseId
+      ? undefined
+      : takeBackgroundToolCallEnd(session, sessionId, taskId, "stopped");
+    return end ? [end] : [];
+  });
   session.backgroundLevel = undefined;
-  return exits;
+  return [...exits, ...ends];
 }
 
 /**
- * Stops the background command whose terminal `terminalId` the session
- * `sessionId` lists (v2 `terminal/cancel`). `sessions` are the root sessions,
- * by id: a subagent session's list is built with its root's. The terminal
- * exits when Claude Code reports the task stopped.
+ * Stops the task of a terminal or tool call that the session `sessionId`
+ * lists (v2 `terminal/cancel` and `tool_call/cancel`). `sessions` are the
+ * root sessions, by id: a subagent session's list is built with its root's.
+ * The terminal exits, or the tool call gets its final status, when Claude
+ * Code reports the task stopped.
  */
-export async function cancelBackgroundTerminal(
+export async function cancelBackgroundWork(
   sessions: Record<string, BackgroundWorkSession>,
   sessionId: string,
-  terminalId: string,
+  target: { terminalId: string } | { toolCallId: string },
 ): Promise<void> {
   const notCancellable = () =>
-    RequestError.invalidParams(
-      { sessionId, terminalId },
-      `Terminal ${terminalId} is not a command running in the background, so it cannot be cancelled.`,
-    );
+    "terminalId" in target
+      ? RequestError.invalidParams(
+          { sessionId, terminalId: target.terminalId },
+          `Terminal ${target.terminalId} is not a command running in the background, so it cannot be cancelled.`,
+        )
+      : RequestError.invalidParams(
+          { sessionId, toolCallId: target.toolCallId },
+          `Tool call ${target.toolCallId} is not running in the background, so it cannot be cancelled.`,
+        );
+  const isTarget = (item: BackgroundItem) =>
+    "terminalId" in target
+      ? item.type === "terminal" && item.terminalId === target.terminalId
+      : item.type === "tool_call" && item.toolCallId === target.toolCallId;
   const listed = (root: string, session: BackgroundWorkSession) =>
     session.reportsBackground === true &&
-    (backgroundLists(session, root)
-      .get(sessionId)
-      ?.some((item) => item.type === "terminal" && item.terminalId === terminalId) ??
-      false);
+    (backgroundLists(session, root).get(sessionId)?.some(isTarget) ?? false);
   const owner = Object.entries(sessions).find(([root, session]) => listed(root, session));
   if (!owner) throw notCancellable();
   const [root, session] = owner;
-  const taskId = [...(session.backgroundTerminals ?? [])].find(
-    ([, terminal]) => terminal.toolCallId === terminalId,
-  )![0];
+  const id = "terminalId" in target ? target.terminalId : target.toolCallId;
+  const taskId = [
+    ...(("terminalId" in target ? session.backgroundTerminals : session.backgroundToolCalls) ?? []),
+  ].find(([, entry]) => entry.toolCallId === id)![0];
   try {
     await session.query.stopTask(taskId);
   } catch (error) {
-    // The command ended meanwhile: it has exited, or is about to.
+    // The task ended meanwhile: it has ended on the client too, or is about to.
     if (!listed(root, session)) throw notCancellable();
     throw error;
   }
