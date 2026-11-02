@@ -168,6 +168,7 @@ import {
   backgroundLevel,
   type BackgroundLevel,
   type BackgroundSink,
+  type BackgroundTerminal,
   backgroundToolCallPause,
   backgroundToolCallStates,
   type BackgroundTaskEnd,
@@ -176,6 +177,8 @@ import {
   cancelBackgroundWork,
   droppedTasks,
   endBackgroundWork,
+  finishBackgroundTerminalOutput,
+  followBackgroundTerminalOutput,
   registerBackgroundToolCalls,
   takeBackgroundTerminalExit,
   takeBackgroundToolCallEnd,
@@ -1487,7 +1490,7 @@ export type Session = {
    *  terminal exits when the task ends, not at the tool result (see
    *  `withRunningTerminal`). Only for a client that renders terminals and is
    *  not AIR, which shows the command through its async tasks. */
-  backgroundTerminals?: Map<string, { toolCallId: string; parentToolUseId?: string }>;
+  backgroundTerminals?: Map<string, BackgroundTerminal>;
   /** The tool calls whose tasks went on in the background and still run, by
    *  task id: a Monitor, a Workflow, or a backgrounded MCP call. The tool call
    *  stays `in_progress` (or `paused`) after its result, until its task ends
@@ -5422,6 +5425,7 @@ export class ClaudeAcpAgent {
      *  status, once the task ends (see `Session.backgroundTerminals` and
      *  `Session.backgroundToolCalls`). */
     const endBackgroundTask = async (taskId: string, end: BackgroundTaskEnd) => {
+      await finishBackgroundTerminalOutput(session, taskId);
       const exit = takeBackgroundTerminalExit(session, params.sessionId, taskId);
       if (exit) await sendUpdate(exit);
       const toolCallEnd = takeBackgroundToolCallEnd(session, params.sessionId, taskId, end);
@@ -8527,6 +8531,7 @@ export class ClaudeAcpAgent {
             const acceptedPlanToolUseId = observeExitPlanToolResults(message, content, session);
             let backgroundedToolCalls: ReadonlySet<string> = new Set();
             let runningTerminal: string | undefined;
+            let runningTerminalTask: string | undefined;
             let runningToolCalls: ReadonlySet<string> = new Set();
             if (message.type === "user") {
               rememberResolvedToolNames(session, content);
@@ -8558,7 +8563,11 @@ export class ClaudeAcpAgent {
                   ...(message.parent_tool_use_id
                     ? { parentToolUseId: message.parent_tool_use_id }
                     : {}),
+                  ...(backgroundBashTask.outputFilePath
+                    ? { outputFilePath: backgroundBashTask.outputFilePath }
+                    : {}),
                 });
+                runningTerminalTask = backgroundBashTask.taskId;
               }
               runningToolCalls = registerBackgroundToolCalls(
                 session,
@@ -8640,6 +8649,22 @@ export class ClaudeAcpAgent {
                   ),
                   runningToolCalls,
                 ),
+              );
+            }
+            // After the result's own updates: the command's output replaces
+            // the placeholder that they gave its terminal.
+            if (runningTerminalTask) {
+              followBackgroundTerminalOutput(
+                session,
+                params.sessionId,
+                runningTerminalTask,
+                (notification) =>
+                  sendUpdate(notification).catch((error) => {
+                    this.logger.error(
+                      `Session ${params.sessionId}: failed to send background command output:`,
+                      error,
+                    );
+                  }),
               );
             }
             break;
