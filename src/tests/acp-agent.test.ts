@@ -56,6 +56,7 @@ import {
   type StreamedToolInputCache,
 } from "../acp-agent.js";
 import { SessionTitles } from "../session-titles.js";
+import { SessionBackgroundWork } from "../background-work.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "../usage-markdown.js";
 import { Pushable } from "../utils.js";
 import { heldRequest, initializeClient, makeMockQuery } from "./helpers.js";
@@ -5201,6 +5202,7 @@ describe("permission request cancellation", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      background: new SessionBackgroundWork(sessionId, false),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
@@ -14998,6 +15000,7 @@ describe("session/close", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      background: new SessionBackgroundWork(sessionId, false),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
@@ -15120,6 +15123,7 @@ describe("session/delete", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      background: new SessionBackgroundWork(sessionId, false),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
@@ -15283,6 +15287,7 @@ describe("getOrCreateSession param change detection", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      background: new SessionBackgroundWork(sessionId, false),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
@@ -19764,6 +19769,7 @@ describe("post-error recovery", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      background: new SessionBackgroundWork("test-session", false),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
@@ -28199,6 +28205,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      background: new SessionBackgroundWork("test-session", false),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
@@ -30107,6 +30114,7 @@ describe("agent selection config option", () => {
         toolUseCache: {},
         emittedToolCalls: new Set(),
         liveBackgroundTasks: new Map(),
+        background: new SessionBackgroundWork(sessionId, false),
         emittedAssistantText: false,
         owedTrailingIdles: 0,
         messageIdToUuid: new Map(),
