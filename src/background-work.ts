@@ -30,6 +30,7 @@ import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import type { AcpSessionNotification } from "./acp-subagents.js";
 import type { NativeSubagent } from "./native-subagents.js";
 import { type AcpToolCallRenderer, V2_CANCELLED, V2_PAUSED } from "./tool-calls/renderer.js";
+import { type BackgroundOutput, BackgroundOutputTail } from "./background-output.js";
 
 /** An item of a `background` list. */
 export type BackgroundItem =
@@ -37,6 +38,18 @@ export type BackgroundItem =
   | { type: "tool_call"; toolCallId: string }
   | { type: "subagent"; sessionId: string }
   | { type: "_claude/task"; taskId: string; description: string };
+
+/** The display terminal of a command that went to the background (see `Session.backgroundTerminals`). */
+export interface BackgroundTerminal {
+  /** The Bash tool call, whose id names the terminal. */
+  toolCallId: string;
+  /** The subagent tool call that ran the command, if any. */
+  parentToolUseId?: string;
+  /** The file that Claude Code writes the command's output to, from the Bash result. */
+  outputFilePath?: string;
+  /** Reads that file into the terminal while the command runs. */
+  output?: BackgroundOutputTail;
+}
 
 /** A tool call whose task runs on in the background (see `Session.backgroundToolCalls`). */
 export interface BackgroundToolCall {
@@ -82,7 +95,7 @@ export interface BackgroundSink {
 export interface BackgroundWorkSession {
   reportsBackground?: boolean;
   backgroundLevel?: BackgroundLevel;
-  backgroundTerminals?: Map<string, { toolCallId: string; parentToolUseId?: string }>;
+  backgroundTerminals?: Map<string, BackgroundTerminal>;
   backgroundToolCalls?: Map<string, BackgroundToolCall>;
   nativeSubagentsByTaskId?: Map<string, NativeSubagent>;
   liveBackgroundTasks?: Map<string, { parentToolUseId?: string; isSubagent: boolean }>;
@@ -281,6 +294,61 @@ export function droppedTasks(session: BackgroundWorkSession, level: BackgroundLe
 }
 
 /**
+ * Starts reading the output of the background command `taskId` into its
+ * terminal, when the session reports its background work and the Bash result
+ * named the command's output file. `send` sends an update of the terminal's
+ * tool call, routed as the call's other updates. Called once the Bash
+ * result's own updates are sent: the first output replaces the placeholder
+ * that they gave the terminal.
+ */
+export function followBackgroundTerminalOutput(
+  session: BackgroundWorkSession,
+  sessionId: string,
+  taskId: string,
+  send: (notification: AcpSessionNotification) => Promise<void>,
+): void {
+  const terminal = session.backgroundTerminals?.get(taskId);
+  if (!session.reportsBackground || !terminal?.outputFilePath || terminal.output) return;
+  terminal.output = new BackgroundOutputTail(terminal.outputFilePath, (output) =>
+    send(terminalOutputUpdate(sessionId, terminal, output)),
+  );
+}
+
+/** The update that gives the terminal of `terminal` the text `output`. */
+function terminalOutputUpdate(
+  sessionId: string,
+  terminal: BackgroundTerminal,
+  output: BackgroundOutput,
+): AcpSessionNotification {
+  const data = { terminal_id: terminal.toolCallId, data: output.text };
+  return {
+    sessionId,
+    update: {
+      sessionUpdate: "tool_call_update",
+      toolCallId: terminal.toolCallId,
+      _meta: {
+        ...(terminal.parentToolUseId
+          ? { claudeCode: { parentToolUseId: terminal.parentToolUseId } }
+          : {}),
+        ...(output.replaces ? { terminal_output: data } : { terminal_output_delta: data }),
+      },
+    },
+  };
+}
+
+/**
+ * Reads the rest of the output of the background command `taskId` into its
+ * terminal: the command ended, and its output goes before its exit, as v2
+ * asks.
+ */
+export async function finishBackgroundTerminalOutput(
+  session: BackgroundWorkSession,
+  taskId: string,
+): Promise<void> {
+  await session.backgroundTerminals?.get(taskId)?.output?.finish();
+}
+
+/**
  * Removes the terminal of the background command `taskId` of the session
  * `sessionId`, and returns the update that exits it, or undefined when the
  * command has no terminal. Claude Code reports no exit code for it, and
@@ -294,6 +362,7 @@ export function takeBackgroundTerminalExit(
 ): AcpSessionNotification | undefined {
   const terminal = session.backgroundTerminals?.get(taskId);
   if (!terminal) return undefined;
+  terminal.output?.stop();
   session.backgroundTerminals!.delete(taskId);
   return {
     sessionId,
@@ -406,6 +475,8 @@ export function endBackgroundWork(
   sessionId: string,
 ): AcpSessionNotification[] {
   if (!session.reportsBackground) return [];
+  // No command writes output any more.
+  for (const terminal of session.backgroundTerminals?.values() ?? []) terminal.output?.stop();
   const exits = [...(session.backgroundTerminals ?? [])].flatMap(([taskId, terminal]) => {
     const exit = terminal.parentToolUseId
       ? undefined

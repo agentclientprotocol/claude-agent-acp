@@ -5,7 +5,7 @@
  * schema, so a malformed v2 message fails the test.
  */
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -5596,6 +5596,78 @@ describe("ACP v2 terminal of a command in the background", () => {
         "exit, no cancel",
         "idle []",
       ]);
+    });
+
+    it("reads the command's output file into its terminal, and the rest before its exit", async () => {
+      const dir = await mkdtemp(path.join(os.tmpdir(), "background-output-"));
+      const outputFile = path.join(dir, "tasks", "bg1.output");
+      await mkdir(path.dirname(outputFile));
+      await writeFile(outputFile, "compiling\n");
+      const ended = Promise.withResolvers<void>();
+      scriptTurns(async function* (options) {
+        yield level(options, [{}]);
+        yield taskStarted(options);
+        yield bashUse(options);
+        // The Bash result names the file, as Claude Code writes it.
+        const bashResult = backgrounded(options);
+        yield {
+          ...bashResult,
+          message: {
+            ...bashResult.message,
+            content: [
+              {
+                ...bashResult.message.content[0],
+                content: `Command running in background with ID: bg1. Output is being written to: ${outputFile}`,
+              },
+            ],
+          },
+        };
+        yield result(options);
+        yield idleState(options);
+        await ended.promise;
+        yield* taskEnded(options);
+        yield level(options, []);
+      });
+      const output = (client: ReturnType<typeof v2Client>) =>
+        client.sessionUpdates.flatMap(({ update }) => {
+          if (update.sessionUpdate === "terminal_output_chunk") {
+            return [`chunk ${Buffer.from(String(update.data), "base64").toString()}`];
+          }
+          if (update.sessionUpdate !== "terminal_update") return [];
+          return [
+            ...(update.output
+              ? [
+                  `output ${Buffer.from((update.output as { data: string }).data, "base64").toString()}`,
+                ]
+              : []),
+            ...(update.exitStatus ? ["exit"] : []),
+          ];
+        });
+      try {
+        const client = await promptUntil("idle end_turn [toolu_bg]", async (_, __, client) => {
+          await vi.waitFor(() => expect(output(client)).toContain("output compiling\n"), {
+            timeout: 2000,
+          });
+          await appendFile(outputFile, "tests passed\n");
+          await vi.waitFor(() => expect(output(client)).toContain("chunk tests passed\n"), {
+            timeout: 2000,
+          });
+          // The command writes its last line as it ends.
+          await appendFile(outputFile, "done\n");
+          ended.resolve();
+          await vi.waitFor(() => expect(backgroundTrace(client)).toContain("idle []"));
+        });
+
+        // The file's first text replaces the Bash result's placeholder.
+        expect(output(client).slice(-4)).toEqual([
+          "output compiling\n",
+          "chunk tests passed\n",
+          "chunk done\n",
+          "exit",
+        ]);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
     });
 
     it("ends the listed terminals when the query ends, as its background tasks end with it", async () => {
