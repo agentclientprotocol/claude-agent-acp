@@ -19,9 +19,17 @@ export const BACKGROUND_OUTPUT_POLL_MS = 500;
 export const BACKGROUND_OUTPUT_READ_BYTES = 256 * 1024;
 
 /**
- * Text that the file adds. The first is a snapshot that replaces the
- * terminal's output so far, the placeholder of the Bash result. Each later
- * one appends to it.
+ * The most unread bytes that are still sent. A command that writes faster
+ * than the polls read falls behind. Past this, the reads skip to the file's
+ * last bytes, as a snapshot: a terminal shows the latest output, and a
+ * client keeps a bounded amount of it anyway.
+ */
+export const BACKGROUND_OUTPUT_MAX_BACKLOG_BYTES = 1024 * 1024;
+
+/**
+ * Text that the file adds. A snapshot replaces the terminal's output so far:
+ * the first one replaces the placeholder of the Bash result, and a later one
+ * follows a skip or a file that shrank. Other text appends to it.
  */
 export type BackgroundOutput = { text: string; replaces: boolean };
 
@@ -33,8 +41,9 @@ export type BackgroundOutput = { text: string; replaces: boolean };
  */
 export class BackgroundOutputTail {
   private offset = 0;
-  private readonly decoder = new StringDecoder("utf8");
-  private replaced = false;
+  private decoder = new StringDecoder("utf8");
+  /** Whether the next text replaces the terminal's output. */
+  private replaces = true;
   private stopped = false;
   private reading: Promise<void> = Promise.resolve();
   private readonly timer: ReturnType<typeof setInterval>;
@@ -64,35 +73,59 @@ export class BackgroundOutputTail {
     this.stopped = true;
   }
 
+  /**
+   * Reads what the file adds, one read of at most
+   * {@link BACKGROUND_OUTPUT_READ_BYTES} at a time, and publishes each read's
+   * text before the next. `toEnd` reads until the end of the file, and ends a
+   * character that the command cut off with a replacement character.
+   */
   private read(toEnd: boolean): Promise<void> {
     this.reading = this.reading.then(async () => {
       if (this.stopped) return;
-      let text = "";
+      let file;
       try {
-        const file = await open(this.path, "r");
-        try {
-          do {
-            const buffer = Buffer.alloc(BACKGROUND_OUTPUT_READ_BYTES);
-            const { bytesRead } = await file.read(buffer, 0, buffer.length, this.offset);
-            if (bytesRead === 0) break;
-            this.offset += bytesRead;
-            text += this.decoder.write(buffer.subarray(0, bytesRead));
-          } while (toEnd);
-        } finally {
-          await file.close();
-        }
+        file = await open(this.path, "r");
       } catch {
         // Nothing written yet, or the file is gone: try again at the next
         // poll. At the end, the terminal keeps the output it has.
         return;
       }
-      // At the end, a sequence that the command cut off is replaced, not held.
-      if (toEnd) text += this.decoder.end();
-      if (text === "" && (this.replaced || !toEnd)) return;
-      const replaces = !this.replaced;
-      this.replaced = true;
-      await this.publish({ text, replaces });
+      try {
+        const { size } = await file.stat();
+        // A file that shrank is a new one: its output starts over. Past the
+        // backlog, the reads skip to the file's last bytes.
+        const start = size < this.offset ? 0 : this.offset;
+        const skipTo = Math.max(start, size - BACKGROUND_OUTPUT_MAX_BACKLOG_BYTES);
+        if (skipTo !== this.offset) {
+          this.offset = skipTo;
+          this.decoder = new StringDecoder("utf8");
+          this.replaces = true;
+        }
+        const buffer = Buffer.alloc(BACKGROUND_OUTPUT_READ_BYTES);
+        let bytesRead: number;
+        do {
+          ({ bytesRead } = await file.read(buffer, 0, buffer.length, this.offset));
+          this.offset += bytesRead;
+          const text = this.decoder.write(buffer.subarray(0, bytesRead));
+          if (text !== "") await this.send(text);
+        } while (toEnd && bytesRead > 0);
+        if (toEnd) {
+          const rest = this.decoder.end();
+          // A command that wrote nothing still replaces the placeholder.
+          if (rest !== "" || this.replaces) await this.send(rest);
+        }
+      } catch {
+        // The read failed: try again at the next poll.
+      } finally {
+        await file.close();
+      }
     });
     return this.reading;
+  }
+
+  private async send(text: string): Promise<void> {
+    const replaces = this.replaces;
+    this.replaces = false;
+    await this.publish({ text, replaces });
   }
 }

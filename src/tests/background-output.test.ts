@@ -2,7 +2,12 @@ import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { type BackgroundOutput, BackgroundOutputTail } from "../background-output.js";
+import {
+  BACKGROUND_OUTPUT_MAX_BACKLOG_BYTES,
+  BACKGROUND_OUTPUT_READ_BYTES,
+  type BackgroundOutput,
+  BackgroundOutputTail,
+} from "../background-output.js";
 
 describe("BackgroundOutputTail", () => {
   let dir: string;
@@ -67,6 +72,35 @@ describe("BackgroundOutputTail", () => {
     await new Promise((resolve) => setTimeout(resolve, 700));
 
     expect(published.map((output) => output.text).join("")).toBe("ab");
+  });
+
+  it("sends at most the backlog, read by read, from the file's last bytes as a snapshot", async () => {
+    // More than the backlog, written faster than the polls read it.
+    const skipped = "x".repeat(BACKGROUND_OUTPUT_MAX_BACKLOG_BYTES);
+    const kept = "y".repeat(BACKGROUND_OUTPUT_MAX_BACKLOG_BYTES - 4) + "end\n";
+    await writeFile(file, skipped + kept);
+    follow();
+    await tail!.finish();
+
+    expect(published.map((output) => output.text).join("")).toBe(kept);
+    expect(published[0].replaces).toBe(true);
+    expect(published.slice(1).every((output) => !output.replaces)).toBe(true);
+    expect(
+      published.every((output) => Buffer.byteLength(output.text) <= BACKGROUND_OUTPUT_READ_BYTES),
+    ).toBe(true);
+  });
+
+  it("starts over with a snapshot when the file shrinks", async () => {
+    await writeFile(file, "old output\n");
+    follow();
+    await vi.waitFor(() => expect(published).toHaveLength(1), { timeout: 2000 });
+    await writeFile(file, "new\n");
+    await tail!.finish();
+
+    expect(published).toEqual([
+      { text: "old output\n", replaces: true },
+      { text: "new\n", replaces: true },
+    ]);
   });
 
   it("replaces the placeholder with an empty output when the command wrote nothing", async () => {
