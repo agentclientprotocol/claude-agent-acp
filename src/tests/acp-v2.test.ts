@@ -37,6 +37,7 @@ import {
   v1SetSessionConfigOptionRequest,
   v2ConfigOptions,
 } from "../v2/session.js";
+import { startupFailure } from "./helpers.js";
 import packageJson from "../../package.json" with { type: "json" };
 
 const execFileSpy = vi.hoisted(() => vi.fn());
@@ -60,6 +61,16 @@ const sdk = vi.hoisted(() => ({
   stopTask: async (_taskId: string): Promise<void> => {},
   /** The query is closed, as `session/close` closes it. */
   close: (): void => {},
+  initializationResult: async (): Promise<Record<string, unknown>> => ({
+    models: [
+      {
+        value: "claude-sonnet-4-6",
+        displayName: "Claude Sonnet",
+        description: "Fast",
+        supportsAutoMode: true,
+      },
+    ],
+  }),
   mcpServerStatus: async (): Promise<Array<{ name: string; status: string }>> => [],
   supportedCommands: async (): Promise<
     Array<{ name: string; description: string; argumentHint: string }>
@@ -86,16 +97,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
       const messages = sdk.run(prompt, options);
       const controls = makeMockQuery({
         [Symbol.asyncIterator]: () => messages,
-        initializationResult: async () => ({
-          models: [
-            {
-              value: "claude-sonnet-4-6",
-              displayName: "Claude Sonnet",
-              description: "Fast",
-              supportsAutoMode: true,
-            },
-          ],
-        }),
+        initializationResult: () => sdk.initializationResult(),
         supportedCommands: () => sdk.supportedCommands(),
         mcpServerStatus: () => sdk.mcpServerStatus(),
         mcpAuthenticate: (serverName: string) => sdk.mcpAuthenticate(serverName),
@@ -479,6 +481,22 @@ describe("ACP v2 sessions", () => {
     expect(client.updates("available_commands_update")).toEqual([
       { sessionUpdate: "available_commands_update", availableCommands: SESSION_COMMANDS },
     ]);
+  });
+
+  it("rejects session/new with the reason Claude Code gave for not starting", async () => {
+    sdk.initializationResult = async () => {
+      throw startupFailure("proxy_invalid", 'Invalid proxy URL in HTTPS_PROXY: "not a url".');
+    };
+    const { app, authUpdate } = v2Client();
+    await app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      await expect(agent.request(v2.methods.agent.session.new, { cwd })).rejects.toMatchObject({
+        code: -32603,
+        message: 'Internal error: Invalid proxy URL in HTTPS_PROXY: "not a url".',
+        data: { startupFailureReason: "proxy_invalid" },
+      });
+      await authUpdate(1);
+    });
   });
 
   it("rejects an MCP transport that v1 cannot express", async () => {
