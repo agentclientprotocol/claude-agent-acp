@@ -405,7 +405,7 @@ class V2ClientConnection implements AcpClient {
     const response = await this.ctx.request(
       v2.methods.client.session.requestPermission,
       v2PermissionRequest({ ...params, toolCall }),
-      { cancellationSignal: signal },
+      { cancellationSignal: signal, stopWaitingOnCancel: true },
     );
     return v1PermissionResponse(response);
   }
@@ -421,7 +421,7 @@ class V2ClientConnection implements AcpClient {
       // one only in a received value. As on v1, an MCP server's schema is
       // relayed here unchanged, so this cast does not check it.
       params as v2.CreateElicitationRequest,
-      { cancellationSignal: signal },
+      { cancellationSignal: signal, stopWaitingOnCancel: true },
     );
   }
 
