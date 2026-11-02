@@ -106,13 +106,17 @@ export function v2AgentApp(
       // v2 requires a snapshot of the foreground state after the replay and
       // before the response, also without a replay: a resumed live session can
       // be running a turn, or waiting on a permission request. The current
-      // state of each subagent and terminal it lists comes first, as v2
-      // requires. The subagents' go again after the response (see below).
+      // state of each subagent, terminal and tool call it lists comes first,
+      // as v2 requires. The subagents' go again after the response (see below).
       await agent.publishLiveSubagents(
         params.sessionId,
         client.background.listedSubagents(params.sessionId),
       );
-      for (const notification of client.background.currentTerminals(params.sessionId)) {
+      await agent.publishBackgroundToolCalls(
+        params.sessionId,
+        client.background.listedToolCalls(params.sessionId),
+      );
+      for (const notification of client.background.currentItems(params.sessionId)) {
         void client.send(notification);
       }
       void client.send({
@@ -175,6 +179,10 @@ export function v2AgentApp(
     )
     .onRequest(v2.methods.agent.terminal.cancel, async ({ params }) => {
       await agent.cancelBackgroundTerminal(params);
+      return {};
+    })
+    .onRequest(v2.methods.agent.toolCall.cancel, async ({ params }) => {
+      await agent.cancelBackgroundToolCall(params);
       return {};
     })
     .onNotification(v2.methods.agent.session.cancel, ({ params }) => agent.cancel(params));

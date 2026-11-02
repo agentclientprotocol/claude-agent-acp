@@ -5519,7 +5519,11 @@ describe("ACP v2 terminal of a command in the background", () => {
           "stopReason" in update && update.stopReason ? ` ${update.stopReason}` : "";
         const { background } = update as { background?: v2.BackgroundWork[] | null };
         const items = (background ?? []).map((item) =>
-          "terminalId" in item ? String(item.terminalId) : String(item.type),
+          "terminalId" in item
+            ? String(item.terminalId)
+            : "toolCallId" in item
+              ? String(item.toolCallId)
+              : String(item.type),
         );
         return [`${update.state}${stopReason} [${items.join(",")}]`];
       });
@@ -5696,23 +5700,234 @@ describe("ACP v2 terminal of a command in the background", () => {
       expect(rejected).toMatchObject({ code: -32602 });
     });
 
-    it("lists another task, such as a Monitor, as a _claude/task item", async () => {
-      scriptTurns(async function* (options) {
-        yield level(options, [
-          { task_id: "mon1", task_type: "local_monitor", description: "Watch the logs" },
-        ]);
-        yield result(options);
-        yield idleState(options);
-      });
-      const client = await promptUntil("idle end_turn [_claude/task]");
+    describe("a task that a tool call started", () => {
+      const monitor = {
+        task_id: "mon1",
+        task_type: "local_monitor",
+        description: "Watch the logs",
+      };
+      const workflow = { task_id: "wf1", task_type: "local_workflow", description: "Review" };
+      /** A Monitor call whose task `mon1` runs on after the call returns. The
+       *  tool starts the task, which joins the level before its
+       *  `task_started`, and returns. */
+      async function* monitorStarts(options: Options) {
+        yield toolUseMessage(options, "toolu_mon", "Monitor", { command: "tail -f app.log" });
+        yield level(options, [monitor]);
+        yield taskEvent(options, "task_started", { ...monitor, tool_use_id: "toolu_mon" });
+        yield {
+          ...toolResultMessage(options, "toolu_mon", { content: "Monitor started (task mon1)." }),
+          tool_use_result: { taskId: "mon1", timeoutMs: 0, persistent: true },
+        };
+      }
+      const monitorEvent = (options: Options, subtype: string, fields: Record<string, unknown>) =>
+        taskEvent(options, subtype, { ...fields, task_id: "mon1" });
 
-      expect(backgroundTrace(client)).toEqual([
-        "running []",
-        "running [_claude/task]",
-        "idle end_turn [_claude/task]",
-      ]);
-      expect(client.updates("state_update").at(-1)).toMatchObject({
-        background: [{ type: "_claude/task", taskId: "mon1", description: "Watch the logs" }],
+      /** The states with their lists, and the Monitor call's statuses and capability. */
+      const toolCallTrace = (client: ReturnType<typeof v2Client>) =>
+        client.sessionUpdates.flatMap(({ update }) => {
+          if (update.sessionUpdate === "tool_call_update" && update.toolCallId === "toolu_mon") {
+            const capabilities = update.capabilities as { cancel?: unknown } | null | undefined;
+            return [
+              ...(update.status ? [String(update.status)] : []),
+              ...(capabilities === null ? ["no cancel"] : capabilities?.cancel ? ["cancel"] : []),
+            ];
+          }
+          if (update.sessionUpdate !== "state_update") return [];
+          const stopReason =
+            "stopReason" in update && update.stopReason ? ` ${update.stopReason}` : "";
+          const { background } = update as { background?: v2.BackgroundWork[] | null };
+          const items = (background ?? []).map((item) =>
+            "toolCallId" in item ? String(item.toolCallId) : String(item.type),
+          );
+          return [`${update.state}${stopReason} [${items.join(",")}]`];
+        });
+
+      it("keeps the call in_progress and listed until its task ends, and paused while the task is", async () => {
+        scriptTurns(async function* (options) {
+          yield* monitorStarts(options);
+          yield result(options);
+          yield idleState(options);
+          yield monitorEvent(options, "task_updated", { patch: { status: "paused" } });
+          yield monitorEvent(options, "task_updated", { patch: { status: "running" } });
+          yield monitorEvent(options, "task_notification", {
+            tool_use_id: "toolu_mon",
+            status: "completed",
+            output_file: "/tmp/tasks/mon1.output",
+            summary: "Done",
+          });
+          yield level(options, []);
+        });
+        const client = await promptUntil("idle end_turn [toolu_mon]");
+        await vi.waitFor(() => expect(toolCallTrace(client)).toContain("idle []"));
+
+        // The task is part of the call until the call returns, so nothing is
+        // listed before. The call can be cancelled before a list names it, and
+        // no longer once it ends, before the list drops it.
+        expect(toolCallTrace(client)).toEqual([
+          "running []",
+          "pending",
+          "in_progress",
+          "cancel",
+          "running [toolu_mon]",
+          "idle end_turn [toolu_mon]",
+          "paused",
+          "in_progress",
+          "completed",
+          "no cancel",
+          "idle []",
+        ]);
+      });
+
+      it("stops the task on tool_call/cancel, and reports the call cancelled", async () => {
+        const stopped = Promise.withResolvers<string>();
+        sdk.stopTask = async (taskId) => stopped.resolve(taskId);
+        scriptTurns(async function* (options) {
+          yield* monitorStarts(options);
+          yield result(options);
+          yield idleState(options);
+          await stopped.promise;
+          // Claude Code reports a stopped task as killed first.
+          yield monitorEvent(options, "task_updated", { patch: { status: "killed" } });
+          yield monitorEvent(options, "task_notification", {
+            tool_use_id: "toolu_mon",
+            status: "stopped",
+            output_file: "/tmp/tasks/mon1.output",
+            summary: "Stopped",
+          });
+          yield level(options, []);
+        });
+        let rejected: unknown;
+        const client = await promptUntil(
+          "idle end_turn [toolu_mon]",
+          async (agent, sessionId, client) => {
+            await expect(
+              agent.request(v2.methods.agent.toolCall.cancel, {
+                sessionId,
+                toolCallId: "toolu_mon",
+              }),
+            ).resolves.toEqual({});
+            expect(await stopped.promise).toBe("mon1");
+            await vi.waitFor(() => expect(toolCallTrace(client)).toContain("idle []"));
+            rejected = await agent
+              .request(v2.methods.agent.toolCall.cancel, { sessionId, toolCallId: "toolu_mon" })
+              .catch((error: unknown) => error);
+          },
+        );
+
+        expect(toolCallTrace(client).slice(-3)).toEqual(["cancelled", "no cancel", "idle []"]);
+        expect(rejected).toMatchObject({ code: -32602 });
+      });
+
+      it("cancels the call when the query ends, as its task ends with it", async () => {
+        scriptTurns(async function* (options) {
+          yield* monitorStarts(options);
+          yield result(options);
+          yield idleState(options);
+          throw new Error("The Claude Code process exited");
+        });
+        const client = await promptUntil("idle []");
+
+        expect(toolCallTrace(client).slice(-4)).toEqual([
+          "idle end_turn [toolu_mon]",
+          "cancelled",
+          "no cancel",
+          "idle []",
+        ]);
+      });
+
+      it("leaves a listed Workflow running on session/cancel", async () => {
+        const interrupted = Promise.withResolvers<void>();
+        sdk.interrupt = async () => interrupted.resolve();
+        const stopTask = vi.fn(async () => {});
+        sdk.stopTask = stopTask;
+        scriptTurns(async function* (options) {
+          yield toolUseMessage(options, "toolu_wf", "Workflow", { script: "review" });
+          yield level(options, [workflow]);
+          yield taskEvent(options, "task_started", { ...workflow, tool_use_id: "toolu_wf" });
+          yield {
+            ...toolResultMessage(options, "toolu_wf", { content: "Workflow launched." }),
+            tool_use_result: {
+              status: "async_launched",
+              taskId: "wf1",
+              taskType: "local_workflow",
+            },
+          };
+          await interrupted.promise;
+          yield result(options, ABORTED_TOOLS);
+          yield idleState(options);
+        });
+        const client = await promptUntil("running [toolu_wf]", async (agent, sessionId, client) => {
+          await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+          await vi.waitFor(() =>
+            expect(backgroundTrace(client)).toContain("idle cancelled [toolu_wf]"),
+          );
+        });
+
+        expect(stopTask).not.toHaveBeenCalled();
+        expect(
+          client
+            .updates("tool_call_update")
+            .filter((update) => update.toolCallId === "toolu_wf" && update.status)
+            .map((update) => update.status),
+        ).toEqual(["pending", "in_progress"]);
+      });
+
+      it("sends each listed call's current state before the state snapshot of session/resume", async () => {
+        scriptTurns(async function* (options) {
+          yield* monitorStarts(options);
+          yield result(options);
+          yield idleState(options);
+          yield monitorEvent(options, "task_updated", { patch: { status: "paused" } });
+        });
+        let resumed: v2.SessionUpdate[] = [];
+        await promptUntil("idle end_turn [toolu_mon]", async (agent, sessionId, client) => {
+          await vi.waitFor(() => expect(toolCallTrace(client)).toContain("paused"));
+          const before = client.sessionUpdates.length;
+          await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+          resumed = client.sessionUpdates.slice(before).map(({ update }) => update);
+        });
+
+        // The call as its tool use shows it, with its status now, then its
+        // capability.
+        expect(resumed).toEqual([
+          expect.objectContaining({
+            sessionUpdate: "tool_call_update",
+            toolCallId: "toolu_mon",
+            name: "Monitor",
+            status: "paused",
+            rawInput: { command: "tail -f app.log" },
+          }),
+          {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "toolu_mon",
+            capabilities: { cancel: {} },
+          },
+          {
+            sessionUpdate: "state_update",
+            state: "idle",
+            background: [{ type: "tool_call", toolCallId: "toolu_mon" }],
+          },
+        ]);
+      });
+
+      it("lists a task without such a call as a _claude/task item", async () => {
+        scriptTurns(async function* (options) {
+          yield level(options, [monitor]);
+          // No tool call started it, such as a task that a hook started.
+          yield taskEvent(options, "task_started", monitor);
+          yield result(options);
+          yield idleState(options);
+        });
+        const client = await promptUntil("idle end_turn [_claude/task]");
+
+        expect(backgroundTrace(client)).toEqual([
+          "running []",
+          "running [_claude/task]",
+          "idle end_turn [_claude/task]",
+        ]);
+        expect(client.updates("state_update").at(-1)).toMatchObject({
+          background: [{ type: "_claude/task", taskId: "mon1", description: "Watch the logs" }],
+        });
       });
     });
 

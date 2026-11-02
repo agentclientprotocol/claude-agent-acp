@@ -29,12 +29,13 @@ export type ToolCallUpdate = SessionNotification["update"];
 const PLAN_FILE_CLEAR_SUFFIX = ":plan-file-clear";
 
 /**
- * ACP v2's `cancelled` tool call status. v1's statuses have no such value, and
- * the agent builds its reports in v1 types, so it travels as a v1 status. Only
- * a v2 client gets it, and the v2 surface sends it as it is
- * (`src/v2/tool-call.ts`).
+ * ACP v2's `cancelled` and `paused` tool call statuses. v1's statuses have no
+ * such values, and the agent builds its reports in v1 types, so they travel as
+ * v1 statuses. Only a v2 client gets them, and the v2 surface sends them as
+ * they are (`src/v2/tool-call.ts`).
  */
-const V2_CANCELLED = "cancelled" as unknown as ToolCallStatus;
+export const V2_CANCELLED = "cancelled" as unknown as ToolCallStatus;
+export const V2_PAUSED = "paused" as unknown as ToolCallStatus;
 
 /** Whether `status` ends a tool call: `completed`, `failed`, or, on v2, `cancelled`. */
 export function isFinalToolCallStatus(status: ToolCallStatus | null | undefined): boolean {
