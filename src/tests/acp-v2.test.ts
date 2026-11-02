@@ -5982,6 +5982,25 @@ describe("ACP v2 terminal of a command in the background", () => {
         ]);
       });
 
+      it("lists a task whose call returned before the task started as a _claude/task item", async () => {
+        scriptTurns(async function* (options) {
+          yield toolUseMessage(options, "toolu_mcp", "mcp__ci__watch", { job: "build" });
+          yield toolResultMessage(options, "toolu_mcp", { content: "Watching the build." });
+          // The call's task joins the level and starts after the call returned,
+          // so the call ended and cannot be listed.
+          const task = { task_id: "mcp1", task_type: "mcp_task", description: "Watch the build" };
+          yield level(options, [task]);
+          yield taskEvent(options, "task_started", { ...task, tool_use_id: "toolu_mcp" });
+          yield result(options);
+          yield idleState(options);
+        });
+        const client = await promptUntil("idle end_turn [_claude/task]");
+
+        expect(client.updates("state_update").at(-1)).toMatchObject({
+          background: [{ type: "_claude/task", taskId: "mcp1", description: "Watch the build" }],
+        });
+      });
+
       it("lists a task without such a call as a _claude/task item", async () => {
         scriptTurns(async function* (options) {
           yield level(options, [monitor]);
