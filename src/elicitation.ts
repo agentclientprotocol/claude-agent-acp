@@ -303,7 +303,7 @@ export function applyAskElicitationResponse(
   questions: AskUserQuestion[],
   options: { reportUnanswered?: boolean } = {},
 ): AskUserQuestionOutcome {
-  // Typed against the output schema: as of SDK 0.3.312 only it lists
+  // Typed against the output schema: as of SDK 0.3.316 only it lists
   // `unanswered`, though the tool reads the same annotations from its input.
   const annotations: NonNullable<AskUserQuestionOutput["annotations"]> = {};
   const withAnnotations = (answers: AskUserQuestionOutput["answers"]) => ({
