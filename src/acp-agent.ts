@@ -381,6 +381,7 @@ import {
   ultracodeWorkflowsEnabled,
   type UltracodeOptionState,
 } from "./session-ultracode.js";
+import { STARTUP_FAILURE_RESULTS_ENV, startupFailureError } from "./startup-failure.js";
 
 export { EFFORT_CONFIG_ID, settingsEffortForModel } from "./session-effort.js";
 export {
@@ -12064,6 +12065,7 @@ export class ClaudeAcpAgent {
       ...providerEnv,
       // Opt-in to session state events like when the agent is idle
       CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
+      ...STARTUP_FAILURE_RESULTS_ENV,
     };
     // Scopes the context-window cache to this query's backend (see
     // `contextWindowCache`). Derived from the same `env` object handed to the
@@ -12318,7 +12320,7 @@ export class ClaudeAcpAgent {
         ) {
           throw RequestError.sessionNotFound(sessionId);
         }
-        throw error;
+        throw startupFailureError(error) ?? error;
       }
       timing.phase("sdk-initialize");
 
