@@ -293,6 +293,30 @@ export class NativeSubagentRuntime {
   }
 
   /**
+   * The RFD form: the `subagent_update` that tells a client that holds nothing
+   * of the announced child `sessionId` of this live session what it is now:
+   * its labels, its directory, its `cancel` capability, and its work state.
+   * Undefined when no such child runs here.
+   */
+  currentUpdate(sessionId: string): AcpSessionNotification | undefined {
+    if (this.form !== "rfd") return undefined;
+    const child = this.childOfSession(sessionId);
+    if (!child?.announced || !child.workState) return undefined;
+    return {
+      sessionId: child.parentSessionId,
+      update: {
+        sessionUpdate: "subagent_update",
+        sessionId: child.sessionId,
+        ...(child.title ? { title: child.title } : {}),
+        ...(child.description ? { description: child.description } : {}),
+        ...(child.reportedCwd ? { cwd: child.reportedCwd } : {}),
+        capabilities: { cancel: {} },
+        state: { state: child.workState },
+      },
+    };
+  }
+
+  /**
    * Reports the model of a child response, an exact model id, as the entry of
    * the root session's `model` option that matches it, else as the id (see
    * {@link responseModelEntry}). The child gets no model before its first
