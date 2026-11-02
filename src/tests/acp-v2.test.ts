@@ -194,6 +194,19 @@ function v2Client({
   const elicitations: v2.CreateElicitationRequest[] = [];
   const completedElicitations: v2.CompleteElicitationNotification[] = [];
   const permissionRequests: v2.RequestPermissionRequest[] = [];
+  /** The methods of the requests that the agent cancelled with `$/cancel_request`. */
+  const cancelledRequests: string[] = [];
+  // The request's signal also aborts when the connection closes, with another reason.
+  const recordCancel = (method: string, signal: AbortSignal) =>
+    signal.addEventListener(
+      "abort",
+      () => {
+        if ((signal.reason as { code?: unknown } | undefined)?.code === -32800) {
+          cancelledRequests.push(method);
+        }
+      },
+      { once: true },
+    );
   let notifyAuthUpdate = () => {};
   const app = v2
     .client({ name: V2_CLIENT_INFO.name })
@@ -208,15 +221,17 @@ function v2Client({
     .onNotification(v2.methods.client.session.update, ({ params }) => {
       sessionUpdates.push(params);
     })
-    .onRequest(v2.methods.client.elicitation.create, ({ params }) => {
+    .onRequest(v2.methods.client.elicitation.create, ({ params, signal }) => {
       elicitations.push(params);
+      recordCancel(v2.methods.client.elicitation.create, signal);
       return answerElicitation(params);
     })
     .onNotification(v2.methods.client.elicitation.complete, ({ params }) => {
       completedElicitations.push(params);
     })
-    .onRequest(v2.methods.client.session.requestPermission, ({ params }) => {
+    .onRequest(v2.methods.client.session.requestPermission, ({ params, signal }) => {
       permissionRequests.push(params);
+      recordCancel(v2.methods.client.session.requestPermission, signal);
       return answerPermission(params);
     });
   /** Resolves once the client has received `count` auth status updates. */
@@ -245,6 +260,7 @@ function v2Client({
     elicitations,
     completedElicitations,
     permissionRequests,
+    cancelledRequests,
   };
 }
 
@@ -4799,6 +4815,8 @@ describe("ACP v2 requests that a cancel withdraws", () => {
       });
 
       expect(trace).toEqual(["user_message", "running", "requires_action", "idle cancelled"]);
+      // The client does not answer the request, so the agent cancels it.
+      expect(client.cancelledRequests).toHaveLength(1);
     },
   );
 
@@ -4818,14 +4836,18 @@ describe("ACP v2 requests that a cancel withdraws", () => {
       const client = holdingClient();
 
       let atClose: string[] = [];
+      let cancelledAtClose: string[] = [];
       await runTurn(client, async (agent, sessionId) => {
         await awaitsUser(client);
         await agent.request(v2.methods.agent.session.close, { sessionId });
         atClose = turnTrace(client.sessionUpdates);
+        cancelledAtClose = [...client.cancelledRequests];
       });
       closed.resolve();
 
       expect(atClose).toEqual(["user_message", "running", "requires_action", "idle cancelled"]);
+      // The request is cancelled with `$/cancel_request` before session/close responds.
+      expect(cancelledAtClose).toHaveLength(1);
     },
   );
 

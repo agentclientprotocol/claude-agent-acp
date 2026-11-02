@@ -2443,8 +2443,8 @@ export function isReplayHiddenMetaMessage(message: unknown): boolean {
 export interface AcpClient {
   sessionUpdate(params: AcpSessionNotification): Promise<void>;
   /** `signal`, when aborted, sends `$/cancel_request` for the in-flight
-   *  permission request so the client can dismiss its prompt (and settle our
-   *  await) instead of leaving the dialog open after the turn was cancelled. */
+   *  permission request so the client can dismiss its prompt, and rejects the
+   *  call at once: a client that ignores the cancel never answers. */
   requestPermission(
     params: AcpPermissionRequest,
     signal?: AbortSignal,
@@ -2452,7 +2452,8 @@ export interface AcpClient {
   readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse>;
   writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse>;
   /** `signal`, when aborted, sends `$/cancel_request` for the in-flight
-   *  elicitation so the client can dismiss its prompt and settle our await. */
+   *  elicitation so the client can dismiss its prompt, and rejects the call
+   *  at once, as {@link requestPermission} does. */
   createElicitation(
     params: CreateElicitationRequest,
     signal?: AbortSignal,
@@ -2481,6 +2482,7 @@ class ClientConnection implements AcpClient {
   ): Promise<RequestPermissionResponse> {
     return this.ctx.request(methods.client.session.requestPermission, params, {
       cancellationSignal: signal,
+      stopWaitingOnCancel: true,
     });
   }
 
@@ -2498,6 +2500,7 @@ class ClientConnection implements AcpClient {
   ): Promise<CreateElicitationResponse> {
     return this.ctx.request(methods.client.elicitation.create, params, {
       cancellationSignal: signal,
+      stopWaitingOnCancel: true,
     });
   }
 
@@ -10331,10 +10334,9 @@ export class ClaudeAcpAgent {
   /** Forward a permission request to the client, wiring the tool call's
    *  `signal` through as a `cancellationSignal`. When the turn is cancelled
    *  while the client's prompt is still open the signal aborts, the SDK sends
-   *  `$/cancel_request`, and our local abort race settles even if the client
-   *  ignores it. A request rejection and a local abort surface the same
-   *  "Tool use aborted" that the callers expect. `canUseTool` decides what a
-   *  `cancelled` outcome means. */
+   *  `$/cancel_request` and stops waiting for the client's answer. The
+   *  rejection surfaces as the "Tool use aborted" that the callers expect.
+   *  `canUseTool` decides what a `cancelled` outcome means. */
   private async requestPermissionFromClient(
     params: AcpPermissionRequest,
     toolName: string,
@@ -10365,9 +10367,6 @@ export class ClaudeAcpAgent {
     );
     if (signal.aborted) throw new Error("Tool use aborted");
 
-    // Do not rely on every ACP client settling requestPermission after the
-    // cancellation signal. The local race guarantees that Claude's tool call
-    // is released even when an older or broken client ignores $/cancel_request.
     // The request goes to a subagent's child session for a tool call of that
     // subagent, but it blocks the turn of the owner session.
     try {
@@ -10375,7 +10374,7 @@ export class ClaudeAcpAgent {
         this.withPendingUserInput(
           ownerSessionId,
           signal,
-          () => raceWithAbort(this.client.requestPermission(params, signal), signal),
+          () => this.client.requestPermission(params, signal),
           agentID,
         ),
       );
@@ -10388,25 +10387,24 @@ export class ClaudeAcpAgent {
   }
 
   /** Send the client an elicitation for a callback of Claude Code. When the
-   *  callback's `signal` aborts, the SDK sends `$/cancel_request` and keeps
-   *  waiting for the client's reply, which a client that ignores the cancel
-   *  never sends. So the call also rejects at once on the abort, as
-   *  {@link requestPermissionFromClient} does for a permission request. Left
-   *  open, the request would stay in `openUserInputs` (see
-   *  {@link withPendingUserInput}), which keeps steering non-interrupting, and
-   *  a child's `openRequests` would not drop. */
+   *  callback's `signal` aborts, the SDK sends `$/cancel_request` and the call
+   *  rejects at once, without waiting for a reply that a client ignoring the
+   *  cancel never sends. Left open, the request would stay in
+   *  `openUserInputs` (see {@link withPendingUserInput}), which keeps steering
+   *  non-interrupting, and a child's `openRequests` would not drop. */
   private elicitFromClient(
     request: CreateElicitationRequest,
     signal: AbortSignal,
   ): Promise<CreateElicitationResponse> {
-    return raceWithAbort(this.client.createElicitation(request, signal), signal);
+    return this.client.createElicitation(request, signal);
   }
 
   /** `signal`, also aborted when `teardownSession` aborts the
    *  `abortController` of session `sessionId`. Claude Code aborts a callback's
    *  own signal when its query closes, but not necessarily before
-   *  `session/close` responds, and v2 requires every pending elicitation of
-   *  the session to be cancelled with `$/cancel_request` before that response. */
+   *  `session/close` responds, and v2 requires every pending permission
+   *  request and elicitation of the session to be cancelled with
+   *  `$/cancel_request` before that response. */
   private untilSessionClosed(sessionId: string, signal: AbortSignal): AbortSignal {
     const sessionSignal = this.sessions[sessionId]?.abortController?.signal;
     return sessionSignal ? AbortSignal.any([signal, sessionSignal]) : signal;

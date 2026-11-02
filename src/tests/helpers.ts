@@ -4,7 +4,11 @@
  * their own vi.fn spies via `overrides`.
  */
 
-import type { ClientCapabilities, InitializeRequest } from "@agentclientprotocol/sdk/unstable";
+import {
+  RequestError,
+  type ClientCapabilities,
+  type InitializeRequest,
+} from "@agentclientprotocol/sdk/unstable";
 
 /** The context-usage report the base mock query returns. `rawMaxTokens`
  *  matches the agent's DEFAULT_CONTEXT_WINDOW so window-related assertions
@@ -63,4 +67,17 @@ export async function initializeClient(
   clientCapabilities: ClientCapabilities,
 ): Promise<void> {
   await agent.initialize({ protocolVersion: 1, clientCapabilities });
+}
+
+/**
+ * A request to a client that never answers it, as the SDK connection returns
+ * it with `stopWaitingOnCancel`: it rejects with `-32800` once `signal`
+ * aborts. The real connection also sends `$/cancel_request` then.
+ */
+export function heldRequest<T>(_params?: unknown, signal?: AbortSignal): Promise<T> {
+  return new Promise<T>((_resolve, reject) => {
+    const cancel = () => reject(RequestError.requestCancelled(signal?.reason));
+    if (signal?.aborted) cancel();
+    else signal?.addEventListener("abort", cancel, { once: true });
+  });
 }
