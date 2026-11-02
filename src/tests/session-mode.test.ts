@@ -253,15 +253,14 @@ describe("resolveInitialPermissionMode", () => {
     expect(resolveInitialPermissionMode({ defaultMode: "plan" }, logger(), true)).toBe("plan");
   });
 
-  it("continues in the mode of the resumed transcript instead of defaultMode", () => {
-    expect(
-      resolveInitialPermissionMode(
-        { resumed: "bypassPermissions", defaultMode: "plan" },
-        logger(),
-        true,
-      ),
-    ).toBe("bypassPermissions");
-  });
+  it.each(["default", "acceptEdits", "plan", "auto", "bypassPermissions"])(
+    "continues in the supported restored mode %s instead of defaultMode",
+    (resumed) => {
+      expect(
+        resolveInitialPermissionMode({ resumed, defaultMode: "dontAsk" }, logger(), true),
+      ).toBe(resumed);
+    },
+  );
 
   it("lets an explicit mode win over the resumed transcript", () => {
     expect(
@@ -285,9 +284,25 @@ describe("resolveInitialPermissionMode", () => {
     expect(log.error).toHaveBeenCalledWith(expect.stringContaining('"bypassPermissions"'));
   });
 
-  it("falls back to defaultMode for an unknown resumed mode", () => {
+  it.each(["warp", "dontAsk"])("falls back to defaultMode for resumed mode %s", (resumed) => {
     expect(
-      resolveInitialPermissionMode({ resumed: "warp", defaultMode: "acceptEdits" }, logger(), true),
+      resolveInitialPermissionMode({ resumed, defaultMode: "acceptEdits" }, logger(), true),
     ).toBe("acceptEdits");
   });
+
+  it.each([
+    { defaultMode: "plan", allowBypass: true, expected: "plan" },
+    { defaultMode: "bypassPermissions", allowBypass: true, expected: "bypassPermissions" },
+    { defaultMode: "bypassPermissions", allowBypass: false, expected: "default" },
+    { defaultMode: "dontAsk", allowBypass: true, expected: "default" },
+    { defaultMode: "warp", allowBypass: true, expected: "default" },
+    { defaultMode: undefined, allowBypass: true, expected: "default" },
+  ])(
+    "uses available settings fallback $defaultMode for an unavailable restored mode",
+    ({ defaultMode, allowBypass, expected }) => {
+      expect(
+        resolveInitialPermissionMode({ resumed: "dontAsk", defaultMode }, logger(), allowBypass),
+      ).toBe(expected);
+    },
+  );
 });
