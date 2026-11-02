@@ -10441,6 +10441,19 @@ export class ClaudeAcpAgent {
             resolvedProvider.bedrockRegionPrefix,
           )
         : settingsAllowedModels;
+      // Alias-only catalogs do not identify every model the provider must serve.
+      if (
+        resolvedProvider?.listedModels !== undefined &&
+        initializationResult.models.length > 0 &&
+        settingsAllowedModels.length > 0 &&
+        settingsAllowedModels.every((model) => Boolean(model.resolvedModel?.trim())) &&
+        allowedModels.length === 0
+      ) {
+        throw RequestError.internalError(
+          { providerId: PROVIDER_ID },
+          "The selected provider offers no compatible Claude models. Choose a different provider and try again.",
+        );
+      }
 
       const models = await getAvailableModels(
         q,
