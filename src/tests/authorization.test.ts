@@ -1076,6 +1076,62 @@ describe("authorization", () => {
         expect([...respawned.sessionFailureState.active.values()]).toHaveLength(0);
       });
 
+      it("restores the user's choices on the respawned query, then a choice sent meanwhile", async () => {
+        const [agent, updates] = createRecordingAgent(true);
+        hideClaudeAuth();
+        const effortModels = ["sonnet", "opus"].map((value) => ({
+          value,
+          displayName: value,
+          description: "",
+          supportsAutoMode: true,
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high"],
+        }));
+        const scripts = [[[signOutResult()]], [[successResult()]]];
+        let releaseRespawn!: () => void;
+        const respawnGate = new Promise<void>((resolve) => (releaseRespawn = resolve));
+        const queries: any[] = [];
+        mockQuery.mockImplementation((args: any) => {
+          const query = scriptedQuery(args, SIGNED_IN_WITH_KEY, scripts[queries.length] ?? []);
+          const gate = queries.length > 0 ? respawnGate : undefined;
+          query.initializationResult = async () => {
+            await gate;
+            return { models: effortModels, account: SIGNED_IN_WITH_KEY };
+          };
+          query.setModel = vi.fn(async () => {});
+          query.applyFlagSettings = vi.fn(async () => {});
+          queries.push(query);
+          return query;
+        });
+        const { sessionId } = await agent.newSession(newSessionParams());
+        await agent.setSessionConfigOption({ sessionId, configId: "model", value: "opus" });
+        await agent.setSessionConfigOption({ sessionId, configId: "effort", value: "high" });
+        await expect(agent.prompt(promptParams(sessionId))).rejects.toMatchObject({
+          code: AUTH_REQUIRED_CODE,
+        });
+
+        const turn = agent.prompt(promptParams(sessionId));
+        await vi.waitFor(() => expect(queries).toHaveLength(2));
+        const choice = agent.setSessionConfigOption({
+          sessionId,
+          configId: "effort",
+          value: "low",
+        });
+        releaseRespawn();
+        await expect(turn).resolves.toMatchObject({ stopReason: "end_turn" });
+        await choice;
+
+        expect(queries[1].setModel).toHaveBeenCalledWith("opus");
+        expect(queries[1].applyFlagSettings.mock.calls).toEqual([
+          [{ effortLevel: "high" }],
+          [{ effortLevel: "low" }],
+        ]);
+        expect(updates).toContainEqual({
+          sessionId,
+          update: expect.objectContaining({ sessionUpdate: "config_option_update" }),
+        });
+      });
+
       it("refuses with the plain error and no second row when still signed out", async () => {
         const [agent, updates] = createRecordingAgent(true);
         hideClaudeAuth();

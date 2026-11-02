@@ -7,7 +7,11 @@ import {
   listGatewayModels,
   selectBedrockRegion,
 } from "../gateway-models.js";
-import { getAvailableModels, narrowToGatewayModels } from "../session-model.js";
+import {
+  buildModelConfigOption,
+  getAvailableModels,
+  narrowToGatewayModels,
+} from "../session-model.js";
 
 const logger = { log: vi.fn(), error: vi.fn() };
 
@@ -391,6 +395,13 @@ describe("getAvailableModels under a gateway listing", () => {
 
     expect(state.currentModelId).toBe("claude-opus-5");
     expect(setModel).not.toHaveBeenCalled();
+    // The model option lists the resumed model so its currentValue is selectable.
+    const option = buildModelConfigOption(state, LISTED, false);
+    expect(option.currentValue).toBe("claude-opus-5");
+    expect(
+      option.type === "select" &&
+        option.options.map((entry) => ("value" in entry ? entry.value : entry.group)),
+    ).toEqual([...state.availableModels.map((model) => model.modelId), "claude-opus-5"]);
   });
 
   it("reports the SDK default when a PreModelSwitch hook vetoes the switch", async () => {

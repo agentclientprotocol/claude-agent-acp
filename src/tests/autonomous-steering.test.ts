@@ -35,7 +35,11 @@ function request(text = "also handle this"): SteerRequest {
   };
 }
 
-async function setup(onUpdate?: (notification: any) => void | Promise<void>, asyncTasks = false) {
+async function setup(
+  onUpdate?: (notification: any) => void | Promise<void>,
+  asyncTasks = false,
+  extraCapabilities: string[] = [],
+) {
   const updates: any[] = [];
   const foreground: string[] = [];
   const agent = new ClaudeAcpAgent(
@@ -55,9 +59,16 @@ async function setup(onUpdate?: (notification: any) => void | Promise<void>, asy
       }),
     },
   );
-  if (asyncTasks) {
+  if (asyncTasks || extraCapabilities.length) {
     agent.clientCapabilities = {
-      _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+      _meta: {
+        jetbrains: {
+          air: {
+            version: 1,
+            capabilities: [...(asyncTasks ? ["asyncTasks"] : []), ...extraCapabilities],
+          },
+        },
+      },
     };
   }
   const input = new Pushable<any>();
@@ -273,6 +284,111 @@ describe("steering an autonomous cycle", () => {
     await send(successfulResultMessage({ user_message_uuid: queued.uuid }));
     await prompt;
   });
+
+  it.each([false, true])(
+    "preserves scheduled-fire reporting and steer ownership (running first: %s)",
+    async (runningFirst) => {
+      const { agent, session, send, outgoing, updates } = await setup(undefined, true);
+      if (runningFirst) await send(state("running"));
+      await send({
+        type: "command_lifecycle",
+        state: "started",
+        command_uuid: "scheduled-command",
+        wakeup_source: "schedule_wakeup",
+      });
+      if (!runningFirst) await send(state("running"));
+      const taskUpdates = updates.filter(
+        ({ update }) =>
+          update.sessionUpdate === "async_task_spawned" ||
+          update.sessionUpdate === "async_task_progress",
+      );
+      expect(taskUpdates.at(-1)?.update.description).toBe("A scheduled task fired.");
+      const taskId = taskUpdates[0].update.asyncTaskId;
+      await agent.steer(request());
+      const steered = (await outgoing.next()).value;
+      await send({ type: "command_lifecycle", state: "started", command_uuid: steered.uuid });
+      // Older runtimes can omit the result's UUID. The started command still
+      // owns this result, so it closes the task without creating a user Turn.
+      await send(successfulResultMessage({ origin: { kind: "human" } }));
+      expect(
+        updates
+          .filter(({ update }) => update.sessionUpdate === "async_task_state_update")
+          .map(({ update }) => update),
+      ).toEqual([
+        { sessionUpdate: "async_task_state_update", asyncTaskId: taskId, state: "completed" },
+      ]);
+      expect(session.turnQueue).toEqual([]);
+      expect(session.activeTurn).toBeNull();
+    },
+  );
+
+  it("steers a fresh followup after an opted-in prompt ends with a live subagent", async () => {
+    const { agent, session, send, outgoing, prompt } = await setup(undefined, true, [
+      "backgroundSubagents",
+    ]);
+    session.requestMarkerListsV1 = true;
+    const answer = agent.prompt(request("delegate work"));
+    const parent = (await outgoing.next()).value;
+    await send(userEcho(parent));
+    await send(state("running"));
+    await send({
+      type: "system",
+      subtype: "task_started",
+      task_id: "child-1",
+      tool_use_id: "toolu_child-1",
+      description: "Explore the project",
+      subagent_type: "Explore",
+      uuid: "task-start",
+      session_id: "test-session",
+    });
+    await send(successfulResultMessage({ user_message_uuid: parent.uuid }));
+    await expect(answer).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(session.activeTurn).toBeNull();
+    expect(session.liveBackgroundTasks.has("child-1")).toBe(true);
+    await expect(agent.steer(request())).resolves.toEqual({
+      outcome: "promptRequired",
+      reason: "noRunningTurn",
+    });
+    await send({ type: "system", subtype: "status", status: "requesting", user_message_uuids: [] });
+    prompt.mockClear();
+    await expect(agent.steer(request())).resolves.toEqual({ outcome: "injected" });
+    expect(prompt).not.toHaveBeenCalled();
+    const steered = (await outgoing.next()).value;
+    await send(successfulResultMessage({ user_message_uuid: steered.uuid }));
+    expect(session.turnQueue).toEqual([]);
+    expect(session.liveBackgroundTasks.has("child-1")).toBe(true);
+  });
+
+  it.each([false, true])(
+    "does not report an interrupted autonomous plan as a provider failure (failure capability: %s)",
+    async (sessionFailure) => {
+      const { agent, session, send, outgoing, updates } = await setup(undefined, false, [
+        "backgroundSubagents",
+        ...(sessionFailure ? ["sessionFailure"] : []),
+      ]);
+      await send(state("running"));
+      await agent.steer(request());
+      const steered = (await outgoing.next()).value;
+      session.pendingExitPlanModeInterruption = { toolUseId: "plan-tool", toolResultSeen: true };
+      const result = successfulResultMessage({
+        origin: { kind: "task-notification" },
+        user_message_uuid: steered.uuid,
+        subtype: "error_during_execution",
+        is_error: true,
+        errors: ["[ede_diagnostic] result_type=user stop_reason=tool_use"],
+        stop_reason: null,
+      });
+      delete (result as any).result;
+      await send(result);
+      expect(session.pendingExitPlanModeInterruption).toBeUndefined();
+      expect(session.pendingExitPlanContextReset).toBeUndefined();
+      expect(session.lastTurnFailed).not.toBe(true);
+      expect(JSON.stringify(updates)).not.toContain("provider_error");
+      expect(
+        updates.filter(({ update }) => update.sessionUpdate === "agent_message_chunk"),
+      ).toEqual([]);
+    },
+  );
 
   it.each([undefined, "promptRequired"] as const)(
     "keeps autonomous steering out of prompt() with idle behavior %s",
@@ -1043,6 +1159,68 @@ describe("steering an autonomous cycle", () => {
       expect(foreground).toEqual(["running", "ended cancelled", "running"]);
       (agent as any).endAutonomousCycle("test-session", { outcome: { stopReason: "end_turn" } });
       expect(foreground).toEqual(["running", "ended cancelled", "running", "ended end_turn"]);
+    },
+  );
+
+  it.each([false, true])(
+    "preserves a prompt received while an autonomous cancel awaits (started: %s)",
+    async (started) => {
+      const { agent, session, send, outgoing, updates } = await setup();
+      const cancelAsyncMessage = vi.fn(async () => {});
+      session.query.cancelAsyncMessage = cancelAsyncMessage;
+      session.requestMarkerListsV1 = true;
+      await send(state("running"));
+      await agent.steer(request());
+      const steered = (await outgoing.next()).value;
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      vi.spyOn(session.contextCompaction, "interrupt").mockImplementationOnce(async () => {
+        entered.resolve();
+        await release.promise;
+      });
+      const cancel = agent.cancel({ sessionId: "test-session" });
+      await entered.promise;
+      const next = agent.prompt(request("replacement"));
+      const nextMessage = (await outgoing.next()).value;
+      try {
+        expect(session.cancelledPrompts).toContain(steered.uuid);
+        expect(session.cancelledPrompts).not.toContain(nextMessage.uuid);
+        if (started) {
+          await send({
+            type: "command_lifecycle",
+            state: "started",
+            command_uuid: nextMessage.uuid,
+          });
+          await send({
+            type: "system",
+            subtype: "status",
+            status: "requesting",
+            user_message_uuids: [nextMessage.uuid],
+          });
+        }
+      } finally {
+        release.resolve();
+        await cancel;
+      }
+      expect(cancelAsyncMessage).toHaveBeenCalledExactlyOnceWith(steered.uuid);
+      expect(session.turnQueue).toHaveLength(1);
+      expect(session.turnQueue[0].settled).toBe(false);
+      await send(userEcho(nextMessage));
+      await send(
+        successfulResultMessage({
+          user_message_uuid: steered.uuid,
+          is_error: true,
+          result: "Cancelled autonomous steer",
+        }),
+      );
+      expect(session.activeTurn?.promptUuid).toBe(nextMessage.uuid);
+      expect(session.activeTurn?.settled).toBe(false);
+      expect(
+        updates.some(({ update }) => update.content?.text === "Cancelled autonomous steer"),
+      ).toBe(false);
+      expect(session.lastTurnFailed).not.toBe(true);
+      await send(successfulResultMessage({ user_message_uuid: nextMessage.uuid }));
+      await expect(next).resolves.toMatchObject({ stopReason: "end_turn" });
     },
   );
 

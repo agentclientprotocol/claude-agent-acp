@@ -41,7 +41,8 @@ const launch = (uuid: string, launchId: string) => ({
 });
 /**
  * The directive message that Claude Code writes after the copy of the launching
- * message in a `subagent_type: "fork"` child's transcript.
+ * message in a `subagent_type: "fork"` child's transcript, with the tool_result
+ * text of Claude Code before 2.1.307.
  */
 const forkDirective = (uuid: string, launchIds: string[], prompt: string) => ({
   ...base,

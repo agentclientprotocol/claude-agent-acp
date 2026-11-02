@@ -70,7 +70,7 @@ export function buildExitPlanModePermissionOptions(
       : (["auto", "bypassPermissions"] as const)
   ).filter((mode) => modes.has(mode));
   const preferredMode = elevatedModes[0] ?? "acceptEdits";
-  if (plainString(context.input.plan)) {
+  if (context.allowContextReset !== false && plainString(context.input.plan)) {
     const usage =
       context.contextUsedPercent === undefined ? "" : ` (${context.contextUsedPercent}% used)`;
     options.push(

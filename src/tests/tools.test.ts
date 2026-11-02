@@ -2448,6 +2448,18 @@ describe("toolInfoFromToolUse - ExitPlanMode", () => {
   });
 });
 
+describe("toolInfoFromToolUse - EnterPlanMode", () => {
+  it("reports a mode switch", () => {
+    const info = toolInfoFromToolUse(
+      { name: "EnterPlanMode", id: "toolu_enter", input: {} },
+      false,
+    );
+
+    expect(info.kind).toBe("switch_mode");
+    expect(info.title).toBe("EnterPlanMode");
+  });
+});
+
 describe("toolInfoFromToolUse - Write input aliases", () => {
   it.each([
     ["path + file_text", { path: "/repo/a.ts", file_text: "x" }],
@@ -4935,9 +4947,9 @@ describe("toAcpNotifications - the plan of an approved ExitPlanMode", () => {
       .map(({ update }) => update);
   }
 
-  const markdownPlan = (content: string) => ({
+  const markdownPlan = (content: string, planId = "plan-mode") => ({
     sessionUpdate: "plan_update",
-    plan: { type: "markdown", planId: "plan-mode", content },
+    plan: { type: "markdown", planId, content },
   });
 
   it("shows the plan of the structured result, which includes the user's edits", () => {
@@ -4954,6 +4966,24 @@ describe("toAcpNotifications - the plan of an approved ExitPlanMode", () => {
   it("shows the plan of the input when the structured result has none", () => {
     const toolUseResult = { plan: null, isAgent: false };
     expect(planUpdates({}, { toolUseResult })).toEqual([markdownPlan("Implement it")]);
+  });
+
+  it.each([false, true])("links an AIR plan by ID with planFile=%s", (planFile) => {
+    const clientCapabilities: ClientCapabilities = {
+      plan: {},
+      _meta: {
+        jetbrains: { air: { version: 1, capabilities: planFile ? ["planFile"] : [] } },
+      },
+    };
+    expect(
+      planUpdates(
+        {},
+        { clientCapabilities, toolUseResult: { plan: "Edited plan", isAgent: false } },
+      ),
+    ).toEqual([markdownPlan("Edited plan", "plan-mode:toolu_plan")]);
+    expect(planUpdates({}, { clientCapabilities }, { plan: "\nOriginal plan\n" })).toEqual([
+      markdownPlan("Original plan", "plan-mode:toolu_plan"),
+    ]);
   });
 
   it("shows the plan after the tool call's result", () => {

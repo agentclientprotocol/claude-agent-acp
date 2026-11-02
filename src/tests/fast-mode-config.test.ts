@@ -114,7 +114,10 @@ describe("resolveFastModeEnabled", () => {
 
   it("rejects any other value", () => {
     expect(() => resolveFastModeEnabled({ ...base, value: "maybe" })).toThrow(
-      /Invalid value for config option fast/,
+      expect.objectContaining({
+        code: -32602,
+        message: expect.stringContaining("Invalid value for config option fast"),
+      }),
     );
   });
 });
@@ -251,6 +254,31 @@ describe("setSessionConfigOption Fast mode toggle", () => {
     });
     expect(applyFlagSettings).toHaveBeenCalledWith({ fastMode: true });
     expect(response.configOptions).toContainEqual(createFastModeConfigOption(true, false));
+  });
+
+  it("rejects a value whose type differs from the option's advertised type", async () => {
+    // Advertised as `type: "boolean"`: "on" is not a boolean.
+    const booleanClient = setup({ useBooleanOption: true });
+    await expect(
+      booleanClient.agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: FAST_MODE_CONFIG_ID,
+        value: FAST_MODE_ON,
+      }),
+    ).rejects.toMatchObject({ code: -32602 });
+    expect(booleanClient.applyFlagSettings).not.toHaveBeenCalled();
+
+    // Advertised as an on/off select: `true` is not a string.
+    const selectClient = setup({ useBooleanOption: false });
+    await expect(
+      selectClient.agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: FAST_MODE_CONFIG_ID,
+        type: "boolean",
+        value: true,
+      }),
+    ).rejects.toMatchObject({ code: -32602 });
+    expect(selectClient.applyFlagSettings).not.toHaveBeenCalled();
   });
 
   it("does not change session state when the SDK rejects the flag", async () => {

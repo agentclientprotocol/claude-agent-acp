@@ -247,7 +247,10 @@ export class SessionModeManager<S extends SessionMode> {
     const session = this.requireOpenSession(sessionId);
     const requestedMode = this.parseMode(modeId);
     if (!this.isAvailable(session.modes.availableModes, requestedMode)) {
-      throw new Error(`Mode ${modeId} is not available in this session`);
+      throw RequestError.invalidParams(
+        undefined,
+        `Mode ${modeId} is not available in this session`,
+      );
     }
 
     const effectiveMode = this.effectiveMode(session, requestedMode);
@@ -314,7 +317,7 @@ export class SessionModeManager<S extends SessionMode> {
 
   private requireOpenSession(sessionId: string): S {
     const session = this.options.getSession(sessionId);
-    if (!session) throw new Error("Session not found");
+    if (!session) throw RequestError.sessionNotFound(sessionId);
     if (session.queryClosed) {
       throw RequestError.internalError(undefined, this.options.sessionEndedMessage);
     }
@@ -343,7 +346,7 @@ export class SessionModeManager<S extends SessionMode> {
       case "plan":
         return modeId;
       default:
-        throw new Error("Invalid Mode");
+        throw RequestError.invalidParams(undefined, `Invalid Mode: ${modeId}`);
     }
   }
 
