@@ -1432,6 +1432,10 @@ describe("ACP v2 prompts", () => {
       { sessionUpdate: "response" },
       { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn", background: [] },
     ]);
+    expect(
+      client.sessionUpdates.find(({ update }) => update.sessionUpdate === "subagent_update")?.update
+        ._meta,
+    ).toEqual({ claudeCode: { subagentRole: "Explore" } });
     // The current state on the parent grants nothing: the child cannot run again here.
     expect(
       client.sessionUpdates.filter(
@@ -4200,6 +4204,10 @@ describe("ACP v2 requests that subagents make", () => {
     const root = client.sessionUpdates.find(
       ({ update }) => update.sessionUpdate === "user_message",
     )!.sessionId;
+    expect(
+      client.sessionUpdates.find(({ update }) => update.sessionUpdate === "subagent_update")?.update
+        ._meta,
+    ).toEqual({ claudeCode: { subagentRole: "Explore" } });
     const traffic = client.sessionUpdates.flatMap(({ sessionId, update }) => {
       const on = sessionId === root ? "root" : sessionId;
       if (update.sessionUpdate === "subagent_update") {
@@ -4474,6 +4482,7 @@ describe("ACP v2 requests that subagents make", () => {
         {
           sessionUpdate: "subagent_update",
           sessionId: "agent-1",
+          _meta: { claudeCode: { subagentRole: "Explore" } },
           title: "Explore the project",
           description: "Explore",
           capabilities: { cancel: {} },

@@ -32,7 +32,7 @@ export type NativeSubagent = {
    * its name, else its task.
    */
   title?: string;
-  /** The RFD form: the child's role, its `subagent_type`. */
+  /** The child's explicit `subagent_type`, restored as `agentType` in history. */
   role?: string;
   /** The RFD form: `subagent_update.description`, the child's role. */
   description?: string;
@@ -307,6 +307,7 @@ export class NativeSubagentRuntime {
       update: {
         sessionUpdate: "subagent_update",
         sessionId: child.sessionId,
+        ...subagentRoleMeta(child.role),
         ...(child.title ? { title: child.title } : {}),
         ...(child.description ? { description: child.description } : {}),
         ...(child.reportedCwd ? { cwd: child.reportedCwd } : {}),
@@ -559,6 +560,19 @@ export class NativeSubagentRuntime {
       const child = this.childByParentToolUse.get(toolCallId);
       if (!parentPending) {
         this.parentByToolUse.set(toolCallId, parentSessionId ?? this.rootSessionId);
+        if (child?.announced && identity?.subagentType && identity.subagentType !== child.role) {
+          if (this.form === "rfd") {
+            await this.publish({
+              sessionId: child.parentSessionId,
+              update: {
+                sessionUpdate: "subagent_update",
+                sessionId: child.sessionId,
+                ...subagentRoleMeta(identity.subagentType),
+              },
+            });
+          }
+          child.role = identity.subagentType;
+        }
         if (child && !child.announced) {
           child.parentSessionId = parentSessionId ?? this.rootSessionId;
           applySubagentIdentity(child, this.identityByToolUse.get(toolCallId));
@@ -765,6 +779,7 @@ export class NativeSubagentRuntime {
         parentToolUseId: previous.parentToolUseId,
         name: previous.name,
         task: previous.task,
+        role: previous.role,
         ...promptField(promptText(prompt)),
       },
       true,
@@ -1055,6 +1070,7 @@ export class NativeSubagentRuntime {
           update: {
             sessionUpdate: "subagent_update",
             sessionId: child.sessionId,
+            ...subagentRoleMeta(child.role),
             ...(child.title ? { title: child.title } : {}),
             ...(child.description ? { description: child.description } : {}),
             ...(cwd ? { cwd } : {}),
@@ -1164,6 +1180,7 @@ export class NativeSubagentRuntime {
           parentToolUseId: entry.launchId,
           name: subagentDisplayName(entry.name, entry.description, entry.agentType, agentId),
           task: subagentDescription(undefined, entry.description),
+          role: entry.agentType,
           ...promptField(promptText(prompt)),
         },
         true,
@@ -1721,6 +1738,14 @@ export function responseModelEntry(
   return models?.entry(model) ?? { value: model, name: models?.name(model) ?? model };
 }
 
+/** Explicit Claude Agent role; omitted when the SDK has not supplied one. */
+export function subagentRoleMeta(role: unknown): {
+  _meta?: { claudeCode: { subagentRole: string } };
+} {
+  const value = nonBlankString(role);
+  return value ? { _meta: { claudeCode: { subagentRole: value } } } : {};
+}
+
 /**
  * Announces the child on its parent, once, before any update of the child.
  * The RFD form announces it as running and then sends the prompt as the
@@ -1745,6 +1770,7 @@ export async function announceNativeSubagent(
         update: {
           sessionUpdate: "subagent_update",
           sessionId: child.sessionId,
+          ...subagentRoleMeta(child.role),
           ...(child.title ? { title: child.title } : {}),
           ...(child.description ? { description: child.description } : {}),
           ...(cwd ? { cwd } : {}),
@@ -1772,6 +1798,7 @@ export async function announceNativeSubagent(
       update: {
         sessionUpdate: "subagent_spawned",
         subagentSessionId: child.sessionId,
+        ...subagentRoleMeta(child.role),
         name: child.name,
         task: child.task,
         ...promptField(child.prompt),
@@ -1804,6 +1831,7 @@ export async function finishNativeSubagent(
       update: {
         sessionUpdate: "subagent_state_update",
         subagentSessionId: child.sessionId,
+        ...subagentRoleMeta(child.role),
         state,
       },
     });

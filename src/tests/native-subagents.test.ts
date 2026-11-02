@@ -1210,6 +1210,7 @@ describe("NativeSubagentRuntime in the RFD form", () => {
         update: {
           sessionUpdate: "subagent_update",
           sessionId: "worker-1",
+          _meta: { claudeCode: { subagentRole: "Explore" } },
           title: "builder",
           description: "Explore",
           capabilities: { cancel: {} },
@@ -1692,6 +1693,7 @@ describe("NativeSubagentRuntime in the RFD form", () => {
           update: {
             sessionUpdate: "subagent_update",
             sessionId: "echoer-1",
+            _meta: { claudeCode: { subagentRole: "Explore" } },
             title: "echoer",
             description: "Explore",
             capabilities: { cancel: {} },
@@ -1746,6 +1748,7 @@ describe("NativeSubagentRuntime in the RFD form", () => {
       expect(published[0]?.update).toEqual({
         sessionUpdate: "subagent_update",
         sessionId: "coordinator-1",
+        _meta: { claudeCode: { subagentRole: "general-purpose" } },
         title: "coordinator",
         description: "general-purpose",
       });
@@ -2349,6 +2352,7 @@ describe("NativeSubagentRuntime in the AIR form, for an agent from before a load
         sessionUpdate: "subagent_spawned",
         subagentSessionId: `worker-1:generation:${NOW}`,
         name: "worker",
+        _meta: { claudeCode: { subagentRole: "Explore" } },
         task: "Inspect",
         prompt: "Say PING",
       });
@@ -2363,6 +2367,10 @@ describe("NativeSubagentRuntime in the AIR form, for an agent from before a load
         `root -> worker-1:generation:${NOW}`,
         `root -> worker-1:generation:${NOW + 1}`,
       ]);
+      expect(
+        published.filter(({ update }) => update.sessionUpdate === "subagent_spawned").at(-1)?.update
+          ._meta,
+      ).toEqual({ claudeCode: { subagentRole: "Explore" } });
     });
   });
 

@@ -3848,6 +3848,9 @@ describe("subagent transcript replay", () => {
         [sessionId, "abc123", { dir: "/tmp/proj" }],
       ]);
 
+      expect(
+        updates.find(({ update }) => update.sessionUpdate === "subagent_spawned")?.update._meta,
+      ).toEqual({ claudeCode: { subagentRole: "general-purpose" } });
       const child1 = `${sessionId}:replay-subagent:toolu_agent`;
       const child2 = `${sessionId}:replay-subagent:toolu_lost`;
       expect(
@@ -7874,6 +7877,7 @@ describe("subagent permission attribution (issue #851)", () => {
         {
           sessionUpdate: "subagent_spawned",
           subagentSessionId: "agent-42",
+          _meta: { claudeCode: { subagentRole: "Explore" } },
           name: "Investigate",
           task: "Investigate",
           capabilities: {},
@@ -7881,6 +7885,7 @@ describe("subagent permission attribution (issue #851)", () => {
         {
           sessionUpdate: "subagent_state_update",
           subagentSessionId: "agent-42",
+          _meta: { claudeCode: { subagentRole: "Explore" } },
           state: "completed",
         },
       ]),
@@ -8008,6 +8013,7 @@ describe("subagent permission attribution (issue #851)", () => {
           update: {
             sessionUpdate: "subagent_update",
             sessionId: "agent-42",
+            _meta: { claudeCode: { subagentRole: "Explore" } },
             title: "Investigate",
             description: "Explore",
             capabilities: { cancel: {} },
@@ -8563,6 +8569,7 @@ describe("subagent permission attribution (issue #851)", () => {
             update: {
               sessionUpdate: "subagent_update",
               sessionId: "agent-7",
+              _meta: { claudeCode: { subagentRole: "Explore" } },
               title: "echoer",
               description: "Explore",
               capabilities: { cancel: {} },
@@ -9686,6 +9693,7 @@ describe("subagent permission attribution (issue #851)", () => {
       update: {
         sessionUpdate: "subagent_state_update",
         subagentSessionId: "agent-42",
+        _meta: { claudeCode: { subagentRole: "Explore" } },
         state: "failed",
       },
     });
@@ -9727,6 +9735,7 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(updates.at(-1)?.update).toEqual({
       sessionUpdate: "subagent_state_update",
       subagentSessionId: "agent-42",
+      _meta: { claudeCode: { subagentRole: "Explore" } },
       state: "cancelled",
     });
   });
@@ -9773,6 +9782,7 @@ describe("subagent permission attribution (issue #851)", () => {
       {
         sessionUpdate: "subagent_spawned",
         subagentSessionId: "agent-42",
+        _meta: { claudeCode: { subagentRole: "Explore" } },
         name: "Investigate",
         task: "Investigate",
         capabilities: {},
@@ -9780,6 +9790,7 @@ describe("subagent permission attribution (issue #851)", () => {
       {
         sessionUpdate: "subagent_state_update",
         subagentSessionId: "agent-42",
+        _meta: { claudeCode: { subagentRole: "Explore" } },
         state: "cancelled",
       },
     ]);

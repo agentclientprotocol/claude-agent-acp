@@ -1282,6 +1282,10 @@ This section covers only the AIR bridge.
   The source is the `task_started` prompt, else the Agent or Task input `prompt`.
   A resumed generation gets the SendMessage `message` text.
   The field is absent when the adapter has no prompt. The adapter does not truncate it.
+- `subagent_spawned` carries `_meta.claudeCode.subagentRole` when the SDK supplies an explicit type, including during replay.
+  A live `subagent_state_update` carries the latest explicit type.
+  AIR's draft has no partial association update, so a later type reaches the client with that state update.
+  The field is absent when the type is unknown. Names, descriptions, and prompts do not determine the role.
 - Without either signal, Agent and Task stay ordinary tool calls. AIR gets `_meta.jetbrains.air.subagent: true` on them.
   Child interactions stay on the root session.
 - A client that uses the older `_meta["subagent-transcript"]` capability or the `forwardSubagentText` session option keeps the flat child transcript.

@@ -39,6 +39,7 @@ import {
   type Scenario,
   type ScenarioRun,
   streamMessage,
+  system,
   toolCall,
   toolResult,
 } from "./acp-scenarios/harness.js";
@@ -317,6 +318,110 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
       expect(validateRecorded(location(2 ** 32 - 1), none)).toEqual([]);
       expect(validateRecorded(location(2 ** 32), none)).not.toEqual([]);
     });
+  });
+
+  it.each(["rfd", "air"] as const)(
+    "retains a later explicit role across partial launch reports in %s",
+    async (form) => {
+      const scenario: Scenario = {
+        name: "subagent-late-role",
+        capabilities: { subagents: {} },
+        turns: [
+          async function* () {
+            const launch = (messageId: string, input: Record<string, unknown>) =>
+              assistantTurn(messageId, [
+                {
+                  type: "tool_use",
+                  id: "launch",
+                  name: "Agent",
+                  input,
+                },
+              ]);
+            yield* launch("initial", {
+              description: "Inspect",
+              prompt: "Look around",
+              subagent_type: "Explore",
+            });
+            yield system("task_started", {
+              task_id: "child",
+              task_type: "local_agent",
+              tool_use_id: "launch",
+              subagent_type: "Explore",
+            });
+            yield* launch("role", { subagent_type: "Review" });
+            yield* launch("duplicate", { subagent_type: "Review" });
+            yield* launch("partial", { description: "Plan" });
+            yield system("task_notification", {
+              task_id: "child",
+              tool_use_id: "launch",
+              status: "completed",
+              summary: "Done",
+              output_file: "",
+            });
+            yield result();
+          },
+        ],
+      };
+      const recorded = await runScenario(
+        Agent,
+        form === "air" ? PROFILES.air : PROFILES.plain,
+        scenario,
+      );
+      expect(
+        updates(recorded.raw).flatMap((update) =>
+          update._meta?.claudeCode?.subagentRole ? [update._meta.claudeCode.subagentRole] : [],
+        ),
+      ).toEqual(["Explore", "Review"]);
+    },
+  );
+
+  it.each(["Plan", undefined, "   "])(
+    "replays only an explicit AIR role (%s), without guessing from labels",
+    async (role) => {
+      const recorded = await runAir({
+        name: "subagent-role-replay",
+        turns: [],
+        transcript: ({ cwd, sessionId }) => [
+          {
+            type: "assistant",
+            uuid: "launch-message",
+            sessionId,
+            cwd,
+            message: {
+              id: "launch-message",
+              role: "assistant",
+              content: [
+                {
+                  type: "tool_use",
+                  id: "launch",
+                  name: "Agent",
+                  input: {
+                    name: "Explore",
+                    description: "Review",
+                    prompt: "Plan",
+                    subagent_type: role,
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      });
+      const spawned = updates(recorded).find(
+        (update) => update.sessionUpdate === "subagent_spawned",
+      );
+      expect(spawned).toBeDefined();
+      expect(spawned?._meta).toEqual(
+        role === "Plan" ? { claudeCode: { subagentRole: "Plan" } } : undefined,
+      );
+    },
+  );
+
+  it("reports the explicit role on an AIR child announcement", () => {
+    const spawned = updates(run("air", "subagent-native-sessions").raw).find(
+      (update) => update.sessionUpdate === "subagent_spawned",
+    );
+    expect(spawned?._meta).toEqual({ claudeCode: { subagentRole: "general-purpose" } });
   });
 
   describe("air golden files", () => {

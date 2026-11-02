@@ -48,6 +48,7 @@ import {
   responseModelEntry,
   rfdEndState,
   rfdLabels,
+  subagentRoleMeta,
   sameDirectory,
   type SubagentModels,
   type WorkState,
@@ -194,6 +195,7 @@ export class RfdSubagentReplay {
       update: {
         sessionUpdate: "subagent_update",
         sessionId: child.sessionId,
+        ...subagentRoleMeta(labels.role),
         ...(labels.title ? { title: labels.title } : {}),
         ...(labels.description ? { description: labels.description } : {}),
         ...(cwd ? { cwd } : {}),
