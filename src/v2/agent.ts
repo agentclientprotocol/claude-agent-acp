@@ -32,6 +32,7 @@ import packageJson from "../../package.json" with { type: "json" };
 import { messageIdForGrouping } from "../sdk-to-acp.js";
 import type { Logger } from "../logger.js";
 import { customAgents } from "../session-config-options.js";
+import { startsWithRemoteControl } from "../remote-control.js";
 import { claudeCliPath } from "../claude-cli.js";
 import { clientSystemPrompt, sessionSystemPrompt } from "../client-system-prompt.js";
 import type { ElicitationSupport } from "../elicitation.js";
@@ -1034,6 +1035,8 @@ class V2Agent implements AgentHandle, SessionConnection {
     }
     // For the description of a child's agent type in its configuration.
     session.tasks.configs.configureAgents(customAgents(initialization.agents ?? []));
+    // Read again for every query, so a restart's new query starts it too.
+    session.setRemoteControlAtStartup(startsWithRemoteControl(initialization));
     let models;
     try {
       models = await sessionModels(

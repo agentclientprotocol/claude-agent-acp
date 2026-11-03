@@ -322,6 +322,7 @@ export class V2Session implements RequestTarget {
     });
     this.remoteControl = new SessionRemoteControl({
       logger: connection.logger,
+      sessionId,
       query: () => this.query,
       terminalCommands: () => this.commands.terminal(),
       idle: () => this.turnBoundary(false),
@@ -333,6 +334,9 @@ export class V2Session implements RequestTarget {
         this.output.agentMessage(text, messageId);
         this.closeTurn();
       },
+      working: () => !this.atTurnBoundary(false),
+      notice: (notice) =>
+        this.output.emitV1([{ sessionId: this.sessionId, update: noticeUpdate(notice) }]),
     });
   }
 
@@ -347,6 +351,35 @@ export class V2Session implements RequestTarget {
     this.mcpServers = JSON.stringify(mcpServers);
     this.commands = new SessionCommands(query);
     void this.consume(query);
+  }
+
+  /**
+   * Whether Claude Code asked at `initialize` for Remote Control to start
+   * with the query (see `startsWithRemoteControl`), for
+   * {@link connectRemoteControlAtStartup}.
+   */
+  setRemoteControlAtStartup(asked: boolean): void {
+    this.remoteControl.atStartup = asked;
+  }
+
+  /**
+   * Starts Remote Control for a query that Claude Code asked to start with it
+   * (see `SessionRemoteControl.connectAtStartup`), in line with the session's
+   * prompts: the prompts after it wait for its notice, as they wait for the
+   * adapter's `/remote-control`.
+   */
+  connectRemoteControlAtStartup(): void {
+    this.pushes = this.pushes.then(async () => {
+      if (this.closed) return;
+      try {
+        await this.remoteControl.connectAtStartup();
+      } catch (error) {
+        this.connection.logger.error(
+          `Session ${this.sessionId}: failed to start Remote Control with the session`,
+          error,
+        );
+      }
+    });
   }
 
   /** Sends the session's commands in an update, read again from Claude Code. */

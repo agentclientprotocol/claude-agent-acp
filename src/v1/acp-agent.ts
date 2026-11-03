@@ -274,6 +274,9 @@ import {
   type RemoteControlCommand,
   type RemoteControlQuery,
   runRemoteControlCommand,
+  startRemoteControl,
+  startsWithRemoteControl,
+  supportsRemoteControl,
 } from "../remote-control.js";
 import {
   AGENT_FILE_CHANGE_REPORT_CAPABILITY,
@@ -957,6 +960,10 @@ export type Session = {
   /** The `/remote-control` command that is running, from its request to its
    *  reply. Prompts wait for it, and a second command is refused meanwhile. */
   remoteControlCommand?: Promise<void>;
+  /** Claude Code asked at `initialize` for Remote Control to start with the
+   *  session (see {@link startsWithRemoteControl}). The first run of
+   *  {@link ClaudeAcpAgent.connectRemoteControlAtStartup} clears it. */
+  remoteControlAtStartup?: boolean;
   /** The resolved SKILL.md paths of the skill commands, keyed by the cwd and
    *  the command name. A `commands_changed` clears it, because the skill
    *  files can have changed then. */
@@ -2604,6 +2611,46 @@ export class ClaudeAcpAgent {
       sessionId,
       update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
     });
+  }
+
+  /**
+   * Starts Remote Control after the setup response of a session that Claude
+   * Code asked to start with it (`remoteControlAtStartup` in the settings), and
+   * reports how it went in a notice. It runs once per session, so a later load
+   * or resume of the live session starts nothing. While a `/remote-control`
+   * command runs, it starts nothing and leaves Remote Control to that command.
+   * While Claude is working, it starts nothing either, as its notice would land
+   * inside that work; `/remote-control` still connects the session then. Like
+   * the command, it holds prompts back until the notice is sent.
+   */
+  async connectRemoteControlAtStartup(sessionId: string): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session?.remoteControlAtStartup) return;
+    session.remoteControlAtStartup = false;
+    if (!supportsRemoteControl(session.query) || session.remoteControlCommand) return;
+    if (this.claudeIsWorking(sessionId, session)) {
+      this.logger.log(
+        `Session ${sessionId}: Claude is working, so Remote Control does not start with the session. /remote-control starts it.`,
+      );
+      return;
+    }
+    // Messages typed in other clients reach this one through the query stream,
+    // as after a `/remote-control` command.
+    this.ensureConsumer(session, sessionId);
+    const start = startRemoteControl(session.query, this.logger).then((notice) =>
+      this.client.sessionUpdate({
+        sessionId,
+        update: noticeOrTranscriptUpdate(notice, clientSupportsNotices(this.clientCapabilities)),
+      }),
+    );
+    session.remoteControlCommand = start;
+    try {
+      await start;
+    } catch (error) {
+      this.logger.error(`Session ${sessionId}: failed to send the Remote Control notice:`, error);
+    } finally {
+      session.remoteControlCommand = undefined;
+    }
   }
 
   /** `--hide-claude-auth` applies only to the CLI's own login. A provider
@@ -9217,8 +9264,9 @@ export class ClaudeAcpAgent {
 
   /**
    * The work that follows a session setup response: the session's commands,
-   * the current states of the subagents a load replayed, and MCP server
-   * authentication.
+   * the current states of the subagents a load replayed, MCP server
+   * authentication, and Remote Control for a session that Claude Code asked to
+   * start with it.
    *
    * Call it in the same synchronous step as the handler's `return`: an
    * `await` between them would let the timer run before the response. The ACP
@@ -9236,6 +9284,7 @@ export class ClaudeAcpAgent {
       this.sendAvailableCommandsUpdate(sessionId);
       void this.publishCurrentSubagentStates(sessionId);
       startMcpAuthentication(this, sessionId, mcpServers);
+      void this.connectRemoteControlAtStartup(sessionId);
     }, 0);
   }
 
@@ -10482,6 +10531,7 @@ export class ClaudeAcpAgent {
         ...(this.toolCallCapabilities.air.client
           ? { promptSuggestions: new PromptSuggestions() }
           : {}),
+        remoteControlAtStartup: startsWithRemoteControl(initializationResult),
       };
       const registered = this.sessions[sessionId];
       registered.idleCompaction = new IdleCompaction(

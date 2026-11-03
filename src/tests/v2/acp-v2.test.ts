@@ -574,6 +574,86 @@ describe("ACP v2 sessions", () => {
     ]);
   });
 
+  it("starts Remote Control after the response when Claude Code asks for it", async () => {
+    const initialization = sdkDefaults.initializationResult;
+    sdk.initializationResult = async () => ({
+      ...(await initialization()),
+      remote_control_auto_enable: true,
+    });
+    const enableRemoteControl = vi.fn(async () => ({
+      session_url: "https://claude.ai/code/session_123",
+    }));
+    sdk.enableRemoteControl = enableRemoteControl;
+    // The query stream stays open, as Claude Code's does.
+    sdk.run = async function* () {
+      await new Promise<never>(() => {});
+      yield* [];
+    };
+    const client = v2Client();
+    const noticesAtResponse = await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      await agent.request(v2.methods.agent.session.new, { cwd });
+      const atResponse = client.updates("notice").length;
+      await vi.waitFor(() => expect(client.updates("notice")).toHaveLength(1));
+      await client.authUpdate(1);
+      return atResponse;
+    });
+
+    expect(noticesAtResponse).toBe(0);
+    expect(enableRemoteControl).toHaveBeenCalledExactlyOnceWith(true);
+    expect(client.updates("notice")).toEqual([
+      {
+        sessionUpdate: "notice",
+        severity: "info",
+        title: "Remote Control connected",
+        description:
+          "Continue this session from claude.ai/code or the Claude mobile app: https://claude.ai/code/session_123\nRun /remote-control off to disconnect.",
+      },
+    ]);
+  });
+
+  it("holds a prompt back until the notice of Remote Control at session start is sent", async () => {
+    const initialization = sdkDefaults.initializationResult;
+    sdk.initializationResult = async () => ({
+      ...(await initialization()),
+      remote_control_auto_enable: true,
+    });
+    let connect!: () => void;
+    const enableRemoteControl = vi.fn(
+      () =>
+        new Promise<{ session_url?: string }>((resolve) => {
+          connect = () => resolve({ session_url: "https://claude.ai/code/session_123" });
+        }),
+    );
+    sdk.enableRemoteControl = enableRemoteControl;
+    const echoed = scriptTurns(async function* (options) {
+      yield assistantText(options, "Done.");
+      yield result(options);
+      yield idleState(options);
+    });
+    const client = v2Client();
+    const echoedWhileConnecting = await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalled());
+      const prompted = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("hi"),
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const whileConnecting = echoed.length;
+      connect();
+      await prompted;
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      await client.authUpdate(1);
+      return whileConnecting;
+    });
+
+    expect(echoedWhileConnecting).toBe(0);
+    expect(echoed).toHaveLength(1);
+    expect(client.updates("notice")).toHaveLength(1);
+  });
+
   it("rejects session/new with the reason Claude Code gave for not starting", async () => {
     sdk.initializationResult = async () => {
       throw startupFailure("proxy_invalid", 'Invalid proxy URL in HTTPS_PROXY: "not a url".');
