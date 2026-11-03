@@ -1679,14 +1679,14 @@ For AIR, both forms carry `_meta.jetbrains.air.contextCompaction`:
 }
 ```
 
-| Field        | Meaning                                                               |
-| ------------ | --------------------------------------------------------------------- |
-| `version`    | Must equal `1`.                                                       |
-| `trigger`    | `manual` or `automatic`.                                              |
-| `preTokens`  | The context size before the compaction.                               |
-| `postTokens` | The context size after the compaction.                                |
-| `durationMs` | The duration of the compaction.                                       |
-| `error`      | The error of a failed compaction. Only the tool call form carries it. |
+| Field        | Meaning                                                                                                  |
+| ------------ | -------------------------------------------------------------------------------------------------------- |
+| `version`    | Must equal `1`.                                                                                          |
+| `trigger`    | `manual`, `automatic`, or `idle`: the adapter compacted an idle session before its prompt cache expired. |
+| `preTokens`  | The context size before the compaction.                                                                  |
+| `postTokens` | The context size after the compaction.                                                                   |
+| `durationMs` | The duration of the compaction.                                                                          |
+| `error`      | The error of a failed compaction. Only the tool call form carries it.                                    |
 
 The standard `toolCallId` or `compactionId` and the `status` own the identity and the phase.
 The `compaction_update` form puts the error in the standard `error` field.

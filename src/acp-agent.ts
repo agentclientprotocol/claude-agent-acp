@@ -279,6 +279,7 @@ import {
   contextCompactionMetadataFromBoundary,
   isCompactSummaryMessage,
 } from "./context-compaction.js";
+import { IdleCompaction } from "./idle-compaction.js";
 import {
   clientSupportsNotices,
   MAX_NOTICE_TITLE_LENGTH,
@@ -1518,6 +1519,8 @@ export type Session = {
   /** The consumer's compaction lifecycle, exposed so the PostCompact hook can
    *  hand it the retained summary. */
   contextCompaction?: ContextCompactionLifecycle;
+  /** Compacts the session shortly before its one-hour prompt cache expires. */
+  idleCompaction?: IdleCompaction;
   /** Whether any top-level assistant text reached the client since the last
    *  stretch boundary. Set as a side effect of sending in the consumer's
    *  `sendUpdate`, never at an emission site; read at the terminal `result`
@@ -3957,6 +3960,9 @@ export class ClaudeAcpAgent {
     if (!session) {
       throw RequestError.sessionNotFound(params.sessionId);
     }
+    // Before the first await below: a timer that fires meanwhile would send
+    // `/compact` right behind this prompt.
+    session.idleCompaction?.disarm("prompt");
     // The one re-read per user prompt, fired here and never awaited: a prompt
     // must not wait on a CLI process, and its result is pushed on change
     // whenever it lands, mid-turn included. It runs BEFORE the guard on
@@ -4002,10 +4008,7 @@ export class ClaudeAcpAgent {
       // around it. Refuse instead of interleaving. `foregroundWork` also covers
       // a cycle that Claude Code started on its own, such as its follow-up
       // after a background subagent finished, which is not in `turnQueue`.
-      if (
-        this.foregroundWork.has(params.sessionId) ||
-        (session.turnQueue ?? []).some((turn) => !turn.settled)
-      ) {
+      if (this.claudeIsWorking(params.sessionId, session)) {
         throw RequestError.invalidRequest(
           undefined,
           "Remote Control can't be changed while Claude is working. Try again when the turn ends.",
@@ -4614,6 +4617,7 @@ export class ClaudeAcpAgent {
     // check: the interrupt can have the CLI finalizing the aborted cycle by the
     // time the consumer next runs, and an unmarked result would settle the turn
     // (see Turn.steeredEchoes).
+    session.idleCompaction?.disarm("steer");
     (turnInFlight.steeredEchoes ??= new Set()).add(steeredUuid);
     (turnInFlight.steeredUuids ??= new Set()).add(steeredUuid);
     // A turn already held for background subagents has a recorded outcome the
@@ -6348,6 +6352,7 @@ export class ClaudeAcpAgent {
                 } else if (message.compact_result === "success") {
                   await compaction.finish(message.uuid, "completed");
                 } else if (message.compact_result === "failed") {
+                  session.idleCompaction?.noteCompactionFailed(message.compact_error);
                   await compaction.finish(message.uuid, "failed", {
                     ...(message.compact_error ? { error: message.compact_error } : {}),
                   });
@@ -6374,7 +6379,11 @@ export class ClaudeAcpAgent {
                 await compaction.finish(
                   message.uuid,
                   "completed",
-                  compactMetadata ? contextCompactionMetadataFromBoundary(compactMetadata) : {},
+                  compactMetadata
+                    ? contextCompactionMetadataFromBoundary(compactMetadata, {
+                        idleCompaction: session.idleCompaction?.isCompacting,
+                      })
+                    : {},
                   true,
                 );
                 const usedTokens = compactMetadata?.post_tokens ?? 0;
@@ -6592,6 +6601,10 @@ export class ClaudeAcpAgent {
                   // generatable; see SessionTitles.onTurnEnd.
                   await session.titles.onTurnEnd(session);
                 }
+                // After the settle block above: steered turns, held turns and
+                // autonomous cycles count as work until it settles them, and no
+                // further idle arrives to arm the timer.
+                if (message.state === "idle") session.idleCompaction?.onIdle();
                 break;
               }
               case "memory_recall": {
@@ -8311,6 +8324,7 @@ export class ClaudeAcpAgent {
                 lastAssistantUsage = snapshotFromUsage(message.message.usage);
                 lastAssistantTotalUsage = totalTokens(lastAssistantUsage);
                 session.contextUsedTokens = lastAssistantTotalUsage;
+                session.idleCompaction?.noteRequest(message.message.usage);
               }
               lastAssistantWasUsageLimit = isSyntheticUsageLimitMessage(message.message);
               if (message.error || lastAssistantWasUsageLimit) {
@@ -8704,6 +8718,8 @@ export class ClaudeAcpAgent {
             // The follow-up prompt was predicted from the transcript the reset
             // dropped, so it no longer follows from anything.
             await this.publishPromptSuggestion(params.sessionId, null);
+            // The recorded request and TTL describe the dropped conversation.
+            session.idleCompaction?.reset();
             break;
           }
           case "tool_use_summary":
@@ -8940,6 +8956,7 @@ export class ClaudeAcpAgent {
       return;
     }
     session.cancelled = true;
+    session.idleCompaction?.disarm("cancel");
     // Only prompts received before this cancel are cancelled. A prompt that
     // arrives while the awaits below run is queued and runs after the cancel
     // (ACP v2: a `session/prompt` received after `session/cancel` is not
@@ -9340,6 +9357,7 @@ export class ClaudeAcpAgent {
     }
     session.consumer = undefined;
     session.contextCompaction = undefined;
+    session.idleCompaction?.dispose();
     session.settingsManager.dispose();
     session.input.end();
     session.query.close();
@@ -10254,6 +10272,15 @@ export class ClaudeAcpAgent {
     work.awaitingUser = waiting;
     if (waiting) work.events.awaitingUser();
     else if (!withdrawnByCancel) work.events.running();
+  }
+
+  /** Whether Claude is working in the session `sessionId`: an unsettled turn in
+   *  its queue, or foreground work that no turn owns, such as a cycle that
+   *  Claude Code started on its own. */
+  private claudeIsWorking(sessionId: string, session: Session): boolean {
+    return (
+      this.foregroundWork.has(sessionId) || (session.turnQueue ?? []).some((turn) => !turn.settled)
+    );
   }
 
   /** Sends the current title and `updatedAt` of the session `sessionId` as a
@@ -11446,6 +11473,7 @@ export class ClaudeAcpAgent {
       const newModelInfo = session.modelInfos.find((m) => m.value === value);
       const modelChanged = session.models.currentModelId !== value;
       if (modelChanged) {
+        session.idleCompaction?.disarm("model change");
         // Seed the new model's context window WITHOUT awaited IPC on the
         // switch path: cached authoritative value if we've already learned it
         // (from a prior turn's `result.modelUsage`), else the text heuristic,
@@ -12722,6 +12750,23 @@ export class ClaudeAcpAgent {
         )?.kind,
         fileChangeReporter,
       };
+      const registered = this.sessions[sessionId];
+      registered.idleCompaction = new IdleCompaction(
+        {
+          // `openUserInputs` also covers permission requests: `requestPermission`
+          // is wrapped in `withPendingUserInput`.
+          isBusy: () =>
+            this.claudeIsWorking(sessionId, registered) ||
+            (registered.openUserInputs?.size ?? 0) > 0,
+          contextTokens: () => registered.contextUsedTokens,
+          settings: () => registered.settingsManager.getSettings(),
+          compact: () => this.prompt({ sessionId, prompt: [{ type: "text", text: "/compact" }] }),
+          // The logger has no debug level.
+          log: (message) => this.logger.log(message),
+        },
+        // The CLI's own environment: process env, the client's and the provider's.
+        { env },
+      );
       timing.phase("register");
       this.backgroundWork.sync(
         sessionId,
