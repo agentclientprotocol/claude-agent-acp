@@ -615,6 +615,40 @@ describe("ACP v2 sessions", () => {
     });
   });
 
+  it("resumes an unavailable mode using the configured mode in the v2 response", async () => {
+    const project = path.join(tempDir, "claude", "projects", "-project");
+    await mkdir(project, { recursive: true });
+    await writeFile(
+      path.join(tempDir, "claude", "settings.json"),
+      JSON.stringify({ permissions: { defaultMode: "plan" } }),
+    );
+    const sessionId = randomUUID();
+    await writeFile(
+      path.join(project, `${sessionId}.jsonl`),
+      JSON.stringify({
+        type: "user",
+        uuid: randomUUID(),
+        parentUuid: null,
+        sessionId,
+        cwd,
+        isSidechain: false,
+        origin: { kind: "human" },
+        message: { role: "user", content: "hello" },
+        permissionMode: "dontAsk",
+      }) + "\n",
+    );
+    const { app, authUpdate } = v2Client();
+    await app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const response = await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+      expect(sdk.queryOptions.at(-1)?.permissionMode).toBe("plan");
+      expect(
+        response.configOptions?.find((option) => option.configId === "mode")?.currentValue,
+      ).toBe("plan");
+      await authUpdate(1);
+    });
+  });
+
   it("sets a config option with a v2 value and reports modes only as config options", async () => {
     const client = v2Client();
     const { response, updatesBeforeResponse } = await client.app.connectWith(

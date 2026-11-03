@@ -79,8 +79,9 @@ type InitializeSessionModeParams = {
  * The permission mode a new Claude query starts in.
  *
  * An explicit mode wins. A resume or a load continues in the mode of the last
- * user record of the transcript. If that mode is unknown or not available now,
- * for example bypass, the session starts in `defaultMode` of the settings.
+ * user record of the transcript. If that mode is unknown or absent from the
+ * session's mode catalog, use an available `defaultMode` from settings, or
+ * `default` when that setting is unavailable too.
  */
 export function resolveInitialPermissionMode(
   sources: { explicit?: PermissionMode; resumed?: string; defaultMode?: unknown },
@@ -97,13 +98,23 @@ export function resolveInitialPermissionMode(
       { error: () => (rejected = true) },
       allowBypass,
     );
-    if (!rejected) return mode;
+    if (!rejected && buildAvailableModes(allowBypass).some((available) => available.id === mode)) {
+      return mode;
+    }
     logger.error(
       `Ignoring permission mode "${sources.resumed}" of the resumed transcript: ` +
         `not available in this session.`,
     );
   }
-  return resolvePermissionMode(sources.defaultMode, logger, allowBypass);
+  const configuredMode = resolvePermissionMode(sources.defaultMode, logger, allowBypass);
+  // A rejected transcript mode falls back only to a mode this session can offer.
+  if (
+    sources.resumed !== undefined &&
+    !buildAvailableModes(allowBypass).some((available) => available.id === configuredMode)
+  ) {
+    return "default";
+  }
+  return configuredMode;
 }
 
 /** Owns session-mode policy and the ACP/SDK synchronization it requires. */
@@ -120,7 +131,7 @@ export class SessionModeManager<S extends SessionMode> {
     modes: SessionModeState;
     autoModeFallbackWarningPending: boolean;
   }> {
-    const availableModes = this.buildAvailableModes(allowBypass);
+    const availableModes = buildAvailableModes(allowBypass, this.options.airClient?.() ?? false);
     let effectiveMode = requestedMode;
     let autoModeFallbackWarningPending = false;
 
@@ -350,50 +361,6 @@ export class SessionModeManager<S extends SessionMode> {
     }
   }
 
-  private buildAvailableModes(allowBypass: boolean): SessionModeState["availableModes"] {
-    // Only AIR gets the mode kind.
-    const air = this.options.airClient?.() ?? false;
-    const kind = (value: string) => {
-      const meta = airOnlyMeta(air, AIR_KIND_KEY, value);
-      return meta ? { _meta: meta } : {};
-    };
-    const modes: SessionModeState["availableModes"] = [
-      {
-        id: "default",
-        name: "Manual",
-        description: "Always ask before making changes",
-        ...kind("standard"),
-      },
-      {
-        id: "acceptEdits",
-        name: "Accept edits",
-        description: "Automatically accept all file edits",
-        ...kind("standard"),
-      },
-      {
-        id: "plan",
-        name: "Plan",
-        description: "Create a plan before making changes",
-        ...kind("plan"),
-      },
-      {
-        id: "auto",
-        name: "Auto",
-        description: "Claude handles permission decisions",
-        ...kind("auto_review"),
-      },
-    ];
-    if (allowBypass) {
-      modes.push({
-        id: "bypassPermissions",
-        name: "Bypass permissions",
-        description: "Accepts all permissions",
-        ...kind("full_access"),
-      });
-    }
-    return modes;
-  }
-
   private async trySyncMode(
     query: Pick<Query, "setPermissionMode">,
     mode: PermissionMode,
@@ -405,4 +372,50 @@ export class SessionModeManager<S extends SessionMode> {
       this.options.logError(errorMessage, error);
     }
   }
+}
+
+function buildAvailableModes(
+  allowBypass: boolean,
+  air = false,
+): SessionModeState["availableModes"] {
+  // Only AIR gets the mode kind.
+  const kind = (value: string) => {
+    const meta = airOnlyMeta(air, AIR_KIND_KEY, value);
+    return meta ? { _meta: meta } : {};
+  };
+  const modes: SessionModeState["availableModes"] = [
+    {
+      id: "default",
+      name: "Manual",
+      description: "Always ask before making changes",
+      ...kind("standard"),
+    },
+    {
+      id: "acceptEdits",
+      name: "Accept edits",
+      description: "Automatically accept all file edits",
+      ...kind("standard"),
+    },
+    {
+      id: "plan",
+      name: "Plan",
+      description: "Create a plan before making changes",
+      ...kind("plan"),
+    },
+    {
+      id: "auto",
+      name: "Auto",
+      description: "Claude handles permission decisions",
+      ...kind("auto_review"),
+    },
+  ];
+  if (allowBypass) {
+    modes.push({
+      id: "bypassPermissions",
+      name: "Bypass permissions",
+      description: "Accepts all permissions",
+      ...kind("full_access"),
+    });
+  }
+  return modes;
 }

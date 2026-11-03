@@ -464,6 +464,16 @@ describe("ClaudeAcpAgent settings", () => {
       expect(response.modes.currentModeId).toBe("plan");
     });
 
+    it("uses the available configured mode when the restored mode is not in the catalog", async () => {
+      const { permissionMode, response } = await resume([user("dontAsk")]);
+
+      expect(permissionMode).toBe("plan");
+      expect(response.modes.currentModeId).toBe("plan");
+      expect(response.configOptions.find((option: any) => option.id === "mode").currentValue).toBe(
+        "plan",
+      );
+    });
+
     it("uses permissions.defaultMode when bypass is not available now", async () => {
       const { permissionMode, response } = await resume([user("bypassPermissions")], {
         claudeCode: { options: { allowDangerouslySkipPermissions: false } },
