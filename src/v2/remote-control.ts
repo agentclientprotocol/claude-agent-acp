@@ -10,6 +10,10 @@
  * and the turn ends `idle` with `end_turn`. It waits until no turn is open
  * and no prompt waits in Claude Code's queue, and the prompts after it wait
  * for it: v2 asks to hold a prompt rather than reject it while Claude works.
+ *
+ * Remote Control also starts with a query that Claude Code asked to start
+ * with it (`remoteControlAtStartup` in the settings). That is no turn: it
+ * reports in a notice, as v1 does.
  */
 import { randomUUID } from "node:crypto";
 import type { Query, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
@@ -19,11 +23,15 @@ import {
   isRemoteHumanMessage,
   parseRemoteControlCommand,
   runRemoteControlCommand,
+  startRemoteControl,
+  supportsRemoteControl,
 } from "../remote-control.js";
+import type { SessionNotice } from "../session-notices.js";
 
 /** What the command needs of its session. */
 export interface RemoteControlHost {
   readonly logger: Logger;
+  readonly sessionId: string;
   query(): Query | undefined;
   /** Claude Code's terminal-bound commands, which it does not offer. */
   terminalCommands(): readonly string[] | undefined;
@@ -33,13 +41,46 @@ export interface RemoteControlHost {
   begin(uuid: string): void;
   /** Sends the reply `text`, as agent text of the message `messageId`, and ends the turn. */
   end(text: string, messageId: string): void;
+  /** Whether a turn is open or a prompt waits in Claude Code's queue. */
+  working(): boolean;
+  /** Sends `notice` to the client. */
+  notice(notice: SessionNotice): void;
 }
 
 export class SessionRemoteControl {
   /** The uuids of the prompts that this session sent, until Claude Code echoes them. */
   private readonly sent = new Set<string>();
 
+  /**
+   * Claude Code asked at `initialize` for Remote Control to start with the
+   * query (see `startsWithRemoteControl`). {@link connectAtStartup} clears it.
+   */
+  atStartup = false;
+
   constructor(private readonly host: RemoteControlHost) {}
+
+  /**
+   * Starts Remote Control after the setup response of a query that Claude
+   * Code asked to start with it, and reports how it went in a notice. It runs
+   * once per query, so a later load of the live session starts nothing, while
+   * a restart of the query (see `restarts.ts`), whose new query asks again,
+   * starts it again. While Claude is working, it starts nothing, as its notice
+   * would land inside that work; `/remote-control` still connects the session
+   * then. The session holds its prompts back until the notice is sent.
+   */
+  async connectAtStartup(): Promise<void> {
+    if (!this.atStartup) return;
+    this.atStartup = false;
+    const query = this.host.query();
+    if (!query || !supportsRemoteControl(query)) return;
+    if (this.host.working()) {
+      this.host.logger.log(
+        `Session ${this.host.sessionId}: Claude is working, so Remote Control does not start with the session. /remote-control starts it.`,
+      );
+      return;
+    }
+    this.host.notice(await startRemoteControl(query, this.host.logger));
+  }
 
   /** Whether `prompt` may be the adapter's command, which {@link run} then decides. */
   mayRun(prompt: Parameters<typeof parseRemoteControlCommand>[0]): boolean {
