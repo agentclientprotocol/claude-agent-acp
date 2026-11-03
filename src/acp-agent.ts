@@ -356,6 +356,15 @@ import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "./u
 export { DEFAULT_AGENT_ID } from "./session-config-ids.js";
 import { MCP_AVAILABLE_COMMAND, parseMcpCommand, runMcpCommand } from "./mcp-command.js";
 import {
+  parseRemoteControlCommand,
+  REMOTE_CONTROL_COMMAND_NAME,
+  type RemoteControlCommand,
+  type RemoteControlQuery,
+  startRemoteControl,
+  startsWithRemoteControl,
+  supportsRemoteControl,
+} from "./remote-control.js";
+import {
   MODE_CONFIG_ID,
   resolveInitialPermissionMode,
   SessionModeManager,
@@ -606,38 +615,6 @@ type McpOAuthQuery = Query & {
 
 function supportsMcpOAuth(query: Query): query is McpOAuthQuery {
   return typeof (query as Partial<McpOAuthQuery>).mcpAuthenticate === "function";
-}
-
-/** Runtime Remote Control control exposed by the pinned Agent SDK. Like
- *  `mcpAuthenticate`, it is not in the public `Query` declaration yet. The CLI's
- *  own `/remote-control` is terminal-bound and not offered to SDK hosts, so the
- *  adapter handles the command itself and answers with the session URL. */
-type RemoteControlQuery = Query & {
-  enableRemoteControl(
-    enabled: boolean,
-    name?: string,
-  ): Promise<{ session_url?: string; connect_url?: string }>;
-};
-
-function supportsRemoteControl(query: Query): query is RemoteControlQuery {
-  return typeof (query as Partial<RemoteControlQuery>).enableRemoteControl === "function";
-}
-
-const REMOTE_CONTROL_COMMAND_NAME = "remote-control";
-
-type RemoteControlCommand = { action: "connect"; name?: string } | { action: "disconnect" };
-
-/** Parses `/remote-control [name]` and `/remote-control off` from a single-text
- *  prompt. Connecting is idempotent, so the command never needs to know whether
- *  Remote Control is already on. */
-function parseRemoteControlCommand(prompt: PromptRequest["prompt"]): RemoteControlCommand | null {
-  const [first] = prompt;
-  if (prompt.length !== 1 || first?.type !== "text") return null;
-  const match = /^\/remote-control(?:\s+([\s\S]*))?$/.exec(first.text.trim());
-  if (!match) return null;
-  const argument = match[1]?.trim();
-  if (argument?.toLowerCase() === "off") return { action: "disconnect" };
-  return argument ? { action: "connect", name: argument } : { action: "connect" };
 }
 
 /** A top-level message a person typed in another client of the session, such
@@ -1167,6 +1144,10 @@ export type Session = {
   /** The `/remote-control` command that is running, from its request to its
    *  reply. Prompts wait for it, and a second command is refused meanwhile. */
   remoteControlCommand?: Promise<void>;
+  /** Claude Code asked at `initialize` for Remote Control to start with the
+   *  session (see {@link startsWithRemoteControl}). The first run of
+   *  {@link ClaudeAcpAgent.connectRemoteControlAtStartup} clears it. */
+  remoteControlAtStartup?: boolean;
   /** The resolved SKILL.md paths of the skill commands, keyed by the cwd and
    *  the command name. A `commands_changed` clears it, because the skill
    *  files can have changed then. */
@@ -4148,6 +4129,46 @@ export class ClaudeAcpAgent {
       sessionId,
       update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
     });
+  }
+
+  /**
+   * Starts Remote Control after the setup response of a session that Claude
+   * Code asked to start with it (`remoteControlAtStartup` in the settings), and
+   * reports how it went in a notice. It runs once per session, so a later load
+   * or resume of the live session starts nothing. While a `/remote-control`
+   * command runs, it starts nothing and leaves Remote Control to that command.
+   * While Claude is working, it starts nothing either, as its notice would land
+   * inside that work; `/remote-control` still connects the session then. Like
+   * the command, it holds prompts back until the notice is sent.
+   */
+  async connectRemoteControlAtStartup(sessionId: string): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session?.remoteControlAtStartup) return;
+    session.remoteControlAtStartup = false;
+    if (!supportsRemoteControl(session.query) || session.remoteControlCommand) return;
+    if (this.claudeIsWorking(sessionId, session)) {
+      this.logger.log(
+        `Session ${sessionId}: Claude is working, so Remote Control does not start with the session. /remote-control starts it.`,
+      );
+      return;
+    }
+    // Messages typed in other clients reach this one through the query stream,
+    // as after a `/remote-control` command.
+    this.ensureConsumer(session, sessionId);
+    const start = startRemoteControl(session.query, this.logger).then((notice) =>
+      this.client.sessionUpdate({
+        sessionId,
+        update: noticeOrTranscriptUpdate(notice, clientSupportsNotices(this.clientCapabilities)),
+      }),
+    );
+    session.remoteControlCommand = start;
+    try {
+      await start;
+    } catch (error) {
+      this.logger.error(`Session ${sessionId}: failed to send the Remote Control notice:`, error);
+    } finally {
+      session.remoteControlCommand = undefined;
+    }
   }
 
   /** `--hide-claude-auth` applies only to the CLI's own login. A provider
@@ -11312,9 +11333,10 @@ export class ClaudeAcpAgent {
 
   /**
    * The work that follows a session setup response: the session's commands,
-   * the current states of the subagents a load replayed, and MCP server
-   * authentication. On v2 the setup handlers of `src/v2/agent.ts` do this
-   * work once they have sent their response, so it does nothing here.
+   * the current states of the subagents a load replayed, MCP server
+   * authentication, and Remote Control for a session that Claude Code asked to
+   * start with it. On v2 the setup handlers of `src/v2/agent.ts` do this work
+   * once they have sent their response, so it does nothing here.
    */
   private afterSetupResponse(sessionId: string, mcpServers: McpServer[]): void {
     if (this.v2) return;
@@ -11322,6 +11344,7 @@ export class ClaudeAcpAgent {
       this.sendAvailableCommandsUpdate(sessionId);
       void this.publishCurrentSubagentStates(sessionId);
       startMcpAuthentication(this, sessionId, mcpServers);
+      void this.connectRemoteControlAtStartup(sessionId);
     }, 0);
   }
 
@@ -12746,6 +12769,7 @@ export class ClaudeAcpAgent {
           settingsManager.getApiKeyHelper(configuredSettingsObject),
         )?.kind,
         fileChangeReporter,
+        remoteControlAtStartup: startsWithRemoteControl(initializationResult),
       };
       const registered = this.sessions[sessionId];
       registered.idleCompaction = new IdleCompaction(

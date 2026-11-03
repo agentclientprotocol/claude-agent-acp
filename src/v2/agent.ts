@@ -220,6 +220,8 @@ async function setupCommands(
  * - `then`, such as sending the current states of replayed subagents.
  * - OAuth for the MCP servers that need it. Its URL elicitation must not
  *   reach the client before the response, which v2 asks against.
+ * - Remote Control, for a session that Claude Code asked to start with it
+ *   (see `ClaudeAcpAgent.connectRemoteControlAtStartup`).
  */
 function afterSetupResponse(
   agent: ClaudeAcpAgent,
@@ -240,6 +242,7 @@ function afterSetupResponse(
     }
     then?.();
     agent.authenticateMcpServers(sessionId, mcpServers);
+    void agent.connectRemoteControlAtStartup(sessionId);
   }, 0);
 }
 
