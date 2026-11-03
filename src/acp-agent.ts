@@ -166,6 +166,13 @@ import {
   clientSupportsAsyncTasks,
 } from "./async-tasks.js";
 import {
+  type BackgroundSink,
+  type BackgroundTaskEnd,
+  BackgroundWorkReporter,
+  cancelBackgroundWork,
+  SessionBackgroundWork,
+} from "./background-work.js";
+import {
   AUTH_STATUS_PROBE_TIMEOUT_MS,
   AUTH_STATUS_UPDATE_METHOD,
   type AuthStatus,
@@ -303,7 +310,11 @@ import {
   unregisterHookCallback,
 } from "./tools.js";
 import { previewPatchContent } from "./diff.js";
-import { backgroundedBashToolCall, withRunningTerminal } from "./tool-calls/background.js";
+import {
+  backgroundedBashToolCall,
+  withRunningTerminal,
+  withRunningToolCall,
+} from "./tool-calls/background.js";
 import { ChangedMetaFilter } from "./tool-calls/changed-meta-filter.js";
 import { ToolCallFieldTracker } from "./tool-calls/field-tracker.js";
 import { ClientCapabilities as ToolCallClientCapabilities } from "./tool-calls/client-capabilities.js";
@@ -382,6 +393,7 @@ import {
   ultracodeWorkflowsEnabled,
   type UltracodeOptionState,
 } from "./session-ultracode.js";
+import { STARTUP_FAILURE_RESULTS_ENV, startupFailureError } from "./startup-failure.js";
 
 export { EFFORT_CONFIG_ID, settingsEffortForModel } from "./session-effort.js";
 export {
@@ -1455,17 +1467,18 @@ export type Session = {
    *  `perTaskStopAffordance`: then it spares both, and the client is expected
    *  to stop each one itself. A client that can cancel one subagent gets the
    *  declaration, but it has no control for a workflow unless it is AIR with
-   *  `asyncTasks` (`_session/async_task/stop`). So for such a client the
+   *  `asyncTasks` (`_session/async_task/stop`), or gets the session's
+   *  background work (`background.reported`, with `tool_call/cancel`), which
+   *  `session/cancel` must leave running. So for any other such client the
    *  adapter stops the workflows after the interrupt, as the interrupt did
    *  before. */
   stopsWorkflowsOnCancel?: boolean;
-  /** The display terminals of the commands that went to the background and
-   *  still run, by the id of the command's task: the Bash tool call whose
-   *  terminal it is, and the subagent tool call that ran it, if any. The
-   *  terminal exits when the task ends, not at the tool result (see
-   *  `withRunningTerminal`). Only for a client that renders terminals and is
-   *  not AIR, which shows the command through its async tasks. */
-  backgroundTerminals?: Map<string, { toolCallId: string; parentToolUseId?: string }>;
+  /** The tasks that Claude Code runs in the background for the session: the
+   *  terminals of commands, kept for a client that renders terminals and is
+   *  not AIR (AIR shows a command through its async tasks), and, when the
+   *  client gets the session's background work, the tool calls of tasks and
+   *  the `background` lists. Per CLI process, as is a session. */
+  background: SessionBackgroundWork;
   /** The parent tool call of each subagent that a settle bookend removed from
    *  `liveBackgroundTasks`. The SDK can resume such a subagent under the same
    *  agent id without a new `task_started` (a running `task_updated` patch or
@@ -2445,8 +2458,8 @@ export function isReplayHiddenMetaMessage(message: unknown): boolean {
 export interface AcpClient {
   sessionUpdate(params: AcpSessionNotification): Promise<void>;
   /** `signal`, when aborted, sends `$/cancel_request` for the in-flight
-   *  permission request so the client can dismiss its prompt (and settle our
-   *  await) instead of leaving the dialog open after the turn was cancelled. */
+   *  permission request so the client can dismiss its prompt, and rejects the
+   *  call at once: a client that ignores the cancel never answers. */
   requestPermission(
     params: AcpPermissionRequest,
     signal?: AbortSignal,
@@ -2454,7 +2467,8 @@ export interface AcpClient {
   readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse>;
   writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse>;
   /** `signal`, when aborted, sends `$/cancel_request` for the in-flight
-   *  elicitation so the client can dismiss its prompt and settle our await. */
+   *  elicitation so the client can dismiss its prompt, and rejects the call
+   *  at once, as {@link requestPermission} does. */
   createElicitation(
     params: CreateElicitationRequest,
     signal?: AbortSignal,
@@ -2483,6 +2497,7 @@ class ClientConnection implements AcpClient {
   ): Promise<RequestPermissionResponse> {
     return this.ctx.request(methods.client.session.requestPermission, params, {
       cancellationSignal: signal,
+      stopWaitingOnCancel: true,
     });
   }
 
@@ -2500,6 +2515,7 @@ class ClientConnection implements AcpClient {
   ): Promise<CreateElicitationResponse> {
     return this.ctx.request(methods.client.elicitation.create, params, {
       cancellationSignal: signal,
+      stopWaitingOnCancel: true,
     });
   }
 
@@ -2827,6 +2843,8 @@ export class ClaudeAcpAgent {
   >();
   /** See the `foreground` constructor option. */
   private readonly foregroundEvents?: (sessionId: string) => ForegroundEvents;
+  /** See the `background` constructor option. */
+  private readonly backgroundWork: BackgroundWorkReporter;
   /** Counts the prompts `startTurn()` has received, across sessions. */
   private promptsReceived = 0;
   /** Per session, the `promptsReceived` count when its last cancel started.
@@ -2878,10 +2896,17 @@ export class ClaudeAcpAgent {
        * ended from its prompt response.
        */
       foreground?: (sessionId: string) => ForegroundEvents;
+      /**
+       * Where the agent reports the background work of each session (see
+       * `background-work.ts`): once when the session starts, and each time
+       * the work changes. Without it, nothing reports the work.
+       */
+      background?: BackgroundSink;
     } = {},
   ) {
     this.v2 = options.v2 ?? false;
     this.foregroundEvents = options.foreground;
+    this.backgroundWork = new BackgroundWorkReporter(options.background);
     this.sessions = {};
     this.client = new ChangedMetaClient(client, () => this.toolCallCapabilities.air.client);
     this.logger = logger ?? console;
@@ -5395,28 +5420,10 @@ export class ClaudeAcpAgent {
       this.syncAwaitingUser(params.sessionId, session);
     };
 
-    /** Ends the display terminal of a command that went to the background, once
-     *  its task ends (see `Session.backgroundTerminals`). Claude Code reports no
-     *  exit code for it, and `completed` does not mean 0: Claude Code accepts
-     *  some non-zero codes as a success, such as grep's 1. */
-    const endBackgroundTerminal = async (taskId: string) => {
-      const terminal = session.backgroundTerminals?.get(taskId);
-      if (!terminal) return;
-      session.backgroundTerminals!.delete(taskId);
-      await sendUpdate({
-        sessionId: params.sessionId,
-        update: {
-          sessionUpdate: "tool_call_update",
-          toolCallId: terminal.toolCallId,
-          _meta: {
-            ...(terminal.parentToolUseId
-              ? { claudeCode: { parentToolUseId: terminal.parentToolUseId } }
-              : {}),
-            terminal_exit: { terminal_id: terminal.toolCallId, exit_code: null, signal: null },
-          },
-        },
-      });
-    };
+    /** Ends the terminal and the tool call of a task that ran in the
+     *  background, once the task ends (see `Session.background`). */
+    const endBackgroundTask = (taskId: string, end: BackgroundTaskEnd) =>
+      session.background.taskEnded(taskId, end, sendUpdate);
 
     /** Settles a task. Its request may still be open, and an agent without a
      *  record no longer blocks the foreground work, so that is checked again. */
@@ -5945,6 +5952,9 @@ export class ClaudeAcpAgent {
         // pulled only after the pause.
         const pause = messageLoopYielder.maybeYield();
         if (pause) await pause;
+        // The last message may have changed the background work, and its
+        // updates are sent, so the list follows them.
+        this.backgroundWork.sync(params.sessionId, session, this.foregroundState(params.sessionId));
         pendingNext ??= session.query
           .next()
           .then((result) => ({ kind: "message" as const, result }));
@@ -6877,7 +6887,7 @@ export class ClaudeAcpAgent {
                   streamedBlocksByParent.delete(message.tool_use_id);
                   droppedStreams.delete(message.tool_use_id);
                 }
-                await endBackgroundTerminal(message.task_id);
+                await endBackgroundTask(message.task_id, message.status);
                 if (message.status === "stopped") {
                   await closeStoppedSubagentToolCalls(message.tool_use_id);
                 }
@@ -6922,15 +6932,23 @@ export class ClaudeAcpAgent {
                     streamedBlocksByParent.delete(parentToolUseId);
                     droppedStreams.delete(parentToolUseId);
                   }
-                  await endBackgroundTerminal(message.task_id);
+                  await endBackgroundTask(
+                    message.task_id,
+                    message.patch.status === "killed" ? "stopped" : message.patch.status,
+                  );
                   if (message.patch.status === "killed") {
                     await closeStoppedSubagentToolCalls(parentToolUseId);
                   }
                   settleLiveTask(message.task_id);
+                } else if (message.patch.status === "paused") {
+                  const pause = session.background.taskPaused(message.task_id, true);
+                  if (pause) await sendUpdate(pause);
                 } else if (
                   message.patch.status === "running" ||
                   message.patch.status === "pending"
                 ) {
+                  const resume = session.background.taskPaused(message.task_id, false);
+                  if (resume) await sendUpdate(resume);
                   // The SDK can resume a finished subagent under the same
                   // agent id without a new task_started.
                   resumeLiveTask(message.task_id);
@@ -7099,8 +7117,9 @@ export class ClaudeAcpAgent {
               // control requests, which this adapter never issues.
               case "control_request_progress":
                 break;
-              case "background_tasks_changed":
+              case "background_tasks_changed": {
                 await asyncTasks.backgroundTasksChanged(message.tasks);
+                await session.background.levelChanged(message.tasks, sendUpdate);
                 // A level signal: the full live background-task set on every
                 // membership change, with REPLACE semantics. Used only to
                 // reconcile `liveBackgroundTasks` — dropping (or, for
@@ -7144,6 +7163,7 @@ export class ClaudeAcpAgent {
                   }
                 }
                 break;
+              }
               default:
                 unreachable(message, this.logger);
                 break;
@@ -8564,6 +8584,8 @@ export class ClaudeAcpAgent {
             const acceptedPlanToolUseId = observeExitPlanToolResults(message, content, session);
             let backgroundedToolCalls: ReadonlySet<string> = new Set();
             let runningTerminal: string | undefined;
+            let runningTerminalTask: string | undefined;
+            let runningToolCalls: ReadonlySet<string> = new Set();
             if (message.type === "user") {
               rememberResolvedToolNames(session, content);
               recordSubagentFileEdits(
@@ -8589,13 +8611,24 @@ export class ClaudeAcpAgent {
                 session.liveBackgroundTasks.has(backgroundBashTask.taskId)
               ) {
                 runningTerminal = terminalId;
-                (session.backgroundTerminals ??= new Map()).set(backgroundBashTask.taskId, {
+                session.background.terminalStarted(backgroundBashTask.taskId, {
                   toolCallId: terminalId,
                   ...(message.parent_tool_use_id
                     ? { parentToolUseId: message.parent_tool_use_id }
                     : {}),
+                  ...(typeof backgroundBashTask.outputFilePath === "string"
+                    ? { outputFilePath: backgroundBashTask.outputFilePath }
+                    : {}),
                 });
+                runningTerminalTask = backgroundBashTask.taskId;
               }
+              runningToolCalls = session.background.toolResults(
+                session,
+                content,
+                toolUseResult,
+                session.toolUseCache,
+                message.parent_tool_use_id,
+              );
               await asyncTasks.toolResults(content);
               backgroundedToolCalls = backgroundedBashToolCallIds(
                 content,
@@ -8658,14 +8691,29 @@ export class ClaudeAcpAgent {
               // (e.g. a subagent image) carry the stamped parentToolUseId
               // meta and are excluded there.
               await sendUpdate(
-                withRunningTerminal(
-                  backgroundedBashToolCall(
-                    acceptedPlanToolResult(notification, acceptedPlanToolUseId),
-                    backgroundedToolCalls,
-                    asyncTasks.enabled,
+                withRunningToolCall(
+                  withRunningTerminal(
+                    backgroundedBashToolCall(
+                      acceptedPlanToolResult(notification, acceptedPlanToolUseId),
+                      backgroundedToolCalls,
+                      asyncTasks.enabled,
+                    ),
+                    runningTerminal,
                   ),
-                  runningTerminal,
+                  runningToolCalls,
                 ),
+              );
+            }
+            // After the result's own updates: the command's output replaces
+            // the placeholder that they gave its terminal.
+            if (runningTerminalTask) {
+              session.background.followOutput(runningTerminalTask, (notification) =>
+                sendUpdate(notification).catch((error) => {
+                  this.logger.error(
+                    `Session ${params.sessionId}: failed to send background command output:`,
+                    error,
+                  );
+                }),
               );
             }
             break;
@@ -9382,9 +9430,17 @@ export class ClaudeAcpAgent {
     }
     session.queryClosed = true;
     session.autonomousSteering?.close();
-    // Its list row now shows what the registry and the transcript tell.
     for (const [sessionId, candidate] of Object.entries(this.sessions)) {
-      if (candidate === session) this.sessionIndex.onOwnSessionChanged(sessionId);
+      if (candidate !== session) continue;
+      // Its list row now shows what the registry and the transcript tell.
+      this.sessionIndex.onOwnSessionChanged(sessionId);
+      // Its background tasks end with the query's process.
+      for (const exit of session.background.queryClosed()) {
+        this.client.sessionUpdate(exit).catch((error) => {
+          this.logger.error(`Session ${sessionId}: failed to end a background terminal:`, error);
+        });
+      }
+      this.backgroundWork.sync(sessionId, session, this.foregroundState(sessionId));
     }
     session.consumer = undefined;
     session.contextCompaction = undefined;
@@ -9440,6 +9496,7 @@ export class ClaudeAcpAgent {
     session.asyncTaskRuntime?.clear();
     this.replayedChildModels.delete(sessionId);
     this.cancelledThrough.delete(sessionId);
+    this.backgroundWork.forget(sessionId);
     delete this.sessions[sessionId];
     this.sessionIndex.onTeardown(sessionId);
     const ended = await raceTimeoutAndAbort(
@@ -9484,6 +9541,57 @@ export class ClaudeAcpAgent {
     }
     await this.teardownSession(params.sessionId);
     return {};
+  }
+
+  /** Stops a command running in the background (v2 `terminal/cancel`, see
+   *  {@link cancelBackgroundWork}). */
+  cancelBackgroundTerminal(params: { sessionId: string; terminalId: string }): Promise<void> {
+    return cancelBackgroundWork(Object.values(this.sessions), params.sessionId, {
+      terminalId: params.terminalId,
+    });
+  }
+
+  /** Stops the task of a tool call running in the background (v2
+   *  `tool_call/cancel`, see {@link cancelBackgroundWork}). */
+  cancelBackgroundToolCall(params: { sessionId: string; toolCallId: string }): Promise<void> {
+    return cancelBackgroundWork(Object.values(this.sessions), params.sessionId, {
+      toolCallId: params.toolCallId,
+    });
+  }
+
+  /** Sends the current state of each tool call in `toolCallIds` that the root
+   *  session `sessionId` runs in the background: the call as its tool use
+   *  shows it, with its status now. v2 requires it for each tool call that a
+   *  `session/resume` snapshot lists. A failure is logged, as for
+   *  {@link publishLiveSubagents}. */
+  async publishBackgroundToolCalls(sessionId: string, toolCallIds: string[]): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) return;
+    const renderer = new AcpToolCallRenderer(this.toolCallCapabilities);
+    try {
+      for (const update of session.background.toolCallStates(toolCallIds, renderer, session.cwd)) {
+        await this.client.sessionUpdate(update);
+      }
+    } catch (error) {
+      this.logger.error(`Session ${sessionId}: failed to send background tool calls:`, error);
+    }
+  }
+
+  /** Sends the current `subagent_update` of each live subagent session in
+   *  `children`, of the session `sessionId` (see
+   *  {@link NativeSubagentRuntime.currentUpdate}). v2 requires it for each
+   *  child that a `session/resume` snapshot lists. A failure is logged, as
+   *  for {@link publishCurrentSubagentStates}. */
+  async publishLiveSubagents(sessionId: string, children: string[]): Promise<void> {
+    const runtime = this.sessions[sessionId]?.nativeSubagentRuntime;
+    try {
+      for (const child of children) {
+        const update = runtime?.currentUpdate(child);
+        if (update) await this.client.sessionUpdate(asSdkSessionNotification(update));
+      }
+    } catch (error) {
+      this.logger.error(`Session ${sessionId}: failed to send current subagent states:`, error);
+    }
   }
 
   /** Per client: see {@link sessionIndex.SessionIndexConnection.deleteSession}. */
@@ -10434,10 +10542,9 @@ export class ClaudeAcpAgent {
   /** Forward a permission request to the client, wiring the tool call's
    *  `signal` through as a `cancellationSignal`. When the turn is cancelled
    *  while the client's prompt is still open the signal aborts, the SDK sends
-   *  `$/cancel_request`, and our local abort race settles even if the client
-   *  ignores it. A request rejection and a local abort surface the same
-   *  "Tool use aborted" that the callers expect. `canUseTool` decides what a
-   *  `cancelled` outcome means. */
+   *  `$/cancel_request` and stops waiting for the client's answer. The
+   *  rejection surfaces as the "Tool use aborted" that the callers expect.
+   *  `canUseTool` decides what a `cancelled` outcome means. */
   private async requestPermissionFromClient(
     params: AcpPermissionRequest,
     toolName: string,
@@ -10468,9 +10575,6 @@ export class ClaudeAcpAgent {
     );
     if (signal.aborted) throw new Error("Tool use aborted");
 
-    // Do not rely on every ACP client settling requestPermission after the
-    // cancellation signal. The local race guarantees that Claude's tool call
-    // is released even when an older or broken client ignores $/cancel_request.
     // The request goes to a subagent's child session for a tool call of that
     // subagent, but it blocks the turn of the owner session.
     try {
@@ -10478,7 +10582,7 @@ export class ClaudeAcpAgent {
         this.withPendingUserInput(
           ownerSessionId,
           signal,
-          () => raceWithAbort(this.client.requestPermission(params, signal), signal),
+          () => this.client.requestPermission(params, signal),
           agentID,
         ),
       );
@@ -10491,25 +10595,24 @@ export class ClaudeAcpAgent {
   }
 
   /** Send the client an elicitation for a callback of Claude Code. When the
-   *  callback's `signal` aborts, the SDK sends `$/cancel_request` and keeps
-   *  waiting for the client's reply, which a client that ignores the cancel
-   *  never sends. So the call also rejects at once on the abort, as
-   *  {@link requestPermissionFromClient} does for a permission request. Left
-   *  open, the request would stay in `openUserInputs` (see
-   *  {@link withPendingUserInput}), which keeps steering non-interrupting, and
-   *  a child's `openRequests` would not drop. */
+   *  callback's `signal` aborts, the SDK sends `$/cancel_request` and the call
+   *  rejects at once, without waiting for a reply that a client ignoring the
+   *  cancel never sends. Left open, the request would stay in
+   *  `openUserInputs` (see {@link withPendingUserInput}), which keeps steering
+   *  non-interrupting, and a child's `openRequests` would not drop. */
   private elicitFromClient(
     request: CreateElicitationRequest,
     signal: AbortSignal,
   ): Promise<CreateElicitationResponse> {
-    return raceWithAbort(this.client.createElicitation(request, signal), signal);
+    return this.client.createElicitation(request, signal);
   }
 
   /** `signal`, also aborted when `teardownSession` aborts the
    *  `abortController` of session `sessionId`. Claude Code aborts a callback's
    *  own signal when its query closes, but not necessarily before
-   *  `session/close` responds, and v2 requires every pending elicitation of
-   *  the session to be cancelled with `$/cancel_request` before that response. */
+   *  `session/close` responds, and v2 requires every pending permission
+   *  request and elicitation of the session to be cancelled with
+   *  `$/cancel_request` before that response. */
   private untilSessionClosed(sessionId: string, signal: AbortSignal): AbortSignal {
     const sessionSignal = this.sessions[sessionId]?.abortController?.signal;
     return sessionSignal ? AbortSignal.any([signal, sessionSignal]) : signal;
@@ -12168,6 +12271,7 @@ export class ClaudeAcpAgent {
       ...providerEnv,
       // Opt-in to session state events like when the agent is idle
       CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
+      ...STARTUP_FAILURE_RESULTS_ENV,
     };
     // Scopes the context-window cache to this query's backend (see
     // `contextWindowCache`). Derived from the same `env` object handed to the
@@ -12422,7 +12526,7 @@ export class ClaudeAcpAgent {
         ) {
           throw RequestError.sessionNotFound(sessionId);
         }
-        throw error;
+        throw startupFailureError(error) ?? error;
       }
       timing.phase("sdk-initialize");
 
@@ -12699,8 +12803,13 @@ export class ClaudeAcpAgent {
         emittedToolCalls: new Set(),
         eagerToolCallSessions: new Map(),
         liveBackgroundTasks: new Map(),
+        background: new SessionBackgroundWork(
+          sessionId,
+          this.backgroundWork.enabled && options.perTaskStopAffordance === true,
+        ),
         stopsWorkflowsOnCancel:
           options.perTaskStopAffordance === true &&
+          !this.backgroundWork.enabled &&
           !clientSupportsAsyncTasks(this.clientCapabilities),
         nativeSubagentsByTaskId: new Map(),
         nativeSubagentTaskIdByToolUseId: new Map(),
@@ -12718,6 +12827,11 @@ export class ClaudeAcpAgent {
         fileChangeReporter,
       };
       timing.phase("register");
+      this.backgroundWork.sync(
+        sessionId,
+        this.sessions[sessionId],
+        this.foregroundState(sessionId),
+      );
       this.refreshContextWindowInBackground(sessionId, this.sessions[sessionId]);
 
       return {

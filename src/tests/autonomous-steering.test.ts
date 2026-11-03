@@ -728,11 +728,24 @@ describe("steering an autonomous cycle", () => {
     },
   );
 
-  it("rejects after the consumer disconnects and releases command ownership", async () => {
-    const { agent, send, session, close } = await setup();
+  it("closes steering ownership before background cleanup when the consumer disconnects", async () => {
+    const { agent, send, session, outgoing, close } = await setup();
     await send(state("running"));
     await agent.steer(request());
+    const steered = (await outgoing.next()).value;
+    const closeBackground = session.background.queryClosed.bind(session.background);
+    const steeringAtBackgroundClose: Array<{ running: boolean; ownsCommand: boolean }> = [];
+    vi.spyOn(session.background, "queryClosed").mockImplementation(() => {
+      steeringAtBackgroundClose.push({
+        running: session.autonomousSteering.isRunning,
+        ownsCommand: session.autonomousSteering.owns(steered.uuid),
+      });
+      return closeBackground();
+    });
     await close();
+    // Teardown can revisit a stream the consumer already closed.
+    (agent as any).closeQueryStream(session);
+    expect(steeringAtBackgroundClose).toEqual([{ running: false, ownsCommand: false }]);
     expect(session.queryClosed).toBe(true);
     expect(session.autonomousSteering.cancel()).toEqual([]);
     await expect(agent.steer(request())).rejects.toThrow();

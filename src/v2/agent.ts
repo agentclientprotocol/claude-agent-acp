@@ -18,6 +18,7 @@ import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import { ClaudeAcpAgent, type AcpClient, type Logger } from "../acp-agent.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import type { AcpPermissionRequest } from "../permissions/presentation.js";
+import { stateUpdate, V2Background } from "./background.js";
 import { v1InitializeRequest, v2InitializeResponse } from "./initialize.js";
 import { v1PermissionResponse, v2PermissionRequest } from "./permission.js";
 import { v2Foreground, v2Prompt } from "./prompt.js";
@@ -61,6 +62,14 @@ export function v2AgentApp(
           v2Foreground((update) => {
             void client.send({ sessionId, update });
           }),
+        background: {
+          changed: (report) => {
+            for (const notification of client.background.changed(report)) {
+              void client.send(notification);
+            }
+          },
+          forget: (sessionId) => client.background.forget(sessionId),
+        },
       });
       onAgent(agent);
     })
@@ -96,10 +105,23 @@ export function v2AgentApp(
       await agent.publishCurrentSessionInfo(params.sessionId);
       // v2 requires a snapshot of the foreground state after the replay and
       // before the response, also without a replay: a resumed live session can
-      // be running a turn, or waiting on a permission request.
+      // be running a turn, or waiting on a permission request. The current
+      // state of each subagent, terminal and tool call it lists comes first,
+      // as v2 requires. The subagents' go again after the response (see below).
+      await agent.publishLiveSubagents(
+        params.sessionId,
+        client.background.listedSubagents(params.sessionId),
+      );
+      await agent.publishBackgroundToolCalls(
+        params.sessionId,
+        client.background.listedToolCalls(params.sessionId),
+      );
+      for (const notification of client.background.currentItems(params.sessionId)) {
+        void client.send(notification);
+      }
       void client.send({
         sessionId: params.sessionId,
-        update: stateSnapshot(agent.foregroundState(params.sessionId)),
+        update: stateUpdate(agent.foregroundState(params.sessionId)),
       });
       const commands = await setupCommands(agent, params.sessionId, logger);
       // The response ends a replay. The subagents RFD treats the replayed
@@ -155,14 +177,15 @@ export function v2AgentApp(
         void client.send({ sessionId: params.sessionId, update });
       }),
     )
+    .onRequest(v2.methods.agent.terminal.cancel, async ({ params }) => {
+      await agent.cancelBackgroundTerminal(params);
+      return {};
+    })
+    .onRequest(v2.methods.agent.toolCall.cancel, async ({ params }) => {
+      await agent.cancelBackgroundToolCall(params);
+      return {};
+    })
     .onNotification(v2.methods.agent.session.cancel, ({ params }) => agent.cancel(params));
-}
-
-/** The `state_update` that reports `state` as the current foreground state. */
-function stateSnapshot(state: "idle" | "running" | "requires_action"): v2.SessionUpdate {
-  if (state === "idle") return { sessionUpdate: "state_update", state: "idle" };
-  if (state === "running") return { sessionUpdate: "state_update", state: "running" };
-  return { sessionUpdate: "state_update", state: "requires_action" };
 }
 
 /**
@@ -249,6 +272,9 @@ class V2ClientConnection implements AcpClient {
   /** The `_meta` that the client stores for each tool call. */
   readonly toolCallMeta = new V2ToolCallMeta();
 
+  /** The `background` list of each session's `state_update`s. */
+  readonly background = new V2Background(this.terminals);
+
   constructor(
     private readonly ctx: v2.AgentContext,
     private readonly logger: Logger,
@@ -296,9 +322,11 @@ class V2ClientConnection implements AcpClient {
    * request opening.)
    */
   send(notification: v2.UpdateSessionNotification): Promise<void> {
-    return this.ctx.notify(v2.methods.client.session.update, notification).catch((error) => {
-      this.logger.error(`Failed to send a ${notification.update.sessionUpdate} update:`, error);
-    });
+    return this.ctx
+      .notify(v2.methods.client.session.update, this.background.stamp(notification))
+      .catch((error) => {
+        this.logger.error(`Failed to send a ${notification.update.sessionUpdate} update:`, error);
+      });
   }
 
   extNotification(method: string, params: Record<string, unknown>): Promise<void> {
@@ -335,13 +363,17 @@ class V2ClientConnection implements AcpClient {
       childState = undefined;
     }
     // Every update goes to the connection before any is awaited, so an update
-    // that another call sends meanwhile cannot come between them.
-    await Promise.all([
-      ...updates.map((v2Update) =>
-        this.ctx.notify(v2.methods.client.session.update, { ...notification, update: v2Update }),
+    // that another call sends meanwhile cannot come between them. The parent's
+    // copy is stamped first: a child's announcement starts its list.
+    const stamped = [
+      ...updates.map((v2Update) => this.background.stamp({ ...notification, update: v2Update })),
+      ...(childState ? [this.background.stamp(childState)] : []),
+    ];
+    await Promise.all(
+      stamped.map((v2Notification) =>
+        this.ctx.notify(v2.methods.client.session.update, v2Notification),
       ),
-      ...(childState ? [this.ctx.notify(v2.methods.client.session.update, childState)] : []),
-    ]);
+    );
   }
 
   /**
@@ -405,7 +437,7 @@ class V2ClientConnection implements AcpClient {
     const response = await this.ctx.request(
       v2.methods.client.session.requestPermission,
       v2PermissionRequest({ ...params, toolCall }),
-      { cancellationSignal: signal },
+      { cancellationSignal: signal, stopWaitingOnCancel: true },
     );
     return v1PermissionResponse(response);
   }
@@ -421,7 +453,7 @@ class V2ClientConnection implements AcpClient {
       // one only in a received value. As on v1, an MCP server's schema is
       // relayed here unchanged, so this cast does not check it.
       params as v2.CreateElicitationRequest,
-      { cancellationSignal: signal },
+      { cancellationSignal: signal, stopWaitingOnCancel: true },
     );
   }
 
