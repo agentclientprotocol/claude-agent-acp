@@ -56,17 +56,11 @@ export function v1InitializeRequest(request: v2.InitializeRequest): InitializeRe
 }
 
 /**
- * The top-level `_meta` keys of the agent's v1 `initialize` response that
- * advertise an extension the v2 surface does not serve yet: `steering`, for
- * `_session/steering`.
- */
-const UNSERVED_EXTENSION_KEYS: readonly string[] = ["steering"];
-
-/**
  * The v2 `initialize` response for the v1 response of the agent.
  *
- * It does not advertise what the v2 surface does not serve yet: the
- * extensions of {@link UNSERVED_EXTENSION_KEYS}, and the AIR extensions of
+ * It keeps the top-level `_meta` of the v1 response, which advertises
+ * `_session/steering` as `_meta.steering`: the v2 surface serves it too. It
+ * does not advertise the AIR extensions the v2 surface does not serve yet, of
  * {@link withoutUnservedAirExtensions}.
  */
 export function v2InitializeResponse(response: InitializeResponse): v2.InitializeResponse {
@@ -74,13 +68,7 @@ export function v2InitializeResponse(response: InitializeResponse): v2.Initializ
     throw new Error("ACP v2 requires agentInfo, and the agent reported none");
   }
   const meta = response.agentCapabilities?._meta;
-  const topMeta = withoutUnservedAirExtensions(
-    Object.fromEntries(
-      Object.entries(response._meta ?? {}).filter(
-        ([key]) => !UNSERVED_EXTENSION_KEYS.includes(key),
-      ),
-    ),
-  );
+  const topMeta = withoutUnservedAirExtensions({ ...(response._meta ?? {}) });
   return {
     protocolVersion: v2.PROTOCOL_VERSION,
     info: response.agentInfo,
