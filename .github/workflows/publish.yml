@@ -88,7 +88,7 @@ jobs:
           npm publish
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-  # Single-file executables for the GitHub release, stable releases only. They
+  # Standalone executables for the GitHub release, stable releases only. They
   # don't gate the npm publish: a failed build leaves the release without
   # binaries, and re-running the failed jobs attaches them.
   build-binaries:

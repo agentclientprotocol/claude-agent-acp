@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// Smoke-tests a built agent over ACP. Defaults to the single-file binary from
-// scripts/build-binary.mjs; pass another command after `--` to compare, e.g.
+// Smoke-tests a built agent over ACP. Defaults to the executable from
+// scripts/build-binary.mjs, with `claude` next to it. Pass another command
+// after `--` to compare, e.g.
 // `node scripts/smoke-binary.mjs --full -- node "$PWD/dist/index.js"` (the full
 // run starts the agent in a scratch directory, so paths must be absolute).
 //
@@ -17,10 +18,18 @@
 // Claude Code's native builds have no Grep or Glob tool: its Bash shell wraps
 // `grep` and `find` in functions that run the ugrep and bfs built into the
 // Claude binary at `$CLAUDE_CODE_EXECPATH`. The full run checks that those
-// run, since they are the helpers a single-file build could fail to reach.
+// run, since they are the helpers a packaged build could fail to reach.
 
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import readline from "node:readline";
@@ -48,8 +57,8 @@ function check(ok, label, detail) {
 
 // ---------------------------------------------------------------- basic
 
-function runSync(args) {
-  const result = spawnSync(command, [...commandArgs, ...args], {
+function runSync(args, [cmd, ...cmdArgs] = [command, ...commandArgs]) {
+  const result = spawnSync(cmd, [...cmdArgs, ...args], {
     encoding: "utf8",
     timeout: 60_000,
   });
@@ -62,9 +71,39 @@ check(own.stdout === version, `--version prints ${version}`, own.stdout || own.e
 const cli = runSync(["--cli", "--version"]);
 check(
   /\(Claude Code\)$/.test(cli.stdout),
-  "--cli --version runs the embedded Claude CLI",
+  "--cli --version runs the bundled Claude CLI",
   cli.stdout || cli.error,
 );
+
+// The release archive's layout: the executable finds `claude` in the directory
+// of its real path. Only for the default executable; a `--` command has no
+// such layout.
+if (positionals.length === 0) {
+  const scratch = mkdtempSync(join(tmpdir(), "acp-layout-"));
+  try {
+    if (process.platform !== "win32") {
+      const link = join(scratch, "claude-agent-acp");
+      symlinkSync(command, link);
+      const linked = runSync(["--cli", "--version"], [link]);
+      check(
+        /\(Claude Code\)$/.test(linked.stdout),
+        "a symlink to the executable finds the bundled CLI",
+        linked.stdout || linked.error,
+      );
+      rmSync(link);
+    }
+    const alone = join(scratch, `claude-agent-acp${exe}`);
+    copyFileSync(command, alone);
+    const missing = runSync(["--cli", "--version"], [alone]);
+    check(
+      String(missing.error).includes("The Claude CLI is missing"),
+      "without claude next to it, says the CLI is missing",
+      missing.stdout || missing.error,
+    );
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
 
 /** Starts the agent and speaks newline-delimited JSON-RPC to it. */
 function startAgent(cwd, onNotification) {

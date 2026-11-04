@@ -8,7 +8,7 @@ keeps a single release PR open, titled `chore(main): release X.Y.Z` and labelled
 
 Merging that PR is what releases. It tags `vX.Y.Z`, creates the GitHub release,
 publishes to npm, dispatches a version update to the agent registry, and
-attaches the [single-file executables](../README.md#single-file-executables) to
+attaches the [standalone executables](../README.md#standalone-executables) to
 the GitHub release. Previews get no executables.
 
 There is no manual release button, and versions are never typed in by hand: the
@@ -46,6 +46,9 @@ gates. Once the workflow finishes, confirm both outputs landed:
 gh release view "v<version>"
 npm view "@agentclientprotocol/claude-agent-acp@<version>"
 ```
+
+The release should list 8 `claude-agent-acp-*` archives. They are attached a
+few minutes after the release is created, once every platform has built.
 
 ## Preview releases
 

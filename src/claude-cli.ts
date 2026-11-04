@@ -1,54 +1,44 @@
 import { existsSync } from "node:fs";
+import { join } from "node:path";
 
-/** Returns a spawnable path to the Claude CLI embedded in a single-file build. */
-export type EmbeddedClaudeCli = () => string;
+const CLI_FILE_NAME = process.platform === "win32" ? "claude.exe" : "claude";
 
-let embeddedCli: EmbeddedClaudeCli | undefined;
-let extractedCliPath: string | undefined;
+let bundledCliDirectory: string | undefined;
 
 /**
- * Called by the single-file entry (`scripts/build-binary.mjs`) before the agent
- * starts. A `bun build --compile` binary has no `node_modules` to resolve the
- * SDK's platform package from, and a child process cannot run a file inside
- * Bun's `$bunfs`, so the entry embeds the CLI and passes a function that
- * extracts it to a real path.
+ * Called by the executable's entry (`src/binary-entry.ts`) before the agent
+ * starts. A `bun build --compile` executable has no `node_modules` to resolve
+ * the SDK's platform package from, so the release archive ships the Claude CLI
+ * next to it. The CLI isn't embedded: a child process can't run a file inside
+ * Bun's `$bunfs`, so an embedded copy would have to be extracted to disk first.
  */
-export function useEmbeddedClaudeCli(extract: EmbeddedClaudeCli): void {
-  embeddedCli = extract;
-  extractedCliPath = undefined;
+export function useBundledClaudeCli(directory: string): void {
+  bundledCliDirectory = directory;
 }
 
 /**
  * The Claude CLI binary to spawn: `CLAUDE_CODE_EXECUTABLE` if set, then the CLI
- * embedded in a single-file build, then the SDK's platform-specific package.
+ * shipped next to the executable, then the SDK's platform-specific package.
  */
 export async function claudeCliPath(): Promise<string> {
   if (process.env.CLAUDE_CODE_EXECUTABLE) {
     return process.env.CLAUDE_CODE_EXECUTABLE;
   }
-  if (embeddedCli) {
-    return embeddedClaudeCliPath(embeddedCli);
+  if (bundledCliDirectory !== undefined) {
+    return bundledClaudeCliPath(bundledCliDirectory);
   }
   return installedClaudeCliPath();
 }
 
-function embeddedClaudeCliPath(extract: EmbeddedClaudeCli): string {
-  // Extraction reads and hashes the whole ~300 MB binary, so reuse the path
-  // while it exists. A temp cleaner may delete it mid-run; extract again then.
-  if (extractedCliPath && existsSync(extractedCliPath)) {
-    return extractedCliPath;
-  }
-  const path = extract();
-  // `extractFromBunfs` only warns and hands back the `$bunfs` path when the
-  // write fails (e.g. a read-only temp dir), and spawning that path fails with
-  // a bare ENOENT.
-  if (path.includes("$bunfs") || path.includes("~BUN")) {
+function bundledClaudeCliPath(directory: string): string {
+  const path = join(directory, CLI_FILE_NAME);
+  // Without this check, spawning a missing CLI fails with a bare ENOENT.
+  if (!existsSync(path)) {
     throw new Error(
-      "Could not extract the bundled Claude CLI to the temp directory. " +
-        "Set CLAUDE_CODE_TMPDIR to a writable directory, or set CLAUDE_CODE_EXECUTABLE to a Claude CLI binary.",
+      `The Claude CLI is missing: expected ${path}. Keep ${CLI_FILE_NAME} from the release archive ` +
+        "in the same directory as claude-agent-acp, or set CLAUDE_CODE_EXECUTABLE to a Claude CLI binary.",
     );
   }
-  extractedCliPath = path;
   return path;
 }
 

@@ -1,5 +1,6 @@
-# Builds the single-file executables (scripts/build-binary.mjs) and smoke-tests
-# each one on a runner of its own platform. CI calls this to check that every
+# Builds the standalone executables (scripts/build-binary.mjs) and smoke-tests
+# each one on a runner of its own platform. Each archive holds
+# `claude-agent-acp` and the Claude CLI (`claude`) it runs from its directory. CI calls this to check that every
 # target still builds and starts; the release calls it with `upload: true` and
 # attaches the archives to the GitHub release.
 name: Binaries
@@ -100,12 +101,12 @@ jobs:
           cd dist-bin
           if [[ "$ARCHIVE" == *.zip ]]; then
             if [[ "$RUNNER_OS" == "Windows" ]]; then
-              pwsh -Command "Compress-Archive -Path claude-agent-acp.exe -DestinationPath ../$ARCHIVE"
+              pwsh -Command "Compress-Archive -Path claude-agent-acp.exe,claude.exe -DestinationPath ../$ARCHIVE"
             else
-              zip "../$ARCHIVE" claude-agent-acp
+              zip "../$ARCHIVE" claude-agent-acp claude
             fi
           else
-            tar czf "../$ARCHIVE" claude-agent-acp
+            tar czf "../$ARCHIVE" claude-agent-acp claude
           fi
 
       - name: Upload

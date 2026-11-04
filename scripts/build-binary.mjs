@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// Builds a single-file executable of the agent with `bun build --compile`,
-// embedding the Claude CLI binary for the target platform.
+// Builds an executable of the agent with `bun build --compile` and copies the
+// target platform's Claude CLI next to it. Both files go in the release
+// archive: the executable runs the CLI from its own directory.
 //
 //   node scripts/build-binary.mjs [--target bun-linux-x64-musl] [--outfile path]
 //
@@ -9,7 +10,7 @@
 // is missing.
 
 import { spawnSync } from "node:child_process";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -56,8 +57,9 @@ const outfile = resolve(values.outfile ?? join(repoRoot, "dist-bin", `claude-age
 const sdkRequire = createRequire(
   createRequire(join(repoRoot, "package.json")).resolve("@anthropic-ai/claude-agent-sdk"),
 );
+let cliPath;
 try {
-  sdkRequire.resolve(cliSpecifier);
+  cliPath = sdkRequire.resolve(cliSpecifier);
 } catch {
   const sdkVersion = JSON.parse(
     readFileSync(
@@ -72,36 +74,19 @@ try {
   process.exit(1);
 }
 
-// The entry registers the embedded CLI before importing the agent: index.ts
-// starts serving (or, with --cli, spawns the CLI) during its own evaluation,
-// and a static import would evaluate it before this module's body runs.
-const entry = join(repoRoot, `.binary-entry-${process.pid}.ts`);
-writeFileSync(
-  entry,
-  `import embeddedCli from ${JSON.stringify(cliSpecifier)} with { type: "file" };
-import { extractFromBunfs } from "@anthropic-ai/claude-agent-sdk/extract";
-import { useEmbeddedClaudeCli } from "./src/claude-cli.ts";
-
-useEmbeddedClaudeCli(() => extractFromBunfs(embeddedCli));
-await import("./src/index.ts");
-`,
+const bun = spawnSync(
+  "bun",
+  ["build", "src/binary-entry.ts", "--compile", "--target", target, "--outfile", outfile],
+  { cwd: repoRoot, stdio: "inherit", shell: process.platform === "win32" },
 );
-
-try {
-  const bun = spawnSync(
-    "bun",
-    ["build", entry, "--compile", "--target", target, "--outfile", outfile],
-    {
-      cwd: repoRoot,
-      stdio: "inherit",
-      shell: process.platform === "win32",
-    },
-  );
-  if (bun.error) {
-    console.error(`Could not run bun: ${bun.error.message}. Install it from https://bun.sh.`);
-    process.exit(1);
-  }
-  process.exitCode = bun.status ?? 1;
-} finally {
-  rmSync(entry, { force: true });
+if (bun.error) {
+  console.error(`Could not run bun: ${bun.error.message}. Install it from https://bun.sh.`);
+  process.exit(1);
 }
+if (bun.status !== 0) process.exit(bun.status ?? 1);
+
+// The executable runs the CLI from its own directory (src/binary-entry.ts).
+const cliOutfile = join(dirname(outfile), `claude${exe}`);
+copyFileSync(cliPath, cliOutfile);
+chmodSync(cliOutfile, 0o755);
+console.log(`Copied ${cliSpecifier} to ${cliOutfile}`);

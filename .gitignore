@@ -5,4 +5,3 @@ dist
 CLAUDE.local.md
 .idea/
 dist-bin
-.binary-entry-*.ts

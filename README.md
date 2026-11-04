@@ -36,15 +36,15 @@ To try changes that have landed on `main` but are not released yet, install from
 npm install @agentclientprotocol/claude-agent-acp@preview
 ```
 
-### Single-file executables
+### Standalone executables
 
-Each release attaches executables for Linux (glibc and musl), macOS and Windows,
-on x64 and arm64, to its [GitHub release](https://github.com/agentclientprotocol/claude-agent-acp/releases).
-They need no Node.js install and bundle the Claude CLI. On first run the CLI is
-extracted to `claude-agent-sdk-<uid>` in the temp directory (about 300 MB, once
-per version); set `CLAUDE_CODE_TMPDIR` to put it elsewhere, or
-`CLAUDE_CODE_EXECUTABLE` to use a Claude CLI you already have. On Alpine,
-install `libgcc` and `libstdc++` first.
+Each release attaches archives for Linux (glibc and musl), macOS and Windows, on
+x64 and arm64, to its [GitHub release](https://github.com/agentclientprotocol/claude-agent-acp/releases).
+They need no Node.js install. Each holds two files: `claude-agent-acp`, and the
+Claude CLI (`claude`) it runs. Keep them in the same directory; a symlink to
+`claude-agent-acp` elsewhere works. To use a Claude CLI you already have
+instead, set `CLAUDE_CODE_EXECUTABLE`. On Alpine, install `libgcc` and
+`libstdc++` first.
 
 To build one for your machine (needs [Bun](https://bun.sh)) and check it:
 

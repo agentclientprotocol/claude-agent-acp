@@ -21,6 +21,7 @@
   "files": [
     "dist/",
     "!dist/tests/",
+    "!dist/binary-entry.*",
     "README.md",
     "LICENSE",
     "package.json"

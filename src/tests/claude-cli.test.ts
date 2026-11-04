@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// Fresh module state per test: the embedded CLI is process-wide.
+// Fresh module state per test: the bundled CLI directory is process-wide.
 async function load() {
   vi.resetModules();
   return import("../claude-cli.js");
@@ -22,45 +22,33 @@ describe("claudeCliPath", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("prefers CLAUDE_CODE_EXECUTABLE over the embedded CLI", async () => {
-    const { claudeCliPath, useEmbeddedClaudeCli } = await load();
-    const extract = vi.fn(() => join(dir, "claude"));
-    useEmbeddedClaudeCli(extract);
+  const cliFileName = process.platform === "win32" ? "claude.exe" : "claude";
+
+  it("prefers CLAUDE_CODE_EXECUTABLE over the bundled CLI", async () => {
+    const { claudeCliPath, useBundledClaudeCli } = await load();
+    writeFileSync(join(dir, cliFileName), "");
+    useBundledClaudeCli(dir);
     vi.stubEnv("CLAUDE_CODE_EXECUTABLE", "/opt/claude");
 
     expect(await claudeCliPath()).toBe("/opt/claude");
-    expect(extract).not.toHaveBeenCalled();
   });
 
-  it("extracts the embedded CLI once while the extracted file exists", async () => {
-    const { claudeCliPath, useEmbeddedClaudeCli } = await load();
-    const extracted = join(dir, "claude");
-    const extract = vi.fn(() => {
-      writeFileSync(extracted, "");
-      return extracted;
-    });
-    useEmbeddedClaudeCli(extract);
+  it("returns the CLI next to the executable", async () => {
+    const { claudeCliPath, useBundledClaudeCli } = await load();
+    writeFileSync(join(dir, cliFileName), "");
+    useBundledClaudeCli(dir);
 
-    expect(await claudeCliPath()).toBe(extracted);
-    expect(await claudeCliPath()).toBe(extracted);
-    expect(extract).toHaveBeenCalledTimes(1);
-
-    rmSync(extracted);
-    expect(await claudeCliPath()).toBe(extracted);
-    expect(extract).toHaveBeenCalledTimes(2);
+    expect(await claudeCliPath()).toBe(join(dir, cliFileName));
   });
 
-  it.each(["/$bunfs/root/claude", "B:\\~BUN\\root\\claude.exe"])(
-    "throws when extraction falls back to the embedded path %s",
-    async (embedded) => {
-      const { claudeCliPath, useEmbeddedClaudeCli } = await load();
-      useEmbeddedClaudeCli(() => embedded);
+  it("throws when the CLI is missing next to the executable", async () => {
+    const { claudeCliPath, useBundledClaudeCli } = await load();
+    useBundledClaudeCli(dir);
 
-      await expect(claudeCliPath()).rejects.toThrow(
-        "Could not extract the bundled Claude CLI to the temp directory. Set CLAUDE_CODE_TMPDIR",
-      );
-    },
-  );
+    await expect(claudeCliPath()).rejects.toThrow(
+      `The Claude CLI is missing: expected ${join(dir, cliFileName)}. Keep ${cliFileName} from the release archive`,
+    );
+  });
 
   it.skipIf(!process.env.RUN_INTEGRATION_TESTS)("finds the installed CLI", async () => {
     const { claudeCliPath } = await load();
