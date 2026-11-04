@@ -184,6 +184,8 @@ import {
   notLoggedInAuthStatus,
   sameAuthStatus,
 } from "./auth-status.js";
+import { agentCommand } from "./agent-command.js";
+import { claudeCliPath } from "./claude-cli.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { execFile } from "node:child_process";
@@ -2162,54 +2164,6 @@ function recoveredToolInput(prefix: string): Record<string, unknown> | undefined
   }
 }
 
-export async function claudeCliPath(): Promise<string> {
-  if (process.env.CLAUDE_CODE_EXECUTABLE) {
-    return process.env.CLAUDE_CODE_EXECUTABLE;
-  }
-  // The SDK's CLI is a native binary shipped as a platform-specific optional
-  // dependency of @anthropic-ai/claude-agent-sdk. Resolve via a require bound
-  // to the SDK so nested installs are found even when npm doesn't hoist.
-  const { createRequire } = await import("node:module");
-  const req = createRequire(import.meta.resolve("@anthropic-ai/claude-agent-sdk"));
-  const ext = process.platform === "win32" ? ".exe" : "";
-  // On linux, both glibc and musl variants may be installed side-by-side
-  // (e.g. bunx hydrates every optional dep), so picking one by trial is
-  // unreliable: the wrong binary segfaults at runtime instead of failing to
-  // spawn. Detect the runtime libc and prefer the matching variant, falling
-  // back to the other only if the preferred one isn't installed.
-  const candidates =
-    process.platform === "linux"
-      ? isMuslLibc()
-        ? [
-            `@anthropic-ai/claude-agent-sdk-linux-${process.arch}-musl/claude${ext}`,
-            `@anthropic-ai/claude-agent-sdk-linux-${process.arch}/claude${ext}`,
-          ]
-        : [
-            `@anthropic-ai/claude-agent-sdk-linux-${process.arch}/claude${ext}`,
-            `@anthropic-ai/claude-agent-sdk-linux-${process.arch}-musl/claude${ext}`,
-          ]
-      : [`@anthropic-ai/claude-agent-sdk-${process.platform}-${process.arch}/claude${ext}`];
-  for (const candidate of candidates) {
-    try {
-      return req.resolve(candidate);
-    } catch {
-      // try next candidate
-    }
-  }
-  throw new Error(
-    `Claude native binary not found for ${process.platform}-${process.arch}. ` +
-      `Reinstall @anthropic-ai/claude-agent-sdk without --omit=optional, or set CLAUDE_CODE_EXECUTABLE.`,
-  );
-}
-
-function isMuslLibc(): boolean {
-  // process.report.getReport().header.glibcVersionRuntime is populated when
-  // Node is dynamically linked against glibc, and absent on musl.
-  const report = process.report?.getReport() as
-    { header?: { glibcVersionRuntime?: string } } | undefined;
-  return !report?.header?.glibcVersionRuntime;
-}
-
 /** Returned to clients when a prompt or cancel targets a session whose SDK
  *  query stream has already ended (ran to `done` or died). The stream is not
  *  revivable, so the only recovery is a fresh session. */
@@ -3028,10 +2982,11 @@ export class ClaudeAcpAgent {
       };
 
       if (supportsMetaTerminalAuth) {
+        const agent = agentCommand();
         remoteLoginMethod._meta = {
           "terminal-auth": {
-            command: process.execPath,
-            args: [...process.argv.slice(1), "--cli"],
+            command: agent.command,
+            args: [...agent.args, "--cli"],
             label: "Claude Login",
           },
         };
@@ -3058,18 +3013,18 @@ export class ClaudeAcpAgent {
       };
 
       if (supportsMetaTerminalAuth) {
-        const baseArgs = process.argv.slice(1);
+        const agent = agentCommand();
         claudeLoginMethod._meta = {
           "terminal-auth": {
-            command: process.execPath,
-            args: [...baseArgs, "--cli", "auth", "login", "--claudeai"],
+            command: agent.command,
+            args: [...agent.args, "--cli", "auth", "login", "--claudeai"],
             label: "Claude Login",
           },
         };
         consoleLoginMethod._meta = {
           "terminal-auth": {
-            command: process.execPath,
-            args: [...baseArgs, "--cli", "auth", "login", "--console"],
+            command: agent.command,
+            args: [...agent.args, "--cli", "auth", "login", "--console"],
             label: "Anthropic Console Login",
           },
         };
@@ -12241,7 +12196,7 @@ export class ClaudeAcpAgent {
             supportedDialogKinds: [REFUSAL_FALLBACK_DIALOG_KIND],
           }
         : {}),
-      pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE ?? (await claudeCliPath()),
+      pathToClaudeCodeExecutable: await claudeCliPath(),
       extraArgs: {
         ...userProvidedOptions?.extraArgs,
         "replay-user-messages": "",

@@ -42,7 +42,6 @@ import {
   isSyntheticLoginMessage,
   stripLocalCommandMetadata,
   ClaudeAcpAgent,
-  claudeCliPath,
   computeSessionFingerprint,
   streamEventToAcpNotifications,
   messageIdForGrouping,
@@ -4936,11 +4935,6 @@ describe("prompt conversion", () => {
 });
 
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("SDK behavior", () => {
-  it("finds vendored cli path", async () => {
-    const path = await claudeCliPath();
-    expect(path).toMatch(/@anthropic-ai\/claude-agent-sdk-[^/]+\/claude(\.exe)?$/);
-  });
-
   it("query has a 'default' model", async () => {
     const q = query({ prompt: "hi" });
     const models = await q.supportedModels();
