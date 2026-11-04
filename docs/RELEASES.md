@@ -7,7 +7,9 @@ keeps a single release PR open, titled `chore(main): release X.Y.Z` and labelled
 `autorelease: pending`.
 
 Merging that PR is what releases. It tags `vX.Y.Z`, creates the GitHub release,
-publishes to npm, and dispatches a version update to the agent registry.
+publishes to npm, dispatches a version update to the agent registry, and
+attaches the [single-file executables](../README.md#single-file-executables) to
+the GitHub release. Previews get no executables.
 
 There is no manual release button, and versions are never typed in by hand: the
 version is an output of the commit history, not an input.
@@ -202,6 +204,13 @@ gh workflow run publish.yml -f ref="v<version>" -f publish_npm=true
 npm versions are immutable. If the package already published and only the
 registry update failed, pass `-f publish_npm=false` so the run skips publishing
 and only re-dispatches the registry update.
+
+### The release has no executables
+
+`build-binaries` and `upload-binaries` don't gate npm, so a failed build only
+leaves the release without archives. Re-run the failed jobs of that publish run
+(`gh run rerun <run-id> --failed`); the upload uses `--clobber`, so archives
+already attached are replaced rather than duplicated.
 
 ### A preview published but the commit was not tagged
 

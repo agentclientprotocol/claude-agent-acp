@@ -1,0 +1,118 @@
+# Builds the single-file executables (scripts/build-binary.mjs) and smoke-tests
+# each one on a runner of its own platform. CI calls this to check that every
+# target still builds and starts; the release calls it with `upload: true` and
+# attaches the archives to the GitHub release.
+name: Binaries
+
+on:
+  workflow_call:
+    inputs:
+      upload:
+        description: Upload each archive as a workflow artifact for the release job.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Binary (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: bun-linux-x64
+            runner: ubuntu-latest
+            archive: claude-agent-acp-linux-x64.tar.gz
+          - target: bun-linux-arm64
+            runner: ubuntu-24.04-arm
+            archive: claude-agent-acp-linux-arm64.tar.gz
+          # npm skips the musl package on a glibc host, so these are
+          # cross-built and smoke-tested in an Alpine container.
+          - target: bun-linux-x64-musl
+            runner: ubuntu-latest
+            archive: claude-agent-acp-linux-x64-musl.tar.gz
+            musl: true
+          - target: bun-linux-arm64-musl
+            runner: ubuntu-24.04-arm
+            archive: claude-agent-acp-linux-arm64-musl.tar.gz
+            musl: true
+          - target: bun-darwin-x64
+            runner: macos-15-intel
+            archive: claude-agent-acp-darwin-x64.zip
+          - target: bun-darwin-arm64
+            runner: macos-latest
+            archive: claude-agent-acp-darwin-arm64.zip
+          - target: bun-windows-x64
+            runner: windows-latest
+            archive: claude-agent-acp-windows-x64.zip
+          - target: bun-windows-arm64
+            runner: windows-11-arm
+            archive: claude-agent-acp-windows-arm64.zip
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: "lts/*"
+          check-latest: true
+          cache: "npm"
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.4"
+
+      - run: npm ci
+
+      - name: Install the musl Claude CLI package
+        if: ${{ matrix.musl }}
+        run: |
+          version="$(node -p "require('./node_modules/@anthropic-ai/claude-agent-sdk/package.json').version")"
+          npm install --no-save --force "@anthropic-ai/claude-agent-sdk-linux-${RUNNER_ARCH,,}-musl@$version"
+
+      - name: Build
+        run: node scripts/build-binary.mjs --target ${{ matrix.target }}
+
+      - name: Smoke test
+        if: ${{ !matrix.musl }}
+        run: node scripts/smoke-binary.mjs
+
+      # Claude Code's Alpine requirements: libgcc and libstdc++.
+      - name: Smoke test (Alpine)
+        if: ${{ matrix.musl }}
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work node:lts-alpine \
+            sh -c 'apk add --no-cache libgcc libstdc++ >/dev/null && node scripts/smoke-binary.mjs'
+
+      - name: Archive
+        if: ${{ inputs.upload }}
+        env:
+          ARCHIVE: ${{ matrix.archive }}
+        run: |
+          cd dist-bin
+          if [[ "$ARCHIVE" == *.zip ]]; then
+            if [[ "$RUNNER_OS" == "Windows" ]]; then
+              pwsh -Command "Compress-Archive -Path claude-agent-acp.exe -DestinationPath ../$ARCHIVE"
+            else
+              zip "../$ARCHIVE" claude-agent-acp
+            fi
+          else
+            tar czf "../$ARCHIVE" claude-agent-acp
+          fi
+
+      - name: Upload
+        if: ${{ inputs.upload }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+          retention-days: 7
+          if-no-files-found: error

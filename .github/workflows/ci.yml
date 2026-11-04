@@ -44,3 +44,7 @@ jobs:
 
       - name: Run tests
         run: npm run test:run
+
+  binaries:
+    name: Binaries
+    uses: ./.github/workflows/binaries.yml

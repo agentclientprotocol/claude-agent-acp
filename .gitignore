@@ -4,3 +4,5 @@ dist
 .claude/*.local.*
 CLAUDE.local.md
 .idea/
+dist-bin
+.binary-entry-*.ts
