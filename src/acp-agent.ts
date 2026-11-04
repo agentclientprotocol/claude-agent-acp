@@ -184,6 +184,7 @@ import {
   notLoggedInAuthStatus,
   sameAuthStatus,
 } from "./auth-status.js";
+import { agentCommand } from "./agent-command.js";
 import { claudeCliPath } from "./claude-cli.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
@@ -2981,10 +2982,11 @@ export class ClaudeAcpAgent {
       };
 
       if (supportsMetaTerminalAuth) {
+        const agent = agentCommand();
         remoteLoginMethod._meta = {
           "terminal-auth": {
-            command: process.execPath,
-            args: [...process.argv.slice(1), "--cli"],
+            command: agent.command,
+            args: [...agent.args, "--cli"],
             label: "Claude Login",
           },
         };
@@ -3011,18 +3013,18 @@ export class ClaudeAcpAgent {
       };
 
       if (supportsMetaTerminalAuth) {
-        const baseArgs = process.argv.slice(1);
+        const agent = agentCommand();
         claudeLoginMethod._meta = {
           "terminal-auth": {
-            command: process.execPath,
-            args: [...baseArgs, "--cli", "auth", "login", "--claudeai"],
+            command: agent.command,
+            args: [...agent.args, "--cli", "auth", "login", "--claudeai"],
             label: "Claude Login",
           },
         };
         consoleLoginMethod._meta = {
           "terminal-auth": {
-            command: process.execPath,
-            args: [...baseArgs, "--cli", "auth", "login", "--console"],
+            command: agent.command,
+            args: [...agent.args, "--cli", "auth", "login", "--console"],
             label: "Anthropic Console Login",
           },
         };

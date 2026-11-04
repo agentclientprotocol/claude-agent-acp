@@ -10,7 +10,8 @@
 //
 // SMOKE_DEBUG=1 prints every tool call the full run saw.
 //
-// The basic run checks `--version`, `--cli --version` and `initialize` (v1 and v2). The
+// The basic run checks `--version`, `--cli --version`, `initialize` (v1 and
+// v2) and the `terminal-auth` login command. The
 // full run also has Claude use Bash, Read (text and image), Edit and a
 // subagent in a scratch directory, then cancels a turn, lists the session and
 // loads it in a fresh agent process.
@@ -182,6 +183,31 @@ const initializeParams = { protocolVersion: 1, clientCapabilities: {} };
   );
   const { code } = await agent.stop();
   check(code === 0, "exits 0 when stdin closes", code);
+}
+{
+  // The `terminal-auth` login command reruns the agent; run it with
+  // `--version` in place of `auth login --console` instead of logging in.
+  // `--version` wins over a stray argument, so also check that no path inside
+  // a compiled executable leaked into the arguments.
+  const agent = startAgent(process.cwd());
+  const init = await agent.request("initialize", {
+    protocolVersion: 1,
+    clientCapabilities: { _meta: { "terminal-auth": true } },
+  });
+  await agent.stop();
+  const login = init.result?.authMethods?.find((m) => m.id === "console-login")?._meta?.[
+    "terminal-auth"
+  ];
+  const cliArgs = login?.args?.slice(0, login.args.indexOf("--cli") + 1);
+  const rerun = login
+    ? runSync([...cliArgs, "--version"], [login.command])
+    : { stdout: "", error: "no terminal-auth console-login method" };
+  check(
+    /\(Claude Code\)$/.test(rerun.stdout) &&
+      !login.args.some((arg) => arg.includes("$bunfs") || arg.includes("~BUN")),
+    "the terminal-auth login command reruns the agent",
+    `${JSON.stringify(login)} -> ${rerun.stdout || rerun.error}`,
+  );
 }
 {
   const agent = startAgent(process.cwd());
