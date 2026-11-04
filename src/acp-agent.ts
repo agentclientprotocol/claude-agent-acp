@@ -6591,6 +6591,16 @@ export class ClaudeAcpAgent {
                 );
                 break;
               }
+              case "session_writes_lost": {
+                // A full disk (ENOSPC) or used-up quota (EDQUOT) kept the CLI
+                // from saving transcript lines or ~/.claude.json. The CLI sends
+                // it as it exits, after the last result, so no turn is open to
+                // carry a session/update: log it like `mirror_error`.
+                this.logger.error(
+                  `Session ${message.session_id}: Claude Code could not save ${message.lost.join(" and ")} (${message.error_code}); resuming may miss part of the conversation`,
+                );
+                break;
+              }
               case "permission_denied": {
                 unregisterHookCallback(message.tool_use_id);
                 // A tool call was auto-denied (by a rule, the classifier,
