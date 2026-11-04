@@ -111,8 +111,11 @@ function needsReconnect(status: McpServerStatus): boolean {
 function codeSpan(text: string): string {
   const longestRun = Math.max(0, ...(text.match(/`+/g) ?? []).map((run) => run.length));
   const fence = "`".repeat(longestRun + 1);
-  // CommonMark strips one space from each end of a span, so a pad keeps the text unchanged.
-  const pad = text.startsWith("`") || text.endsWith("`") || /^ .*[^ ].* $/.test(text) ? " " : "";
+  // CommonMark strips one space from each end of a span that is not all spaces
+  // (line endings count as spaces), so a pad keeps the text unchanged. Plain
+  // string checks, not one regex: `^ .*[^ ].* $` backtracks quadratically.
+  const strippedByCommonMark = text.startsWith(" ") && text.endsWith(" ") && /[^ \r\n]/.test(text);
+  const pad = text.startsWith("`") || text.endsWith("`") || strippedByCommonMark ? " " : "";
   return `${fence}${pad}${text}${pad}${fence}`;
 }
 
