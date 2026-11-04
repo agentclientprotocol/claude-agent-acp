@@ -19,9 +19,7 @@ export type IdleCompactionHost = {
 
 export type IdleCompactionOptions = {
   env?: Record<string, string | undefined>;
-  now?: () => number;
   setTimeout?: (callback: () => void, ms: number) => unknown;
-  clearTimeout?: (handle: unknown) => void;
 };
 
 /** The longest delay `setTimeout` takes; a longer one fires at once. */
@@ -32,6 +30,9 @@ const MIN_TOKENS_FLOOR = 100_000;
 // 54 min for a 1h cache: leaves a margin for the gap between the provider
 // writing the cache and the adapter receiving the response.
 const DEFAULT_DELAY_MS = 0.9 * HOUR_MS;
+// Node timers do not run while the machine sleeps, so one can fire hours after
+// its deadline, on a cache that expired meanwhile. Same threshold as Claude Code.
+const LAPSED_AFTER_MS = 60_000;
 // The values Claude Code reads as "on" for env flags such as DISABLE_COMPACT
 // (case-insensitive, trimmed).
 const TRUTHY_ENV = new Set(["1", "true", "yes", "on"]);
@@ -60,11 +61,10 @@ function parseCacheTtl(usage: unknown): PromptCacheTtl | undefined {
  */
 export class IdleCompaction {
   private readonly env: Record<string, string | undefined>;
-  private readonly now: () => number;
   private readonly setTimer: (callback: () => void, ms: number) => unknown;
-  private readonly clearTimer: (handle: unknown) => void;
   private ttl: PromptCacheTtl | undefined;
   private lastRequestAt: number | undefined;
+  private lastMessageId: string | undefined;
   /** Set when `/compact` was sent, cleared by the next request: a compaction that failed,
    *  or left the context large, would otherwise re-arm at once and loop until the user prompts. */
   private compactedSinceLastRequest = false;
@@ -72,16 +72,15 @@ export class IdleCompaction {
   private compacting = false;
   private disposed = false;
   private warnedInvalidDelay = false;
+  /** `status` of the last `rate_limit_event`; unknown until one arrives. */
+  private rateLimitStatus: string | undefined;
 
   constructor(
     private readonly host: IdleCompactionHost,
     options: IdleCompactionOptions = {},
   ) {
     this.env = options.env ?? process.env;
-    this.now = options.now ?? Date.now;
     this.setTimer = options.setTimeout ?? ((cb, ms) => setTimeout(cb, ms));
-    this.clearTimer =
-      options.clearTimeout ?? ((handle) => clearTimeout(handle as ReturnType<typeof setTimeout>));
   }
 
   /** Whether an idle compaction it started is still running. `acp-agent.ts` reports
@@ -93,14 +92,18 @@ export class IdleCompaction {
     return this.compacting;
   }
 
-  /** A main-thread assistant message arrived. Records its time and cache TTL, and drops any armed timer.
-   *  The CLI sends one `assistant` message per content block of a response, so this can run
-   *  several times for one request. That is harmless: the usage is the same, and each call
-   *  only re-records the time. */
-  noteRequest(usage: unknown): void {
+  /** A main-thread response arrived. Records its time and cache TTL, and drops any armed timer.
+   *  The provider writes the cache when the request starts, so the deadline is measured from the
+   *  response's first sighting: the `message_start` stream event, or its first `assistant` message
+   *  when it was not streamed. The CLI sends one `assistant` message per content block, and a
+   *  7-minute response would otherwise put the deadline 7 minutes after the cache was written.
+   *  A later call with the same `messageId` only updates the TTL. */
+  noteRequest(usage: unknown, messageId?: string): void {
     if (this.disposed) return;
     this.ttl = parseCacheTtl(usage) ?? this.ttl;
-    this.lastRequestAt = this.now();
+    if (messageId !== undefined && messageId === this.lastMessageId) return;
+    this.lastMessageId = messageId;
+    this.lastRequestAt = Date.now();
     this.compactedSinceLastRequest = false;
     this.disarm("new request");
   }
@@ -115,9 +118,16 @@ export class IdleCompaction {
     }
     this.disarm("rearm");
     const deadline = this.lastRequestAt! + this.delayMs();
-    this.timer = this.setTimer(() => void this.fire(), Math.max(0, deadline - this.now()));
+    this.timer = this.setTimer(() => void this.fire(), Math.max(0, deadline - Date.now()));
     (this.timer as { unref?: () => void } | undefined)?.unref?.();
     this.host.log(`[idle-compaction] armed deadline=${new Date(deadline).toISOString()}`);
+  }
+
+  /** A `rate_limit_event` arrived (`SDKRateLimitInfo`). Anything but `allowed` skips compaction,
+   *  as in Claude Code. This is account state, so `reset()` keeps it. */
+  noteRateLimit(info: unknown): void {
+    const status = (info as { status?: unknown } | null | undefined)?.status;
+    if (typeof status === "string") this.rateLimitStatus = status;
   }
 
   /** Claude Code reported its compaction as failed. Its turn still ends normally, so `compact()` does not reject. */
@@ -130,6 +140,7 @@ export class IdleCompaction {
   reset(): void {
     this.ttl = undefined;
     this.lastRequestAt = undefined;
+    this.lastMessageId = undefined;
     this.compactedSinceLastRequest = false;
     this.disarm("conversation reset");
   }
@@ -137,7 +148,7 @@ export class IdleCompaction {
   /** Drops the armed timer, if any. `reason` is only logged. */
   disarm(reason: string): void {
     if (this.timer === undefined) return;
-    this.clearTimer(this.timer);
+    clearTimeout(this.timer as ReturnType<typeof setTimeout>);
     this.timer = undefined;
     this.host.log(`[idle-compaction] disarmed: ${reason}`);
   }
@@ -174,6 +185,12 @@ export class IdleCompaction {
     const disabled = this.disabledBy();
     if (disabled) return `disabled by ${disabled}`;
     if (this.lastRequestAt === undefined) return "no request recorded in this process";
+    if (Date.now() > this.lastRequestAt + this.delayMs() + LAPSED_AFTER_MS) {
+      return "cache lapsed: more than 60 s past the deadline";
+    }
+    if (this.rateLimitStatus !== undefined && this.rateLimitStatus !== "allowed") {
+      return `rate limit status is ${this.rateLimitStatus}`;
+    }
     if (this.compactedSinceLastRequest) return "already compacted for this request";
     if (this.ttl !== "1h") return `cache TTL is ${this.ttl ?? "unknown"}, not 1h`;
     const tokens = this.host.contextTokens();
@@ -190,16 +207,20 @@ export class IdleCompaction {
     if (settings.idleCompaction === false) return "idleCompaction setting";
     if (settings.autoCompactEnabled === false) return "autoCompactEnabled setting";
     for (const name of ["DISABLE_COMPACT", "DISABLE_AUTO_COMPACT"]) {
-      // The CLI applies the settings `env` block after the launch env, so it wins.
-      if (isTruthyEnv(settings.env?.[name] ?? this.env[name])) return name;
+      if (isTruthyEnv(this.claudeCodeEnv(name))) return name;
     }
     return undefined;
+  }
+
+  /** The CLI applies the settings `env` block after the launch env, so it wins. */
+  private claudeCodeEnv(name: string): string | undefined {
+    return this.host.settings().env?.[name] ?? this.env[name];
   }
 
   /** `0` and invalid values fall back to 200,000, as in the CLI, which declares the variable
    *  with `min: 1` and computes `Math.max(100000, env ?? 200000)`. */
   private minTokens(): number {
-    const raw = this.env.CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS;
+    const raw = this.claudeCodeEnv("CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS");
     const parsed = raw !== undefined && /^\d+$/.test(raw.trim()) ? Number(raw.trim()) : 0;
     return Math.max(MIN_TOKENS_FLOOR, parsed > 0 ? parsed : DEFAULT_MIN_TOKENS);
   }

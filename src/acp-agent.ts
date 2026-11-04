@@ -796,6 +796,11 @@ function parseSteerRequest(params: unknown): SteerRequest {
   };
 }
 
+/** Who started a turn. `idleCompaction` is the adapter's own `/compact` (see
+ *  `IdleCompaction`): it is not a user prompt, so it neither disarms idle
+ *  compaction, asks for a title from its prompt, nor clears the published prompt suggestion. */
+type TurnOrigin = "client" | "idleCompaction";
+
 /** One in-flight turn, started by `startTurn()`. A persistent per-session
  *  consumer (see `runConsumer`) drains the SDK query stream for the whole
  *  session and settles each Turn when that turn's outcome is known, so
@@ -3930,7 +3935,7 @@ export class ClaudeAcpAgent {
    * `promptToClaude` would drop it. v2 prompts reach `startTurn` through
    * `v1PromptRequest`, which rejects these blocks itself.
    */
-  async prompt(params: PromptRequest): Promise<PromptResponse> {
+  async prompt(params: PromptRequest, origin: TurnOrigin = "client"): Promise<PromptResponse> {
     for (const block of params.prompt) {
       if (!SUPPORTED_PROMPT_CONTENT_TYPES.includes(block.type)) {
         throw RequestError.invalidParams(
@@ -3943,7 +3948,7 @@ export class ClaudeAcpAgent {
     const outcome = new Promise<TurnOutcome>((resolve, reject) => {
       events = { inserted() {}, ended: resolve, failed: reject };
     });
-    await this.startTurn(params, events);
+    await this.startTurn(params, events, origin);
     return outcome;
   }
 
@@ -3953,16 +3958,21 @@ export class ClaudeAcpAgent {
    * on, `events` reports how the turn goes (see {@link TurnEvents}), possibly
    * before this resolves.
    */
-  async startTurn(params: PromptRequest, events: TurnEvents): Promise<void> {
+  async startTurn(
+    params: PromptRequest,
+    events: TurnEvents,
+    origin: TurnOrigin = "client",
+  ): Promise<void> {
+    // Before the first await below: a timer that fires during those awaits
+    // would queue `/compact` right behind this prompt. The idle compaction's
+    // own turn comes from that timer, which is already cleared.
+    if (origin === "client") this.sessions[params.sessionId]?.idleCompaction?.disarm("prompt");
     const received = ++this.promptsReceived;
     while (this.providerUpdate) await this.providerUpdate;
     let session = this.sessions[params.sessionId];
     if (!session) {
       throw RequestError.sessionNotFound(params.sessionId);
     }
-    // Before the first await below: a timer that fires meanwhile would send
-    // `/compact` right behind this prompt.
-    session.idleCompaction?.disarm("prompt");
     // The one re-read per user prompt, fired here and never awaited: a prompt
     // must not wait on a CLI process, and its result is pushed on change
     // whenever it lands, mid-turn included. It runs BEFORE the guard on
@@ -4072,18 +4082,22 @@ export class ClaudeAcpAgent {
     const localCommand = this.localCommandMarkdown(params);
     const localCommandAbort = localCommand ? new AbortController() : undefined;
 
-    session.titles.onPrompt(params.prompt);
+    // An idle compaction is not something the user sent: it must not title the
+    // session `/compact` or spend the prediction the user is still looking at.
+    if (origin === "client") {
+      session.titles.onPrompt(params.prompt);
 
-    // The prompt the previous turn predicted is spent: the user either sent it
-    // or sent something else. Clearing it here keeps a turn that predicts
-    // nothing (the CLI predicts none in plan mode, after an API error, or at
-    // the usage limit) from leaving the stale prediction in the composer. A
-    // session that holds no prediction needs no clear, and the prompt path
-    // then keeps the ordering it has without this feature.
-    if (session.lastPublishedPromptSuggestion != null) {
-      await this.publishPromptSuggestion(params.sessionId, null);
-    } else {
-      session.promptSuggestionExpected = false;
+      // The prompt the previous turn predicted is spent: the user either sent it
+      // or sent something else. Clearing it here keeps a turn that predicts
+      // nothing (the CLI predicts none in plan mode, after an API error, or at
+      // the usage limit) from leaving the stale prediction in the composer. A
+      // session that holds no prediction needs no clear, and the prompt path
+      // then keeps the ordering it has without this feature.
+      if (session.lastPublishedPromptSuggestion != null) {
+        await this.publishPromptSuggestion(params.sessionId, null);
+      } else {
+        session.promptSuggestionExpected = false;
+      }
     }
 
     // A `/remote-control` command still in flight answers into the session's
@@ -4141,7 +4155,7 @@ export class ClaudeAcpAgent {
     (session.sentUserUuids ??= new Set()).add(promptUuid);
     session.input.push(userMessage);
     this.ensureConsumer(session, params.sessionId);
-    session.titles.onPromptQueued(session, params.prompt);
+    if (origin === "client") session.titles.onPromptQueued(session, params.prompt);
     // The prompt is queued, so its turn goes ahead even if the client misses
     // the goal it sets; the turn's events report the outcome.
     await this.publishGoalFromPrompt(params.sessionId, firstText, promptUuid).catch((error) =>
@@ -7953,6 +7967,15 @@ export class ClaudeAcpAgent {
                 const model = message.event.message.model;
                 if (model && model !== "<synthetic>") {
                   lastAssistantModel = model;
+                  // `message_start` arrives with the first streamed token, close to
+                  // when the provider wrote the cache. The `assistant` message
+                  // below covers a response that was not streamed (the CLI's
+                  // non-streaming fallback); its shared id keeps the per-block
+                  // messages from moving the time.
+                  session.idleCompaction?.noteRequest(
+                    message.event.message.usage,
+                    message.event.message.id || undefined,
+                  );
                   // Only upgrade from the heuristic default — once we have an
                   // authoritative window (cache-seeded at session creation or
                   // on a model switch, read from the resumed session on
@@ -8324,7 +8347,10 @@ export class ClaudeAcpAgent {
                 lastAssistantUsage = snapshotFromUsage(message.message.usage);
                 lastAssistantTotalUsage = totalTokens(lastAssistantUsage);
                 session.contextUsedTokens = lastAssistantTotalUsage;
-                session.idleCompaction?.noteRequest(message.message.usage);
+                session.idleCompaction?.noteRequest(
+                  message.message.usage,
+                  message.message.id || undefined,
+                );
               }
               lastAssistantWasUsageLimit = isSyntheticUsageLimitMessage(message.message);
               if (message.error || lastAssistantWasUsageLimit) {
@@ -8684,6 +8710,7 @@ export class ClaudeAcpAgent {
             break;
           }
           case "rate_limit_event": {
+            session.idleCompaction?.noteRateLimit(message.rate_limit_info);
             if (lastAssistantTotalUsage !== null) {
               await sendUpdate({
                 sessionId: params.sessionId,
@@ -12760,7 +12787,11 @@ export class ClaudeAcpAgent {
             (registered.openUserInputs?.size ?? 0) > 0,
           contextTokens: () => registered.contextUsedTokens,
           settings: () => registered.settingsManager.getSettings(),
-          compact: () => this.prompt({ sessionId, prompt: [{ type: "text", text: "/compact" }] }),
+          compact: () =>
+            this.prompt(
+              { sessionId, prompt: [{ type: "text", text: "/compact" }] },
+              "idleCompaction",
+            ),
           // The logger has no debug level.
           log: (message) => this.logger.log(message),
         },

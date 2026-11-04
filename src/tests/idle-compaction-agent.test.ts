@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Options, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, ClaudeAcpAgent } from "../acp-agent.js";
 import { initializeClient } from "./helpers.js";
+import { successfulResultMessage } from "./session-doubles.js";
 
 const execFileSpy = vi.hoisted(() => vi.fn());
 
@@ -91,11 +92,16 @@ afterEach(async () => {
   await rm(tempDir, { recursive: true, force: true, maxRetries: 10 });
 });
 
-function assistant(options: Options, usage: Record<string, unknown>, parent: string | null = null) {
+function assistant(
+  options: Options,
+  usage: Record<string, unknown>,
+  parent: string | null = null,
+  id = `msg_${randomUUID()}`,
+) {
   return {
     type: "assistant",
     message: {
-      id: `msg_${randomUUID()}`,
+      id,
       type: "message",
       role: "assistant",
       model: "claude-sonnet-4-6",
@@ -110,33 +116,20 @@ function assistant(options: Options, usage: Record<string, unknown>, parent: str
   };
 }
 
-function result(options: Options) {
-  return {
-    type: "result",
-    subtype: "success",
-    stop_reason: "end_turn",
-    is_error: false,
-    result: "",
-    errors: [],
-    duration_ms: 0,
-    duration_api_ms: 0,
-    num_turns: 1,
-    total_cost_usd: 0,
-    usage: {
-      input_tokens: 10,
-      output_tokens: 5,
-      cache_read_input_tokens: 0,
-      cache_creation_input_tokens: 0,
-    },
-    modelUsage: {},
-    permission_denials: [],
-    uuid: randomUUID(),
-    session_id: options.sessionId,
-  };
-}
-
 function system(options: Options, subtype: string, fields: Record<string, unknown>) {
   return { type: "system", subtype, ...fields, uuid: randomUUID(), session_id: options.sessionId };
+}
+
+/** The `user` message Claude Code replays for a prompt it took in. */
+function echo(value: SDKUserMessage, options: Options) {
+  return {
+    type: "user",
+    message: value.message,
+    parent_tool_use_id: null,
+    uuid: value.uuid,
+    session_id: options.sessionId,
+    isReplay: true,
+  };
 }
 
 /**
@@ -149,10 +142,16 @@ function scriptClaudeCode({
   usage = LARGE_ONE_HOUR_USAGE,
   during,
   compactResult = "success",
+  suggestion,
+  responseTakesMs,
 }: {
   usage?: Record<string, unknown>;
   during?: (options: Options) => AsyncGenerator<any>;
   compactResult?: "success" | "failed";
+  /** The prompt the CLI predicts after each answered prompt, as it does after a result. */
+  suggestion?: string;
+  /** Streams the answer: `message_start` first, then the `assistant` message (same id) this long after. */
+  responseTakesMs?: number;
 } = {}) {
   const received: string[] = [];
   /** Resolves each time the consumer has handled an `idle` message. */
@@ -177,14 +176,7 @@ function scriptClaudeCode({
           ...(compactResult === "failed" ? { compact_error: "too short" } : {}),
         });
       } else if (text === "/clear") {
-        yield {
-          type: "user",
-          message: value.message,
-          parent_tool_use_id: null,
-          uuid: value.uuid,
-          session_id: options.sessionId,
-          isReplay: true,
-        };
+        yield echo(value, options);
         yield {
           type: "conversation_reset",
           new_conversation_id: randomUUID(),
@@ -192,18 +184,33 @@ function scriptClaudeCode({
           session_id: options.sessionId,
         };
       } else {
-        yield {
-          type: "user",
-          message: value.message,
-          parent_tool_use_id: null,
-          uuid: value.uuid,
-          session_id: options.sessionId,
-          isReplay: true,
-        };
+        yield echo(value, options);
         if (during) yield* during(options);
-        yield assistant(options, usage);
+        const id = `msg_${randomUUID()}`;
+        if (responseTakesMs !== undefined) {
+          yield {
+            type: "stream_event",
+            event: {
+              type: "message_start",
+              message: { id, role: "assistant", model: "claude-sonnet-4-6", content: [], usage },
+            },
+            parent_tool_use_id: null,
+            uuid: randomUUID(),
+            session_id: options.sessionId,
+          };
+          await vi.advanceTimersByTimeAsync(responseTakesMs);
+        }
+        yield assistant(options, usage, null, id);
       }
-      yield result(options);
+      yield successfulResultMessage({ session_id: options.sessionId });
+      if (suggestion && text !== "/compact") {
+        yield {
+          type: "prompt_suggestion",
+          suggestion,
+          uuid: randomUUID(),
+          session_id: options.sessionId,
+        };
+      }
       yield system(options, "session_state_changed", { state: "idle" });
       idleHandled.resolve();
     }
@@ -366,25 +373,17 @@ describe("idle compaction in the agent", () => {
     const idleHandled = Promise.withResolvers<void>();
     sdk.run = async function* (prompts, options) {
       const input = prompts[Symbol.asyncIterator]();
-      const echo = (value: SDKUserMessage) => ({
-        type: "user",
-        message: value.message,
-        parent_tool_use_id: null,
-        uuid: value.uuid,
-        session_id: options.sessionId,
-        isReplay: true,
-      });
       const { value: first } = await input.next();
       received.push((first.message.content as Array<{ text: string }>)[0].text);
-      yield echo(first);
+      yield echo(first, options);
       await release.promise;
       yield assistant(options, LARGE_ONE_HOUR_USAGE);
-      yield result(options);
+      yield successfulResultMessage({ session_id: options.sessionId });
       const { value: steer } = await input.next();
       received.push((steer.message.content as Array<{ text: string }>)[0].text);
-      yield echo(steer);
+      yield echo(steer, options);
       yield assistant(options, LARGE_ONE_HOUR_USAGE);
-      yield result(options);
+      yield successfulResultMessage({ session_id: options.sessionId });
       yield system(options, "session_state_changed", { state: "idle" });
       idleHandled.resolve();
       for (;;) {
@@ -404,6 +403,116 @@ describe("idle compaction in the agent", () => {
     await vi.advanceTimersByTimeAsync(54 * MINUTE_MS);
 
     expect(received).toEqual(["hi", "also X", "/compact"]);
+    await agent.dispose();
+  });
+
+  /** The idle `/compact` is not the prompt the user is looking at a prediction for, so the prediction stays. */
+  it("keeps the published prompt suggestion through the idle compaction", async () => {
+    const claude = scriptClaudeCode({ suggestion: "Run the tests" });
+    const { agent, sessionId, updates } = await connect(AIR_CLIENT_CAPABILITIES);
+
+    await promptHi(agent, sessionId);
+    await claude.untilIdle();
+    await vi.advanceTimersByTimeAsync(54 * MINUTE_MS);
+    await claude.untilIdle();
+
+    expect(claude.received).toEqual(["hi", "/compact"]);
+    expect(promptSuggestions(updates)).toEqual([{ suggestions: [{ text: "Run the tests" }] }]);
+    await agent.dispose();
+  });
+
+  /** A prompt still waiting on a provider update when the timer fires disarmed it first, so no `/compact` lands before the prompt. */
+  it("does not compact behind a prompt that is waiting on a provider update", async () => {
+    const claude = scriptClaudeCode();
+    const { agent, sessionId, logs } = await connect();
+    await promptHi(agent, sessionId);
+    await claude.untilIdle();
+
+    const update = Promise.withResolvers<void>();
+    (agent as any).providerUpdate = update.promise;
+    const waiting = promptHi(agent, sessionId);
+    await vi.advanceTimersByTimeAsync(54 * MINUTE_MS);
+    expect(claude.received).toEqual(["hi"]);
+    expect(logs).not.toContain("[idle-compaction] firing /compact");
+    expect(logs).toContain("[idle-compaction] disarmed: prompt");
+    (agent as any).providerUpdate = null;
+    update.resolve();
+    await waiting;
+
+    expect(claude.received).toEqual(["hi", "hi"]);
+    await agent.dispose();
+  });
+
+  /** The idle `/compact` is not a user prompt, so it asks for no title; a client prompt in the same session does. */
+  it("does not feed the idle compaction's prompt to the title machinery", async () => {
+    const claude = scriptClaudeCode();
+    const { agent, sessionId } = await connect();
+    const titles = agent.sessions[sessionId].titles;
+    const onPrompt = vi.spyOn(titles, "onPrompt");
+    const onPromptQueued = vi.spyOn(titles, "onPromptQueued");
+
+    await promptHi(agent, sessionId);
+    await claude.untilIdle();
+    expect(onPrompt).toHaveBeenCalledTimes(1);
+    expect(onPromptQueued).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(54 * MINUTE_MS);
+    await claude.untilIdle();
+
+    expect(claude.received).toEqual(["hi", "/compact"]);
+    expect(onPrompt).toHaveBeenCalledTimes(1);
+    expect(onPromptQueued).toHaveBeenCalledTimes(1);
+    await agent.dispose();
+  });
+
+  /** A rate limit warning that arrives mid-turn, before the turn's first request, still skips the compaction at the deadline. */
+  it("does not compact after a rate limit warning", async () => {
+    const claude = scriptClaudeCode({
+      during: async function* (options) {
+        yield {
+          type: "rate_limit_event",
+          rate_limit_info: { status: "allowed_warning", resetsAt: 1700000000, utilization: 0.9 },
+          uuid: randomUUID(),
+          session_id: options.sessionId,
+        };
+      },
+    });
+    const { agent, sessionId, logs } = await connect();
+
+    await promptHi(agent, sessionId);
+    await claude.untilIdle();
+    await vi.advanceTimersByTimeAsync(2 * 60 * MINUTE_MS);
+
+    expect(claude.received).toEqual(["hi"]);
+    expect(logs).toContain("[idle-compaction] skip: rate limit status is allowed_warning");
+    await agent.dispose();
+  });
+
+  /** The cache is written when the request starts, so a 7-minute answer still compacts 54 minutes after `message_start`, not after its last block. */
+  it("measures the deadline from the start of a long streamed response", async () => {
+    const claude = scriptClaudeCode({ responseTakesMs: 7 * MINUTE_MS });
+    const { agent, sessionId } = await connect();
+
+    await promptHi(agent, sessionId);
+    await claude.untilIdle();
+    await vi.advanceTimersByTimeAsync(47 * MINUTE_MS - 1);
+    expect(claude.received).toEqual(["hi"]);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(claude.received).toEqual(["hi", "/compact"]);
+    await agent.dispose();
+  });
+
+  /** A timer that fires hours late (the machine slept) finds a cold cache: compacting would write the whole context. */
+  it("does not compact when the clock jumped past the deadline before the timer fired", async () => {
+    const claude = scriptClaudeCode();
+    const { agent, sessionId } = await connect();
+
+    await promptHi(agent, sessionId);
+    await claude.untilIdle();
+    vi.setSystemTime(Date.now() + 8 * 60 * MINUTE_MS);
+    await vi.advanceTimersByTimeAsync(54 * MINUTE_MS);
+
+    expect(claude.received).toEqual(["hi"]);
     await agent.dispose();
   });
 
@@ -428,6 +537,14 @@ describe("idle compaction in the agent", () => {
     await agent.dispose();
   });
 });
+
+/** Each `promptSuggestions` value that the client received. */
+function promptSuggestions(updates: Array<{ update: Record<string, any> }>) {
+  return updates.flatMap(({ update }) => {
+    const suggestions = update._meta?.promptSuggestions;
+    return suggestions ? [suggestions] : [];
+  });
+}
 
 /** The `trigger` of each compaction report that the client received. */
 function compactionTriggers(updates: Array<{ update: Record<string, any> }>) {

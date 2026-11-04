@@ -17,6 +17,7 @@ function setup(
     env?: Record<string, string | undefined>;
     tokens?: number;
     settings?: ReturnType<IdleCompactionHost["settings"]>;
+    setTimeout?: (callback: () => void, ms: number) => unknown;
   } = {},
 ) {
   const state = {
@@ -31,7 +32,7 @@ function setup(
     compact: vi.fn(async (): Promise<unknown> => undefined),
     log: vi.fn(),
   };
-  const idle = new IdleCompaction(host, { env: options.env ?? {} });
+  const idle = new IdleCompaction(host, { env: options.env ?? {}, setTimeout: options.setTimeout });
   return { idle, host, state };
 }
 
@@ -79,14 +80,6 @@ describe("IdleCompaction", () => {
     requestAndIdle(idle);
     await vi.advanceTimersByTimeAsync(54 * MIN);
     expect(host.compact).toHaveBeenCalledTimes(1);
-  });
-
-  /** Claude Code also reads these from the `env` block of settings.json. */
-  it("is disabled by DISABLE_AUTO_COMPACT in the settings env", async () => {
-    const { idle, host } = setup({ settings: { env: { DISABLE_AUTO_COMPACT: "1" } } });
-    requestAndIdle(idle);
-    await vi.advanceTimersByTimeAsync(2 * 60 * MIN);
-    expect(host.compact).not.toHaveBeenCalled();
   });
 
   /** A reported failure is logged only while the adapter's own compaction runs. */
@@ -140,6 +133,64 @@ describe("IdleCompaction", () => {
     expect(host.compact).toHaveBeenCalledTimes(1);
   });
 
+  /** A cache whose deadline passed more than 60 s ago is cold: a timer that fires that late (the machine slept) compacts nothing. */
+  it.each([
+    ["the timer fires 61 s late", 61_000, false],
+    ["the timer fires 60 s late", 60_000, true],
+  ])("when %s, compacts: %s", async (_name, lateMs, compacts) => {
+    const { idle, host } = setup();
+    requestAndIdle(idle);
+    vi.setSystemTime(Date.now() + lateMs);
+    await vi.advanceTimersByTimeAsync(54 * MIN);
+
+    expect(host.compact).toHaveBeenCalledTimes(compacts ? 1 : 0);
+  });
+
+  /** Going idle after the deadline is more than 60 s past arms nothing. */
+  it("does not arm when the deadline passed more than 60 s ago", async () => {
+    const { idle, host } = setup();
+    idle.noteRequest(ONE_HOUR);
+    await vi.advanceTimersByTimeAsync(54 * MIN + 61_000);
+    idle.onIdle();
+
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(host.compact).not.toHaveBeenCalled();
+    expect(host.log).toHaveBeenCalledWith(expect.stringContaining("lapsed"));
+  });
+
+  /** The rate limit status is the last one reported: a reset or a malformed event keeps `rejected`, a later `allowed` clears it. */
+  it("keeps the rate limit status across a reset and a malformed event until an allowed one", async () => {
+    const { idle, host } = setup();
+    idle.noteRateLimit({ status: "rejected" });
+    idle.noteRateLimit(null);
+    idle.reset();
+    requestAndIdle(idle);
+    expect(vi.getTimerCount()).toBe(0);
+
+    idle.noteRateLimit({ status: "allowed" });
+    idle.onIdle();
+    await vi.advanceTimersByTimeAsync(54 * MIN);
+    expect(host.compact).toHaveBeenCalledTimes(1);
+  });
+
+  /** Later blocks of one response (same message id) keep the deadline from its first sighting; a new id moves it. */
+  it.each([
+    ["the same message id", "msg_1", 54 * MIN],
+    ["a new message id", "msg_2", 54 * MIN + 7 * MIN],
+  ])("a request with %s: the deadline stays or moves", async (_name, id, firesAt) => {
+    const { idle, host } = setup();
+    idle.noteRequest(ONE_HOUR, "msg_1");
+    await vi.advanceTimersByTimeAsync(7 * MIN);
+    idle.noteRequest(ONE_HOUR, id);
+    idle.onIdle();
+
+    await vi.advanceTimersByTimeAsync(firesAt - 7 * MIN - 1);
+    expect(host.compact).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(host.compact).toHaveBeenCalledTimes(1);
+  });
+
   /** A deadline already in the past fires immediately. */
   it("fires right away when the deadline has passed", async () => {
     const { idle, host } = setup();
@@ -161,9 +212,29 @@ describe("IdleCompaction", () => {
     ["autoCompactEnabled: false", { settings: { autoCompactEnabled: false } }],
     ["DISABLE_COMPACT", { env: { DISABLE_COMPACT: "1" } }],
     ["DISABLE_AUTO_COMPACT", { env: { DISABLE_AUTO_COMPACT: "true" } }],
+    // Claude Code also reads these from the `env` block of settings.json.
+    [
+      "DISABLE_AUTO_COMPACT in the settings env",
+      { settings: { env: { DISABLE_AUTO_COMPACT: "1" } } },
+    ],
+    ["rate limit status allowed_warning", { rateLimit: "allowed_warning" }],
+    ["rate limit status rejected", { rateLimit: "rejected" }],
+    [
+      "CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS in the settings env",
+      { tokens: 250_000, settings: { env: { CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS: "500000" } } },
+    ],
+    [
+      "CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS in the settings env over the launch env",
+      {
+        tokens: 250_000,
+        env: { CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS: "100000" },
+        settings: { env: { CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS: "500000" } },
+      },
+    ],
   ])("does not arm: %s", async (_name, options0: Record<string, any>) => {
-    const { usage, ...options } = options0;
+    const { usage, rateLimit, ...options } = options0;
     const { idle, host } = setup(options);
+    if (rateLimit) idle.noteRateLimit({ status: rateLimit });
     requestAndIdle(idle, "usage" in options0 ? usage : ONE_HOUR);
 
     await vi.advanceTimersByTimeAsync(2 * 60 * MIN);
@@ -172,20 +243,18 @@ describe("IdleCompaction", () => {
     expect(host.log).toHaveBeenCalledWith(expect.stringContaining("skip"));
   });
 
-  /** The settings env is applied after the launch env, so its value wins, not an OR of the two. */
-  it("lets a falsy DISABLE_AUTO_COMPACT in the settings env override the launch env", async () => {
-    const { idle, host } = setup({
-      env: { DISABLE_AUTO_COMPACT: "1" },
-      settings: { env: { DISABLE_AUTO_COMPACT: "0" } },
-    });
-    requestAndIdle(idle);
-    await vi.advanceTimersByTimeAsync(54 * MIN);
-    expect(host.compact).toHaveBeenCalledTimes(1);
-  });
-
-  /** A falsy DISABLE_COMPACT value does not opt out. */
-  it("treats DISABLE_COMPACT=0 as not set", async () => {
-    const { idle, host } = setup({ env: { DISABLE_COMPACT: "0" } });
+  /** A falsy value is not an opt-out, and the settings env is applied after the launch env, so its value wins, not an OR of the two. */
+  it.each([
+    ["DISABLE_COMPACT=0 in the launch env", { env: { DISABLE_COMPACT: "0" } }],
+    [
+      "DISABLE_AUTO_COMPACT=0 in the settings env over =1 in the launch env",
+      {
+        env: { DISABLE_AUTO_COMPACT: "1" },
+        settings: { env: { DISABLE_AUTO_COMPACT: "0" } },
+      },
+    ],
+  ])("arms: %s", async (_name, options) => {
+    const { idle, host } = setup(options);
     requestAndIdle(idle);
 
     await vi.advanceTimersByTimeAsync(54 * MIN);
@@ -254,19 +323,9 @@ describe("IdleCompaction", () => {
     expect(warnings).toHaveLength(invalid ? 1 : 0);
   });
 
-  /** A new request drops the armed timer; the next idle re-arms from the new request. */
-  it("noteRequest drops the timer", async () => {
-    const { idle, host } = setup();
-    requestAndIdle(idle);
-    idle.noteRequest(ONE_HOUR);
-
-    expect(vi.getTimerCount()).toBe(0);
-    await vi.advanceTimersByTimeAsync(60 * MIN);
-    expect(host.compact).not.toHaveBeenCalled();
-  });
-
-  /** disarm and dispose each drop the timer; dispose also ignores later calls. */
+  /** A new request drops the armed timer, so the deadline cannot fire for the old one; disarm and dispose drop it too. */
   it.each([
+    ["noteRequest", (idle: IdleCompaction) => idle.noteRequest(ONE_HOUR)],
     ["disarm", (idle: IdleCompaction) => idle.disarm("prompt")],
     ["dispose", (idle: IdleCompaction) => idle.dispose()],
   ])("%s drops the timer", async (_name, drop) => {
@@ -288,15 +347,27 @@ describe("IdleCompaction", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  /** If the session became busy while the timer ran, nothing is compacted and nothing re-arms. */
-  it("does not compact when busy at the deadline", async () => {
-    const { idle, host, state } = setup();
-    requestAndIdle(idle);
-    state.busy = true;
+  /** A change after arming (busy, context shrunk, rate limit reached) is re-checked at the deadline: nothing is compacted and nothing re-arms. */
+  it.each([
+    ["the session became busy", "busy", (ctx: ReturnType<typeof setup>) => (ctx.state.busy = true)],
+    [
+      "the context shrank below the minimum",
+      "below the",
+      (ctx: ReturnType<typeof setup>) => (ctx.state.tokens = 50_000),
+    ],
+    [
+      "the rate limit status became rejected",
+      "rate limit",
+      (ctx: ReturnType<typeof setup>) => ctx.idle.noteRateLimit({ status: "rejected" }),
+    ],
+  ])("does not compact at the deadline when %s", async (_name, logged, change) => {
+    const ctx = setup();
+    requestAndIdle(ctx.idle);
+    change(ctx);
 
     await vi.advanceTimersByTimeAsync(54 * MIN);
-    expect(host.compact).not.toHaveBeenCalled();
-    expect(host.log).toHaveBeenCalledWith(expect.stringContaining("busy"));
+    expect(ctx.host.compact).not.toHaveBeenCalled();
+    expect(ctx.host.log).toHaveBeenCalledWith(expect.stringContaining(logged));
   });
 
   /** Going idle while busy arms nothing. */
@@ -306,16 +377,6 @@ describe("IdleCompaction", () => {
     requestAndIdle(idle);
 
     expect(vi.getTimerCount()).toBe(0);
-  });
-
-  /** Context shrinking below the minimum before the deadline cancels the compaction. */
-  it("re-checks the context size at the deadline", async () => {
-    const { idle, host, state } = setup();
-    requestAndIdle(idle);
-    state.tokens = 50_000;
-
-    await vi.advanceTimersByTimeAsync(54 * MIN);
-    expect(host.compact).not.toHaveBeenCalled();
   });
 
   /** Arming twice leaves a single timer, so only one compaction runs. */
@@ -346,14 +407,7 @@ describe("IdleCompaction", () => {
   it("unrefs the timer", () => {
     const unref = vi.fn();
     const setTimeoutSpy = vi.fn(() => ({ unref }));
-    const host = {
-      isBusy: () => false,
-      contextTokens: () => 200_000,
-      settings: () => ({}),
-      compact: async () => undefined,
-      log: vi.fn(),
-    };
-    const idle = new IdleCompaction(host, { env: {}, setTimeout: setTimeoutSpy });
+    const { idle } = setup({ setTimeout: setTimeoutSpy });
     requestAndIdle(idle);
 
     expect(setTimeoutSpy).toHaveBeenCalledTimes(1);
