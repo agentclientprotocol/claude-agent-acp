@@ -1,8 +1,9 @@
 # Builds the standalone executables (scripts/build-binary.mjs) and smoke-tests
 # each one on a runner of its own platform. Each archive holds
-# `claude-agent-acp` and the Claude CLI (`claude`) it runs from its directory. CI calls this to check that every
-# target still builds and starts; the release calls it with `upload: true` and
-# attaches the archives to the GitHub release.
+# `claude-agent-acp` and the Claude CLI (`claude`) it runs from its directory.
+# CI calls this to check that every target still builds and starts; the
+# release calls it with `upload: true` and attaches the archives to the GitHub
+# release.
 name: Binaries
 
 on:
@@ -67,9 +68,12 @@ jobs:
           check-latest: true
           cache: "npm"
 
+      # Unpinned: each build is smoke-tested on its platform before it uploads,
+      # so a Bun release that breaks the executable fails here instead of
+      # shipping. Pin a version if one ever regresses past the smoke test.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: "1.4.4"
+          bun-version: latest
 
       - run: npm ci
 
@@ -80,7 +84,9 @@ jobs:
           npm install --no-save --force "@anthropic-ai/claude-agent-sdk-linux-${RUNNER_ARCH,,}-musl@$version"
 
       - name: Build
-        run: node scripts/build-binary.mjs --target ${{ matrix.target }}
+        run: |
+          echo "Built \`${{ matrix.target }}\` with Bun $(bun --version)" >> "$GITHUB_STEP_SUMMARY"
+          node scripts/build-binary.mjs --target ${{ matrix.target }}
 
       - name: Smoke test
         if: ${{ !matrix.musl }}
