@@ -228,7 +228,11 @@ jobs:
           echo "Tagged \`v$VERSION\` at \`$SHA\`" >> "$GITHUB_STEP_SUMMARY"
 
   trigger-registry-update:
-    needs: [publish-npm, publish-npm-preview]
+    # upload-binaries too, so a stable release's archives are attached before the
+    # registry reads the release: it takes each archive's sha256 from the release
+    # assets when it bumps the version. It only waits; a failed or skipped upload
+    # (every preview) doesn't stop the dispatch.
+    needs: [publish-npm, publish-npm-preview, upload-binaries]
     # Both channels dispatch this: the registry has its own handling for preview
     # versions. The two never fire together — a release merge publishes stable and
     # skips the preview, and every other push does the reverse — so the registry sees

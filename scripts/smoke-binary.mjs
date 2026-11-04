@@ -13,8 +13,8 @@
 // The basic run checks `--version`, `--cli --version`, `initialize` (v1 and
 // v2) and the `terminal-auth` login command. The
 // full run also has Claude use Bash, Read (text and image), Edit and a
-// subagent in a scratch directory, then cancels a turn, lists the session and
-// loads it in a fresh agent process.
+// subagent in a scratch directory, then cancels a turn, lists the session,
+// loads it in a fresh agent process, and forks and deletes it.
 //
 // Claude Code's native builds have no Grep or Glob tool: its Bash shell wraps
 // `grep` and `find` in functions that run the ugrep and bfs built into the
@@ -445,6 +445,24 @@ async function fullSmoke(work) {
   const loaded = await reloaded.request("session/load", { sessionId, cwd: work, mcpServers: [] });
   check(!loaded.error, "session/load in a new process", JSON.stringify(loaded.error));
   check(replayed.includes(token), "session/load replays the first prompt", replayed.slice(0, 200));
+
+  // Fork and delete go through the SDK's transcript helpers, not the CLI.
+  const forked = await reloaded.request("session/fork", { sessionId, cwd: work, mcpServers: [] });
+  const forkId = forked.result?.sessionId;
+  check(
+    forkId && forkId !== sessionId,
+    "session/fork",
+    JSON.stringify(forked.result ?? forked.error),
+  );
+  if (forkId) {
+    const deleted = await reloaded.request("session/delete", { sessionId: forkId });
+    const after = await reloaded.request("session/list", { cwd: work });
+    check(
+      !deleted.error && !after.result?.sessions?.some((s) => s.sessionId === forkId),
+      "session/delete removes the fork",
+      JSON.stringify(deleted.error ?? after.result),
+    );
+  }
   await reloaded.stop();
 }
 
