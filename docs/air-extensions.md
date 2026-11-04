@@ -1644,7 +1644,7 @@ The capability applies to ACP v1 only. ACP v2 keeps the hold, and the agent does
 - The subagent updates, permission requests and elicitations go out after the prompt response.
 - The routing does not change: the native child session, else the root session with the parent tool call in `_meta.claudeCode.parentToolUseId`.
 - The followup cycle after a subagent ends is an autonomous cycle. Its updates go out of a turn. Its result does not end a turn.
-- A steer with no turn in flight starts a new turn, or returns `promptRequired` when the client asks for it.
+- A steer with no user turn in flight can inject into a running autonomous cycle. With no such cycle, it starts a new turn, or returns `promptRequired` when the client asks for it.
 - `session/cancel` with no turn works as before: the adapter interrupts the SDK query and reports each native subagent session as cancelled.
 - The tool call of a running subagent does not fail the incomplete tool call check of the turn.
 - The [agent file-change report](#agent-file-change-report) of the turn does not include an edit that a subagent makes after the result.
