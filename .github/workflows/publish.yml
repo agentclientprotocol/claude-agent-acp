@@ -95,6 +95,9 @@ jobs:
     name: Build binaries
     needs: [release-please]
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    # The called workflow only reads the repository; upload-binaries does the write.
+    permissions:
+      contents: read
     uses: ./.github/workflows/binaries.yml
     with:
       upload: true
