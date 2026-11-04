@@ -2739,6 +2739,19 @@ describe("applyTaskCreate / applyTaskUpdate", () => {
     });
   });
 
+  it("takes the subject and description from the output, which holds the task as saved", () => {
+    const state: TaskState = new Map();
+    applyTaskCreate(
+      state,
+      { subject: "Write tsets", description: "Cover Task*", activeForm: "Writing tests" },
+      { task: { id: "1", subject: "Write tests", description: "Cover Task* flow" } },
+    );
+    expect(state.get("1")).toMatchObject({
+      subject: "Write tests",
+      description: "Cover Task* flow",
+    });
+  });
+
   it("is a no-op when the output has no task ID", () => {
     const state: TaskState = new Map();
     applyTaskCreate(state, { subject: "X", description: "Y" }, undefined);

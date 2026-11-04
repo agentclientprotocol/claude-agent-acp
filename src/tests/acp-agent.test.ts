@@ -18854,6 +18854,38 @@ describe("assembled assistant text fallback", () => {
     });
   });
 
+  it("logs session_writes_lost after the last result without sending an update", async () => {
+    const updates: any[] = [];
+    const error = vi.fn();
+    const agent = new ClaudeAcpAgent(
+      { sessionUpdate: async (n: any) => updates.push(n) } as unknown as AcpClient,
+      { log: () => {}, error },
+    );
+    injectSession(agent, [
+      replayedResult("done"),
+      idle,
+      {
+        type: "system",
+        subtype: "session_writes_lost",
+        error_code: "ENOSPC",
+        lost: ["transcript", "global_config"],
+        transcript_session_ids: ["test-session"],
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+    const sentAtTurnEnd = updates.length;
+
+    await vi.waitFor(() =>
+      expect(error).toHaveBeenCalledWith(
+        "Session test-session: Claude Code could not save transcript and global_config (ENOSPC); resuming may miss part of the conversation",
+      ),
+    );
+    expect(updates).toHaveLength(sentAtTurnEnd);
+  });
+
   it("marks info-level notices even when their text has no severity prefix", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
