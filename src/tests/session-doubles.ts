@@ -40,6 +40,7 @@ export function wrapQuery(generator: AsyncGenerator<any>) {
   return Object.assign(generator, {
     interrupt: vi.fn(async () => {}),
     stopTask: vi.fn(async () => {}),
+    backgroundTasks: vi.fn(async () => true),
     close: vi.fn(),
     setModel: vi.fn(async () => {}),
   }) as any;
