@@ -232,7 +232,7 @@ import {
   type ResumedSessionSnapshot,
 } from "./resumed-session.js";
 import { SessionTiming } from "./session-timing.js";
-import { ALLOW_BYPASS } from "./permissions/modes.js";
+import { ALLOW_BYPASS, autoModeDisabled } from "./permissions/modes.js";
 import { normalizeDurablePermissionChangeSet } from "./permissions/normalization.js";
 import { buildClaudePermissionOptions } from "./permissions/options.js";
 import {
@@ -12072,15 +12072,18 @@ export class ClaudeAcpAgent {
       settingsManager.getSettings().permissions?.disableBypassPermissionsMode !== "disable" &&
       sessionMeta?.claudeCode?.options?.allowDangerouslySkipPermissions !== false;
 
-    const initialPermissionMode = resolveInitialPermissionMode(
-      {
-        explicit: creationOpts.permissionMode,
-        resumed: resumedPermissionMode,
-        defaultMode: settingsManager.getSettings().permissions?.defaultMode,
-      },
-      this.logger,
-      allowBypass,
-    );
+    const allowAuto = !autoModeDisabled(settingsManager.getSettings());
+
+    const { mode: initialPermissionMode, builtInDefault: builtInPermissionMode } =
+      resolveInitialPermissionMode(
+        {
+          explicit: creationOpts.permissionMode,
+          resumed: resumedPermissionMode,
+          defaultMode: settingsManager.getSettings().permissions?.defaultMode,
+        },
+        this.logger,
+        { allowBypass, allowAuto },
+      );
 
     const userProvidedOptions = sessionMeta?.claudeCode?.options;
     const forwardSubagentText = this.forwardsSubagentText(params._meta);
@@ -12556,9 +12559,11 @@ export class ClaudeAcpAgent {
       const { modes, autoModeFallbackWarningPending } = await this.sessionModes.initialize({
         query: q,
         requestedMode: initialPermissionMode,
+        builtInDefault: builtInPermissionMode,
         currentModelInfo,
         currentModelId: models.currentModelId,
         allowBypass,
+        allowAuto,
       });
       timing.phase("modes");
 
