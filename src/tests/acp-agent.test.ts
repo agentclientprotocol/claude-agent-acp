@@ -18610,8 +18610,8 @@ describe("assembled assistant text fallback", () => {
     ]);
     expect(child.some((update) => update.sessionUpdate === "compaction_update")).toBe(false);
 
-    // Unrecognized framing: the text stays visible rather than vanishing
-    // behind a summary-less entity.
+    // Unrecognized framing: still the compaction isCompactSummary says it is,
+    // without summary text, and never a message from the user.
     const unknownFraming = await replay(true, [
       {
         ...summaryMessage("odd-summary"),
@@ -18622,12 +18622,14 @@ describe("assembled assistant text fallback", () => {
         },
       },
     ]);
-    expect(unknownFraming.some((update) => update.sessionUpdate === "compaction_update")).toBe(
-      false,
-    );
-    expect(unknownFraming.some((update) => update.sessionUpdate === "user_message_chunk")).toBe(
-      true,
-    );
+    expect(unknownFraming).toEqual([
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "odd-summary",
+        status: "completed",
+        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
+      },
+    ]);
   });
 
   it("preserves the model response after multiple compactions in one turn", async () => {

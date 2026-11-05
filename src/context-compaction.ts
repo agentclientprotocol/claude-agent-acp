@@ -67,7 +67,7 @@ const ANALYSIS_BLOCKS = [
  *  it as the post-compaction user message. */
 const CONTINUATION_PREAMBLE = /^\s*This session is being continued from a previous conversation/i;
 const PERSISTED_PREAMBLE =
-  /^\s*This session is being continued from a previous conversation[^\n]*\n+Summary:[ \t]*\r?\n/;
+  /^\s*This session is being continued from a previous conversation[^\n]*\n(?:[\s\S]*?\n)?Summary:[ \t]*\r?\n/;
 const PERSISTED_TRAILERS = [
   /\n+If you need specific details from before compaction[\s\S]*$/,
   /\n+(?:Please )?[Cc]ontinue the conversation from where it left (?:it )?off[\s\S]*$/,

@@ -10025,9 +10025,10 @@ export class ClaudeAcpAgent {
       // The entity is keyed by the summary message's uuid, which differs from
       // the live id (the `compacting` status uuid) — replay is terminal-first
       // by the RFD, and no client merges a replay into a live entity store.
-      // A subagent's own compaction summary is not the root session's, and a
-      // summary whose framing is unrecognized stays visible as transcript
-      // text rather than vanishing behind a summary-less entity.
+      // A subagent's own compaction summary is not the root session's. A summary
+      // whose framing is unrecognized is still this compaction, without summary
+      // text: isCompactSummary says what it is, and the framing is Claude Code's
+      // to change.
       if (
         replayCompactionUpdates &&
         isCompactSummaryMessage(message) &&
@@ -10043,10 +10044,9 @@ export class ClaudeAcpAgent {
             airClient: this.toolCallCapabilities.air.client,
           },
         );
-        if (replayCompaction.recordSummary(assistantMessageText(message.message))) {
-          await replayCompaction.finish(message.uuid, "completed");
-          return;
-        }
+        replayCompaction.recordSummary(assistantMessageText(message.message));
+        await replayCompaction.finish(message.uuid, "completed");
+        return;
       }
 
       for (const notification of toAcpNotifications(
