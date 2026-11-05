@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.101.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.100.0...v0.101.0) (2026-11-05)
+
+
+### Features
+
+* compact idle sessions before the prompt cache expires ([#1522](https://github.com/agentclientprotocol/claude-agent-acp/issues/1522)) ([a79d073](https://github.com/agentclientprotocol/claude-agent-acp/commit/a79d07324dc15808c94a889a3b60615cca5a9fbd)), closes [#1454](https://github.com/agentclientprotocol/claude-agent-acp/issues/1454) [#1518](https://github.com/agentclientprotocol/claude-agent-acp/issues/1518)
+* ship single-file executables built with bun ([#1524](https://github.com/agentclientprotocol/claude-agent-acp/issues/1524)) ([e3f0b6c](https://github.com/agentclientprotocol/claude-agent-acp/commit/e3f0b6c89c783939e6ca8c19c220c21b58263f46))
+* start sessions in Auto mode by default ([#1533](https://github.com/agentclientprotocol/claude-agent-acp/issues/1533)) ([7ea9eec](https://github.com/agentclientprotocol/claude-agent-acp/commit/7ea9eec8392a43191b25a5c3636c181cc7eb42f3))
+* stream the output of v2 background commands ([#1512](https://github.com/agentclientprotocol/claude-agent-acp/issues/1512)) ([53e3eec](https://github.com/agentclientprotocol/claude-agent-acp/commit/53e3eec0134209654f53c46f319aaac851b8fff0))
+
+
+### Bug Fixes
+
+* honor configured fallback for unavailable restored modes ([#1520](https://github.com/agentclientprotocol/claude-agent-acp/issues/1520)) ([8bbdea6](https://github.com/agentclientprotocol/claude-agent-acp/commit/8bbdea6cc62a7ae080cb73ff476ed28ad7574018))
+* update to @anthropic-ai/claude-agent-sdk 0.3.318 ([#1525](https://github.com/agentclientprotocol/claude-agent-acp/issues/1525)) ([1d4418f](https://github.com/agentclientprotocol/claude-agent-acp/commit/1d4418f80daf14c29cecc5b23286f52c7f0402ec))
+
 ## [0.100.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.99.1...v0.100.0) (2026-11-02)
 
 
