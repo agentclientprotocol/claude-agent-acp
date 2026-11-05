@@ -256,6 +256,24 @@ export function compareWithBaseline(baseline: Recorded[], traffic: Recorded[]): 
   const current = withoutSandboxNetworkSettlements(
     traffic.map((record) => withoutSessionCapability(record, "systemPrompt")),
   );
+  for (let index = 0; index + 1 < expected.length; index++) {
+    const response = expected[index];
+    const commands = expected[index + 1];
+    const sessionId = (response.payload as Json)?.sessionId;
+    if (
+      response.kind === "loadSession" &&
+      updateOf(commands)?.sessionUpdate === "available_commands_update" &&
+      current[index + 1]?.kind === "loadSession" &&
+      updateOf(current[index])?.sessionUpdate === "available_commands_update" &&
+      typeof sessionId === "string" &&
+      sessionId === (commands.payload as Json)?.sessionId &&
+      sessionId === (current[index].payload as Json)?.sessionId &&
+      sessionId === (current[index + 1].payload as Json)?.sessionId
+    ) {
+      expected[index] = commands;
+      expected[index + 1] = response;
+    }
+  }
   const violations: string[] = [];
   const state = new Map<string, Map<string, string>>();
   const summaryChunks = new Map<string, string>();

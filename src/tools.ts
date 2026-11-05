@@ -278,11 +278,14 @@ export function applyTaskCreate(
 ): void {
   const taskId = output?.task?.id;
   if (!taskId || !input) return;
+  // The output holds the task as saved, which differs from the input when
+  // Claude Code corrects a malformed call or a PreToolUse hook changes it.
+  // `description` is in outputs since CLI 2.1.317.
   state.set(taskId, {
-    subject: input.subject,
+    subject: output.task.subject ?? input.subject,
     status: "pending",
     activeForm: input.activeForm,
-    description: input.description,
+    description: output.task.description ?? input.description,
   });
 }
 

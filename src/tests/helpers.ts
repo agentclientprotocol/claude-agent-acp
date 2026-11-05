@@ -4,7 +4,11 @@
  * their own vi.fn spies via `overrides`.
  */
 
-import type { ClientCapabilities, InitializeRequest } from "@agentclientprotocol/sdk/unstable";
+import {
+  RequestError,
+  type ClientCapabilities,
+  type InitializeRequest,
+} from "@agentclientprotocol/sdk/unstable";
 
 /** The context-usage report the base mock query returns. `rawMaxTokens`
  *  matches the agent's DEFAULT_CONTEXT_WINDOW so window-related assertions
@@ -42,6 +46,19 @@ export function makeMockQuery(overrides: Record<string, unknown> = {}) {
 }
 
 /**
+ * The error `initializationResult()` rejects with when Claude Code refuses to
+ * start with `CLAUDE_CODE_STARTUP_FAILURE_RESULTS` set, as SDK 0.3.316 builds
+ * it from the CLI's error result (same message prefix and fields).
+ */
+export function startupFailure(reason: string, cliMessage: string): Error {
+  return Object.assign(new Error(`Claude Code returned an error result: ${cliMessage}`), {
+    telemetryMessage: "Claude Code returned an error result",
+    errorClass: "error_result",
+    startupFailureReason: reason,
+  });
+}
+
+/**
  * Declares the client capabilities through `initialize`, as a real client
  * does. The agent reads its capability choices only there.
  */
@@ -50,4 +67,17 @@ export async function initializeClient(
   clientCapabilities: ClientCapabilities,
 ): Promise<void> {
   await agent.initialize({ protocolVersion: 1, clientCapabilities });
+}
+
+/**
+ * A request to a client that never answers it, as the SDK connection returns
+ * it with `stopWaitingOnCancel`: it rejects with `-32800` once `signal`
+ * aborts. The real connection also sends `$/cancel_request` then.
+ */
+export function heldRequest<T>(_params?: unknown, signal?: AbortSignal): Promise<T> {
+  return new Promise<T>((_resolve, reject) => {
+    const cancel = () => reject(RequestError.requestCancelled(signal?.reason));
+    if (signal?.aborted) cancel();
+    else signal?.addEventListener("abort", cancel, { once: true });
+  });
 }

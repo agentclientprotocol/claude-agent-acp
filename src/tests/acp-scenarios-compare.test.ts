@@ -73,6 +73,32 @@ describe("compareWithBaseline", () => {
       expect(compareWithBaseline([commands()], [commands("mcp")])).toEqual([]);
     });
 
+    it("accepts commands immediately before the matching load response", () => {
+      const response: Recorded = { kind: "loadSession", payload: { sessionId: "s" } };
+      expect(
+        compareWithBaseline([response, commands("compact")], [commands("compact"), response]),
+      ).toEqual([]);
+    });
+
+    it("still rejects changed commands moved before the load response", () => {
+      const response: Recorded = { kind: "loadSession", payload: { sessionId: "s" } };
+      expect(
+        compareWithBaseline([response, commands("compact")], [commands("other"), response]),
+      ).not.toEqual([]);
+    });
+
+    it("does not allow commands from another session before the load response", () => {
+      const response: Recorded = { kind: "loadSession", payload: { sessionId: "s" } };
+      const original = commands("compact");
+      const other = {
+        ...original,
+        payload: { ...(original.payload as Record<string, unknown>), sessionId: "other" },
+      };
+      expect(compareWithBaseline([response, commands("compact")], [other, response])).not.toEqual(
+        [],
+      );
+    });
+
     it("reports any other extra command", () => {
       expect(compareWithBaseline([commands()], [commands("mcp", "other")])).toContainEqual(
         expect.stringMatching(/but the adapter sent .*"name":"other"/u),

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { claudeCliPath } from "./acp-agent.js";
+import { claudeCliPath } from "./claude-cli.js";
 import { applyManagedPolicyEnv } from "./managed-policy.js";
 import { acpProtocolsFromEnv, serveAcp } from "./serve.js";
 import packageJson from "../package.json" with { type: "json" };

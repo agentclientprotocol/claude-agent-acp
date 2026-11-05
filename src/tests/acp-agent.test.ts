@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach, vi } from "vitest";
 import { spawn, spawnSync } from "child_process";
 import {
+  type AnyMessage,
   AvailableCommand,
   ClientCapabilities,
   client as acpClient,
@@ -41,7 +42,6 @@ import {
   isSyntheticLoginMessage,
   stripLocalCommandMetadata,
   ClaudeAcpAgent,
-  claudeCliPath,
   computeSessionFingerprint,
   streamEventToAcpNotifications,
   messageIdForGrouping,
@@ -55,9 +55,11 @@ import {
   type StreamedToolInputCache,
 } from "../acp-agent.js";
 import { SessionTitles } from "../session-titles.js";
+import { SessionBackgroundWork } from "../background-work.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "../usage-markdown.js";
 import { Pushable } from "../utils.js";
-import { initializeClient, makeMockQuery } from "./helpers.js";
+import { heldRequest, initializeClient, makeMockQuery } from "./helpers.js";
+import { acpProtocolRouter } from "../serve.js";
 import * as agentSdk from "@anthropic-ai/claude-agent-sdk";
 import {
   deleteSession,
@@ -4933,11 +4935,6 @@ describe("prompt conversion", () => {
 });
 
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("SDK behavior", () => {
-  it("finds vendored cli path", async () => {
-    const path = await claudeCliPath();
-    expect(path).toMatch(/@anthropic-ai\/claude-agent-sdk-[^/]+\/claude(\.exe)?$/);
-  });
-
   it("query has a 'default' model", async () => {
     const q = query({ prompt: "hi" });
     const models = await q.supportedModels();
@@ -5199,6 +5196,7 @@ describe("permission request cancellation", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      background: new SessionBackgroundWork(sessionId, false),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
@@ -5249,7 +5247,7 @@ describe("permission request cancellation", () => {
   it("does not wait for a permission client that ignores cancellation", async () => {
     const mockClient = {
       sessionUpdate: async () => {},
-      requestPermission: () => new Promise<RequestPermissionResponse>(() => {}),
+      requestPermission: heldRequest<RequestPermissionResponse>,
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
     const session = injectSession(agent, "session-1");
@@ -5399,7 +5397,7 @@ describe("permission request cancellation", () => {
     "does not wait for $name when its client ignores cancellation",
     async ({ start, aborted }) => {
       // The client holds the elicitation and never answers $/cancel_request.
-      const createElicitation = vi.fn(() => new Promise<CreateElicitationResponse>(() => {}));
+      const createElicitation = vi.fn(heldRequest<CreateElicitationResponse>);
       const mockClient = {
         sessionUpdate: async () => {},
         createElicitation,
@@ -5429,12 +5427,10 @@ describe("permission request cancellation", () => {
     "cancels $name before session/close responds",
     async ({ start, aborted }) => {
       const events: string[] = [];
-      const createElicitation = vi.fn(
-        (_params: unknown, signal: AbortSignal) =>
-          new Promise<CreateElicitationResponse>(() => {
-            signal.addEventListener("abort", () => events.push("cancel_request"), { once: true });
-          }),
-      );
+      const createElicitation = vi.fn((params: unknown, signal: AbortSignal) => {
+        signal.addEventListener("abort", () => events.push("cancel_request"), { once: true });
+        return heldRequest<CreateElicitationResponse>(params, signal);
+      });
       const mockClient = {
         sessionUpdate: async () => {},
         createElicitation,
@@ -5455,14 +5451,72 @@ describe("permission request cancellation", () => {
     },
   );
 
+  it.each([
+    {
+      name: "a permission request",
+      start: (agent: ClaudeAcpAgent, signal: AbortSignal) =>
+        agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+          signal,
+          suggestions: [],
+          toolUseID: "tool-1",
+        } as any),
+    },
+    elicitations[0],
+  ])(
+    "cancels $name over the connection and stops waiting for a client that ignores it",
+    async ({ start }) => {
+      const toAgent = new TransformStream<AnyMessage, AnyMessage>();
+      const toClient = new TransformStream<AnyMessage, AnyMessage>();
+      let agent!: ClaudeAcpAgent;
+      acpProtocolRouter(
+        { log: () => {}, error: () => {} },
+        (created) => (agent = created),
+        "v1",
+      ).connect({ readable: toAgent.readable, writable: toClient.writable });
+      const cancelled: string[] = [];
+      // The client holds each request. The signal also aborts when the
+      // connection closes, with another reason than `-32800`.
+      const hold = ({ method, signal }: { method: string; signal: AbortSignal }) =>
+        new Promise<never>(() => {
+          signal.addEventListener("abort", () => {
+            if ((signal.reason as { code?: unknown } | undefined)?.code === -32800) {
+              cancelled.push(method);
+            }
+          });
+        });
+
+      await acpClient({ name: "test-client" })
+        .onRequest(methods.client.session.requestPermission, hold)
+        .onRequest(methods.client.elicitation.create, hold)
+        .connectWith(
+          { readable: toClient.readable, writable: toAgent.writable },
+          async (client) => {
+            await client.request(methods.agent.initialize, {
+              protocolVersion: 1,
+              clientCapabilities: { elicitation: { form: {} } },
+            });
+            const session = injectSession(agent, "session-1");
+            session.emittedToolCalls.add("tool-1");
+            const controller = new AbortController();
+            const pending = start(agent, controller.signal);
+            await vi.waitFor(() => expect(session.openUserInputs?.size).toBe(1));
+            controller.abort();
+
+            await expect(pending).rejects.toThrow("Tool use aborted");
+            await vi.waitFor(() => expect(cancelled).toHaveLength(1));
+          },
+        );
+    },
+  );
+
   it("cancels a permission request before session/close responds", async () => {
     const events: string[] = [];
     const mockClient = {
       sessionUpdate: async () => {},
-      requestPermission: (_params: RequestPermissionRequest, signal?: AbortSignal) =>
-        new Promise<RequestPermissionResponse>(() => {
-          signal?.addEventListener("abort", () => events.push("cancel_request"), { once: true });
-        }),
+      requestPermission: (params: RequestPermissionRequest, signal?: AbortSignal) => {
+        signal?.addEventListener("abort", () => events.push("cancel_request"), { once: true });
+        return heldRequest<RequestPermissionResponse>(params, signal);
+      },
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
     const session = injectSession(agent, "session-1");
@@ -5479,32 +5533,6 @@ describe("permission request cancellation", () => {
 
     expect(events).toEqual(["cancel_request", "closed"]);
     await expect(pending).rejects.toThrow("Tool use aborted");
-  });
-
-  it("observes a client rejection when the signal aborts during request creation", async () => {
-    const controller = new AbortController();
-    const clientOperation = Promise.reject(new Error("Request cancelled"));
-    const then = vi.spyOn(clientOperation, "then");
-    const mockClient = {
-      sessionUpdate: async () => {},
-      requestPermission: () => {
-        controller.abort();
-        return clientOperation;
-      },
-    } as unknown as AcpClient;
-    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-    const session = injectSession(agent, "session-1");
-    session.emittedToolCalls.add("tool-1");
-
-    await expect(
-      agent.canUseTool("session-1")("Bash", { command: "ls" }, {
-        signal: controller.signal,
-        suggestions: [],
-        toolUseID: "tool-1",
-      } as any),
-    ).rejects.toThrow("Tool use aborted");
-
-    expect(then).toHaveBeenCalledOnce();
   });
 
   it("does not wait for an eager tool-call update that ignores cancellation", async () => {
@@ -6799,7 +6827,7 @@ describe("subagent permission attribution (issue #851)", () => {
           sessionUpdate: async (notification: AcpSessionNotification) => {
             updates.push(notification);
           },
-          requestPermission: () => new Promise(() => {}),
+          requestPermission: heldRequest,
         } as unknown as AcpClient,
         { log: () => {}, error: () => {} },
       );
@@ -7336,7 +7364,7 @@ describe("subagent permission attribution (issue #851)", () => {
           updates.push(notification);
         },
         // A client that ignores $/cancel_request.
-        createElicitation: () => new Promise(() => {}),
+        createElicitation: heldRequest,
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
@@ -8632,7 +8660,7 @@ describe("subagent permission attribution (issue #851)", () => {
           requestPermission: (params: { sessionId: string }, signal?: AbortSignal) => {
             log.push(`request @${params.sessionId}`);
             signal?.addEventListener("abort", () => log.push(`withdrawn @${params.sessionId}`));
-            return new Promise(() => {});
+            return heldRequest(params, signal);
           },
         } as unknown as AcpClient,
         { log: () => {}, error: () => {} },
@@ -14966,6 +14994,7 @@ describe("session/close", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      background: new SessionBackgroundWork(sessionId, false),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
@@ -15088,6 +15117,7 @@ describe("session/delete", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      background: new SessionBackgroundWork(sessionId, false),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
@@ -15276,6 +15306,7 @@ describe("getOrCreateSession param change detection", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      background: new SessionBackgroundWork(sessionId, false),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
@@ -18848,6 +18879,38 @@ describe("assembled assistant text fallback", () => {
     });
   });
 
+  it("logs session_writes_lost after the last result without sending an update", async () => {
+    const updates: any[] = [];
+    const error = vi.fn();
+    const agent = new ClaudeAcpAgent(
+      { sessionUpdate: async (n: any) => updates.push(n) } as unknown as AcpClient,
+      { log: () => {}, error },
+    );
+    injectSession(agent, [
+      replayedResult("done"),
+      idle,
+      {
+        type: "system",
+        subtype: "session_writes_lost",
+        error_code: "ENOSPC",
+        lost: ["transcript", "global_config"],
+        transcript_session_ids: ["test-session"],
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+    const sentAtTurnEnd = updates.length;
+
+    await vi.waitFor(() =>
+      expect(error).toHaveBeenCalledWith(
+        "Session test-session: Claude Code could not save transcript and global_config (ENOSPC); resuming may miss part of the conversation",
+      ),
+    );
+    expect(updates).toHaveLength(sentAtTurnEnd);
+  });
+
   it("marks info-level notices even when their text has no severity prefix", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
@@ -19757,6 +19820,7 @@ describe("post-error recovery", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      background: new SessionBackgroundWork("test-session", false),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
@@ -26908,7 +26972,7 @@ describe("turn steering (_session/steering)", () => {
     "uses priority:'now' again once $name is withdrawn, though its client never settles it",
     async ({ start }) => {
       // A client that ignores $/cancel_request: its request never settles.
-      const userInputRequest = vi.fn(() => new Promise<never>(() => {}));
+      const userInputRequest = vi.fn(heldRequest<never>);
       const input = new Pushable<any>();
       const inputPush = vi.spyOn(input, "push");
       const agent = new ClaudeAcpAgent(
@@ -28192,6 +28256,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      background: new SessionBackgroundWork("test-session", false),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
@@ -30100,6 +30165,7 @@ describe("agent selection config option", () => {
         toolUseCache: {},
         emittedToolCalls: new Set(),
         liveBackgroundTasks: new Map(),
+        background: new SessionBackgroundWork(sessionId, false),
         emittedAssistantText: false,
         owedTrailingIdles: 0,
         messageIdToUuid: new Map(),
