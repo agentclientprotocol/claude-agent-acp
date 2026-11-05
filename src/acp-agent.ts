@@ -2181,6 +2181,12 @@ const SESSION_ENDED_MESSAGE = "The Claude Agent session has ended. Please start 
 // message and without invoking the model.
 const LOCAL_ONLY_COMMANDS = new Set(["/context", "/heapdump", "/extra-usage"]);
 
+const IGNORED_UNTYPED_SYSTEM_SUBTYPES = new Set([
+  "task_summary",
+  "post_turn_summary",
+  "permission_check_status",
+]);
+
 // Commands whose marker-only transcript records are ACP/client-local UI noise,
 // not model-visible user prompts. Marker-only custom slash skills are not in
 // this list, so replay can reconstruct them from `<command-name>`/`<command-args>`.
@@ -6204,6 +6210,14 @@ export class ClaudeAcpAgent {
         if ((message as { type: string }).type === "active_goal") {
           const activeGoal = message as unknown as SDKActiveGoalMessage;
           await this.publishRuntimeGoal(params.sessionId, toGoalSnapshot(activeGoal));
+          continue;
+        }
+
+        // CLI-internal status frames, absent from the SDKMessage union; nothing to show in ACP.
+        if (
+          message.type === "system" &&
+          IGNORED_UNTYPED_SYSTEM_SUBTYPES.has((message as { subtype: string }).subtype)
+        ) {
           continue;
         }
 

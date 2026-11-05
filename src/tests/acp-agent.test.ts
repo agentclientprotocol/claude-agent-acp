@@ -11318,6 +11318,57 @@ describe("stop reason propagation", () => {
     expect(errors.filter((e) => e.includes("Unexpected case"))).toEqual([]);
   });
 
+  it.each([
+    { subtype: "task_summary", detail: "Check the form fields" },
+    {
+      subtype: "post_turn_summary",
+      summarizes_uuid: "0ff53e5d-9d50-4cad-99ac-e31c50c7895b",
+      status_category: "blocked",
+      status_detail: "Which option?",
+      needs_action: "Which option?",
+    },
+    {
+      subtype: "permission_check_status",
+      tool_use_id: "toolu_01VYq2AZXww7ZN1vt4jzmgSL",
+      agent_id: "a33228b5914f2f21c",
+      status: "checking",
+    },
+  ])(
+    "ignores untyped system $subtype frames without logging an unexpected-case error",
+    async (frame) => {
+      const errors: string[] = [];
+      const mockClient = { sessionUpdate: async () => {} } as unknown as AcpClient;
+      const agent = new ClaudeAcpAgent(mockClient, {
+        log: () => {},
+        error: (msg: unknown) => errors.push(String(msg)),
+      });
+
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const { value: userMessage } = await iter.next();
+          yield userEcho(userMessage);
+          yield { type: "system", ...frame, uuid: randomUUID(), session_id: "test-session" };
+          yield createResultMessage({
+            subtype: "success",
+            stop_reason: "end_turn",
+            is_error: false,
+          });
+          yield { type: "system", subtype: "session_state_changed", state: "idle" };
+        }
+        return messageGenerator();
+      });
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "test" }],
+      });
+
+      expect(response.stopReason).toBe("end_turn");
+      expect(errors.filter((e) => e.includes("Unexpected case"))).toEqual([]);
+    },
+  );
+
   it("treats the command_lifecycle 'refused' state (2.1.238+) as terminal, not unknown", async () => {
     // A cross-session peer message declined by the session's receive-side
     // policy gets a terminal `refused` frame instead of no frames at all.
