@@ -30206,6 +30206,61 @@ describe("agent selection config option", () => {
   });
 });
 
+describe("rate_limit_event", () => {
+  it("rides on the next usage_update when it comes before the turn's first assistant frame", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => {
+          updates.push(notification);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    const rateLimit = { status: "allowed", resetsAt: 1700000000, rateLimitType: "seven_day" };
+    const usage = {
+      input_tokens: 10,
+      output_tokens: 5,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    };
+    injectGeneratorSession(agent, async function* (input) {
+      const { value } = await input[Symbol.asyncIterator]().next();
+      yield userEcho(value);
+      yield {
+        type: "rate_limit_event",
+        rate_limit_info: rateLimit,
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      yield {
+        type: "assistant",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+        message: {
+          id: "msg_rate",
+          role: "assistant",
+          model: "claude-sonnet-4-20250514",
+          content: [{ type: "text", text: "ok" }],
+          usage,
+        },
+      };
+      yield successfulResultMessage({ usage });
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    const usageMetas = updates
+      .map((notification) => notification.update)
+      .filter((update) => update.sessionUpdate === "usage_update")
+      .map((update) => update._meta?.["_claude/rateLimit"]);
+    expect(usageMetas[0]).toEqual(rateLimit);
+    expect(usageMetas.slice(1)).toEqual(usageMetas.slice(1).map(() => undefined));
+  });
+});
+
 describe("the SDK session id of a fresh Claude context", () => {
   // After a clear-context restart the SDK runs under a new session id, and
   // every SDK message carries it. The client knows only the ACP session id.
