@@ -81,6 +81,10 @@ const sdk = vi.hoisted(() => ({
     requiresUserAction: false,
     callbackExpected: false,
   }),
+  /** The query's `enableRemoteControl`. Unset leaves it off the query, which
+   *  also keeps `/remote-control` out of the session's commands. */
+  enableRemoteControl: undefined as
+    ((enabled: boolean, name?: string) => Promise<{ session_url?: string }>) | undefined,
 }));
 const sdkDefaults = { ...sdk };
 
@@ -95,6 +99,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
       sdk.queryOptions.push(options);
       // The agent reads the query with `next()`, so it is the generator itself.
       const messages = sdk.run(prompt, options);
+      const { enableRemoteControl } = sdk;
       const controls = makeMockQuery({
         [Symbol.asyncIterator]: () => messages,
         initializationResult: () => sdk.initializationResult(),
@@ -104,6 +109,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         interrupt: () => sdk.interrupt(),
         stopTask: (taskId: string) => sdk.stopTask(taskId),
         close: () => sdk.close(),
+        ...(enableRemoteControl ? { enableRemoteControl } : {}),
       });
       return Object.assign(messages, controls);
     },
@@ -496,6 +502,44 @@ describe("ACP v2 sessions", () => {
     expect(response).not.toHaveProperty("availableCommands");
     expect(client.updates("available_commands_update")).toEqual([
       { sessionUpdate: "available_commands_update", availableCommands: SESSION_COMMANDS },
+    ]);
+  });
+
+  it("starts Remote Control after the response when Claude Code asks for it", async () => {
+    const initialization = sdkDefaults.initializationResult;
+    sdk.initializationResult = async () => ({
+      ...(await initialization()),
+      remote_control_auto_enable: true,
+    });
+    const enableRemoteControl = vi.fn(async () => ({
+      session_url: "https://claude.ai/code/session_123",
+    }));
+    sdk.enableRemoteControl = enableRemoteControl;
+    // The query stream stays open, as Claude Code's does.
+    sdk.run = async function* () {
+      await new Promise<never>(() => {});
+      yield* [];
+    };
+    const client = v2Client();
+    const noticesAtResponse = await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      await agent.request(v2.methods.agent.session.new, { cwd });
+      const atResponse = client.updates("notice").length;
+      await vi.waitFor(() => expect(client.updates("notice")).toHaveLength(1));
+      await client.authUpdate(1);
+      return atResponse;
+    });
+
+    expect(noticesAtResponse).toBe(0);
+    expect(enableRemoteControl).toHaveBeenCalledExactlyOnceWith(true);
+    expect(client.updates("notice")).toEqual([
+      {
+        sessionUpdate: "notice",
+        severity: "info",
+        title: "Remote Control connected",
+        description:
+          "Continue this session from claude.ai/code or the Claude mobile app: https://claude.ai/code/session_123\nRun /remote-control off to disconnect.",
+      },
     ]);
   });
 
