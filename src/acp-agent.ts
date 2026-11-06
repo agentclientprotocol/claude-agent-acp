@@ -4660,6 +4660,8 @@ export class ClaudeAcpAgent {
     let lastAssistantTotalUsage: number | null = null;
     let lastAssistantUsage: UsageSnapshot | null = null;
     let lastAssistantModel: string | null = null;
+    // A rate_limit_event that came before the turn had any usage to report.
+    let pendingRateLimit: unknown = null;
     // When the Claude SDK classifies a turn as failed (e.g. rate limit, auth
     // problem, billing), it sets a categorical `error` field on the
     // `SDKAssistantMessage` that precedes the final `result` message. We capture
@@ -4967,7 +4969,8 @@ export class ClaudeAcpAgent {
     };
 
     // ACP's usage_update has no model field, so the model the usage belongs
-    // to rides in `_meta` alongside the other `_claude/*` keys.
+    // to rides in `_meta` alongside the other `_claude/*` keys, as does a
+    // pending rate limit.
     const attachUsageModel = <
       T extends {
         sessionUpdate: "usage_update";
@@ -4978,6 +4981,13 @@ export class ClaudeAcpAgent {
     >(
       update: T,
     ): T => {
+      if (pendingRateLimit !== null) {
+        update = {
+          ...update,
+          _meta: { "_claude/rateLimit": pendingRateLimit, ...(update._meta ?? {}) },
+        };
+        pendingRateLimit = null;
+      }
       if (!lastAssistantModel) return update;
       return {
         ...update,
@@ -8688,7 +8698,11 @@ export class ClaudeAcpAgent {
           }
           case "rate_limit_event": {
             session.idleCompaction?.noteRateLimit(message.rate_limit_info);
-            if (lastAssistantTotalUsage !== null) {
+            // With partial messages on, the SDK sends this before the turn's
+            // first assistant frame, while there is no usage yet to send it with.
+            if (lastAssistantTotalUsage === null) {
+              pendingRateLimit = message.rate_limit_info;
+            } else {
               await sendUpdate({
                 sessionId: params.sessionId,
                 update: attachUsageModel({
