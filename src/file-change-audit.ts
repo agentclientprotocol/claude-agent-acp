@@ -67,6 +67,10 @@ export type NativeFileChangeReporter = {
     state: FileChangeReportTurnState | undefined,
     reason: FileChangeReportUnavailableReason,
   ): void;
+  /** Retargets the workspace root to a directory the session moved to
+   *  (see `moveSessionCwd`), so the reports of later turns keep the paths of
+   *  the files edited there. */
+  setWorkspace(cwd: string): void;
 };
 
 export function agentFileChangeReportRequestId(meta: unknown): string | undefined {
@@ -136,7 +140,7 @@ export function recordSubagentFileEdits(
 export function createNativeFileChangeReporter(
   options: NativeFileChangeReporterOptions,
 ): NativeFileChangeReporter {
-  const workspace = normalizeWorkspace(options.cwd, options.additionalDirectories);
+  let workspace = normalizeWorkspace(options.cwd, options.additionalDirectories);
   const timeoutMs = options.timeoutMs ?? AGENT_FILE_CHANGE_REPORT_TIMEOUT_MS;
   const requestIds = new Set<string>();
 
@@ -243,6 +247,9 @@ export function createNativeFileChangeReporter(
     finish(state, reason) {
       if (!state) return;
       void finishUnavailable(state, reason);
+    },
+    setWorkspace(cwd) {
+      workspace = normalizeWorkspace(cwd, options.additionalDirectories);
     },
   };
 }
