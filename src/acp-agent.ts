@@ -4126,12 +4126,27 @@ export class ClaudeAcpAgent {
     }
 
     // A rewind that started during the awaits above did not see this prompt,
-    // which is not queued yet, and closes the query it was set up on. Before
-    // the prompt claims its file-change report and title, so the retry does.
-    const lateRewind = this.sessionRewinds.get(params.sessionId);
-    if (lateRewind) {
+    // which is not queued yet, and closes the query it was set up on. The
+    // prompt goes on with the session the rewind leaves, before it claims its
+    // file-change report and title. Only the subscription guard runs again:
+    // it is per query.
+    for (
+      let lateRewind = this.sessionRewinds.get(params.sessionId);
+      lateRewind;
+      lateRewind = this.sessionRewinds.get(params.sessionId)
+    ) {
       await lateRewind;
-      return this.startTurn(params, events, origin);
+      // A `session/cancel` sent while the prompt waited ends it.
+      if (received <= (this.cancelledThrough.get(params.sessionId) ?? 0)) {
+        events.ended({ stopReason: "cancelled" });
+        return;
+      }
+      const rewound = this.sessions[params.sessionId];
+      if (!rewound) throw RequestError.sessionNotFound(params.sessionId);
+      session = rewound;
+      if (session.queryClosed) throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+      const guard = this.runClaudeSubscriptionGuard(params.sessionId, session);
+      if (guard) await guard;
     }
 
     const userMessage = promptToClaude(params);

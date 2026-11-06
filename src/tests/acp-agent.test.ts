@@ -31257,30 +31257,53 @@ describe("_session/rewind", () => {
     expect(importSessionToStore).not.toHaveBeenCalled();
   });
 
-  it("starts a prompt over on the new query when a rewind starts during its setup", async () => {
-    const { agent } = rewindingAgent({
+  /** An agent whose prompt awaits `publishTaskPlan`, during which a rewind starts. */
+  function rewindDuringPromptSetup() {
+    const fixture = rewindingAgent({
       taskState: new Map([["task-1", { subject: "ship it", status: "pending" }]]),
     });
-    const original = agent.sessions["s"];
+    const { agent } = fixture;
     storedConversation();
-    let rewind: Promise<unknown> | undefined;
-    vi.spyOn(agent as any, "publishTaskPlan").mockImplementation(async () => {
-      // The rewind starts while the prompt awaits, before it is queued.
-      rewind ??= agent.rewindSession({ sessionId: "s", beforeMessage: droppedPrompt });
-    });
-    const promptedOn: unknown[] = [];
-    vi.spyOn(agent as any, "respawnSignedOutSession").mockImplementation((_id, session) => {
-      promptedOn.push(session);
-      if (promptedOn.length > 1) throw new Error("stop the prompt here");
+    const started: { rewind?: Promise<unknown> } = {};
+    const publishTaskPlan = vi
+      .spyOn(agent as any, "publishTaskPlan")
+      .mockImplementation(async () => {
+        // The prompt is set up but not queued, so the rewind does not see it.
+        started.rewind ??= agent.rewindSession({ sessionId: "s", beforeMessage: droppedPrompt });
+      });
+    return { ...fixture, started, publishTaskPlan };
+  }
+
+  it("goes on with the session a rewind leaves when it starts during the prompt's setup", async () => {
+    const { agent, started, publishTaskPlan } = rewindDuringPromptSetup();
+    const original = agent.sessions["s"];
+    const guardedOn: unknown[] = [];
+    vi.spyOn(agent as any, "runClaudeSubscriptionGuard").mockImplementation((_id, session) => {
+      guardedOn.push(session);
+      if (guardedOn.length > 1) throw new Error("stop the prompt here");
       return undefined;
     });
 
     await expect(
       agent.prompt({ sessionId: "s", prompt: [{ type: "text", text: "edited" }] }),
     ).rejects.toThrow("stop the prompt here");
-    expect(await rewind).toEqual({ rewound: true });
-    expect(promptedOn).toEqual([original, agent.sessions["s"]]);
-    expect(promptedOn[1]).not.toBe(original);
+    expect(await started.rewind).toEqual({ rewound: true });
+    // The guard is per query, so it runs again on the new one; nothing else does.
+    expect(guardedOn).toEqual([original, agent.sessions["s"]]);
+    expect(guardedOn[1]).not.toBe(original);
+    expect(publishTaskPlan).toHaveBeenCalledTimes(1);
+  });
+
+  it("ends a prompt cancelled while it waits for a rewind that started during its setup", async () => {
+    const { agent, started } = rewindDuringPromptSetup();
+
+    const prompted = agent.prompt({ sessionId: "s", prompt: [{ type: "text", text: "edited" }] });
+    await vi.waitFor(() => expect(started.rewind).toBeDefined());
+    await agent.cancel({ sessionId: "s" });
+
+    expect(await prompted).toMatchObject({ stopReason: "cancelled" });
+    expect(await started.rewind).toEqual({ rewound: true });
+    expect(agent.sessions["s"]!.turnQueue ?? []).toEqual([]);
   });
 
   it("reports an unknown session rather than rewinding nothing", async () => {
