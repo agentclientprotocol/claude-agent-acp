@@ -5,8 +5,9 @@
  * "Background work").
  *
  * The lists are built from Claude Code's live background task set
- * (`background_tasks_changed`), without the tasks it marks `ambient`, which
- * are housekeeping that it started on its own. The root session and each
+ * (`background_tasks_changed`). Claude Code marks `ambient` its own
+ * housekeeping and every live-update watcher; those are left out, except a
+ * task that a tool call started, such as a `Monitor` call's. The root session and each
  * announced subagent session (the subagents RFD form) has its own list. Each
  * task is listed once, in the list of the session that runs it:
  *
@@ -166,7 +167,11 @@ export class SessionBackgroundWork {
    *   `Monitor` or `Workflow` call, whose structured result names its task,
    *   or a call that a live task names as its tool use, such as a
    *   backgrounded MCP call. The task must be in the level: one that ended
-   *   already, or that Claude Code marks `ambient`, leaves its call as it is.
+   *   already leaves its call as it is. Claude Code marks every live-update
+   *   watcher `ambient`, including the task of a `Monitor` call; a call
+   *   started it, so it is work the client can see and stop, and is
+   *   registered all the same. Ambient tasks without a call of their own,
+   *   such as watchers Claude Code starts by itself, are never registered.
    *
    * Returns the ids of the registered calls, whose result then reports
    * `in_progress` (see `withRunningToolCall`).
@@ -210,12 +215,7 @@ export class SessionBackgroundWork {
           ([, task]) => task.parentToolUseId === toolCallId && !task.isSubagent,
         )?.[0];
       const task = taskId === undefined ? undefined : this.level.get(taskId);
-      if (
-        !task ||
-        task.ambient ||
-        task.taskType === "local_bash" ||
-        task.taskType === "local_agent"
-      ) {
+      if (!task || task.taskType === "local_bash" || task.taskType === "local_agent") {
         continue;
       }
       this.toolCalls.set(taskId!, {
@@ -363,19 +363,21 @@ export class SessionBackgroundWork {
     const ownerOf = (parentToolUseId: string | undefined) =>
       parentToolUseId ? childByToolUse.get(parentToolUseId)?.sessionId : this.sessionId;
     for (const [taskId, task] of this.level) {
+      // A registered call's task is listed even when ambient, as a `Monitor`
+      // call's is (see `toolResults`).
+      const toolCall = this.toolCalls.get(taskId);
+      if (toolCall) {
+        const session = ownerOf(toolCall.parentToolUseId);
+        if (session)
+          lists.get(session)!.push({ type: "tool_call", toolCallId: toolCall.toolCallId });
+        continue;
+      }
       if (task.ambient) continue;
       const terminal = this.terminals.get(taskId);
       if (terminal) {
         const session = ownerOf(terminal.parentToolUseId);
         if (session)
           lists.get(session)!.push({ type: "terminal", terminalId: terminal.toolCallId });
-        continue;
-      }
-      const toolCall = this.toolCalls.get(taskId);
-      if (toolCall) {
-        const session = ownerOf(toolCall.parentToolUseId);
-        if (session)
-          lists.get(session)!.push({ type: "tool_call", toolCallId: toolCall.toolCallId });
         continue;
       }
       // A command without a terminal yet is one that foreground work waits on.
