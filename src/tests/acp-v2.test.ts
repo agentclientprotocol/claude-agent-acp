@@ -5879,10 +5879,13 @@ describe("ACP v2 terminal of a command in the background", () => {
     });
 
     describe("a task that a tool call started", () => {
+      // Claude Code marks every live-update watcher ambient, a requested
+      // Monitor's task included.
       const monitor = {
         task_id: "mon1",
         task_type: "local_monitor",
         description: "Watch the logs",
+        ambient: true,
       };
       const workflow = { task_id: "wf1", task_type: "local_workflow", description: "Review" };
       /** A Monitor call whose task `mon1` runs on after the call returns. The
@@ -6107,25 +6110,34 @@ describe("ACP v2 terminal of a command in the background", () => {
         });
       });
 
-      it("lists a task without such a call as a _claude/task item", async () => {
-        scriptTurns(async function* (options) {
-          yield level(options, [monitor]);
-          // No tool call started it, such as a task that a hook started.
-          yield taskEvent(options, "task_started", monitor);
-          yield result(options);
-          yield idleState(options);
-        });
-        const client = await promptUntil("idle end_turn [_claude/task]");
+      // No tool call started these, such as tasks that a hook started.
+      it.each([
+        {
+          task: workflow,
+          trace: ["running []", "running [_claude/task]", "idle end_turn [_claude/task]"],
+          background: [{ type: "_claude/task", taskId: "wf1", description: "Review" }],
+        },
+        // A watcher Claude Code started by itself is housekeeping.
+        {
+          task: monitor,
+          trace: ["running []", "idle end_turn []"],
+          background: [],
+        },
+      ])(
+        "lists a $task.task_type task without such a call unless it is ambient",
+        async ({ task, trace, background }) => {
+          scriptTurns(async function* (options) {
+            yield level(options, [task]);
+            yield taskEvent(options, "task_started", task);
+            yield result(options);
+            yield idleState(options);
+          });
+          const client = await promptUntil(trace.at(-1)!);
 
-        expect(backgroundTrace(client)).toEqual([
-          "running []",
-          "running [_claude/task]",
-          "idle end_turn [_claude/task]",
-        ]);
-        expect(client.updates("state_update").at(-1)).toMatchObject({
-          background: [{ type: "_claude/task", taskId: "mon1", description: "Watch the logs" }],
-        });
-      });
+          expect(backgroundTrace(client)).toEqual(trace);
+          expect(client.updates("state_update").at(-1)).toMatchObject({ background });
+        },
+      );
     });
 
     it("rejects terminal/cancel with -32602 when the command ends before Claude Code stops it", async () => {
