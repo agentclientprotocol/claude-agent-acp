@@ -9,7 +9,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import type { NewSessionRequest } from "@agentclientprotocol/sdk";
+import type { NewSessionRequest } from "@agentclientprotocol/sdk/unstable";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
 
@@ -48,6 +48,7 @@ describe("session hooks with the Claude Code binary", () => {
   let agent: ClaudeAcpAgent;
   let env: Record<string, string | undefined>;
   let settingsFiles: Record<string, string>;
+  const requests: Array<{ model: string; output_config?: { effort?: string } }> = [];
   let logCursor = 0;
 
   /** A SessionStart hook that writes `tag` to the log. */
@@ -111,12 +112,14 @@ describe("session hooks with the Claude Code binary", () => {
     vi.stubEnv("CLAUDE_CONFIG_DIR", path.join(home, ".claude"));
 
     server = http.createServer((req, res) => {
-      req.resume();
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
       req.on("end", () => {
         if (req.url?.startsWith("/v1/messages/count_tokens")) {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({ input_tokens: 1 }));
         } else if (req.url?.startsWith("/v1/messages")) {
+          requests.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
           res.writeHead(200, { "content-type": "text/event-stream" });
           res.end(REPLY);
         } else {
@@ -149,6 +152,65 @@ describe("session hooks with the Claude Code binary", () => {
     // The CLI may still write the transcript of the last session after dispose.
     if (root) await rm(root, { recursive: true, force: true, maxRetries: 10 });
   });
+
+  it("preserves current settings and hooks after a provider refresh", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("not found", { status: 404 })),
+    );
+    const sessions: string[] = [];
+    const provider = {
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: env!.ANTHROPIC_BASE_URL!,
+    };
+    try {
+      await agent.unstable_setProvider(provider);
+      for (const persisted of [true, false]) {
+        const { sessionId } = await agent.newSession({ cwd, mcpServers: [], _meta: meta("ide") });
+        sessions.push(sessionId);
+        if (persisted) {
+          await finishTurn(sessionId);
+          await hooksSinceLastCheck();
+        }
+        const session = agent.sessions[sessionId];
+        const target = session.modelInfos.find(
+          (model) => model.value !== session.models.currentModelId && model.supportsEffort,
+        );
+        expect(target).toBeDefined();
+        await agent.setSessionConfigOption({ sessionId, configId: "model", value: target!.value });
+        await agent.setSessionConfigOption({ sessionId, configId: "effort", value: "high" });
+      }
+
+      await vi.waitFor(async () => {
+        expect((await readFile(log, "utf8")).split("\n").filter(Boolean)).toHaveLength(6);
+      });
+      expect(await hooksSinceLastCheck()).toEqual(["ide", "project", "user"]);
+      await agent.unstable_setProvider(provider);
+
+      for (const sessionId of sessions) {
+        const session = agent.sessions[sessionId];
+        const model = session.modelInfos.find(
+          (info) => info.value === session.models.currentModelId,
+        )!;
+        await finishTurn(sessionId);
+        expect(requests.at(-1)?.model).toBe(model.resolvedModel ?? model.value);
+        expect(requests.at(-1)?.output_config?.effort).toBe("high");
+      }
+      expect(await hooksSinceLastCheck()).toEqual([
+        "ide",
+        "ide",
+        "project",
+        "project",
+        "user",
+        "user",
+      ]);
+    } finally {
+      await Promise.all(sessions.map((sessionId) => agent.closeSession({ sessionId })));
+      await agent.unstable_disableProvider({ providerId: "main" });
+      vi.unstubAllGlobals();
+    }
+  }, 60_000);
 
   // With CLAUDE_MODEL_CONFIG, the adapter passes the merged settings inline.
   for (const modelConfig of [

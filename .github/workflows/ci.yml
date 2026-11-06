@@ -27,6 +27,7 @@ jobs:
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: "lts/*"
+          check-latest: true
           cache: "npm"
 
       - name: Install dependencies
@@ -43,3 +44,7 @@ jobs:
 
       - name: Run tests
         run: npm run test:run
+
+  binaries:
+    name: Binaries
+    uses: ./.github/workflows/binaries.yml

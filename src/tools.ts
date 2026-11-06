@@ -3,7 +3,7 @@ import type {
   ToolCallContent,
   ToolCallLocation,
   ToolKind,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import type {
   TaskCreateInput,
@@ -278,11 +278,14 @@ export function applyTaskCreate(
 ): void {
   const taskId = output?.task?.id;
   if (!taskId || !input) return;
+  // The output holds the task as saved, which differs from the input when
+  // Claude Code corrects a malformed call or a PreToolUse hook changes it.
+  // `description` is in outputs since CLI 2.1.317.
   state.set(taskId, {
-    subject: input.subject,
+    subject: output.task.subject ?? input.subject,
     status: "pending",
     activeForm: input.activeForm,
-    description: input.description,
+    description: output.task.description ?? input.description,
   });
 }
 
@@ -431,7 +434,7 @@ export const createPostToolUseHook =
   async (input: any, toolUseID: string | undefined): Promise<{ continue: boolean }> => {
     if (input.hook_event_name === "PostToolUse") {
       // Handle EnterPlanMode tool - notify client of mode change after successful execution
-      if (input.tool_name === "EnterPlanMode" && options?.onEnterPlanMode) {
+      if (input.tool_name === "EnterPlanMode" && !input.agent_id && options?.onEnterPlanMode) {
         await options.onEnterPlanMode();
       }
 

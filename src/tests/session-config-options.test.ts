@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { SessionNotification } from "@agentclientprotocol/sdk";
+import { SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
 import { makeMockQuery } from "./helpers.js";
@@ -193,7 +193,7 @@ describe("session config options", () => {
           configId: "mode",
           value: "plan",
         }),
-      ).rejects.toThrow("Session not found");
+      ).rejects.toMatchObject({ code: -32002, data: { sessionId: "nonexistent" } });
     });
 
     it("throws when config option not found", async () => {
@@ -203,7 +203,10 @@ describe("session config options", () => {
           configId: "unknown-option",
           value: "some-value",
         }),
-      ).rejects.toThrow("Unknown config option: unknown-option");
+      ).rejects.toMatchObject({
+        code: -32602,
+        message: expect.stringContaining("Unknown config option: unknown-option"),
+      });
     });
 
     it("throws when value is not valid for the option", async () => {
@@ -213,7 +216,10 @@ describe("session config options", () => {
           configId: "mode",
           value: "invalid-mode",
         }),
-      ).rejects.toThrow("Invalid value for config option mode: invalid-mode");
+      ).rejects.toMatchObject({
+        code: -32602,
+        message: expect.stringContaining("Invalid value for config option mode: invalid-mode"),
+      });
     });
 
     it("rejects mode and config changes once the query stream has closed (husk session)", async () => {
@@ -331,7 +337,25 @@ describe("session config options", () => {
           configId: "model",
           value: "gpt-4",
         }),
-      ).rejects.toThrow("Invalid value for config option model: gpt-4");
+      ).rejects.toMatchObject({
+        code: -32602,
+        message: expect.stringContaining("Invalid value for config option model: gpt-4"),
+      });
+    });
+
+    it("rejects a non-string value for a select option with invalid params", async () => {
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: SESSION_ID,
+          configId: "mode",
+          type: "boolean",
+          value: true,
+        }),
+      ).rejects.toMatchObject({ code: -32602 });
+    });
+
+    it("closes an unknown session without an error", async () => {
+      await expect(agent.closeSession({ sessionId: "nonexistent" })).resolves.toEqual({});
     });
 
     it("returns full configOptions in the response", async () => {
@@ -1094,16 +1118,23 @@ describe("session config options", () => {
       expect(setModelSpy).toHaveBeenCalledWith("sonnet[1m]");
     });
 
-    // A session can be running a model with no picker entry (resumed onto a
-    // model excluded by the availableModels allowlist, or a refusal
-    // fallback); its verbatim id is then the option's currentValue. A client
-    // round-tripping that reported value must not get "Invalid value".
-    it("accepts the reported currentValue even when it has no options entry", async () => {
+    // A session can run a model with no picker entry (resumed onto a model
+    // excluded by the availableModels allowlist, or a refusal fallback). The
+    // model option lists it while it is current, so a client can send it back,
+    // and drops it once the session switches to a listed model.
+    it("lists an off-list current model until the session switches away", async () => {
+      const { buildModelConfigOption } = await import("../session-model.js");
       const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
       session.models = { ...session.models, currentModelId: "claude-offlist-9" };
+      session.modelInfos = [
+        ...session.modelInfos,
+        { value: "claude-offlist-9", displayName: "claude-offlist-9", description: "" },
+      ];
       session.configOptions = session.configOptions.map((o: { id: string }) =>
-        o.id === "model" ? { ...o, currentValue: "claude-offlist-9" } : o,
+        o.id === "model" ? buildModelConfigOption(session.models, session.modelInfos, false) : o,
       );
+      const modelValues = (options: any[] | undefined) =>
+        options?.find((o) => o.id === "model")?.options.map((o: { value: string }) => o.value);
 
       const response = await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
@@ -1115,6 +1146,25 @@ describe("session config options", () => {
       expect(response.configOptions?.find((o) => o.id === "model")?.currentValue).toBe(
         "claude-offlist-9",
       );
+      expect(modelValues(response.configOptions)).toEqual([
+        "claude-opus-4-5",
+        "claude-sonnet-4-6",
+        "claude-offlist-9",
+      ]);
+
+      const switched = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+      expect(modelValues(switched.configOptions)).toEqual(["claude-opus-4-5", "claude-sonnet-4-6"]);
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: SESSION_ID,
+          configId: "model",
+          value: "claude-offlist-9",
+        }),
+      ).rejects.toThrow("Invalid value");
     });
 
     it("setSessionMode also syncs configOptions", async () => {

@@ -19,7 +19,10 @@ import { fullFormats } from "ajv-formats/dist/formats.js";
 import type { Recorded, WireRecorded } from "./harness.js";
 
 const require = createRequire(import.meta.url);
-const schema = require("@agentclientprotocol/sdk/schema/schema.json") as Record<string, unknown>;
+const schema = require("@agentclientprotocol/sdk/schema/v1/schema.unstable.json") as Record<
+  string,
+  unknown
+>;
 const v2Schema = require("@agentclientprotocol/sdk/schema/v2/schema.unstable.json") as {
   $defs: Record<string, { "x-method"?: string; "x-side"?: string }>;
 };

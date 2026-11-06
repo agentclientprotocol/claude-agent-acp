@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { deriveActivity, selectCost } from "../session-index/activity.js";
-import { LiveSessionRegistry } from "../session-index/live-registry.js";
+import { deriveActivity, selectCost, type ActivityState } from "../session-index/activity.js";
+import { LiveSessionRegistry, type LiveRecord } from "../session-index/live-registry.js";
 import {
   encodeProjectPath,
   isSessionId,
@@ -271,6 +271,15 @@ describe("activity", () => {
     hasMessages: true,
     ...overrides,
   });
+  /** An interactive CLI that holds the session. */
+  const live = (status: string, entrypoint = "cli", statusUpdatedAt = now): LiveRecord => ({
+    pid: 1,
+    sessionId: "s",
+    kind: "interactive",
+    entrypoint,
+    status,
+    statusUpdatedAt,
+  });
 
   it("reports the SDK state of a session this connection runs", () => {
     expect(
@@ -316,14 +325,6 @@ describe("activity", () => {
     expect(again.lastTurnError).toBeUndefined();
     expect(deriveActivity({ facts: again, ...at })?.state).toBe("idle");
     // A busy or waiting CLI wins; an idle one shows the error.
-    const live = (status: string) => ({
-      pid: 1,
-      sessionId: "s",
-      kind: "interactive",
-      entrypoint: "cli",
-      status,
-      statusUpdatedAt: now,
-    });
     const held = { facts: errorFacts, transcriptMtimeMs: now - 1, now };
     expect(deriveActivity({ live: live("busy"), ...held })?.state).toBe("running");
     expect(deriveActivity({ live: live("waiting"), ...held })?.state).toBe("requires_action");
@@ -432,6 +433,34 @@ describe("activity", () => {
         facts: facts({ turnState: "unfinished" }),
       }),
     ).toBeUndefined();
+  });
+
+  // IJAI-3744
+  describe("with an open background task", () => {
+    const tasks = (open: string[]) => ({ open, stopCalls: [], complete: true });
+    const waiting = facts({ turnState: "finished", backgroundTasks: tasks(["task-1"]) });
+    /** A status older than the transcript, so the transcript decides. */
+    const held = live("busy", "cli", 1);
+    it.each<[string, LiveRecord, TranscriptFacts, ActivityState | undefined]>([
+      ["an SDK-driven CLI is busy", live("busy", "sdk-ts"), waiting, "running"],
+      ["an SDK-driven CLI is idle", live("idle", "sdk-ts"), waiting, "idle"],
+      ["a newer registry status is waiting", live("waiting"), waiting, "requires_action"],
+      ["a newer registry status is idle", live("idle"), waiting, "idle"],
+      ["the turn failed", held, { ...waiting, lastTurnError: true }, "running"],
+      // An unfinished turn that has not written for 10 minutes has no known state.
+      ["the turn is in progress", held, { ...waiting, turnState: "unfinished" }, undefined],
+      ["the task ended", held, { ...waiting, backgroundTasks: tasks([]) }, "idle"],
+    ])("when %s", (_, record, transcriptFacts, expected) => {
+      // The wait does not end after 10 minutes.
+      const transcriptMtimeMs = now - 11 * 60_000;
+      const state = deriveActivity({
+        live: record,
+        facts: transcriptFacts,
+        transcriptMtimeMs,
+        now,
+      })?.state;
+      expect(state).toBe(expected);
+    });
   });
 });
 

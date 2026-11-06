@@ -7,8 +7,10 @@ import type { ToolReporter, ToolResultContext, ToolResultFacts, ToolUseFacts } f
 export class AgentReporter implements ToolReporter {
   toolUse(input: unknown): ToolUseFacts {
     const agent = input as Partial<AgentInput> | undefined;
-    // `effort` is set only when the user asked for one (CLI 2.1.292+).
-    const effort = agent?.effort ? ` (${agent.effort} effort)` : "";
+    // `effort` is set only when the user asked for one (CLI 2.1.292+). A
+    // `subagent_type: "fork"` child ignores it and runs at the parent's effort.
+    const effort =
+      agent?.effort && agent.subagent_type !== "fork" ? ` (${agent.effort} effort)` : "";
     return {
       title: (agent?.description ? agent.description : "Task") + effort,
       kind: "think",

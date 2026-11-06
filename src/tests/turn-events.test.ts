@@ -4,7 +4,10 @@
  * Claude Code: it echoes each prompt, then runs the turn's script.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { RequestPermissionRequest, SessionNotification } from "@agentclientprotocol/sdk";
+import type {
+  RequestPermissionRequest,
+  SessionNotification,
+} from "@agentclientprotocol/sdk/unstable";
 import type { AcpClient, ClaudeAcpAgent } from "../acp-agent.js";
 import type { ForegroundEvents, TurnEvents } from "../turn-events.js";
 import { DEFAULT_CONTEXT_USAGE } from "./helpers.js";
@@ -833,9 +836,9 @@ describe("turn events", () => {
   it("rejects a prompt that it refuses before starting a turn, and reports nothing", async () => {
     const turn = recordEvents();
 
-    await expect(agent.startTurn(prompt("no-such-session", "hello"), turn.events)).rejects.toThrow(
-      "Session not found",
-    );
+    await expect(
+      agent.startTurn(prompt("no-such-session", "hello"), turn.events),
+    ).rejects.toMatchObject({ code: -32002, data: { sessionId: "no-such-session" } });
 
     expect(turn.log).toEqual([]);
   });

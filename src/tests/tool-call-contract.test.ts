@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ClientCapabilities } from "@agentclientprotocol/sdk";
+import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
 import { AcpClient, toAcpNotifications, ToolUseCache } from "../acp-agent.js";
 import { ClientCapabilities as ToolCallCapabilities } from "../tool-calls/client-capabilities.js";
 import { backgroundedBashToolCall, withRunningTerminal } from "../tool-calls/background.js";
@@ -335,6 +335,16 @@ describe("the ACP tool call contract", () => {
   it("shows a requested Agent effort in the title", () => {
     const input = { description: "Explore", prompt: "Inspect", effort: "high" };
     expect(report(terminalAir, "Agent", input).call.title).toBe("Explore (high effort)");
+  });
+
+  it("does not show an effort for a fork, which runs at the parent's effort", () => {
+    const input = {
+      description: "Explore",
+      prompt: "Inspect",
+      effort: "high",
+      subagent_type: "fork",
+    };
+    expect(report(terminalAir, "Agent", input).call.title).toBe("Explore");
   });
 
   it("reports TodoWrite as a plan, not as a tool call", () => {

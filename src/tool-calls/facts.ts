@@ -1,4 +1,8 @@
-import type { ToolCallContent, ToolCallLocation, ToolKind } from "@agentclientprotocol/sdk";
+import type {
+  ToolCallContent,
+  ToolCallLocation,
+  ToolKind,
+} from "@agentclientprotocol/sdk/unstable";
 import type { ClientCapabilities } from "./client-capabilities.js";
 
 /** A tool use as the SDK reports it. */

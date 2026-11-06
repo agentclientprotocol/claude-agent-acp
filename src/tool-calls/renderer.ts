@@ -5,7 +5,7 @@ import type {
   ToolCallContent,
   ToolCallLocation,
   ToolCallStatus,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import {
   AIR_COMMAND_TITLE_KEY,
   AIR_MCP_KEY,
@@ -29,12 +29,13 @@ export type ToolCallUpdate = SessionNotification["update"];
 const PLAN_FILE_CLEAR_SUFFIX = ":plan-file-clear";
 
 /**
- * ACP v2's `cancelled` tool call status. v1's statuses have no such value, and
- * the agent builds its reports in v1 types, so it travels as a v1 status. Only
- * a v2 client gets it, and the v2 surface sends it as it is
- * (`src/v2/tool-call.ts`).
+ * ACP v2's `cancelled` and `paused` tool call statuses. v1's statuses have no
+ * such values, and the agent builds its reports in v1 types, so they travel as
+ * v1 statuses. Only a v2 client gets them, and the v2 surface sends them as
+ * they are (`src/v2/tool-call.ts`).
  */
-const V2_CANCELLED = "cancelled" as unknown as ToolCallStatus;
+export const V2_CANCELLED = "cancelled" as unknown as ToolCallStatus;
+export const V2_PAUSED = "paused" as unknown as ToolCallStatus;
 
 /** Whether `status` ends a tool call: `completed`, `failed`, or, on v2, `cancelled`. */
 export function isFinalToolCallStatus(status: ToolCallStatus | null | undefined): boolean {
@@ -319,13 +320,16 @@ export class AcpToolCallRenderer {
     const facts = this.facts(toolUse, options.cwd);
     if (!this.capabilities.air.client) {
       // The upstream shape: the whole tool call again. A v2 client also gets
-      // the exact preview patch, which the tool call does not show.
+      // the exact preview patch, which the tool call does not show, but not the
+      // status: its subject is an update of the call, which was emitted before
+      // the request (`ensureToolCallEmitted`), and a `pending` there would move
+      // a call that already runs back.
       const content = options.previewContent ?? this.toolUseContent(toolUse.id, facts);
       const locations = [...(facts.locations ?? []), ...(options.extraLocations ?? [])];
       return {
         toolCallId: toolUse.id,
         name: toolUse.name,
-        status: "pending",
+        ...(this.capabilities.v2 ? {} : { status: "pending" as const }),
         rawInput: toolUse.input,
         title: options.title ?? facts.title,
         kind: facts.kind,

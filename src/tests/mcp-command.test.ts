@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import type { McpServerStatus } from "@anthropic-ai/claude-agent-sdk";
-import type { SessionNotification } from "@agentclientprotocol/sdk";
+import type { SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import { ClaudeAcpAgent, stripLocalCommandMetadata, type AcpClient } from "../acp-agent.js";
 import {
   cleanMcpError,
@@ -380,6 +380,15 @@ describe("formatMcpStatus", () => {
     ]);
     expect(markdown).toContain("- ``a`b``\n");
     expect(markdown).toContain("**Disabled:** `` `edge ``");
+  });
+
+  /** A name with a space at each end is padded so CommonMark keeps both spaces;
+   *  an all-space name is not, since CommonMark does not strip it. */
+  it.each([
+    [" db ", "- `  db  `"],
+    ["   ", "- `   `"],
+  ])("pads the server name %j only when CommonMark would strip it", (name, line) => {
+    expect(formatMcpStatus([{ name, status: "connected" }])).toContain(line);
   });
 });
 

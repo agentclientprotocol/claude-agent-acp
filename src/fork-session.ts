@@ -1,4 +1,8 @@
-import { ForkSessionRequest, ForkSessionResponse, RequestError } from "@agentclientprotocol/sdk";
+import {
+  ForkSessionRequest,
+  ForkSessionResponse,
+  RequestError,
+} from "@agentclientprotocol/sdk/unstable";
 import {
   forkSession as forkClaudeSession,
   getSessionMessages,
@@ -31,14 +35,44 @@ function forkPoint(meta: unknown): SessionHistoryPoint | undefined {
   return historyPoint(fork);
 }
 
+/**
+ * Whether `error` is the Claude SDK's report that `sessionId` has no
+ * transcript: `forkSession` and `importSessionToStore` throw
+ * `Error("Session <id> not found")`, and both throw
+ * `"Invalid sessionId: <id>"` for an id that is not a UUID.
+ */
+function isUnknownSessionError(error: unknown, sessionId: string): boolean {
+  if (!(error instanceof Error)) return false;
+  return (
+    error.message === `Session ${sessionId} not found` ||
+    error.message === `Invalid sessionId: ${sessionId}`
+  );
+}
+
 export async function forkSession(
+  params: ForkSessionRequest,
+  dependencies: ForkSessionDependencies,
+): Promise<ForkSessionResponse> {
+  try {
+    return await forkTranscript(params, dependencies);
+  } catch (error) {
+    if (isUnknownSessionError(error, params.sessionId)) {
+      throw RequestError.sessionNotFound(params.sessionId);
+    }
+    throw error;
+  }
+}
+
+async function forkTranscript(
   params: ForkSessionRequest,
   dependencies: ForkSessionDependencies,
 ): Promise<ForkSessionResponse> {
   const timing = new SessionTiming(dependencies.logger, "fork", params.sessionId);
   const point = forkPoint(params._meta);
+  // SDK `dir` scopes source lookup, not the fork's working directory. Search
+  // all projects: params.cwd can name a different workspace for the new session.
   if (!point) {
-    const forked = await forkClaudeSession(params.sessionId, { dir: params.cwd });
+    const forked = await forkClaudeSession(params.sessionId);
     timing.phase("sdk-fork", " resolution=latest");
     return { sessionId: forked.sessionId };
   }
@@ -47,9 +81,7 @@ export async function forkSession(
   const liveUuid = candidateIds
     .map((candidateId) => dependencies.liveMessageIdToUuid?.get(candidateId))
     .find(Boolean);
-  const history = liveUuid
-    ? undefined
-    : await getSessionMessages(params.sessionId, { dir: params.cwd });
+  const history = liveUuid ? undefined : await getSessionMessages(params.sessionId);
   timing.phase("active-history", ` resolution=${liveUuid ? "live" : "pending"}`);
   const messageUuid =
     liveUuid ??
@@ -64,7 +96,7 @@ export async function forkSession(
       .find(Boolean);
   const fullHistoryUuid = messageUuid
     ? undefined
-    : await resolveFromFullHistory(params.sessionId, params.cwd, point, dependencies);
+    : await resolveFromFullHistory(params.sessionId, point, dependencies);
   timing.phase(
     "full-history",
     ` resolution=${liveUuid ? "live" : messageUuid ? "active" : fullHistoryUuid ? "full" : "missing"}`,
@@ -78,7 +110,6 @@ export async function forkSession(
   }
 
   const forked = await forkClaudeSession(params.sessionId, {
-    dir: params.cwd,
     upToMessageId: messageUuid ?? fullHistoryUuid,
   });
   timing.phase("sdk-fork");
@@ -87,11 +118,10 @@ export async function forkSession(
 
 async function resolveFromFullHistory(
   sessionId: string,
-  cwd: string,
   point: SessionHistoryPoint,
   dependencies: ForkSessionDependencies,
 ): Promise<string | undefined> {
-  const entries = await loadFullSessionHistory(sessionId, cwd);
+  const entries = await loadFullSessionHistory(sessionId);
   return resolveHistoryPointUuid(
     entries,
     assistantGroups(entries, dependencies.messageIdForGrouping),

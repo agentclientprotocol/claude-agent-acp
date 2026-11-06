@@ -46,7 +46,7 @@ import {
   ndJsonStream,
   type PromptRequest,
   type PromptResponse,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 
 /** The steering extension method, per the ACP steering wire protocol. */
 const STEERING_METHOD = "_session/steering";

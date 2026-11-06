@@ -3,7 +3,7 @@ import type {
   FileWriteInput,
   NotebookEditInput,
 } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
-import type { ToolCallContent } from "@agentclientprotocol/sdk";
+import type { ToolCallContent } from "@agentclientprotocol/sdk/unstable";
 import {
   patchUpdateFromDiffToolResponse,
   toolUpdateFromDiffToolResponse,

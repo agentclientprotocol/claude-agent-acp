@@ -40,7 +40,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
-import { RequestError, type SessionInfo } from "@agentclientprotocol/sdk";
+import { RequestError, type SessionInfo } from "@agentclientprotocol/sdk/unstable";
 import type { OwnSessionState } from "./activity.js";
 import {
   bySession,

@@ -1,4 +1,4 @@
-import type { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk";
+import type { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import {
   getSessionMessages,
   type SDKAssistantMessageError,

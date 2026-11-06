@@ -1,4 +1,4 @@
-import type { SessionConfigOption } from "@agentclientprotocol/sdk";
+import type { SessionConfigOption } from "@agentclientprotocol/sdk/unstable";
 import type { ModelInfo, Query, Settings } from "@anthropic-ai/claude-agent-sdk";
 import { AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY, withAirMeta } from "./air-extension.js";
 import { bedrockRegionPrefix } from "./gateway-models.js";
@@ -210,22 +210,12 @@ export function buildModelConfigOption(
     ? models.availableModels.filter((model) => model.modelId !== "default")
     : models.availableModels;
 
-  return {
-    id: MODEL_CONFIG_ID,
-    name: "Model",
-    description: "AI model to use",
-    category: "model",
-    type: "select",
-    currentValue:
-      concreteRecommendation && models.currentModelId === "default"
-        ? recommended.value
-        : models.currentModelId,
-    ...(concreteRecommendation
-      ? {
-          _meta: withAirMeta(undefined, AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY, recommended.value),
-        }
-      : {}),
-    options: available.map((model) => {
+  const currentValue =
+    concreteRecommendation && models.currentModelId === "default"
+      ? recommended.value
+      : models.currentModelId;
+  const options: Array<{ value: string; name: string; description?: string }> = available.map(
+    (model) => {
       if (model.modelId === "default" && defaultInfo?.resolvedModel) {
         const named = modelInfos.find(
           (info) => info.value !== "default" && info.resolvedModel === defaultInfo.resolvedModel,
@@ -241,7 +231,35 @@ export function buildModelConfigOption(
         name: model.name,
         description: model.description ?? undefined,
       };
-    }),
+    },
+  );
+  // ACP requires `currentValue` to be one of `options`. A session can run a
+  // model the picker does not list: resumed onto a model excluded by the
+  // `availableModels` allowlist, or switched by a refusal fallback. List that
+  // model as its own entry. It is not added to `models.availableModels`, so the
+  // next rebuild after switching to a listed model drops it.
+  if (!options.some((option) => option.value === currentValue)) {
+    const info = modelInfos.find((model) => model.value === currentValue);
+    options.push({
+      value: currentValue,
+      name: info?.displayName || currentValue,
+      description: info?.description || undefined,
+    });
+  }
+
+  return {
+    id: MODEL_CONFIG_ID,
+    name: "Model",
+    description: "AI model to use",
+    category: "model",
+    type: "select",
+    currentValue,
+    ...(concreteRecommendation
+      ? {
+          _meta: withAirMeta(undefined, AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY, recommended.value),
+        }
+      : {}),
+    options,
   };
 }
 
@@ -264,25 +282,40 @@ function resolveSettingsModel(
 const MODEL_FAMILY_ALIASES = new Set(["opus", "sonnet", "haiku", "fable"]);
 
 /** A model id without the spellings that name the same model: provider
- *  prefixes, dates, version suffixes, `-fast` and context hints. `deniedModels`
- *  and gateway listings both match on it. */
+ *  prefixes, dates, version suffixes, `:variant` suffixes, dotted versions,
+ *  `-fast` and context hints. `deniedModels` and gateway listings both match on
+ *  it. OpenRouter lists `anthropic/claude-opus-5.5:batch[1m]`, which normalizes
+ *  to `claude-opus-5-5`; `anthropic/openai/gpt-5` keeps its `openai/` prefix and
+ *  matches no Claude id. */
 function normalizeModelId(value: string): string {
   let id = stripContextHints(value.trim().toLowerCase());
   const providerPrefix = id.lastIndexOf("anthropic.");
   if (providerPrefix !== -1) id = id.slice(providerPrefix + "anthropic.".length);
-  return id
-    .replace(/@.*$/, "")
-    .replace(/-v\d+(?::\d+)?$/, "")
-    .replace(/-fast$/, "")
-    .replace(/-\d{8}$/, "");
+  return (
+    id
+      // Only a leading `anthropic/`: OpenRouter's `anthropic/openai/gpt-5` must
+      // keep `openai/`, which `lastIndexOf` would strip along with it.
+      .replace(/^anthropic\//, "")
+      // `:batch`, `:free`. A letter must follow the colon, so Bedrock's `-v1:0`
+      // is left for the `-vN:M` step below.
+      .replace(/:[a-z][a-z0-9-]*$/, "")
+      // `claude-opus-5.5` -> `claude-opus-5-5`; only dots between two digits.
+      .replace(/(?<=\d)\.(?=\d)/g, "-")
+      .replace(/@.*$/, "")
+      .replace(/-v\d+(?::\d+)?$/, "")
+      .replace(/-fast$/, "")
+      .replace(/-\d{8}$/, "")
+  );
 }
 
 /**
  * Whether managed `deniedModels` blocks a model id, following the CLI's rules
  * closely enough for the picker: a family alias blocks the whole family, and a
  * model id blocks that version in every spelling plus the later minor versions
- * it prefixes (`claude-opus-5` also blocks `claude-opus-5-5`). The CLI stays
- * the enforcer; this only keeps the picker from offering a refused row.
+ * it prefixes (`claude-opus-5` also blocks `claude-opus-5-5`). Entries share
+ * `normalizeModelId`, so `claude-opus-4.5` or `anthropic/claude-opus-4.5` also
+ * blocks `claude-opus-4-5`, which the CLI may still allow. The CLI stays the
+ * enforcer; this only keeps the picker from offering a refused row.
  */
 export function isDeniedModel(modelId: string, deniedModels: readonly string[]): boolean {
   const id = normalizeModelId(modelId);
@@ -580,14 +613,107 @@ export async function getAvailableModels(
   for (const name of displayNames) {
     displayNameCounts.set(name, (displayNameCounts.get(name) ?? 0) + 1);
   }
+  const names = models.map((model, index) =>
+    displayNameCounts.get(displayNames[index]) === 1 ? displayNames[index] : model.displayName,
+  );
+  const nameCounts = new Map<string, number>();
+  for (const name of names) {
+    nameCounts.set(name, (nameCounts.get(name) ?? 0) + 1);
+  }
 
   return {
     availableModels: models.map((model, index) => ({
       modelId: model.value,
-      name:
-        displayNameCounts.get(displayNames[index]) === 1 ? displayNames[index] : model.displayName,
+      // Allowlisted aliases can inherit the same SDK label. Keep every ID
+      // selectable, but distinguish the rows for clients that show only names.
+      name: nameCounts.get(names[index]) === 1 ? names[index] : `${names[index]} (${model.value})`,
       description: model.description,
     })),
     currentModelId: currentModel.value,
   };
+}
+
+/** The display name of the model id `model` in `modelInfos`, if it is there. */
+export function modelDisplayName(modelInfos: ModelInfo[], model: string): string | undefined {
+  let byModel = displayNameCache.get(modelInfos);
+  if (!byModel) displayNameCache.set(modelInfos, (byModel = new Map()));
+  if (!byModel.has(model)) {
+    const info = modelInfos.find((info) => info.value === model || info.resolvedModel === model);
+    byModel.set(model, info?.displayName);
+  }
+  return byModel.get(model);
+}
+
+/** {@link modelDisplayName} per model list, which a session replaces and never edits. */
+const displayNameCache = new WeakMap<ModelInfo[], Map<string, string | undefined>>();
+
+/** The flat entries of a session's `model` select option. */
+function modelOptionEntries(option: SessionConfigOption): Array<{ value: string; name: string }> {
+  if (option.type !== "select") return [];
+  return option.options.flatMap((entry) =>
+    "value" in entry ? [{ value: entry.value, name: entry.name }] : entry.options,
+  );
+}
+
+/**
+ * The entry of the `model` option among `configOptions` for `model`, a model
+ * id that a response reported, so that a client can compare it with the
+ * session's own model. Best first:
+ *
+ * 1. the current entry, when it runs that model up to a context hint: a
+ *    session on `opus[1m]` or `default` that answers as `claude-opus-4-6`;
+ * 2. the entry whose value or resolved model is that id;
+ * 3. an entry that runs that model up to a context hint.
+ *
+ * Among several entries for one model, a concrete entry comes before
+ * `default`, as in {@link resolveModelPreference}. Undefined when no entry
+ * matches. A model's resolved id comes from `modelInfos`
+ * (`ModelInfo.resolvedModel`), the wire id that a response reports, as for
+ * {@link matchResumedModel}. It is compared as it is: a dated id such as
+ * `claude-haiku-4-5-20251001` matches only the same dated id.
+ */
+export function modelEntryFor(
+  configOptions: readonly SessionConfigOption[],
+  modelInfos: ModelInfo[],
+  model: string,
+): { value: string; name: string } | undefined {
+  // Each response of a subagent reports its model, so the result is kept per
+  // list. A session replaces its lists on a change and never edits them.
+  let byInfos = modelEntryCache.get(configOptions);
+  if (!byInfos) modelEntryCache.set(configOptions, (byInfos = new WeakMap()));
+  let byModel = byInfos.get(modelInfos);
+  if (!byModel) byInfos.set(modelInfos, (byModel = new Map()));
+  if (byModel.has(model)) return byModel.get(model);
+  const entry = findModelEntry(configOptions, modelInfos, model);
+  byModel.set(model, entry);
+  return entry;
+}
+
+const modelEntryCache = new WeakMap<
+  readonly SessionConfigOption[],
+  WeakMap<ModelInfo[], Map<string, { value: string; name: string } | undefined>>
+>();
+
+function findModelEntry(
+  configOptions: readonly SessionConfigOption[],
+  modelInfos: ModelInfo[],
+  model: string,
+): { value: string; name: string } | undefined {
+  const option = configOptions.find((candidate) => candidate.id === MODEL_CONFIG_ID);
+  if (option?.type !== "select") return undefined;
+  // Concrete entries first; `sort` keeps the list order otherwise.
+  const entries = modelOptionEntries(option).sort(
+    (left, right) => Number(left.value === "default") - Number(right.value === "default"),
+  );
+  const observed = canonicalizeModelId(model);
+  const resolved = (value: string) =>
+    canonicalizeModelId(modelInfos.find((info) => info.value === value)?.resolvedModel ?? value);
+  const sameModel = (value: string) =>
+    stripContextHints(resolved(value)) === stripContextHints(observed);
+  const current = entries.find((entry) => entry.value === option.currentValue);
+  if (current && sameModel(current.value)) return current;
+  return (
+    entries.find((entry) => entry.value === model || resolved(entry.value) === observed) ??
+    entries.find((entry) => sameModel(entry.value))
+  );
 }

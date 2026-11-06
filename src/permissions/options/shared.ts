@@ -1,4 +1,4 @@
-import type { PermissionOption } from "@agentclientprotocol/sdk";
+import type { PermissionOption } from "@agentclientprotocol/sdk/unstable";
 import type { DurablePermissionChangeSet } from "../normalization.js";
 
 export const PERMISSION_OPTION_ID = {
@@ -30,6 +30,9 @@ export interface PermissionOptionContext {
   /** The mode the session left when it entered plan mode. */
   prePlanMode?: string;
   contextUsedPercent?: number;
+  /** False when no ACP turn can continue an accepted plan in a fresh
+   *  context. Then an ExitPlanMode request offers no clear-context option. */
+  allowContextReset?: boolean;
 }
 
 export function allowOnce(name = "Yes"): PermissionOption {

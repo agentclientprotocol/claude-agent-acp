@@ -2,7 +2,7 @@
  * The v2 form of the session updates that `ClaudeAcpAgent` sends as v1
  * updates.
  */
-import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import { v2AvailableCommands, v2ConfigOptions } from "./session.js";
 import { v2ToolCallUpdate } from "./tool-call.js";

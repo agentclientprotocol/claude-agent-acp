@@ -11,6 +11,10 @@
  * - an interactive CLI that is not driven by an SDK holds it, and its registry
  *   status is newer than the transcript: the registry status (an idle one is
  *   `error` after such a turn);
+ * - a turn that ended with an open background task is `running`, also after
+ *   10 minutes: Claude Code wakes the session again when the task ends. The
+ *   wait ends when the registry status is `idle`, because a task can end
+ *   without a transcript record (a stop in the task UI);
  * - otherwise the transcript tail: a finished turn is `idle` (`error` after
  *   an API error), an unfinished turn written in the last 10 minutes is
  *   `running`, and anything else has no known state.
@@ -72,6 +76,14 @@ function usesRegistryStatus(record: LiveRecord, transcriptMtimeMs: number): bool
   );
 }
 
+/** Whether the last turn ended while a background task of the session is
+ *  open. */
+function waitsForBackgroundTasks(facts: TranscriptFacts): boolean {
+  if (facts.turnState !== "finished") return false;
+  const openTasks = facts.backgroundTasks?.open ?? [];
+  return openTasks.length > 0;
+}
+
 function iso(ms: number | undefined): string | undefined {
   return ms === undefined || !Number.isFinite(ms) ? undefined : new Date(ms).toISOString();
 }
@@ -103,6 +115,9 @@ export function deriveActivity(input: {
     // A busy or waiting CLI wins; an idle one shows how its turn ended.
     state = registryState(live.status);
     if (state === "idle" && failed) state = "error";
+  } else if (waitsForBackgroundTasks(facts) && live.status !== "idle") {
+    // Claude Code wakes the session again when an open task ends.
+    state = "running";
   } else if (failed) {
     state = "error";
   } else if (facts.turnState === "finished") {

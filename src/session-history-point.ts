@@ -50,10 +50,7 @@ export function historyPointMessageIdCandidates(messageId: string): string[] {
   return protocolMessageId === messageId ? [messageId] : [messageId, protocolMessageId];
 }
 
-export async function loadFullSessionHistory(
-  sessionId: string,
-  cwd: string,
-): Promise<SessionStoreEntry[]> {
+export async function loadFullSessionHistory(sessionId: string): Promise<SessionStoreEntry[]> {
   // getSessionMessages returns only the active parentUuid chain. The import keeps inactive branches that AIR can still reference.
   const entries: SessionStoreEntry[] = [];
   const store: SessionStore = {
@@ -62,7 +59,7 @@ export async function loadFullSessionHistory(
     },
     load: async () => null,
   };
-  await importSessionToStore(sessionId, store, { dir: cwd, includeSubagents: false });
+  await importSessionToStore(sessionId, store, { includeSubagents: false });
   return entries;
 }
 

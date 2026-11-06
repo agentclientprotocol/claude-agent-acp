@@ -1,4 +1,4 @@
-import { RequestError } from "@agentclientprotocol/sdk";
+import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import type { SDKActiveGoalMessage } from "@anthropic-ai/claude-agent-sdk";
 
 export const GOAL_EXTENSION_VERSION = 1 as const;

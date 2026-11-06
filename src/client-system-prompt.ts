@@ -18,7 +18,7 @@ import {
   RequestError,
   type SessionCapabilities,
   type SystemPrompt,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 
 /** The `sessionCapabilities.systemPrompt` the agent advertises: both modes. */
 export const SYSTEM_PROMPT_CAPABILITY = {

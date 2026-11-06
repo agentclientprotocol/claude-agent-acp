@@ -1,4 +1,4 @@
-import { RequestError } from "@agentclientprotocol/sdk";
+import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import type { SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk";
 import {
   assistantGroups,
@@ -86,7 +86,7 @@ export async function planSessionRewind(
   request: SessionRewindRequest,
   dependencies: SessionRewindDependencies,
 ): Promise<SessionRewindPlan> {
-  const entries = await loadFullSessionHistory(request.sessionId, dependencies.cwd);
+  const entries = await loadFullSessionHistory(request.sessionId);
   const byUuid = new Map(
     entries.flatMap((entry) => (typeof entry.uuid === "string" ? [[entry.uuid, entry]] : [])),
   );

@@ -1,5 +1,5 @@
-import type { RequestPermissionResponse } from "@agentclientprotocol/sdk";
-import type { PermissionOption } from "@agentclientprotocol/sdk";
+import type { RequestPermissionResponse } from "@agentclientprotocol/sdk/unstable";
+import type { PermissionOption } from "@agentclientprotocol/sdk/unstable";
 import type { PermissionMode, PermissionResult } from "@anthropic-ai/claude-agent-sdk";
 import type { DurablePermissionChangeSet } from "./normalization.js";
 import { applyClaudePermissionSelection, parseClaudePermissionSelection } from "./effects.js";

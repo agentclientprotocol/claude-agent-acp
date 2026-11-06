@@ -1,4 +1,4 @@
-import type { NewSessionRequest } from "@agentclientprotocol/sdk";
+import type { NewSessionRequest } from "@agentclientprotocol/sdk/unstable";
 import type { EffortLevel, Options } from "@anthropic-ai/claude-agent-sdk";
 import { DEFAULT_AGENT_ID, DEFAULT_MODEL_ID } from "./session-config-ids.js";
 

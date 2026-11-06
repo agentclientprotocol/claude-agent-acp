@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { SessionNotification } from "@agentclientprotocol/sdk";
+import type { SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import {
   AUTO_MODE_FALLBACK,
   resolveInitialPermissionMode,
@@ -66,10 +66,14 @@ describe("session mode", () => {
   it("rejects invalid and unavailable modes before touching the query", async () => {
     const session = createSession();
     const { manager } = createManager(session);
-    await expect(manager.selectMode(SESSION_ID, "future")).rejects.toThrow("Invalid Mode");
-    await expect(manager.selectMode(SESSION_ID, "bypassPermissions")).rejects.toThrow(
-      "Mode bypassPermissions is not available in this session",
-    );
+    await expect(manager.selectMode(SESSION_ID, "future")).rejects.toMatchObject({
+      code: -32602,
+      message: expect.stringContaining("Invalid Mode"),
+    });
+    await expect(manager.selectMode(SESSION_ID, "bypassPermissions")).rejects.toMatchObject({
+      code: -32602,
+      message: expect.stringContaining("Mode bypassPermissions is not available in this session"),
+    });
     expect(session.query.setPermissionMode).not.toHaveBeenCalled();
   });
 
@@ -152,7 +156,7 @@ describe("session mode", () => {
   it("rejects missing and closed sessions", async () => {
     await expect(
       createManager(undefined).manager.setSessionMode({ sessionId: SESSION_ID, modeId: "plan" }),
-    ).rejects.toThrow("Session not found");
+    ).rejects.toMatchObject({ code: -32002, data: { sessionId: SESSION_ID } });
 
     await expect(
       createManager(createSession({ queryClosed: true })).manager.setSessionMode({
@@ -170,6 +174,7 @@ describe("session mode", () => {
       requestedMode: "default",
       currentModelId: "opus",
       allowBypass: false,
+      allowAuto: true,
     });
 
     expect(result.modes.availableModes.map((mode) => mode.id)).not.toContain("bypassPermissions");
@@ -184,6 +189,7 @@ describe("session mode", () => {
       currentModelInfo: { value: "haiku", displayName: "Haiku", description: "" },
       currentModelId: "haiku",
       allowBypass: true,
+      allowAuto: true,
     });
 
     expect(result.modes.currentModeId).toBe("acceptEdits");
@@ -193,6 +199,24 @@ describe("session mode", () => {
     expect(result.autoModeFallbackWarningPending).toBe(true);
     expect(setPermissionMode).toHaveBeenCalledWith("acceptEdits");
     expect(notifications.logError).toHaveBeenCalledWith(expect.stringContaining("falling back"));
+  });
+
+  it("starts a built-in Auto default in Manual on a model without Auto", async () => {
+    const setPermissionMode = vi.fn();
+    const { manager } = createManager(undefined);
+    const result = await manager.initialize({
+      query: { setPermissionMode },
+      requestedMode: "auto",
+      builtInDefault: true,
+      currentModelInfo: { value: "haiku", displayName: "Haiku", description: "" },
+      currentModelId: "haiku",
+      allowBypass: true,
+      allowAuto: true,
+    });
+
+    expect(result.modes.currentModeId).toBe("default");
+    expect(result.autoModeFallbackWarningPending).toBe(false);
+    expect(setPermissionMode).toHaveBeenCalledWith("default");
   });
 
   it("keeps mode state and its config option synchronized", () => {
@@ -244,24 +268,46 @@ describe("session mode", () => {
 
 describe("resolveInitialPermissionMode", () => {
   const logger = () => ({ error: vi.fn() });
+  const initialMode = (
+    sources: Parameters<typeof resolveInitialPermissionMode>[0],
+    log: { error: (...args: unknown[]) => void },
+    allowBypass: boolean,
+    allowAuto = true,
+  ) => resolveInitialPermissionMode(sources, log, { allowBypass, allowAuto }).mode;
+
+  it.each([
+    { allowAuto: true, expected: "auto" },
+    { allowAuto: false, expected: "default" },
+  ])(
+    "starts in $expected without defaultMode when allowAuto is $allowAuto",
+    ({ allowAuto, expected }) => {
+      expect(resolveInitialPermissionMode({}, logger(), { allowBypass: true, allowAuto })).toEqual({
+        mode: expected,
+        builtInDefault: true,
+      });
+    },
+  );
+
+  it("falls back to defaultMode for a resumed auto when Auto is disabled", () => {
+    expect(initialMode({ resumed: "auto", defaultMode: "plan" }, logger(), true, false)).toBe(
+      "plan",
+    );
+  });
 
   it("uses defaultMode when nothing else is given", () => {
-    expect(resolveInitialPermissionMode({ defaultMode: "plan" }, logger(), true)).toBe("plan");
+    expect(initialMode({ defaultMode: "plan" }, logger(), true)).toBe("plan");
   });
 
-  it("continues in the mode of the resumed transcript instead of defaultMode", () => {
-    expect(
-      resolveInitialPermissionMode(
-        { resumed: "bypassPermissions", defaultMode: "plan" },
-        logger(),
-        true,
-      ),
-    ).toBe("bypassPermissions");
-  });
+  it.each(["default", "acceptEdits", "plan", "auto", "bypassPermissions"])(
+    "continues in the supported restored mode %s instead of defaultMode",
+    (resumed) => {
+      expect(initialMode({ resumed, defaultMode: "dontAsk" }, logger(), true)).toBe(resumed);
+    },
+  );
 
   it("lets an explicit mode win over the resumed transcript", () => {
     expect(
-      resolveInitialPermissionMode(
+      initialMode(
         { explicit: "acceptEdits", resumed: "bypassPermissions", defaultMode: "plan" },
         logger(),
         true,
@@ -271,19 +317,31 @@ describe("resolveInitialPermissionMode", () => {
 
   it("falls back to defaultMode when bypass is not available now", () => {
     const log = logger();
-    expect(
-      resolveInitialPermissionMode(
-        { resumed: "bypassPermissions", defaultMode: "plan" },
-        log,
-        false,
-      ),
-    ).toBe("plan");
+    expect(initialMode({ resumed: "bypassPermissions", defaultMode: "plan" }, log, false)).toBe(
+      "plan",
+    );
     expect(log.error).toHaveBeenCalledWith(expect.stringContaining('"bypassPermissions"'));
   });
 
-  it("falls back to defaultMode for an unknown resumed mode", () => {
-    expect(
-      resolveInitialPermissionMode({ resumed: "warp", defaultMode: "acceptEdits" }, logger(), true),
-    ).toBe("acceptEdits");
+  it.each(["warp", "dontAsk"])("falls back to defaultMode for resumed mode %s", (resumed) => {
+    expect(initialMode({ resumed, defaultMode: "acceptEdits" }, logger(), true)).toBe(
+      "acceptEdits",
+    );
   });
+
+  it.each([
+    { defaultMode: "plan", allowBypass: true, expected: "plan" },
+    { defaultMode: "bypassPermissions", allowBypass: true, expected: "bypassPermissions" },
+    { defaultMode: "bypassPermissions", allowBypass: false, expected: "default" },
+    { defaultMode: "dontAsk", allowBypass: true, expected: "default" },
+    { defaultMode: "warp", allowBypass: true, expected: "default" },
+    { defaultMode: undefined, allowBypass: true, expected: "auto" },
+  ])(
+    "uses available settings fallback $defaultMode for an unavailable restored mode",
+    ({ defaultMode, allowBypass, expected }) => {
+      expect(initialMode({ resumed: "dontAsk", defaultMode }, logger(), allowBypass)).toBe(
+        expected,
+      );
+    },
+  );
 });
