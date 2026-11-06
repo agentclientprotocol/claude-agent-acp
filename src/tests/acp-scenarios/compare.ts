@@ -33,6 +33,9 @@
  *   that the tool result does not say (see `CommandOutput.exitCode`): 1 for a
  *   failure that names no code or an interrupted command, 0 for a
  *   backgrounded command.
+ * - A permission request also carries the SDK `decisionReason` in
+ *   `_meta.claudeCode.decisionReason`, which origin/main did not send (see
+ *   {@link withoutDecisionReason}).
  */
 import type { Recorded } from "./harness.js";
 
@@ -147,6 +150,25 @@ function withoutSandboxNetworkSettlements(traffic: Recorded[]): Recorded[] {
   });
 }
 
+/** `record` without `_meta.claudeCode.decisionReason`, when it is a permission request. */
+function withoutDecisionReason(record: Recorded): Recorded {
+  if (record.kind !== "requestPermission") return record;
+  const payload = record.payload as Json;
+  const meta = payload._meta as Json | undefined;
+  const claudeCode = meta?.claudeCode as Json | undefined;
+  if (!meta || !claudeCode || !("decisionReason" in claudeCode)) return record;
+  const rest = without(claudeCode, "decisionReason");
+  const restMeta =
+    Object.keys(rest).length > 0 ? { ...meta, claudeCode: rest } : without(meta, "claudeCode");
+  return {
+    ...record,
+    payload:
+      Object.keys(restMeta).length > 0
+        ? { ...payload, _meta: restMeta }
+        : without(payload, "_meta"),
+  } as Recorded;
+}
+
 /** A copy of `value` without `key`. */
 function without(value: Json, key: string): Json {
   const copy = { ...value };
@@ -254,7 +276,9 @@ export function compareWithBaseline(baseline: Recorded[], traffic: Recorded[]): 
       return !(update?.sessionUpdate === "session_info_update" && Object.keys(update).length === 1);
     });
   const current = withoutSandboxNetworkSettlements(
-    traffic.map((record) => withoutSessionCapability(record, "systemPrompt")),
+    traffic.map((record) =>
+      withoutDecisionReason(withoutSessionCapability(record, "systemPrompt")),
+    ),
   );
   const violations: string[] = [];
   const state = new Map<string, Map<string, string>>();
