@@ -284,6 +284,7 @@ import {
 import { IdleCompaction } from "./idle-compaction.js";
 import {
   clientSupportsNotices,
+  collapseHookSpeaker,
   MAX_NOTICE_TITLE_LENGTH,
   normalizeNoticeText,
   noticeOrTranscriptUpdate,
@@ -6720,10 +6721,11 @@ export class ClaudeAcpAgent {
                   }
                 }
                 const severity = message.level === "warning" ? "warning" : "info";
+                const transcriptContent = collapseHookSpeaker(message.content);
                 const transcriptText =
                   message.level === "info"
-                    ? message.content
-                    : `**${sentenceCase(message.level)}:** ${message.content}`;
+                    ? transcriptContent
+                    : `**${sentenceCase(message.level)}:** ${transcriptContent}`;
                 await sendUpdate({
                   sessionId: params.sessionId,
                   update: noticeOrTranscriptUpdate(
