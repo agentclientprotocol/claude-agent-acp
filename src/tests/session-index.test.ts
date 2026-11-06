@@ -288,6 +288,7 @@ describe("sessionIndex negotiation", () => {
     "diffPatch",
     "planFile",
     "backgroundSubagents",
+    "sessionRewind",
   ];
 
   it("is advertised with sessionArchive and sessionRename only to an AIR client that declares it", async () => {

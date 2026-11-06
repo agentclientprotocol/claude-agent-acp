@@ -350,10 +350,12 @@ describe("ACP protocol routing", () => {
       return response;
     });
 
-    // The v2 app registers neither `_session/async_task/stop` nor `_session/goal`.
+    // The v2 app registers neither `_session/async_task/stop`, `_session/rewind`
+    // nor `_session/goal`.
     const air = (response._meta as any)?.jetbrains?.air;
     expect(air.capabilities).toContain("sessionFailure");
     expect(air.capabilities).not.toContain("asyncTasks");
+    expect(air.capabilities).not.toContain("sessionRewind");
     expect(air).not.toHaveProperty("goal");
   });
 
