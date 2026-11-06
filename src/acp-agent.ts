@@ -8502,6 +8502,18 @@ export class ClaudeAcpAgent {
                 content,
                 toolUseResult,
                 session.toolUseCache,
+                (toolUseId) => {
+                  for (const [taskId, task] of session.liveBackgroundTasks) {
+                    if (
+                      task.parentToolUseId === toolUseId &&
+                      task.taskType === "local_bash" &&
+                      task.backgrounded
+                    ) {
+                      return taskId;
+                    }
+                  }
+                  return undefined;
+                },
               );
               if (backgroundBashTask) await asyncTasks.taskBackgrounded(backgroundBashTask);
               // The command's terminal runs until its task ends, unless the
