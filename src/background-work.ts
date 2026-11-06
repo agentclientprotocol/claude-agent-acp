@@ -113,6 +113,8 @@ export type LevelTask = {
 
 /** The most returned tool calls that {@link SessionBackgroundWork} remembers. */
 const MAX_RETURNED_CALLS = 1024;
+/** The most tool calls that wait for the level that names their task. */
+const MAX_PENDING_CALLS = 256;
 
 /** The tools whose structured result names the task that the call started. */
 const TASK_TOOLS = new Set(["Monitor", "Workflow"]);
@@ -140,6 +142,12 @@ export class SessionBackgroundWork {
    * call returns.
    */
   private readonly returned = new Set<string>();
+  /**
+   * The tool calls whose task had not joined the level yet at their result, by
+   * task id. The SDK leaves the order of the level against the tool result
+   * open, so a task can join it after its call returned (see `levelChanged`).
+   */
+  private readonly pending = new Map<string, BackgroundToolCall>();
 
   /**
    * `reported`: whether the client gets the lists. Only when Claude Code's
@@ -209,20 +217,27 @@ export class SessionBackgroundWork {
         [...owner.liveBackgroundTasks].find(
           ([, task]) => task.parentToolUseId === toolCallId && !task.isSubagent,
         )?.[0];
-      const task = taskId === undefined ? undefined : this.level.get(taskId);
-      if (
-        !task ||
-        task.ambient ||
-        task.taskType === "local_bash" ||
-        task.taskType === "local_agent"
-      ) {
-        continue;
-      }
-      this.toolCalls.set(taskId!, {
+      const call = {
         toolCallId,
         toolUse,
         ...(parentToolUseId ? { parentToolUseId } : {}),
-      });
+      };
+      const task = taskId === undefined ? undefined : this.level.get(taskId);
+      if (!task) {
+        // The task's live set entry can follow the tool result: keep the call
+        // for the level that names the task (see `levelChanged`).
+        if (taskId !== undefined) {
+          if (this.pending.size >= MAX_PENDING_CALLS) {
+            this.pending.delete(this.pending.keys().next().value!);
+          }
+          this.pending.set(taskId, call);
+        }
+        continue;
+      }
+      if (task.ambient || task.taskType === "local_bash" || task.taskType === "local_agent") {
+        continue;
+      }
+      this.toolCalls.set(taskId!, call);
       registered.add(toolCallId);
     }
     return registered;
@@ -254,6 +269,7 @@ export class SessionBackgroundWork {
    * accepts some non-zero codes as a success, such as grep's 1.
    */
   async taskEnded(taskId: string, end: BackgroundTaskEnd, send: Send): Promise<void> {
+    this.pending.delete(taskId);
     const terminal = this.terminals.get(taskId);
     if (terminal) {
       await terminal.output?.finish();
@@ -310,6 +326,18 @@ export class SessionBackgroundWork {
       if (!level.has(taskId)) await this.taskEnded(taskId, undefined, send);
     }
     this.level = level;
+    // A call whose task joined the level after its tool result is part of that
+    // task again: it stays in progress, and the next list names it.
+    for (const [taskId, call] of this.pending) {
+      const task = level.get(taskId);
+      if (!task) continue;
+      this.pending.delete(taskId);
+      if (task.ambient || task.taskType === "local_bash" || task.taskType === "local_agent") {
+        continue;
+      }
+      this.toolCalls.set(taskId, call);
+      await send(toolCallStatusUpdate(this.sessionId, call, "in_progress"));
+    }
   }
 
   /**
@@ -335,6 +363,7 @@ export class SessionBackgroundWork {
     }
     this.level = new Map();
     this.returned.clear();
+    this.pending.clear();
     return updates;
   }
 

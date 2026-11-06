@@ -6126,6 +6126,36 @@ describe("ACP v2 terminal of a command in the background", () => {
           background: [{ type: "_claude/task", taskId: "mon1", description: "Watch the logs" }],
         });
       });
+
+      it("keeps a Monitor call in_progress when its task joins the live set after the result", async () => {
+        scriptTurns(async function* (options) {
+          yield toolUseMessage(options, "toolu_mon", "Monitor", { command: "tail -f app.log" });
+          yield {
+            ...toolResultMessage(options, "toolu_mon", { content: "Monitor started (task mon1)." }),
+            tool_use_result: { taskId: "mon1", timeoutMs: 0, persistent: true },
+          };
+          // The SDK leaves the order of the live set against the tool result
+          // open, so the task can join it after the call returned.
+          yield level(options, [monitor]);
+          yield taskEvent(options, "task_started", { ...monitor, tool_use_id: "toolu_mon" });
+          yield result(options);
+          yield idleState(options);
+        });
+        const client = await promptUntil("idle end_turn [toolu_mon]");
+
+        // The call is part of its task, so the level takes it back: it runs in
+        // the background, can be cancelled, and the list names it as the call
+        // rather than as a task that clients do not know.
+        expect(toolCallTrace(client)).toEqual([
+          "running []",
+          "pending",
+          "completed",
+          "in_progress",
+          "cancel",
+          "running [toolu_mon]",
+          "idle end_turn [toolu_mon]",
+        ]);
+      });
     });
 
     it("rejects terminal/cancel with -32602 when the command ends before Claude Code stops it", async () => {
