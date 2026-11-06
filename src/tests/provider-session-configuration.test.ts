@@ -5,7 +5,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ModelInfo, Options } from "@anthropic-ai/claude-agent-sdk";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import { ClaudeAcpAgent, FAST_MODE_CONFIG_ID, type AcpClient } from "../acp-agent.js";
-import { AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY } from "../air-extension.js";
+import {
+  AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
+  AIR_SESSION_FAILURE_CAPABILITY,
+} from "../air-extension.js";
 import { acpProtocolRouter } from "../serve.js";
 import { initializeClient, makeMockQuery } from "./helpers.js";
 import { successfulResultMessage, userEcho } from "./session-doubles.js";
@@ -516,6 +519,54 @@ describe("provider updates preserve session configuration", { timeout: 10_000 },
     },
   );
 
+  it("cleans up an incompatible provider restart and can create a session after recovery", async () => {
+    await initializeClient(agent, {
+      _meta: { jetbrains: { air: { version: 1, capabilities: [AIR_SESSION_FAILURE_CAPABILITY] } } },
+    });
+    const { sessionId } = await newSession();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Response.json({ data: [{ id: "gpt-5" }] })),
+    );
+
+    await agent.unstable_setProvider({ ...PROVIDER, baseUrl: "https://incompatible.example" });
+
+    expect(agent.sessions[sessionId]).toBeUndefined();
+    expect(queries).toHaveLength(2);
+    expect(queries.every((query) => query.close.mock.calls.length === 1)).toBe(true);
+    expect(updates).toContainEqual(
+      expect.objectContaining({
+        sessionId,
+        update: expect.objectContaining({
+          _meta: expect.objectContaining({
+            jetbrains: expect.objectContaining({
+              air: expect.objectContaining({
+                sessionFailure: expect.objectContaining({
+                  details: expect.stringContaining(
+                    "The selected provider offers no compatible Claude models.",
+                  ),
+                }),
+              }),
+            }),
+          }),
+        }),
+      }),
+    );
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        Response.json({
+          data: MODELS.map((model) => ({ id: model.resolvedModel })),
+        }),
+      ),
+    );
+    await refresh();
+    const recovered = await newSession();
+    expect(agent.sessions[recovered.sessionId]).toBeDefined();
+    expect(current(recovered.sessionId, "model")).toBe("sonnet");
+  });
+
   it("removes the old session when provider recreation fails", async () => {
     const { sessionId } = await newSession();
     const held = deferred();
@@ -746,6 +797,38 @@ describe("provider updates preserve session configuration", { timeout: 10_000 },
 
     expect(lastQuery().state).toMatchObject({ model: "opus", effort: "high" });
     expect(lastQuery().request.options.env?.ANTHROPIC_BASE_URL).toBe("https://recovered.example");
+  });
+
+  it("reports incompatible provider setup through the v2 protocol router", async () => {
+    await agent.dispose();
+    const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
+    const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
+    acpProtocolRouter({ log() {}, error() {} }, (created) => (agent = created)).connect({
+      readable: toAgent.readable,
+      writable: toClient.writable,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Response.json({ data: [{ id: "gpt-5" }] })),
+    );
+    await v2
+      .client({ name: "provider-test" })
+      .connectWith({ readable: toClient.readable, writable: toAgent.writable }, async (client) => {
+        await client.request(v2.methods.agent.initialize, {
+          protocolVersion: v2.PROTOCOL_VERSION,
+          info: { name: "provider-test", version: "1" },
+          capabilities: {},
+        });
+        await client.request(v2.methods.agent.providers.set, PROVIDER);
+        await expect(client.request(v2.methods.agent.session.new, { cwd })).rejects.toMatchObject({
+          code: -32603,
+          message: expect.stringContaining(
+            "The selected provider offers no compatible Claude models.",
+          ),
+        });
+        expect(Object.keys(agent.sessions)).toEqual([]);
+        expect(lastQuery().close).toHaveBeenCalledOnce();
+      });
   });
 
   it("publishes the restored configuration through the v2 protocol router", async () => {
