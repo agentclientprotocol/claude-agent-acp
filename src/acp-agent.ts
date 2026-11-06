@@ -235,10 +235,9 @@ import {
 } from "./subagent-replay.js";
 import {
   activeSessionMessages,
-  markResumedLeaf,
+  prepareRewoundResume,
   readResumedSession,
   readResumedTail,
-  rewoundSession,
   type ResumedSessionSnapshot,
 } from "./resumed-session.js";
 import { SessionTiming } from "./session-timing.js";
@@ -1623,6 +1622,9 @@ export type Session = {
    *  `initialize` now describes a credential that no longer works, so the next
    *  turn recreates the query before it runs. */
   needsSignOutRespawn?: boolean;
+  /** The Claude Code session the query runs, when it is not the ACP session
+   *  id: a cleared context continues in a new Claude session under the old id. */
+  claudeSessionId?: string;
   /** The in-flight recreation, so turns that arrive together share one. */
   signOutRespawn?: Promise<void>;
 } & sessionIndex.SessionIndexFields;
@@ -3290,6 +3292,14 @@ export class ClaudeAcpAgent {
     if (!creationParams || session.queryClosed) {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
+    if (session.claudeSessionId) {
+      // The transcript of `sessionId` holds the conversation from before the
+      // restart, which the rewind would put back.
+      this.logger.log(
+        `Rewind of session ${sessionId} refused: its context was cleared into Claude session ${session.claudeSessionId}`,
+      );
+      return Promise.resolve({ rewound: false });
+    }
     return rewindSession(params, {
       logger: this.logger,
       messageIdForGrouping,
@@ -3320,7 +3330,20 @@ export class ClaudeAcpAgent {
         });
       },
       restoreChoices: () => this.carryOverSessionChoices(sessionId, session),
-      discard: () => this.teardownSession(sessionId),
+      abandon: async (error) => {
+        if (error instanceof RequestError && error.code === AUTH_REQUIRED_CODE) {
+          // As after a sign-out: keep the husk, so the prompt after a sign-in
+          // recreates its query instead of meeting "Session not found".
+          session.needsSignOutRespawn = true;
+          return error;
+        }
+        // Not a closed husk: a `session/load` resumes the conversation again.
+        await this.teardownSession(sessionId);
+        return RequestError.internalError(
+          undefined,
+          `The rewind failed and the session could not be resumed: ${error}. Load the session again.`,
+        );
+      },
     });
   }
 
@@ -4100,6 +4123,15 @@ export class ClaudeAcpAgent {
 
     if (Array.from(session.taskState.values()).some((task) => task.status !== "completed")) {
       await this.publishTaskPlan(params.sessionId, session.taskState);
+    }
+
+    // A rewind that started during the awaits above did not see this prompt,
+    // which is not queued yet, and closes the query it was set up on. Before
+    // the prompt claims its file-change report and title, so the retry does.
+    const lateRewind = this.sessionRewinds.get(params.sessionId);
+    if (lateRewind) {
+      await lateRewind;
+      return this.startTurn(params, events, origin);
     }
 
     const userMessage = promptToClaude(params);
@@ -12083,11 +12115,8 @@ export class ClaudeAcpAgent {
     let rewindTo = creationOpts.rewindTo;
     if (creationOpts.resume !== undefined) {
       // A rewound session resumes the branch the rewind left it on.
-      const rewound = await rewoundSession(creationOpts.resume, this.logger);
-      if (rewound) {
-        rewindTo ??= rewound.pending?.resumeSessionAt;
-        await markResumedLeaf(creationOpts.resume, rewound);
-      }
+      const pendingRewind = await prepareRewoundResume(creationOpts.resume, this.logger);
+      rewindTo ??= pendingRewind;
       const withModel = !Object.prototype.hasOwnProperty.call(creationOpts, "resumedModelHint");
       const tail = await readResumedTail(creationOpts.resume, this.logger, withModel);
       if (withModel) resumedModelHint = tail.model;
@@ -12096,6 +12125,7 @@ export class ClaudeAcpAgent {
     }
 
     const input = new Pushable<SDKUserMessage>();
+    let claudeSessionId: string | undefined;
 
     const settingsManager = new SettingsManager(params.cwd, {
       logger: this.logger,
@@ -12513,6 +12543,7 @@ export class ClaudeAcpAgent {
     if (creationOpts?.resume === undefined || creationOpts?.forkSession) {
       // Set our own session id if not resuming an existing session.
       options.sessionId = creationOpts.publicSessionId ? randomUUID() : sessionId;
+      if (creationOpts.publicSessionId) claudeSessionId = options.sessionId;
     }
 
     // Handle abort controller from meta options
@@ -12772,6 +12803,7 @@ export class ClaudeAcpAgent {
         input: input,
         cancelled: false,
         resumedFromHistory: creationOpts.resume !== undefined,
+        ...(claudeSessionId ? { claudeSessionId } : {}),
         cwd: params.cwd,
         sessionFingerprint: computeSessionFingerprint(params),
         creationParams: params,

@@ -31147,7 +31147,6 @@ describe("_session/rewind", () => {
   ])("refuses a rewind while %s", async (_case, overrides, foreground) => {
     const { agent, creations } = rewindingAgent(overrides);
     if (foreground) (agent as any).foregroundWork.set("s", {});
-    storedConversation();
 
     expect(await agent.rewindSession({ sessionId: "s", beforeMessage: droppedPrompt })).toEqual({
       rewound: false,
@@ -31183,6 +31182,105 @@ describe("_session/rewind", () => {
     await expect(prompted).rejects.toThrow("stop the prompt here");
     expect(promptedOn).toEqual([agent.sessions["s"]]);
     expect(promptedOn[0]).not.toBe(original);
+  });
+
+  it("refuses to rewind to a point before the last compaction", async () => {
+    const { agent, creations } = rewindingAgent();
+    storedConversation([
+      ...conversation(),
+      {
+        type: "system",
+        subtype: "compact_boundary",
+        uuid: "boundary",
+        parentUuid: null,
+        logicalParentUuid: "assistant-2",
+        isSidechain: false,
+        sessionId: "s",
+      },
+      prompt("user-3", "boundary", "third"),
+      answer("assistant-3", "user-3", "msg_3", "three"),
+    ]);
+
+    // Claude Code resumes from the boundary on, and finds no entry before it.
+    expect(await agent.rewindSession({ sessionId: "s", beforeMessage: droppedPrompt })).toEqual({
+      rewound: false,
+    });
+    expect(creations).toHaveLength(0);
+    expect(agent.sessions["s"]!.queryClosed).toBeFalsy();
+  });
+
+  it("does not take a compaction summary for the prompt after the retained message", async () => {
+    const { agent, creations } = rewindingAgent();
+    storedConversation([
+      prompt("user-1", undefined, "first"),
+      answer("assistant-1", "user-1", "msg_1", "one"),
+      {
+        ...prompt("summary", "assistant-1", "This session is being continued…"),
+        isCompactSummary: true,
+      },
+      prompt("user-2", "summary", "second"),
+      answer("assistant-2", "user-2", "msg_2", "two"),
+    ]);
+
+    await agent.rewindSession({
+      sessionId: "s",
+      beforeMessage: { messageId: "air-2", messageFingerprint: fingerprint("as AIR shows it") },
+      resumeAtMessage: retainedMessage,
+    });
+
+    expect(creations[0]).toMatchObject({ rewindTo: "summary", rewindDropsTurn: "user-2" });
+  });
+
+  it("keeps the session for a sign-in when the recovery needs one", async () => {
+    const { agent } = rewindingAgent(
+      {},
+      { 0: new Error("refused"), 1: RequestError.authRequired() },
+    );
+    storedConversation();
+    const session = agent.sessions["s"]!;
+
+    await expect(
+      agent.rewindSession({ sessionId: "s", beforeMessage: droppedPrompt }),
+    ).rejects.toMatchObject({ code: RequestError.authRequired().code });
+    // As after a sign-out: the next prompt recreates the query.
+    expect(agent.sessions["s"]).toBe(session);
+    expect(session.needsSignOutRespawn).toBe(true);
+  });
+
+  it("refuses a rewind of a session whose context was cleared into another Claude session", async () => {
+    const { agent, creations } = rewindingAgent({ claudeSessionId: "after-clear" });
+
+    expect(await agent.rewindSession({ sessionId: "s", beforeMessage: droppedPrompt })).toEqual({
+      rewound: false,
+    });
+    expect(creations).toHaveLength(0);
+    expect(importSessionToStore).not.toHaveBeenCalled();
+  });
+
+  it("starts a prompt over on the new query when a rewind starts during its setup", async () => {
+    const { agent } = rewindingAgent({
+      taskState: new Map([["task-1", { subject: "ship it", status: "pending" }]]),
+    });
+    const original = agent.sessions["s"];
+    storedConversation();
+    let rewind: Promise<unknown> | undefined;
+    vi.spyOn(agent as any, "publishTaskPlan").mockImplementation(async () => {
+      // The rewind starts while the prompt awaits, before it is queued.
+      rewind ??= agent.rewindSession({ sessionId: "s", beforeMessage: droppedPrompt });
+    });
+    const promptedOn: unknown[] = [];
+    vi.spyOn(agent as any, "respawnSignedOutSession").mockImplementation((_id, session) => {
+      promptedOn.push(session);
+      if (promptedOn.length > 1) throw new Error("stop the prompt here");
+      return undefined;
+    });
+
+    await expect(
+      agent.prompt({ sessionId: "s", prompt: [{ type: "text", text: "edited" }] }),
+    ).rejects.toThrow("stop the prompt here");
+    expect(await rewind).toEqual({ rewound: true });
+    expect(promptedOn).toEqual([original, agent.sessions["s"]]);
+    expect(promptedOn[1]).not.toBe(original);
   });
 
   it("reports an unknown session rather than rewinding nothing", async () => {

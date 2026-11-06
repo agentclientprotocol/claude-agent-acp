@@ -374,18 +374,43 @@ export async function rewoundSession(
 }
 
 /**
- * Makes Claude Code resume the conversation of a rewound session. Claude Code
- * resumes the branch of the leaf that the last `last-prompt` line of the
- * transcript names, and looks up `resumeSessionAt` on that branch only. A
- * process that resumed at a rewind point writes that line with the leaf it
- * loaded, not the one its turns grow, until it exits; and a query restart
- * starts the next process before the closed one has exited. Without this line
- * the next resume fails with "No message found with message.uuid of …", or
- * resumes the branch the rewind dropped.
+ * Prepares the transcript of the session `sessionId` for a resume, and returns
+ * the pending rewind point the resume must stop at, if any. Run before every
+ * resume of a session.
+ *
+ * Claude Code resumes the branch of the leaf that the last `last-prompt` line
+ * of the transcript names. A line without `explicit: true` stands for the
+ * newest entry descending from its leaf, and Claude Code looks up
+ * `resumeSessionAt` on that branch only. A process that resumed at a rewind
+ * point keeps writing that line with the leaf it loaded until it exits, and a
+ * query restart starts the next process before the closed one has exited, so
+ * the line can name the branch the rewind dropped. A second rewind then fails
+ * with "No message found with message.uuid of …", and a plain resume brings
+ * the dropped turns back. So the line is written for the leaf of the
+ * session's conversation: explicit at a pending rewind point, whose dropped
+ * branch descends from it, and plain at the newest entry otherwise.
+ *
+ * Once the point is no longer pending, the plain line is all the next process
+ * needs, and `rewind.json` is removed.
  */
-export async function markResumedLeaf(sessionId: string, rewound: RewoundSession): Promise<void> {
+export async function prepareRewoundResume(
+  sessionId: string,
+  logger?: ResumeLogger,
+): Promise<string | undefined> {
+  const rewound = await rewoundSession(sessionId, logger);
+  if (!rewound) return undefined;
+  await markResumedLeaf(sessionId, rewound);
+  if (!rewound.pending) {
+    const file = await rewindPointFile(sessionId);
+    if (file) await rm(file, { force: true });
+  }
+  return rewound.pending?.resumeSessionAt;
+}
+
+async function markResumedLeaf(sessionId: string, rewound: RewoundSession): Promise<void> {
   const transcript = await findTranscript(sessionId);
   if (!transcript) return;
+  const explicit = rewound.pending !== undefined;
   const lines = (await readFile(transcript, "utf8")).split("\n");
   for (let index = lines.length - 1; index >= 0; index--) {
     const line = lines[index]!;
@@ -393,7 +418,7 @@ export async function markResumedLeaf(sessionId: string, rewound: RewoundSession
     try {
       const record = JSON.parse(line);
       if (record.type !== "last-prompt") continue;
-      if (record.leafUuid === rewound.leaf) return;
+      if (record.leafUuid === rewound.leaf && (record.explicit === true) === explicit) return;
       break;
     } catch {
       continue;
@@ -403,6 +428,7 @@ export async function markResumedLeaf(sessionId: string, rewound: RewoundSession
     type: "last-prompt",
     ...(rewound.lastPrompt !== undefined ? { lastPrompt: rewound.lastPrompt } : {}),
     leafUuid: rewound.leaf,
+    ...(explicit ? { explicit: true } : {}),
     sessionId,
   };
   const separator = lines.at(-1) === "" ? "" : "\n";

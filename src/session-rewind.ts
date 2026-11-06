@@ -79,6 +79,11 @@ export type SessionRewindPlan = {
    *  for, so it can guard only the rewind of the last turn: the turns after an
    *  earlier one are always in the discarded range. */
   dropsOneTurn: boolean;
+  /** Whether a compaction follows `resumeSessionAt` on the active branch.
+   *  Claude Code resumes a compacted conversation from its newest compaction
+   *  boundary on, and does not find an entry before it ("No message found
+   *  with message.uuid of …"). */
+  beforeCompaction: boolean;
   /** `messageId -> uuid` of the retained conversation only, so the recreated
    *  session cannot resolve a later fork or rewind against a dropped message. */
   retainedMessageIdToUuid: Map<string, string>;
@@ -111,8 +116,9 @@ export type SessionRewindHost = SessionRewindDependencies & {
   /** Puts the user's model, mode, effort, agent, Fast mode and ultracode back
    *  onto the resumed session. */
   restoreChoices(): Promise<void>;
-  /** Ends the session, whose query is closed and could not be resumed. */
-  discard(): Promise<void>;
+  /** Deals with a session whose query is closed and could not be resumed,
+   *  and returns the error the rewind fails with. */
+  abandon(error: unknown): Promise<unknown>;
 };
 
 /**
@@ -145,6 +151,7 @@ export async function rewindSession(
   // refuses to start a new conversation under an id whose transcript exists
   // ("Session ID … is already in use").
   if (!plan.resumeSessionAt) return refuse("the first prompt cannot be dropped");
+  if (plan.beforeCompaction) return refuse("the prompt is before the last compaction");
   // Claude Code can start a cycle on its own while the transcript is read.
   if (host.isBusy()) return refuse("Claude is working");
 
@@ -166,11 +173,7 @@ export async function rewindSession(
     try {
       await host.resume({ messageIdToUuid: host.liveMessageIdToUuid });
     } catch (recoveryError) {
-      await host.discard();
-      throw RequestError.internalError(
-        undefined,
-        `The rewind failed and the session could not be resumed: ${recoveryError}. Load the session again.`,
-      );
+      throw await host.abandon(recoveryError);
     }
     await host.restoreChoices();
     return { rewound: false };
@@ -228,10 +231,14 @@ export async function planSessionRewind(
   const parentUuid = byUuid.get(droppedPromptUuid)?.parentUuid;
   const resumeSessionAt = typeof parentUuid === "string" && parentUuid ? parentUuid : undefined;
   const dropped = entries.findIndex((entry) => entry.uuid === droppedPromptUuid);
+  const later = entries.slice(dropped + 1);
   return {
     droppedPromptUuid,
     ...(resumeSessionAt ? { resumeSessionAt } : {}),
-    dropsOneTurn: !entries.slice(dropped + 1).some((entry) => isUserPrompt(entry.uuid)),
+    dropsOneTurn: !later.some((entry) => isUserPrompt(entry.uuid)),
+    beforeCompaction: later.some(
+      (entry) => entry.type === "system" && entry.subtype === "compact_boundary",
+    ),
     retainedMessageIdToUuid: retainedMessageIdToUuid(
       resumeSessionAt,
       byUuid,

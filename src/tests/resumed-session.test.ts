@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   activeSessionMessages,
-  markResumedLeaf,
+  prepareRewoundResume,
   readResumedTail,
   resumedModelFromTranscript,
   rewoundSession,
@@ -137,26 +137,47 @@ describe("rewind point", () => {
       ids[5],
     ]);
   });
-  it("names the leaf of the conversation for Claude Code's next resume", async () => {
-    // The rewound process wrote the new branch, but its `last-prompt` line still
-    // names the dropped one.
-    const stale = { type: "last-prompt", leafUuid: ids[3], sessionId };
-    await transcript([...twoTurns, entry(4, 1, "user"), entry(5, 4, "assistant"), stale]);
-    await writeRewindPoint(sessionId, point);
-    const rewound = (await rewoundSession(sessionId))!;
-
-    await markResumedLeaf(sessionId, rewound);
-    await markResumedLeaf(sessionId, rewound);
-
-    const lines = (await readFile(path.join(directory(), `${sessionId}.jsonl`), "utf8"))
+  const lastLines = async (count: number) =>
+    (await readFile(path.join(directory(), `${sessionId}.jsonl`), "utf8"))
       .trim()
       .split("\n")
+      .slice(-count)
       .map((line) => JSON.parse(line));
-    // Once: the second call finds the line it wrote.
-    expect(lines.slice(-2)).toEqual([
+  const rewindFile = () => path.join(directory(), sessionId, "rewind.json");
+
+  it("names a pending rewind point explicitly for Claude Code's next resume", async () => {
+    // The process that resumed before the rewind named the dropped branch.
+    const stale = { type: "last-prompt", leafUuid: ids[3], sessionId };
+    await transcript([...twoTurns, stale]);
+    await writeRewindPoint(sessionId, point);
+
+    expect(await prepareRewoundResume(sessionId)).toBe(ids[1]);
+    expect(await prepareRewoundResume(sessionId)).toBe(ids[1]);
+
+    // Once, and explicit: a plain line stands for the newest entry descending
+    // from its leaf, which is in the dropped branch.
+    expect(await lastLines(2)).toEqual([
+      stale,
+      { type: "last-prompt", lastPrompt: "prompt 0", leafUuid: ids[1], explicit: true, sessionId },
+    ]);
+    await expect(readFile(rewindFile(), "utf8")).resolves.toBeDefined();
+  });
+
+  it("names the newest entry once the new branch is written, and forgets the point", async () => {
+    // The rewound process wrote the new branch, but its `last-prompt` line
+    // still names the leaf it loaded, explicitly.
+    const stale = { type: "last-prompt", leafUuid: ids[1], explicit: true, sessionId };
+    await transcript([...twoTurns, entry(4, 1, "user"), entry(5, 4, "assistant"), stale]);
+    await writeRewindPoint(sessionId, point);
+
+    expect(await prepareRewoundResume(sessionId)).toBeUndefined();
+
+    expect(await lastLines(2)).toEqual([
       stale,
       { type: "last-prompt", lastPrompt: "prompt 4", leafUuid: ids[5], sessionId },
     ]);
+    await expect(readFile(rewindFile(), "utf8")).rejects.toThrow();
+    expect(await rewoundSession(sessionId)).toBeUndefined();
   });
 });
 

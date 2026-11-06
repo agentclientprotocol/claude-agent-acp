@@ -1807,24 +1807,29 @@ AIR edits a user message by removing that message and everything after it, and l
   The occurrence of a user message counts user messages, as the occurrence of an agent message counts agent messages.
 - The adapter resolves `beforeMessage` against the id this adapter reported for the message, then against its fingerprint and occurrence.
   Both count only the branch the session continues: the transcript keeps the turns an earlier rewind dropped, so a prompt sent again after a rewind has the same text as the one it replaced.
+  Neither counts the summary that a compaction writes in the user's place.
   A user message the client spells differently than the transcript resolves through `resumeAtMessage` instead: the first user prompt after the retained message.
   When nothing resolves, the request fails with `invalidParams` and the conversation is unchanged.
 - The response is `{ "rewound": true }` when the agent removed the messages, and `{ "rewound": false }` when it left the conversation as it was.
   The client keeps its own history in that case.
 - The session id does not change, and neither does the transcript behind it: the agent replaces its query with a resume of that same conversation, stopped at the last retained entry.
   The subagent history of the session, which a fork would not copy, stays with it.
-  Any user message can be removed, with the turns after it.
+  Any user message after the first can be removed, with the turns after it, unless a compaction follows it (see below).
 - Claude Code writes the removal to the transcript only with the next prompt.
-  The agent records the rewind point in `rewind.json` beside the session's `subagents/` directory: until the next prompt, every resume of the session (`session/load`, `session/resume`, a restart of the agent or of the session's query) stops at it, and a replay ends there.
+  The agent records the rewind point in `rewind.json` beside the session's `subagents/` directory: until the next prompt, every resume of the session (`session/load`, `session/resume`, a restart of the agent or of the session's query) stops at it, a replay ends there, and a `session/fork` without a fork point forks there.
 - Claude Code resumes the branch that the last `last-prompt` line of the transcript names, and a process that resumed at a rewind point keeps naming the branch it loaded until it exits.
-  So before each resume of a rewound session, the agent appends a `last-prompt` line naming the end of the session's conversation, unless the last one already does.
+  So before each resume of a rewound session, the agent appends a `last-prompt` line for the end of the session's conversation, unless the last one already names it: with `explicit: true` at a pending rewind point, since a line without it stands for the newest entry descending from its leaf, which is in the dropped branch.
+  At the first resume after the next prompt, the agent writes the line for the newest entry and removes `rewind.json`.
 - The agent answers `rewound: false` without changing anything:
   - for the first user message: Claude Code has no entry before it to resume at, and does not start a new conversation under an id whose transcript exists;
+  - for a user message before the newest compaction of the conversation: Claude Code resumes a compacted conversation from that compaction on, and does not find an entry before it;
+  - for a session whose context was cleared when a plan was accepted: its conversation went on in another Claude Code session, and the transcript of the session id holds the one before;
   - while Claude is working: a turn runs or is queued, Claude Code runs a cycle on its own, or a background task or subagent runs. AIR stops the turn before it sends the request.
-- A prompt sent while the rewind runs waits for it, and runs on the rewound conversation.
+- A prompt sent while the rewind runs, or still being set up when the rewind starts, waits for it, and runs on the rewound conversation.
 - When the removed message is the last user message, Claude Code also checks the removed range and refuses a truncation that would remove what the client never saw, such as a message the session absorbed mid-turn.
   The refusal is deterministic, so the adapter never retries it: it resumes the conversation as it was once, answers `rewound: false`, and leaves the session promptable with its task list, its failures, and its model, mode, effort, agent, Fast mode and ultracode.
   If that resume fails too, the request fails, the session ends, and the client loads it again.
+  When it fails because the account needs a sign-in, the request fails with `authRequired` and the session stays: the next prompt after the sign-in resumes it.
 
 ## Presentation hints
 

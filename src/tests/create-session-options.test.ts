@@ -709,6 +709,7 @@ describe("createSession options merging", () => {
         type: "last-prompt",
         lastPrompt: "first",
         leafUuid: kept,
+        explicit: true,
         sessionId,
       });
     } finally {

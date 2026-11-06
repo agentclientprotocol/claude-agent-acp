@@ -16,6 +16,7 @@ import {
   type MessageIdForGrouping,
   type SessionHistoryPoint,
 } from "./session-history-point.js";
+import { rewoundSession } from "./resumed-session.js";
 import { SessionTiming } from "./session-timing.js";
 
 type ForkSessionMeta = {
@@ -25,7 +26,7 @@ type ForkSessionMeta = {
 
 type ForkSessionDependencies = {
   liveMessageIdToUuid?: ReadonlyMap<string, string>;
-  logger?: { log: (...args: unknown[]) => void };
+  logger?: { log: (...args: unknown[]) => void; error: (...args: unknown[]) => void };
   messageIdForGrouping: MessageIdForGrouping;
 };
 
@@ -72,8 +73,13 @@ async function forkTranscript(
   // SDK `dir` scopes source lookup, not the fork's working directory. Search
   // all projects: params.cwd can name a different workspace for the new session.
   if (!point) {
-    const forked = await forkClaudeSession(params.sessionId);
-    timing.phase("sdk-fork", " resolution=latest");
+    // The SDK forks the newest branch, which until the next prompt is the
+    // one a pending rewind dropped.
+    const pending = (await rewoundSession(params.sessionId, dependencies.logger))?.pending;
+    const forked = pending
+      ? await forkClaudeSession(params.sessionId, { upToMessageId: pending.resumeSessionAt })
+      : await forkClaudeSession(params.sessionId);
+    timing.phase("sdk-fork", ` resolution=${pending ? "rewind" : "latest"}`);
     return { sessionId: forked.sessionId };
   }
 

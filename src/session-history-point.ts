@@ -4,6 +4,7 @@ import {
   type SessionStoreEntry,
 } from "@anthropic-ai/claude-agent-sdk";
 import { createHash } from "node:crypto";
+import { isCompactSummaryMessage } from "./context-compaction.js";
 import { assistantMessageText } from "./session-failure-extension.js";
 
 /**
@@ -116,9 +117,10 @@ export function entriesByUuid(entries: SessionStoreEntry[]): Map<string, Session
 }
 
 /** The text of a user entry that carries a prompt, and `undefined` for every
- *  other user entry: a tool_result carrier, or a meta entry the CLI wrote. */
+ *  other user entry: a tool_result carrier, a meta entry the CLI wrote, or the
+ *  summary a compaction wrote in the user's place. */
 export function userPromptText(entry: SessionStoreEntry): string | undefined {
-  if (entry.isMeta === true) return undefined;
+  if (entry.isMeta === true || isCompactSummaryMessage(entry)) return undefined;
   const content = (entry.message as { content?: unknown } | undefined)?.content;
   if (
     Array.isArray(content) &&
