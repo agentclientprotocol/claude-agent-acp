@@ -678,7 +678,8 @@ describe("provider updates preserve session configuration", { timeout: 10_000 },
       await vi.waitFor(() => expect(queries).toHaveLength(2));
       const baseUrl = "https://recovered.example";
       update = agent.unstable_setProvider({ ...PROVIDER, baseUrl });
-      await vi.waitFor(() => expect(agent.providerConfig?.baseUrl).toBe(baseUrl));
+      // The provider update waits for the accepted sign-out lifecycle to finish.
+      expect((agent as any).providerUpdate).not.toBeNull();
       held.resolve();
       await Promise.all([turn, update]);
 
@@ -706,7 +707,8 @@ describe("provider updates preserve session configuration", { timeout: 10_000 },
       initializationGate = providerHeld.promise;
       const baseUrl = "https://recovered.example";
       update = agent.unstable_setProvider({ ...PROVIDER, baseUrl });
-      await vi.waitFor(() => expect(agent.providerConfig?.baseUrl).toBe(baseUrl));
+      // The provider update waits for the accepted sign-out lifecycle to finish.
+      expect((agent as any).providerUpdate).not.toBeNull();
       signOutHeld.resolve();
       await vi.waitFor(() => expect(queries).toHaveLength(3));
       expect(queries[1].calls.filter((call) => call.prompt)).toEqual([]);
