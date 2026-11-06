@@ -116,6 +116,12 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
   requests that the stop withdraws report no `running` first. A replayed child, which no longer
   runs, gets no capabilities. A client cannot prompt or otherwise change a child.
 
+When the SDK supplies an explicit agent type, the child association carries
+`_meta.claudeCode.subagentRole` (for example, `Explore`, `Plan`, or a custom agent type).
+Live announcements, restored associations, replay, and current session snapshots use this field.
+A later explicit type produces a partial association update. Other partial updates do not clear the role.
+The field is absent when the type is unknown. Names, descriptions, and prompts do not determine the role.
+
 An [ACP v2](#experimental-acp-v2) client gets the same without declaring anything, since subagents
 are part of v2's baseline. Each child also reports its work state as its own `state_update`, right
 after the parent's copy.
