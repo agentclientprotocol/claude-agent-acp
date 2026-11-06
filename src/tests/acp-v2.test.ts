@@ -4510,10 +4510,13 @@ describe("ACP v2 requests that subagents make", () => {
           description: "make test",
           tool_use_id: "toolu_bg",
           parent_task_id: "agent-1",
+          owned_by_subagent: true,
           is_backgrounded: true,
           uuid: randomUUID(),
           session_id: options.sessionId,
         };
+        // As seen live (CLI 2.1.318): a subagent's tool result has no
+        // `tool_use_result`, so only the `task_started` above names the task.
         yield childMessage(options, {
           type: "user",
           message: {
@@ -4525,13 +4528,6 @@ describe("ACP v2 requests that subagents make", () => {
                 content: "Command running in background with ID: bg1.",
               },
             ],
-          },
-          tool_use_result: {
-            stdout: "",
-            stderr: "",
-            interrupted: false,
-            isImage: false,
-            backgroundTaskId: "bg1",
           },
         });
         yield taskEnd(options, "agent-1", "toolu_agent-1");
