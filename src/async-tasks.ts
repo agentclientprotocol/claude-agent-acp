@@ -15,7 +15,7 @@ type AsyncTask = {
   taskType: string;
   description: string;
   showInTranscript: boolean;
-  /** A Monitor tool call or an SDK `local_monitor` task: published as a monitor the client cannot stop. */
+  /** A Monitor tool call or an SDK `local_monitor` task. */
   monitor: boolean;
   outputFilePath?: string;
   toolCallId?: string;
@@ -115,6 +115,21 @@ export function clientSupportsAsyncTasks(capabilities?: ClientCapabilities | nul
   return clientSupportsAirCapability(capabilities, AIR_ASYNC_TASKS_CAPABILITY);
 }
 
+export type AsyncTaskDetails = { monitors: boolean; schedules: boolean; output: boolean };
+
+export function clientAsyncTaskDetails(capabilities?: ClientCapabilities | null): AsyncTaskDetails {
+  const requested = (capabilities?._meta as Record<string, unknown> | undefined)?.asyncTaskDetails;
+  const details =
+    requested && typeof requested === "object" && !Array.isArray(requested)
+      ? (requested as Record<string, unknown>)
+      : {};
+  return {
+    monitors: details.monitors === true,
+    schedules: details.schedules === true,
+    output: details.output === true,
+  };
+}
+
 /** Publishes Claude's non-agent background work as a separate AIR task lifecycle. */
 export class AsyncTaskRuntime {
   /**
@@ -139,15 +154,10 @@ export class AsyncTaskRuntime {
     readonly enabled: boolean,
     private readonly sessionId: string,
     private readonly publish: Publish,
-    /** `notices`: the client can present `notice` updates, so the stop
-     *  acknowledgement need not be a transcript line. `routeOf`: the route of
-     *  the tasks that a tool call in another session started, for example in
-     *  a native subagent session. `toolNameOf`: the name of the tool of a tool
-     *  call, or `undefined` when the tool call is unknown. A task that a
-     *  `Monitor` tool call started is published as a monitor: the SDK reports
-     *  it as `local_bash`, so the adapter names it a monitor. */
+    /** `toolNameOf` identifies a Monitor tool call that the SDK reports as `local_bash`. */
     private readonly options: {
       notices?: boolean;
+      monitors?: boolean;
       routeOf?: (toolCallId: string) => Route | undefined;
       toolNameOf?: (toolCallId: string) => string | undefined;
     } = {},
@@ -162,7 +172,6 @@ export class AsyncTaskRuntime {
       this.ignore(task);
       return;
     }
-
     const previousOutputFilePath = task.outputFilePath;
     const previousToolCallId = task.toolCallId;
     const wasAnnounced = task.announced;
@@ -193,7 +202,6 @@ export class AsyncTaskRuntime {
       this.ignore(task);
       return;
     }
-
     const previousOutputFilePath = task.outputFilePath;
     const previousToolCallId = task.toolCallId;
     const wasAnnounced = task.announced;
@@ -413,7 +421,7 @@ export class AsyncTaskRuntime {
     const task = this.tasks.get(taskId);
     return (
       task?.announced === true &&
-      !task.monitor &&
+      (!task.monitor || this.options.monitors === true) &&
       !task.ignored &&
       !task.stopping &&
       !isTerminal(task.state)
@@ -508,6 +516,16 @@ export class AsyncTaskRuntime {
   /** Whether the task stands for an autonomous turn, which a stop interrupts. */
   isAutonomousTurn(taskId: string): boolean {
     return this.tasks.get(taskId)?.autonomousTurn === true;
+  }
+
+  /** Only shell and negotiated monitor task IDs may be read through the SDK. */
+  canReadOutput(taskId: string): boolean {
+    const task = this.tasks.get(taskId);
+    return (
+      task?.announced === true &&
+      !task.ignored &&
+      (task.taskType === "shell" || (task.monitor && this.options.monitors === true))
+    );
   }
 
   /** Whether a task of the tool call went to the background, so the client gets it. */
@@ -691,8 +709,7 @@ export class AsyncTaskRuntime {
    * A task that a `Monitor` tool call started is published as a monitor. The
    * SDK reports it as `local_bash`, so the adapter names it a monitor instead of
    * a shell. It has no transcript card because Monitor streams its output to
-   * the model only, and no Stop because stopping it only ends the agent's wait
-   * (the agent's own TaskStop still works). The tool_use streams before the
+   * the model only. The tool_use streams before the
    * tool runs, so the tool name is known when the spawn has the tool call id.
    */
   private async announce(
@@ -719,7 +736,7 @@ export class AsyncTaskRuntime {
       taskType: task.taskType,
       description: task.description,
       showInTranscript: task.showInTranscript,
-      canStop: !task.monitor,
+      canStop: !task.monitor || this.options.monitors === true,
       ...(task.outputFilePath ? { outputFilePath: task.outputFilePath } : {}),
       ...(task.toolCallId ? { toolCallId: task.toolCallId } : {}),
     });
