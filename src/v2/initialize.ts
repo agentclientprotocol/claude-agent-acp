@@ -60,7 +60,7 @@ export function v1InitializeRequest(request: v2.InitializeRequest): InitializeRe
  * advertise an extension the v2 surface does not serve yet: `steering`, for
  * `_session/steering`.
  */
-const UNSERVED_EXTENSION_KEYS: readonly string[] = ["steering"];
+const UNSERVED_EXTENSION_KEYS: readonly string[] = ["steering", "asyncTaskDetails"];
 
 /**
  * The v2 `initialize` response for the v1 response of the agent.

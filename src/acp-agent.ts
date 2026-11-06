@@ -701,6 +701,7 @@ const STEER_METHOD = "_session/steering";
 
 /** Stops one Claude background task without cancelling the parent prompt turn. */
 const ASYNC_TASK_STOP_METHOD = "_session/async_task/stop";
+const ASYNC_TASK_OUTPUT_METHOD = "_session/async_task/output";
 
 type AsyncTaskStopRequest = {
   sessionId: string;
@@ -710,6 +711,8 @@ type AsyncTaskStopRequest = {
 type AsyncTaskStopResponse = {
   stopped: boolean;
 };
+
+type AsyncTaskOutputResponse = { output: string };
 
 function parseAsyncTaskStopRequest(value: unknown): AsyncTaskStopRequest {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -3130,6 +3133,13 @@ export class ClaudeAcpAgent {
         steering: {
           supported: true,
         },
+        // Only to a client that asked through `_meta.asyncTaskDetails.output`.
+        ...((
+          (this.clientCapabilities?._meta as Record<string, unknown> | undefined)
+            ?.asyncTaskDetails as Record<string, unknown> | undefined
+        )?.output === true
+          ? { asyncTaskDetails: { output: true } }
+          : {}),
       },
     };
   }
@@ -4629,6 +4639,35 @@ export class ClaudeAcpAgent {
       asyncTasks.releaseStop(params.asyncTaskId);
       throw error;
     }
+  }
+
+  async asyncTaskOutput(params: AsyncTaskStopRequest): Promise<AsyncTaskOutputResponse> {
+    const details = (this.clientCapabilities?._meta as Record<string, unknown> | undefined)
+      ?.asyncTaskDetails;
+    if (
+      !details ||
+      typeof details !== "object" ||
+      (details as Record<string, unknown>).output !== true
+    ) {
+      throw RequestError.invalidParams(undefined, "async task output was not negotiated");
+    }
+    const session = this.sessions[params.sessionId];
+    const monitors = (details as Record<string, unknown>).monitors === true;
+    if (!session?.asyncTaskRuntime?.canReadOutput(params.asyncTaskId, monitors)) {
+      throw RequestError.invalidParams(undefined, "unknown shell or monitor task id");
+    }
+    // The SDK declares get_task_output on its control wire but does not expose it on Query.
+    const queryControl = session.query as unknown as {
+      request: (request: {
+        subtype: "get_task_output";
+        task_id: string;
+      }) => Promise<{ response: { output: string } }>;
+    };
+    const result = await queryControl.request({
+      subtype: "get_task_output",
+      task_id: params.asyncTaskId,
+    });
+    return { output: Buffer.from(result.response.output).subarray(-8192).toString("utf8") };
   }
 
   /** Lazily start the per-session consumer that drains the SDK query stream for
@@ -14882,6 +14921,11 @@ export function v1AgentApp(
       ASYNC_TASK_STOP_METHOD,
       { parse: parseAsyncTaskStopRequest },
       (ctx) => agent.stopAsyncTask(ctx.params),
+    )
+    .onRequest<AsyncTaskStopRequest, AsyncTaskOutputResponse>(
+      ASYNC_TASK_OUTPUT_METHOD,
+      { parse: parseAsyncTaskStopRequest },
+      (ctx) => agent.asyncTaskOutput(ctx.params),
     )
     .onRequest<GoalRequest, GoalControlResponse>(
       GOAL_CONTROL_METHOD,
