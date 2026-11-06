@@ -954,6 +954,12 @@ The live test only initializes the SDK. It sends no model prompt.
 
 ## Async tasks
 
+### Session schedules
+
+A client that declares `initialize.clientCapabilities._meta.asyncTaskDetails.schedules: true` receives `session_schedules_update` with the complete list of `{ id, schedule, recurring, prompt }` entries whenever that list changes, including an empty list when the last schedule is removed.
+The adapter reads this list from the Claude SDK's `Stop` hook `session_crons` field and repeats a known nonempty list after `session/load` or `session/resume`.
+The SDK does not include session crons in `SessionStart`, so a newly loaded session with no prior adapter snapshot cannot report its existing crons until its next `Stop` hook.
+
 Claude can run work in the background, for example a backgrounded Bash command or a workflow.
 The adapter publishes that work as async tasks when the client declares `asyncTasks`.
 Without the capability, the adapter sends no async task update.
