@@ -1,9 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { SessionMessage } from "@anthropic-ai/claude-agent-sdk";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { readResumedTail, resumedModelFromTranscript } from "../resumed-session.js";
+import {
+  activeSessionMessages,
+  markResumedLeaf,
+  readResumedTail,
+  resumedModelFromTranscript,
+  rewoundSession,
+  writeRewindPoint,
+} from "../resumed-session.js";
 
 function assistant(
   model: unknown,
@@ -48,6 +55,108 @@ describe("resumedModelFromTranscript", () => {
 
   it("returns undefined when the transcript has no real assistant model", () => {
     expect(resumedModelFromTranscript([assistant("<synthetic>")])).toBeUndefined();
+  });
+});
+
+describe("rewind point", () => {
+  let configDir: string;
+  let originalConfigDir: string | undefined;
+  const sessionId = crypto.randomUUID();
+  const directory = () => path.join(configDir, "projects", "-workspace");
+
+  beforeEach(async () => {
+    configDir = await mkdtemp(path.join(os.tmpdir(), "claude-acp-rewind-point-"));
+    originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = configDir;
+    await mkdir(directory(), { recursive: true });
+  });
+
+  afterEach(async () => {
+    if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
+    await rm(configDir, { recursive: true, force: true });
+  });
+
+  const ids = Array.from({ length: 6 }, () => crypto.randomUUID());
+  const entry = (index: number, parent: number | undefined, type: "user" | "assistant") => ({
+    type,
+    uuid: ids[index],
+    parentUuid: parent === undefined ? null : ids[parent],
+    isSidechain: false,
+    sessionId,
+    timestamp: new Date(Date.UTC(2026, 0, 1, 0, index)).toISOString(),
+    message:
+      type === "user"
+        ? { role: "user", content: `prompt ${index}` }
+        : { role: "assistant", content: [{ type: "text", text: `answer ${index}` }] },
+  });
+  async function transcript(entries: unknown[]): Promise<void> {
+    await writeFile(
+      path.join(directory(), `${sessionId}.jsonl`),
+      entries.map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+  }
+  const twoTurns = [
+    entry(0, undefined, "user"),
+    entry(1, 0, "assistant"),
+    entry(2, 1, "user"),
+    entry(3, 2, "assistant"),
+  ];
+  const point = { resumeSessionAt: ids[1]!, droppedPromptUuid: ids[2]! };
+
+  it("leaves a session that was never rewound to Claude Code", async () => {
+    await transcript(twoTurns);
+
+    expect(await rewoundSession(sessionId)).toBeUndefined();
+  });
+
+  it("cuts the conversation at a rewind the next prompt has not written past", async () => {
+    await transcript(twoTurns);
+    await writeRewindPoint(sessionId, point);
+
+    expect(await rewoundSession(sessionId)).toEqual({
+      leaf: ids[1],
+      lastPrompt: "prompt 0",
+      pending: point,
+    });
+    expect((await activeSessionMessages(sessionId)).map((message) => message.uuid)).toEqual([
+      ids[0],
+      ids[1],
+    ]);
+  });
+
+  it("ends the conversation at the newest entry once the next prompt starts the new branch", async () => {
+    await transcript([...twoTurns, entry(4, 1, "user"), entry(5, 4, "assistant")]);
+    await writeRewindPoint(sessionId, point);
+
+    expect(await rewoundSession(sessionId)).toEqual({ leaf: ids[5], lastPrompt: "prompt 4" });
+    expect((await activeSessionMessages(sessionId)).map((message) => message.uuid)).toEqual([
+      ids[0],
+      ids[1],
+      ids[4],
+      ids[5],
+    ]);
+  });
+  it("names the leaf of the conversation for Claude Code's next resume", async () => {
+    // The rewound process wrote the new branch, but its `last-prompt` line still
+    // names the dropped one.
+    const stale = { type: "last-prompt", leafUuid: ids[3], sessionId };
+    await transcript([...twoTurns, entry(4, 1, "user"), entry(5, 4, "assistant"), stale]);
+    await writeRewindPoint(sessionId, point);
+    const rewound = (await rewoundSession(sessionId))!;
+
+    await markResumedLeaf(sessionId, rewound);
+    await markResumedLeaf(sessionId, rewound);
+
+    const lines = (await readFile(path.join(directory(), `${sessionId}.jsonl`), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    // Once: the second call finds the line it wrote.
+    expect(lines.slice(-2)).toEqual([
+      stale,
+      { type: "last-prompt", lastPrompt: "prompt 4", leafUuid: ids[5], sessionId },
+    ]);
   });
 });
 

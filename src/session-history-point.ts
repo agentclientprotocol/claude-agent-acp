@@ -82,6 +82,39 @@ function isMainChainEntry(entry: SessionStoreEntry): boolean {
   );
 }
 
+/** The uuid of the newest entry of the main conversation: the leaf that
+ *  `getSessionMessages` reads. Like it, skips `progress` entries. */
+export function newestMainChainUuid(entries: SessionStoreEntry[]): string | undefined {
+  return entries.findLast(
+    (entry) =>
+      typeof entry.uuid === "string" && entry.type !== "progress" && isMainChainEntry(entry),
+  )?.uuid;
+}
+
+/** The uuids of `leaf` and of every entry it descends from. A compaction
+ *  boundary has no `parentUuid`; its `logicalParentUuid` carries the chain on. */
+export function chainUuids(
+  leaf: string | undefined,
+  byUuid: ReadonlyMap<string, SessionStoreEntry>,
+): Set<string> {
+  const chain = new Set<string>();
+  let cursor = leaf;
+  while (cursor && !chain.has(cursor)) {
+    const entry = byUuid.get(cursor);
+    if (!entry) break;
+    chain.add(cursor);
+    const parent = entry.parentUuid || entry.logicalParentUuid;
+    cursor = typeof parent === "string" ? parent : undefined;
+  }
+  return chain;
+}
+
+export function entriesByUuid(entries: SessionStoreEntry[]): Map<string, SessionStoreEntry> {
+  return new Map(
+    entries.flatMap((entry) => (typeof entry.uuid === "string" ? [[entry.uuid, entry]] : [])),
+  );
+}
+
 /** The text of a user entry that carries a prompt, and `undefined` for every
  *  other user entry: a tool_result carrier, or a meta entry the CLI wrote. */
 export function userPromptText(entry: SessionStoreEntry): string | undefined {
@@ -150,14 +183,12 @@ function fingerprintOccurrenceOnBranch(
   groups: HistoryGroups,
   messageIdForGrouping: MessageIdForGrouping,
 ): number {
-  const entriesByUuid = new Map(
-    entries.flatMap((entry) => (typeof entry.uuid === "string" ? [[entry.uuid, entry]] : [])),
-  );
+  const byUuid = entriesByUuid(entries);
   const seenGroups = new Set<string>();
   let occurrence = 0;
   let cursor: string | undefined = targetUuid;
   while (cursor) {
-    const entry = entriesByUuid.get(cursor);
+    const entry = byUuid.get(cursor);
     if (!entry) break;
     const messageId = isMainChainEntry(entry) ? messageIdForGrouping(entry) : undefined;
     if (messageId && !seenGroups.has(messageId)) {

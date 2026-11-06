@@ -663,6 +663,61 @@ describe("createSession options merging", () => {
     expect(capturedOptions!.tools).toEqual([]);
   });
 
+  it("resumes a rewound session where the rewind left its conversation", async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-rewound-"));
+    const originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = configDir;
+    try {
+      const sessionId = crypto.randomUUID();
+      const [first, kept, dropped, droppedAnswer] = Array.from({ length: 4 }, () =>
+        crypto.randomUUID(),
+      );
+      const line = (uuid: string, parentUuid: string | null, type: string, content: unknown) =>
+        JSON.stringify({
+          type,
+          uuid,
+          parentUuid,
+          isSidechain: false,
+          sessionId,
+          message: { role: type, content },
+        });
+      const projectDir = path.join(configDir, "projects", "-workspace");
+      fs.mkdirSync(path.join(projectDir, sessionId), { recursive: true });
+      const transcript = path.join(projectDir, `${sessionId}.jsonl`);
+      // The rewound process wrote nothing yet, and its `last-prompt` line still
+      // names the dropped turn.
+      fs.writeFileSync(
+        transcript,
+        [
+          line(first!, null, "user", "first"),
+          line(kept!, first!, "assistant", [{ type: "text", text: "one" }]),
+          line(dropped!, kept!, "user", "second"),
+          line(droppedAnswer!, dropped!, "assistant", [{ type: "text", text: "two" }]),
+          JSON.stringify({ type: "last-prompt", leafUuid: droppedAnswer, sessionId }),
+        ].join("\n") + "\n",
+      );
+      fs.writeFileSync(
+        path.join(projectDir, sessionId, "rewind.json"),
+        JSON.stringify({ resumeSessionAt: kept, droppedPromptUuid: dropped }),
+      );
+
+      await agent.resumeSession({ sessionId, cwd: process.cwd(), mcpServers: [] });
+
+      expect(capturedOptions?.resume).toBe(sessionId);
+      expect(capturedOptions?.resumeSessionAt).toBe(kept);
+      expect(JSON.parse(fs.readFileSync(transcript, "utf8").trim().split("\n").at(-1)!)).toEqual({
+        type: "last-prompt",
+        lastPrompt: "first",
+        leafUuid: kept,
+        sessionId,
+      });
+    } finally {
+      if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
+      fs.rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
   it("recreates a resumed Query with changed skills and the same session ID", async () => {
     const created = await agent.newSession({
       cwd: process.cwd(),

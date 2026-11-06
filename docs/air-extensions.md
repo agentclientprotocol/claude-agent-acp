@@ -1800,22 +1800,31 @@ AIR edits a user message by removing that message and everything after it, and l
 }
 ```
 
+- Only the ACP v1 surface serves `_session/rewind`; ACP v2 does not list `sessionRewind`.
 - `beforeMessage` is the user message that the retained conversation excludes.
   `resumeAtMessage` is the last agent message retained before it, and is absent when the edited message is the first of the session.
   Both carry the triple of [Session fork point](#session-fork-point), with the same `:segment:<n>` tolerance and the same meaning of the fingerprint and its occurrence.
   The occurrence of a user message counts user messages, as the occurrence of an agent message counts agent messages.
 - The adapter resolves `beforeMessage` against the id this adapter reported for the message, then against its fingerprint and occurrence.
-  A user message the client spells differently than the transcript resolves through `resumeAtMessage` instead: the nearest user prompt descending from the retained message.
+  Both count only the branch the session continues: the transcript keeps the turns an earlier rewind dropped, so a prompt sent again after a rewind has the same text as the one it replaced.
+  A user message the client spells differently than the transcript resolves through `resumeAtMessage` instead: the first user prompt after the retained message.
   When nothing resolves, the request fails with `invalidParams` and the conversation is unchanged.
 - The response is `{ "rewound": true }` when the agent removed the messages, and `{ "rewound": false }` when it left the conversation as it was.
   The client keeps its own history in that case.
 - The session id does not change, and neither does the transcript behind it: the agent replaces its query with a resume of that same conversation, stopped at the last retained entry.
   The subagent history of the session, which a fork would not copy, stays with it.
-- A rewind of the first user message retains nothing, so the agent starts a fresh conversation under the same session id.
-- The agent refuses a rewind while a turn is running, with `rewound: false`.
-  AIR stops the turn before it sends the request.
-- Claude Code validates the removed range and refuses a truncation that would also remove what the client never saw — a message the session absorbed mid-turn.
-  The refusal is deterministic, so the adapter never retries it: it resumes the untruncated conversation once, answers `rewound: false`, and leaves the session promptable.
+  Any user message can be removed, with the turns after it.
+- Claude Code writes the removal to the transcript only with the next prompt.
+  The agent records the rewind point in `rewind.json` beside the session's `subagents/` directory: until the next prompt, every resume of the session (`session/load`, `session/resume`, a restart of the agent or of the session's query) stops at it, and a replay ends there.
+- Claude Code resumes the branch that the last `last-prompt` line of the transcript names, and a process that resumed at a rewind point keeps naming the branch it loaded until it exits.
+  So before each resume of a rewound session, the agent appends a `last-prompt` line naming the end of the session's conversation, unless the last one already does.
+- The agent answers `rewound: false` without changing anything:
+  - for the first user message: Claude Code has no entry before it to resume at, and does not start a new conversation under an id whose transcript exists;
+  - while Claude is working: a turn runs or is queued, Claude Code runs a cycle on its own, or a background task or subagent runs. AIR stops the turn before it sends the request.
+- A prompt sent while the rewind runs waits for it, and runs on the rewound conversation.
+- When the removed message is the last user message, Claude Code also checks the removed range and refuses a truncation that would remove what the client never saw, such as a message the session absorbed mid-turn.
+  The refusal is deterministic, so the adapter never retries it: it resumes the conversation as it was once, answers `rewound: false`, and leaves the session promptable with its task list, its failures, and its model, mode, effort, agent, Fast mode and ultracode.
+  If that resume fails too, the request fails, the session ends, and the client loads it again.
 
 ## Presentation hints
 
