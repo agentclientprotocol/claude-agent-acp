@@ -1,9 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { SessionMessage } from "@anthropic-ai/claude-agent-sdk";
+import { getSessionMessages, type SessionMessage } from "@anthropic-ai/claude-agent-sdk";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { readResumedTail, resumedModelFromTranscript } from "../resumed-session.js";
+import {
+  readHistoryAcrossCompactions,
+  readResumedTail,
+  resumedModelFromTranscript,
+} from "../resumed-session.js";
 
 function assistant(
   model: unknown,
@@ -201,5 +205,144 @@ describe("readResumedTail", () => {
     await transcript("no-mode", [userLine("hello"), record("claude-opus-5")]);
 
     expect(await readResumedTail("no-mode")).toEqual({ model: "claude-opus-5" });
+  });
+});
+
+describe("readHistoryAcrossCompactions", () => {
+  const sessionId = "33333333-3333-4333-8333-333333333333";
+  let configDir: string;
+  let originalConfigDir: string | undefined;
+
+  beforeEach(async () => {
+    configDir = await mkdtemp(path.join(os.tmpdir(), "claude-acp-compacted-"));
+    originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = configDir;
+  });
+
+  afterEach(async () => {
+    if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
+    await rm(configDir, { recursive: true, force: true });
+  });
+
+  /** Writes the records as Claude Code does: each one links to the record
+   *  before it, except a record that sets its own `parentUuid`. */
+  async function transcript(records: Record<string, unknown>[]): Promise<void> {
+    const directory = path.join(configDir, "projects", "-workspace");
+    await mkdir(directory, { recursive: true });
+    let parentUuid: unknown = null;
+    const lines = records.map((record) => {
+      const line = {
+        parentUuid,
+        sessionId,
+        isSidechain: false,
+        timestamp: "2026-10-11T00:00:00.000Z",
+        ...record,
+      };
+      parentUuid = record.uuid;
+      return JSON.stringify(line);
+    });
+    await writeFile(path.join(directory, `${sessionId}.jsonl`), lines.join("\n") + "\n");
+  }
+
+  const user = (uuid: string, text: string, extra: object = {}) => ({
+    type: "user",
+    uuid,
+    message: { role: "user", content: text },
+    ...extra,
+  });
+  const assistant = (uuid: string, text: string) => ({
+    type: "assistant",
+    uuid,
+    message: {
+      id: `msg_${uuid}`,
+      role: "assistant",
+      model: "claude-opus-5",
+      content: [{ type: "text", text }],
+    },
+  });
+  /** A boundary as Claude Code writes it: no parent, and the last message
+   *  before it in `logicalParentUuid`. */
+  const boundary = (uuid: string, logicalParentUuid: string, compactMetadata: object = {}) => ({
+    type: "system",
+    subtype: "compact_boundary",
+    uuid,
+    parentUuid: null,
+    logicalParentUuid,
+    compactMetadata: { trigger: "manual", preTokens: 1000, ...compactMetadata },
+  });
+  const summary = (uuid: string) => user(uuid, `Summary ${uuid}`, { isCompactSummary: true });
+
+  const texts = (messages: SessionMessage[]) =>
+    messages.map((message) => {
+      const content = (message.message as { content: unknown }).content;
+      return typeof content === "string" ? content : (content as { text: string }[])[0]!.text;
+    });
+
+  it("reads the messages before each compaction", async () => {
+    await transcript([
+      user("u1", "hi"),
+      assistant("a1", "Hello"),
+      boundary("b1", "a1"),
+      summary("s1"),
+      user("u2", "next"),
+      assistant("a2", "Next"),
+      boundary("b2", "a2"),
+      summary("s2"),
+      user("u3", "identify yourself"),
+      assistant("a3", "Claude"),
+    ]);
+
+    // getSessionMessages stops at the last boundary.
+    const chain = await getSessionMessages(sessionId);
+    expect(texts(chain)).toEqual(["Summary s2", "identify yourself", "Claude"]);
+    expect(texts(await readHistoryAcrossCompactions(sessionId, chain))).toEqual([
+      "hi",
+      "Hello",
+      "Summary s1",
+      "next",
+      "Next",
+      "Summary s2",
+      "identify yourself",
+      "Claude",
+    ]);
+  });
+
+  it("keeps the messages that a compaction preserved where they were said", async () => {
+    // Claude Code 2.1.293 keeps u2 and a2 in the context after the summary,
+    // and records them in both forms of preserved-message metadata.
+    await transcript([
+      user("u1", "hi"),
+      assistant("a1", "Hello"),
+      user("u2", "keep this"),
+      assistant("a2", "Kept"),
+      boundary("b1", "a2", {
+        preservedSegment: { headUuid: "u2", anchorUuid: "s1", tailUuid: "a2" },
+        preservedMessages: { anchorUuid: "s1", uuids: ["u2", "a2"] },
+      }),
+      summary("s1"),
+      user("u3", "after"),
+      assistant("a3", "After"),
+    ]);
+
+    // getSessionMessages moves the preserved messages after the summary.
+    const chain = await getSessionMessages(sessionId);
+    expect(texts(chain)).toEqual(["Summary s1", "keep this", "Kept", "after", "After"]);
+    expect(texts(await readHistoryAcrossCompactions(sessionId, chain))).toEqual([
+      "hi",
+      "Hello",
+      "keep this",
+      "Kept",
+      "Summary s1",
+      "after",
+      "After",
+    ]);
+  });
+
+  it("returns the chain of a session without a compaction as it is", async () => {
+    await transcript([user("u1", "hi"), assistant("a1", "Hello")]);
+
+    const chain = await getSessionMessages(sessionId);
+    expect(await readHistoryAcrossCompactions(sessionId, chain)).toBe(chain);
   });
 });
