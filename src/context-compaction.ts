@@ -1,6 +1,7 @@
 import { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import {
   ContextCompactionMetadata,
+  ContextCompactionTrigger,
   createContextCompactionMeta,
 } from "./context-compaction-meta.js";
 import { compactionToolCall } from "./tool-calls/reporters/compaction.js";
@@ -66,7 +67,7 @@ const ANALYSIS_BLOCKS = [
  *  it as the post-compaction user message. */
 const CONTINUATION_PREAMBLE = /^\s*This session is being continued from a previous conversation/i;
 const PERSISTED_PREAMBLE =
-  /^\s*This session is being continued from a previous conversation[^\n]*\n+Summary:[ \t]*\r?\n/;
+  /^\s*This session is being continued from a previous conversation[^\n]*\n(?:[\s\S]*?\n)?Summary:[ \t]*\r?\n/;
 const PERSISTED_TRAILERS = [
   /\n+If you need specific details from before compaction[\s\S]*$/,
   /\n+(?:Please )?[Cc]ontinue the conversation from where it left (?:it )?off[\s\S]*$/,
@@ -408,14 +409,29 @@ function withoutError({
   return facts;
 }
 
-export function contextCompactionMetadataFromBoundary(compactMetadata: {
-  trigger: "manual" | "auto";
-  pre_tokens: number;
-  post_tokens?: number;
-  duration_ms?: number;
-}): Omit<ContextCompactionMetadata, "version"> {
+function compactionTrigger(
+  cliTrigger: "manual" | "auto",
+  sentByAdapter: boolean,
+): ContextCompactionTrigger {
+  // The CLI's own automatic compaction stays automatic, even inside the adapter's /compact turn.
+  if (cliTrigger === "auto") return "automatic";
+  // The CLI reports every /compact as manual; only the adapter knows it sent this one itself.
+  if (sentByAdapter) return "idle";
+  return "manual";
+}
+
+/** `idleCompaction` marks a `/compact` that the adapter sent itself (see `IdleCompaction`). */
+export function contextCompactionMetadataFromBoundary(
+  compactMetadata: {
+    trigger: "manual" | "auto";
+    pre_tokens: number;
+    post_tokens?: number;
+    duration_ms?: number;
+  },
+  { idleCompaction = false }: { idleCompaction?: boolean } = {},
+): Omit<ContextCompactionMetadata, "version"> {
   return {
-    trigger: compactMetadata.trigger === "auto" ? "automatic" : "manual",
+    trigger: compactionTrigger(compactMetadata.trigger, idleCompaction),
     preTokens: compactMetadata.pre_tokens,
     ...(compactMetadata.post_tokens !== undefined
       ? { postTokens: compactMetadata.post_tokens }

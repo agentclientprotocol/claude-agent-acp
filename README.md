@@ -36,6 +36,23 @@ To try changes that have landed on `main` but are not released yet, install from
 npm install @agentclientprotocol/claude-agent-acp@preview
 ```
 
+### Standalone executables
+
+Each release attaches archives for Linux (glibc and musl), macOS and Windows, on
+x64 and arm64, to its [GitHub release](https://github.com/agentclientprotocol/claude-agent-acp/releases).
+They need no Node.js install. Each holds two files: `claude-agent-acp`, and the
+Claude CLI (`claude`) it runs. Keep them in the same directory; a symlink to
+`claude-agent-acp` elsewhere works. To use a Claude CLI you already have
+instead, set `CLAUDE_CODE_EXECUTABLE`. On Alpine, install `libgcc` and
+`libstdc++` first.
+
+To build one for your machine (needs [Bun](https://bun.sh)) and check it:
+
+```sh
+npm run build:binary
+npm run smoke:binary            # add `-- --full` to drive a real session; needs a Claude login
+```
+
 ### Subagent sessions
 
 A client that declares `clientCapabilities.subagents`, other than JetBrains AIR, gets each Agent or

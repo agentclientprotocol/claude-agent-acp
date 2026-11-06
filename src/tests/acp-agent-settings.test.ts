@@ -42,6 +42,7 @@ describe("ClaudeAcpAgent settings", () => {
               value: "claude-sonnet-4-6",
               displayName: "Claude Sonnet 4.5",
               description: "Default",
+              supportsAutoMode: true,
             },
           ],
         }),
@@ -284,7 +285,7 @@ describe("ClaudeAcpAgent settings", () => {
 
   it("drops escalating defaultMode when it comes from project-tier settings", async () => {
     // bypassPermissions in .claude/settings.json (a repo-committed tier) is
-    // filtered by the SDK's trust policy and clamps to 'default'.
+    // filtered by the SDK's trust policy, so the built-in default applies.
     const projectDir = path.join(tempDir, "project");
     await fs.promises.mkdir(path.join(projectDir, ".claude"), { recursive: true });
     await fs.promises.writeFile(
@@ -303,8 +304,8 @@ describe("ClaudeAcpAgent settings", () => {
       _meta: { disableBuiltInTools: true },
     });
 
-    expect(getCapturedOptions().permissionMode).toBe("default");
-    expect(response.modes.currentModeId).toBe("default");
+    expect(getCapturedOptions().permissionMode).toBe("auto");
+    expect(response.modes.currentModeId).toBe("auto");
   });
 
   it("honors the host opt-out from bypassPermissions", async () => {
@@ -380,7 +381,7 @@ describe("ClaudeAcpAgent settings", () => {
     },
   );
 
-  it("defaults to 'default' when no permissions.defaultMode is set", async () => {
+  it("defaults to 'auto' when no permissions.defaultMode is set", async () => {
     const projectDir = path.join(tempDir, "project");
     await fs.promises.mkdir(projectDir, { recursive: true });
 
@@ -395,8 +396,37 @@ describe("ClaudeAcpAgent settings", () => {
       _meta: { disableBuiltInTools: true },
     });
 
-    expect(getCapturedOptions().permissionMode).toBe("default");
+    expect(getCapturedOptions().permissionMode).toBe("auto");
+    expect(response.modes.currentModeId).toBe("auto");
+  });
+
+  it.each([
+    { name: "top-level disableAutoMode", settings: { disableAutoMode: "disable" } },
+    {
+      name: "permissions.disableAutoMode with defaultMode 'auto'",
+      settings: { permissions: { disableAutoMode: "disable", defaultMode: "auto" } },
+    },
+  ])("starts in 'default' without Auto in the catalog for $name", async ({ settings }) => {
+    await fs.promises.writeFile(path.join(tempDir, "settings.json"), JSON.stringify(settings));
+    const projectDir = path.join(tempDir, "project");
+    await fs.promises.mkdir(projectDir, { recursive: true });
+
+    mockQuery();
+
+    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+    (agent as any).logger = { log: () => {}, error: () => {} };
+
+    const response = await (agent as any).createSession({
+      cwd: projectDir,
+      mcpServers: [],
+      _meta: { disableBuiltInTools: true },
+    });
+
     expect(response.modes.currentModeId).toBe("default");
+    expect(response.modes.availableModes.map((mode: { id: string }) => mode.id)).not.toContain(
+      "auto",
+    );
   });
 
   describe("on resume", () => {
@@ -546,7 +576,7 @@ describe("ClaudeAcpAgent settings", () => {
     });
   });
 
-  it("falls back to 'default' when permissions.defaultMode is invalid", async () => {
+  it("falls back to the built-in default when permissions.defaultMode is invalid", async () => {
     await fs.promises.writeFile(
       path.join(tempDir, "settings.json"),
       JSON.stringify({
@@ -570,9 +600,9 @@ describe("ClaudeAcpAgent settings", () => {
       _meta: { disableBuiltInTools: true },
     });
 
-    // Bad mode is ignored at the usage site; session creation must not throw.
-    expect(getCapturedOptions().permissionMode).toBe("default");
-    expect(response.modes.currentModeId).toBe("default");
+    // Settings resolution drops the bad mode; session creation must not throw.
+    expect(getCapturedOptions().permissionMode).toBe("auto");
+    expect(response.modes.currentModeId).toBe("auto");
   });
 
   it("ignores model from settings when it is not a string", async () => {
@@ -712,6 +742,30 @@ describe("ClaudeAcpAgent settings", () => {
         });
       }
       expect(modeIds).not.toContain("dontAsk");
+    });
+
+    it("starts the built-in Auto default in Manual on an unsupported model", async () => {
+      const projectDir = path.join(tempDir, "project");
+      await fs.promises.mkdir(projectDir, { recursive: true });
+
+      const { setPermissionModeSpy } = mockQueryWithModels([
+        { value: "claude-haiku-4-5", displayName: "Claude Haiku", description: "Fast" },
+      ]);
+
+      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+      const response = await (agent as any).createSession({
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+
+      expect(setPermissionModeSpy).toHaveBeenCalledWith("default");
+      expect(response.modes.currentModeId).toBe("default");
+      expect((agent as any).sessions[response.sessionId].autoModeFallbackWarningPending).toBe(
+        false,
+      );
     });
 
     it("falls back permissions.defaultMode='auto' to Accept edits on an unsupported model", async () => {

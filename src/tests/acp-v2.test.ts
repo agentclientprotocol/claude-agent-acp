@@ -2729,6 +2729,78 @@ describe("ACP v2 prompts", () => {
   });
 });
 
+describe("ACP v2 idle compaction", () => {
+  /** A main-thread request that wrote 250k tokens to the one-hour cache. */
+  const largeOneHourRequest = (options: Options) => ({
+    ...assistantText(options, "Done."),
+    message: {
+      ...assistantText(options, "Done.").message,
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_creation_input_tokens: 250_000,
+        cache_creation: { ephemeral_1h_input_tokens: 250_000, ephemeral_5m_input_tokens: 0 },
+      },
+    },
+  });
+
+  /** The session is idle for 54 minutes after a large one-hour request, and the adapter's `/compact` runs. */
+  it("reports the compaction that the adapter starts as running, then idle, with no user_message", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const received: string[] = [];
+      sdk.run = async function* (prompts, options) {
+        const input = prompts[Symbol.asyncIterator]();
+        for (;;) {
+          const { value, done } = await input.next();
+          if (done) return;
+          received.push((value.message.content as Array<{ text: string }>)[0].text);
+          if (received.length === 1) {
+            yield {
+              type: "user",
+              message: value.message,
+              parent_tool_use_id: null,
+              uuid: value.uuid,
+              session_id: options.sessionId,
+              isReplay: true,
+            };
+            yield largeOneHourRequest(options);
+          } else {
+            yield { type: "system", subtype: "status", status: "compacting", uuid: randomUUID() };
+          }
+          yield result(options);
+          yield idleState(options);
+        }
+      };
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+        await vi.advanceTimersByTimeAsync(0);
+        await vi.advanceTimersByTimeAsync(54 * 60_000);
+        for (let i = 0; i < 20 && received.length < 2; i++) await vi.advanceTimersByTimeAsync(0);
+        for (let i = 0; i < 20 && turnTrace(client.sessionUpdates).length < 6; i++) {
+          await vi.advanceTimersByTimeAsync(0);
+        }
+        await client.authUpdate(1);
+      });
+
+      expect(received).toEqual(["hi", "/compact"]);
+      expect(turnTrace(client.sessionUpdates)).toEqual([
+        "user_message",
+        "running",
+        "agent_message_chunk",
+        "idle end_turn",
+        "running",
+        "idle end_turn",
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 // Claude Code runs model cycles that no prompt started, for example its
 // follow-up after a background command finished. v2 reports them as
 // foreground work.
@@ -4438,10 +4510,13 @@ describe("ACP v2 requests that subagents make", () => {
           description: "make test",
           tool_use_id: "toolu_bg",
           parent_task_id: "agent-1",
+          owned_by_subagent: true,
           is_backgrounded: true,
           uuid: randomUUID(),
           session_id: options.sessionId,
         };
+        // As seen live (CLI 2.1.318): a subagent's tool result has no
+        // `tool_use_result`, so only the `task_started` above names the task.
         yield childMessage(options, {
           type: "user",
           message: {
@@ -4453,13 +4528,6 @@ describe("ACP v2 requests that subagents make", () => {
                 content: "Command running in background with ID: bg1.",
               },
             ],
-          },
-          tool_use_result: {
-            stdout: "",
-            stderr: "",
-            interrupted: false,
-            isImage: false,
-            backgroundTaskId: "bg1",
           },
         });
         yield taskEnd(options, "agent-1", "toolu_agent-1");
@@ -5807,10 +5875,13 @@ describe("ACP v2 terminal of a command in the background", () => {
     });
 
     describe("a task that a tool call started", () => {
+      // Claude Code marks every live-update watcher ambient, a requested
+      // Monitor's task included.
       const monitor = {
         task_id: "mon1",
         task_type: "local_monitor",
         description: "Watch the logs",
+        ambient: true,
       };
       const workflow = { task_id: "wf1", task_type: "local_workflow", description: "Review" };
       /** A Monitor call whose task `mon1` runs on after the call returns. The
@@ -6035,25 +6106,34 @@ describe("ACP v2 terminal of a command in the background", () => {
         });
       });
 
-      it("lists a task without such a call as a _claude/task item", async () => {
-        scriptTurns(async function* (options) {
-          yield level(options, [monitor]);
-          // No tool call started it, such as a task that a hook started.
-          yield taskEvent(options, "task_started", monitor);
-          yield result(options);
-          yield idleState(options);
-        });
-        const client = await promptUntil("idle end_turn [_claude/task]");
+      // No tool call started these, such as tasks that a hook started.
+      it.each([
+        {
+          task: workflow,
+          trace: ["running []", "running [_claude/task]", "idle end_turn [_claude/task]"],
+          background: [{ type: "_claude/task", taskId: "wf1", description: "Review" }],
+        },
+        // A watcher Claude Code started by itself is housekeeping.
+        {
+          task: monitor,
+          trace: ["running []", "idle end_turn []"],
+          background: [],
+        },
+      ])(
+        "lists a $task.task_type task without such a call unless it is ambient",
+        async ({ task, trace, background }) => {
+          scriptTurns(async function* (options) {
+            yield level(options, [task]);
+            yield taskEvent(options, "task_started", task);
+            yield result(options);
+            yield idleState(options);
+          });
+          const client = await promptUntil(trace.at(-1)!);
 
-        expect(backgroundTrace(client)).toEqual([
-          "running []",
-          "running [_claude/task]",
-          "idle end_turn [_claude/task]",
-        ]);
-        expect(client.updates("state_update").at(-1)).toMatchObject({
-          background: [{ type: "_claude/task", taskId: "mon1", description: "Watch the logs" }],
-        });
-      });
+          expect(backgroundTrace(client)).toEqual(trace);
+          expect(client.updates("state_update").at(-1)).toMatchObject({ background });
+        },
+      );
     });
 
     it("rejects terminal/cancel with -32602 when the command ends before Claude Code stops it", async () => {

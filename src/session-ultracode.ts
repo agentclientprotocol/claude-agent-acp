@@ -25,7 +25,7 @@ export type UltracodeSettingsReport = {
 };
 
 // `Query.getSettings()` exists at runtime (sdk.mjs) but is missing from the
-// SDK's type declarations as of 0.3.316.
+// SDK's type declarations as of 0.3.318.
 type GetSettingsQuery = Query & {
   getSettings?: () => Promise<{
     applied?: { ultracodeAvailable?: unknown; ultracodeRequested?: unknown };

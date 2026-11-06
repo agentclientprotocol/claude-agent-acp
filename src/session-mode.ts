@@ -66,13 +66,21 @@ type ModeConfigSession = SessionMode & {
   configOptions: SessionConfigOption[];
 };
 
-type InitializeSessionModeParams = {
-  query: Pick<Query, "setPermissionMode">;
-  requestedMode: PermissionMode;
-  currentModelInfo?: ModelInfo;
-  currentModelId: string;
+/** Which optional modes the session's mode catalog offers. */
+export type ModeAvailability = {
   /** When false, bypassPermissions is omitted from the mode catalog. */
   allowBypass: boolean;
+  /** When false (`disableAutoMode: "disable"` in settings), auto is omitted. */
+  allowAuto: boolean;
+};
+
+type InitializeSessionModeParams = ModeAvailability & {
+  query: Pick<Query, "setPermissionMode">;
+  requestedMode: PermissionMode;
+  /** The mode is the built-in default: no request, transcript or setting chose it. */
+  builtInDefault?: boolean;
+  currentModelInfo?: ModelInfo;
+  currentModelId: string;
 };
 
 /**
@@ -82,14 +90,26 @@ type InitializeSessionModeParams = {
  * user record of the transcript. If that mode is unknown or absent from the
  * session's mode catalog, use an available `defaultMode` from settings, or
  * `default` when that setting is unavailable too.
+ *
+ * With no `defaultMode` set, the session starts in `auto` when the catalog
+ * offers it and in `default` otherwise (`builtInDefault: true`), like an
+ * interactive Claude Code session. Claude Code also starts organizations with
+ * the HIPAA configuration in `default`; the SDK does not report that
+ * configuration, so those sessions start in `auto` here.
  */
 export function resolveInitialPermissionMode(
   sources: { explicit?: PermissionMode; resumed?: string; defaultMode?: unknown },
   logger: { error: (...args: unknown[]) => void },
-  allowBypass: boolean,
-): PermissionMode {
+  availability: ModeAvailability,
+): { mode: PermissionMode; builtInDefault: boolean } {
+  const { allowBypass } = availability;
+  const available = (mode: PermissionMode) =>
+    buildAvailableModes(availability).some((entry) => entry.id === mode);
   if (sources.explicit !== undefined) {
-    return resolvePermissionMode(sources.explicit, logger, allowBypass);
+    return {
+      mode: resolvePermissionMode(sources.explicit, logger, allowBypass),
+      builtInDefault: false,
+    };
   }
   if (sources.resumed !== undefined) {
     let rejected = false;
@@ -98,23 +118,23 @@ export function resolveInitialPermissionMode(
       { error: () => (rejected = true) },
       allowBypass,
     );
-    if (!rejected && buildAvailableModes(allowBypass).some((available) => available.id === mode)) {
-      return mode;
+    if (!rejected && available(mode)) {
+      return { mode, builtInDefault: false };
     }
     logger.error(
       `Ignoring permission mode "${sources.resumed}" of the resumed transcript: ` +
         `not available in this session.`,
     );
   }
+  if (sources.defaultMode === undefined) {
+    return { mode: available("auto") ? "auto" : "default", builtInDefault: true };
+  }
   const configuredMode = resolvePermissionMode(sources.defaultMode, logger, allowBypass);
   // A rejected transcript mode falls back only to a mode this session can offer.
-  if (
-    sources.resumed !== undefined &&
-    !buildAvailableModes(allowBypass).some((available) => available.id === configuredMode)
-  ) {
-    return "default";
+  if (sources.resumed !== undefined && !available(configuredMode)) {
+    return { mode: "default", builtInDefault: false };
   }
-  return configuredMode;
+  return { mode: configuredMode, builtInDefault: false };
 }
 
 /** Owns session-mode policy and the ACP/SDK synchronization it requires. */
@@ -124,35 +144,46 @@ export class SessionModeManager<S extends SessionMode> {
   async initialize({
     query,
     requestedMode,
+    builtInDefault = false,
     currentModelInfo,
     currentModelId,
     allowBypass,
+    allowAuto,
   }: InitializeSessionModeParams): Promise<{
     modes: SessionModeState;
     autoModeFallbackWarningPending: boolean;
   }> {
-    const availableModes = buildAvailableModes(allowBypass, this.options.airClient?.() ?? false);
+    const availableModes = buildAvailableModes(
+      { allowBypass, allowAuto },
+      this.options.airClient?.() ?? false,
+    );
     let effectiveMode = requestedMode;
     let autoModeFallbackWarningPending = false;
 
-    if (
+    const autoUnsupported =
       effectiveMode === "auto" &&
       currentModelInfo !== undefined &&
-      currentModelInfo.supportsAutoMode !== true
-    ) {
+      currentModelInfo.supportsAutoMode !== true;
+    if (!this.isAvailable(availableModes, effectiveMode)) {
+      this.options.logError(
+        `permissions.defaultMode "${effectiveMode}" is not available in ` +
+          `this session; falling back to "default".`,
+      );
+      effectiveMode = "default";
+      await this.trySyncMode(query, effectiveMode, "Failed to sync clamped permissionMode to SDK:");
+    } else if (autoUnsupported && builtInDefault) {
+      // Like Claude Code: a built-in Auto default the model can't serve starts
+      // in Manual, without a warning. Nobody chose Auto, so don't escalate to
+      // acceptEdits.
+      effectiveMode = "default";
+      await this.trySyncMode(query, effectiveMode, "Failed to sync clamped permissionMode to SDK:");
+    } else if (autoUnsupported) {
       this.options.logError(
         `permissions.defaultMode "auto" is not available for model ` +
           `"${currentModelId}"; falling back to "${AUTO_MODE_FALLBACK}".`,
       );
       effectiveMode = AUTO_MODE_FALLBACK;
       autoModeFallbackWarningPending = true;
-      await this.trySyncMode(query, effectiveMode, "Failed to sync clamped permissionMode to SDK:");
-    } else if (!this.isAvailable(availableModes, effectiveMode)) {
-      this.options.logError(
-        `permissions.defaultMode "${effectiveMode}" is not available in ` +
-          `this session; falling back to "default".`,
-      );
-      effectiveMode = "default";
       await this.trySyncMode(query, effectiveMode, "Failed to sync clamped permissionMode to SDK:");
     }
 
@@ -375,7 +406,7 @@ export class SessionModeManager<S extends SessionMode> {
 }
 
 function buildAvailableModes(
-  allowBypass: boolean,
+  { allowBypass, allowAuto }: ModeAvailability,
   air = false,
 ): SessionModeState["availableModes"] {
   // Only AIR gets the mode kind.
@@ -402,13 +433,15 @@ function buildAvailableModes(
       description: "Create a plan before making changes",
       ...kind("plan"),
     },
-    {
+  ];
+  if (allowAuto) {
+    modes.push({
       id: "auto",
       name: "Auto",
       description: "Claude handles permission decisions",
       ...kind("auto_review"),
-    },
-  ];
+    });
+  }
   if (allowBypass) {
     modes.push({
       id: "bypassPermissions",

@@ -4,3 +4,4 @@ dist
 .claude/*.local.*
 CLAUDE.local.md
 .idea/
+dist-bin
