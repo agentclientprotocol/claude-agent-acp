@@ -210,6 +210,15 @@ export function fromCliStatus(stdout: string, apiKeyHelper?: string): AuthStatus
   if (!externalBackend && !status.loggedIn && !status.apiKeySource) {
     return notLoggedInAuthStatus();
   }
+  if (
+    status.loggedIn &&
+    status.authMethod === "oauth_token" &&
+    status.apiProvider === "firstParty" &&
+    !status.apiKeySource &&
+    !status.subscriptionType
+  ) {
+    return { kind: "account", label: "Claude subscription", detail: "OAuth token" };
+  }
   return mapAuthFields({
     apiProvider: status.apiProvider,
     subscriptionType: status.subscriptionType,
