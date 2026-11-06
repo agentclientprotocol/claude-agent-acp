@@ -165,6 +165,13 @@ import {
   clientSupportsAsyncTasks,
 } from "./async-tasks.js";
 import {
+  BACKGROUND_TASK_METHOD,
+  backgroundForegroundTasks,
+  parseBackgroundTaskRequest,
+  type BackgroundTaskRequest,
+  type BackgroundTaskResponse,
+} from "./background-foreground-task.js";
+import {
   type BackgroundSink,
   type BackgroundTaskEnd,
   BackgroundWorkReporter,
@@ -4603,6 +4610,12 @@ export class ClaudeAcpAgent {
     const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
     await this.publishGoalFromPrompt(sessionId, firstText, steeredUuid);
     return { outcome: "injected" };
+  }
+
+  async backgroundTask(params: BackgroundTaskRequest): Promise<BackgroundTaskResponse> {
+    const session = this.sessions[params.sessionId];
+    if (!session) return { backgrounded: false };
+    return backgroundForegroundTasks(session.query, params);
   }
 
   async stopAsyncTask(params: AsyncTaskStopRequest): Promise<AsyncTaskStopResponse> {
@@ -14882,6 +14895,11 @@ export function v1AgentApp(
       ASYNC_TASK_STOP_METHOD,
       { parse: parseAsyncTaskStopRequest },
       (ctx) => agent.stopAsyncTask(ctx.params),
+    )
+    .onRequest<BackgroundTaskRequest, BackgroundTaskResponse>(
+      BACKGROUND_TASK_METHOD,
+      { parse: parseBackgroundTaskRequest },
+      (ctx) => agent.backgroundTask(ctx.params),
     )
     .onRequest<GoalRequest, GoalControlResponse>(
       GOAL_CONTROL_METHOD,

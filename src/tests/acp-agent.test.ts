@@ -56,6 +56,7 @@ import {
 } from "../acp-agent.js";
 import { SessionTitles } from "../session-titles.js";
 import { SessionBackgroundWork } from "../background-work.js";
+import { parseBackgroundTaskRequest } from "../background-foreground-task.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "../usage-markdown.js";
 import { Pushable } from "../utils.js";
 import { heldRequest, initializeClient, makeMockQuery } from "./helpers.js";
@@ -10362,6 +10363,161 @@ describe("subagent permission attribution (issue #851)", () => {
     // Agent-native tool metadata keeps its own namespace alongside it.
     // The tool_call sent the tool name, so the update does not repeat it.
     expect((bashUpdate?._meta?.claudeCode as any)?.toolName).toBeUndefined();
+  });
+
+  describe("backgroundTask", () => {
+    function setup() {
+      const agent = new ClaudeAcpAgent({ sessionUpdate: async () => {} } as unknown as AcpClient, {
+        log: () => {},
+        error: () => {},
+      });
+      injectGeneratorSession(agent, makeGenerator([successResult()]));
+      return { agent, query: agent.sessions["test-session"].query as any };
+    }
+
+    it.each([
+      { params: { toolCallId: "bash-tool" }, expected: "bash-tool" },
+      { params: {}, expected: undefined },
+    ])("passes $params to the SDK", async ({ params, expected }) => {
+      const { agent, query } = setup();
+
+      await expect(agent.backgroundTask({ sessionId: "test-session", ...params })).resolves.toEqual(
+        { backgrounded: true },
+      );
+
+      expect(query.backgroundTasks).toHaveBeenCalledExactlyOnceWith(expected);
+    });
+
+    it("returns false when no foreground task matches or the session is unknown", async () => {
+      const { agent, query } = setup();
+      query.backgroundTasks.mockResolvedValueOnce(false);
+
+      await expect(
+        agent.backgroundTask({ sessionId: "test-session", toolCallId: "gone" }),
+      ).resolves.toEqual({ backgrounded: false });
+      await expect(
+        agent.backgroundTask({ sessionId: "no-such-session", toolCallId: "gone" }),
+      ).resolves.toEqual({ backgrounded: false });
+      expect(query.backgroundTasks).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects with a message when the SDK has background tasks disabled", async () => {
+      const { agent, query } = setup();
+      query.backgroundTasks.mockRejectedValueOnce(new Error("background tasks are disabled"));
+
+      await expect(agent.backgroundTask({ sessionId: "test-session" })).rejects.toThrow(
+        /CLAUDE_CODE_DISABLE_BACKGROUND_TASKS.*background tasks are disabled/,
+      );
+    });
+
+    it.each([{}, { sessionId: "s", toolCallId: 5 }, { sessionId: "s", toolCallId: " " }])(
+      "rejects params %j",
+      (params) => {
+        expect(() => parseBackgroundTaskRequest(params)).toThrow(/async task background/);
+      },
+    );
+
+    it("publishes the spawn and the backgrounded marker for a call backgrounded this way", async () => {
+      const updates: AcpSessionNotification[] = [];
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (notification: AcpSessionNotification) => updates.push(notification),
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {
+          _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+        },
+      });
+      // The Bash call blocks until the client backgrounds it. The SDK then
+      // reports the task and returns the tool result with its task id.
+      let release!: () => void;
+      const backgrounded = new Promise<void>((resolve) => (release = resolve));
+      injectGeneratorSession(agent, async function* () {
+        yield {
+          type: "assistant",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          message: {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "bash-tool",
+                name: "Bash",
+                input: { command: "npm run build" },
+              },
+            ],
+            usage: SUBAGENT_TEST_USAGE,
+          },
+        };
+        await backgrounded;
+        yield {
+          type: "system",
+          subtype: "task_started",
+          task_id: "shell-1",
+          task_type: "local_bash",
+          description: "Build",
+          is_backgrounded: true,
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield {
+          type: "user",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          tool_use_result: { backgroundTaskId: "shell-1" },
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "bash-tool",
+                content:
+                  "Command running in background. Output is being written to: /tmp/tasks/shell-1.output. You will be notified when it completes.",
+              },
+            ],
+          },
+        };
+        yield successResult();
+      });
+      const query = agent.sessions["test-session"].query as any;
+      query.backgroundTasks.mockImplementation(async () => {
+        release();
+        return true;
+      });
+
+      const prompt = agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "go" }],
+      });
+      await expect(
+        agent.backgroundTask({ sessionId: "test-session", toolCallId: "bash-tool" }),
+      ).resolves.toEqual({ backgrounded: true });
+      await prompt;
+
+      const sent = updates.map(({ update }) => update);
+      expect(sent).toContainEqual(
+        expect.objectContaining({
+          sessionUpdate: "async_task_spawned",
+          asyncTaskId: "shell-1",
+          toolCallId: "bash-tool",
+        }),
+      );
+      expect(
+        sent.findLast(
+          (update) =>
+            update.sessionUpdate === "tool_call_update" && update.toolCallId === "bash-tool",
+        ),
+      ).toMatchObject({
+        status: "completed",
+        _meta: { jetbrains: { air: { version: 1, asyncTasks: { backgrounded: true } } } },
+      });
+    });
   });
 
   it("omits the background task link for a client without the asyncTasks capability", async () => {

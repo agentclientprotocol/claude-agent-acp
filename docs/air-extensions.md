@@ -152,7 +152,7 @@ The response to a client that is not AIR has no `_meta.jetbrains` key.
 | `diffPatch`              | yes                 | Sends an exact Git patch in the diff block of an Edit or a Write.                                               | [Diff patch](#diff-patch)                               |
 | `sessionFailure`         | yes                 | Sends warnings and errors as typed transcript records.                                                          | [Session failure](#session-failure)                     |
 | `recommendedValue`       | yes                 | Replaces the `default` model and effort rows with concrete values and a recommendation.                         | [Recommended config values](#recommended-config-values) |
-| `asyncTasks`             | yes                 | Publishes background work that is not a subagent as async tasks.                                                | [Async tasks](#async-tasks)                             |
+| `asyncTasks`             | yes                 | Publishes background work that is not a subagent as async tasks, and accepts the stop and background requests.  | [Async tasks](#async-tasks)                             |
 | `agentFileChangeReport`  | yes                 | Accepts a report request on `session/prompt` and sends the changed file list.                                   | [Agent file-change report](#agent-file-change-report)   |
 | `nativeSubagentSessions` | yes                 | Reports an Agent or Task subagent as a native ACP child session.                                                | [Native subagent sessions](#native-subagent-sessions)   |
 | `planFile`               | yes                 | Sends the path of the plan file in place of the plan text of an ExitPlanMode.                                   | [Plan file](#plan-file)                                 |
@@ -1034,6 +1034,27 @@ The client sends `_session/async_task/stop`:
 The adapter calls the SDK `stopTask`, publishes `stopped`, and returns `{ "stopped": true }`.
 It also adds one `Task stopped by user: <name>.` line to the transcript.
 It returns `{ "stopped": false }` for an unknown, finished, or already stopping task.
+
+### Background request
+
+Claude Code moves a blocking Bash command or subagent to the background on Ctrl+B in the terminal.
+The client sends `_session/async_task/background` to do the same:
+
+```json
+{ "sessionId": "session-1", "toolCallId": "toolu_01" }
+```
+
+`toolCallId` is optional. It is the id of the tool call, which is also the SDK `tool_use` id.
+With it, the adapter backgrounds only that call. Without it, the adapter backgrounds every foreground task of the session.
+The adapter calls the SDK `backgroundTasks` and returns `{ "backgrounded": true }` when at least one task moved.
+It returns `{ "backgrounded": false }` for an unknown session, or when `toolCallId` matches no foreground task.
+The blocking tool call then returns at once and the turn goes on.
+The task becomes an async task and the Bash `tool_call_update` carries the `backgrounded` marker, as for a command that started in the background.
+The adapter sends no update of its own for the request.
+
+The request fails with an error when the SDK cannot background tasks, for example when `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` is set.
+The task then keeps running in the foreground.
+There is no separate capability: a client that declares `asyncTasks` can send it, on ACP v1.
 
 ## Agent file-change report
 
