@@ -1277,6 +1277,8 @@ This section covers only the AIR bridge.
 - Either signal enables native subagent sessions, and AIR gets this earlier draft of the RFD whichever it declares.
 - The agent advertises `nativeSubagentSessions` and `agentCapabilities.sessionCapabilities.subagents` to AIR.
 - A client that is not AIR and declares `clientCapabilities.subagents` gets the revised RFD instead (`subagent_update`, `session_message`), see the README.
+- The AIR subagent and async task extensions work on ACP v1 and ACP v2.
+  ACP v2 also serves `_session/async_task/stop` and advertises `asyncTasks`.
 - With native sessions, the adapter sends `subagent_spawned` and `subagent_state_update`.
   The child output goes to the child session. The Agent or Task tool call is not the subagent card.
 - `subagent_spawned` can carry an optional `prompt`: the exact prompt of the child session.

@@ -24,6 +24,7 @@ export const SESSION_PLAN_ID = "plan";
 export function v2SessionUpdate(
   update: AcpSessionNotification["update"],
 ): v2.SessionUpdate | undefined {
+  const kind = update.sessionUpdate;
   switch (update.sessionUpdate) {
     case "available_commands_update":
       return { ...update, availableCommands: v2AvailableCommands(update.availableCommands) };
@@ -35,6 +36,13 @@ export function v2SessionUpdate(
     case "compaction_update":
     case "compaction_summary_chunk":
       return update;
+    case "subagent_spawned":
+    case "subagent_state_update":
+    case "async_task_spawned":
+    case "async_task_progress":
+    case "async_task_state_update":
+      // AIR negotiates these extensions on both protocol versions.
+      return update as unknown as v2.SessionUpdate;
     case "agent_message_chunk":
     case "agent_thought_chunk":
     case "user_message_chunk": {
@@ -76,9 +84,7 @@ export function v2SessionUpdate(
       // `configOptions` of a `session/set_config_option` response.
       return undefined;
     default:
-      throw new Error(
-        `The ACP v2 surface does not translate ${update.sessionUpdate} session updates yet`,
-      );
+      throw new Error(`The ACP v2 surface does not translate ${kind} session updates yet`);
   }
 }
 
