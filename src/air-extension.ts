@@ -75,6 +75,8 @@ export const AIR_CUSTOM_ANSWER_KEY = "customAnswer";
  * client gets it, without a capability: the key only adds data.
  */
 export const AIR_REASONING_EFFORTS_KEY = "reasoningEfforts";
+/** The companion field keys in an ACP v2 form elicitation request. */
+export const AIR_CUSTOM_ANSWER_FIELDS_KEY = "customAnswerFields";
 /** The `_meta.jetbrains.air` key of the update that ends a whole history replay. */
 export const AIR_LOAD_REPLAY_END_KEY = "loadReplayEnd";
 /**
