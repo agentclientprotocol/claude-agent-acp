@@ -196,6 +196,7 @@ The adapter sends these keys only to an AIR client. "AIR" in the Gate column mea
 | `mcp`                          | MCP tool call `_meta.jetbrains.air`                                                   | `{server, tool}`                                                       | AIR                                                                                    |
 | `contextCompaction`            | compaction tool call or `compaction_update`, `_meta.jetbrains.air`                    | `{version: 1, trigger?, preTokens?, postTokens?, durationMs?, error?}` | AIR                                                                                    |
 | `customAnswer`                 | elicitation schema property `_meta.jetbrains.air`                                     | `{questionId, isCustomAnswer: true}`                                   | AIR, when the client supports form elicitation                                         |
+| `customAnswerFields`           | elicitation request `_meta.jetbrains.air`                                             | companion field keys                                                   | AIR on ACP v2, when the client supports form elicitation                               |
 | `kind`                         | session mode `_meta.jetbrains.air` and mode config option value `_meta.jetbrains.air` | `standard`, `plan`, `auto_review`, or `full_access`                    | AIR                                                                                    |
 | `kind`                         | available command `_meta.jetbrains.air` of a skill                                    | `skill`                                                                | AIR, when the skill's `SKILL.md` is found; not for a built-in command or an MCP prompt |
 | `skillPath`                    | available command `_meta.jetbrains.air` of a skill                                    | absolute path of the skill's `SKILL.md`                                | AIR, together with `kind: "skill"`                                                     |
@@ -1702,7 +1703,7 @@ The `compaction_update` form carries no `_meta`.
 Without form elicitation support, the adapter disables the tool when it creates the Claude session.
 
 Each question gets a select field and a companion text field named `Other`.
-For AIR, the companion field carries `_meta.jetbrains.air.customAnswer`:
+For AIR on ACP v1, the companion field carries `_meta.jetbrains.air.customAnswer`:
 
 ```json
 { "questionId": "<select field key>", "isCustomAnswer": true }
@@ -1714,6 +1715,17 @@ A client can render the companion as the free-text choice of that question.
 For AIR, the companion field also carries the same value under the root key `_meta._askUserQuestionCustomAnswer`.
 Released AIR versions read only that key.
 A client that is not AIR gets neither key.
+
+On ACP v2, the request also lists the companion field keys in `_meta.jetbrains.air.customAnswerFields`:
+
+```json
+{ "jetbrains": { "air": { "version": 1, "customAnswerFields": ["question_0_custom"] } } }
+```
+
+The v2 property types do not retain `_meta`.
+AIR reads the request list to show the companion with its question.
+The field keys and the response content stay the same in both versions.
+A client that is not AIR gets no `customAnswerFields` key.
 
 ## Load replay end
 

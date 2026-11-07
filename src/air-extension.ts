@@ -69,6 +69,8 @@ export const AIR_KIND_KEY = "kind";
 export const AIR_SKILL_PATH_KEY = "skillPath";
 export const AIR_PERMISSION_KEY = "permission";
 export const AIR_CUSTOM_ANSWER_KEY = "customAnswer";
+/** The companion field keys in an ACP v2 form elicitation request. */
+export const AIR_CUSTOM_ANSWER_FIELDS_KEY = "customAnswerFields";
 /** The `_meta.jetbrains.air` key of the update that ends a whole history replay. */
 export const AIR_LOAD_REPLAY_END_KEY = "loadReplayEnd";
 /**

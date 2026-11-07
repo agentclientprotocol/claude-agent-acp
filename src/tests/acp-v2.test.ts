@@ -999,6 +999,69 @@ describe("ACP v2 prompts", () => {
     });
   });
 
+  it.each([true, false])("keeps custom answers beside their questions for AIR=%s", async (air) => {
+    let answer: unknown;
+    scriptTurns(async function* (options) {
+      const input = {
+        questions: [false, true].map((multiSelect) => ({
+          question: multiSelect ? "Which features?" : "Which package?",
+          header: multiSelect ? "Features" : "Package",
+          options: [
+            { label: "core", description: "Core" },
+            { label: "cli", description: "CLI" },
+          ],
+          multiSelect,
+        })),
+      };
+      yield toolUseMessage(options, "toolu_question", "AskUserQuestion", input);
+      answer = await options.canUseTool!("AskUserQuestion", input, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "toolu_question",
+        requestId: randomUUID(),
+      } as Parameters<NonNullable<Options["canUseTool"]>>[2]);
+      yield toolResultMessage(options, "toolu_question", {});
+      yield result(options);
+    });
+    const client = v2Client({
+      answerElicitation: () => ({
+        action: "accept",
+        content: {
+          question_0: "core",
+          question_0_custom: "A note",
+          question_1_custom: "My feature",
+        },
+      }),
+    });
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent, {
+        elicitation: { form: {} },
+        ...(air ? { _meta: { jetbrains: { air: { version: 1, capabilities: [] } } } } : {}),
+      });
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("Ask me") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+    });
+
+    expect(client.elicitations).toHaveLength(1);
+    expect(client.elicitations[0]._meta).toEqual(
+      air
+        ? {
+            jetbrains: {
+              air: { version: 1, customAnswerFields: ["question_0_custom", "question_1_custom"] },
+            },
+          }
+        : undefined,
+    );
+    expect(answer).toMatchObject({
+      behavior: "allow",
+      updatedInput: {
+        answers: { "Which package?": "core", "Which features?": "My feature" },
+        annotations: { "Which package?": { notes: "A note" } },
+      },
+    });
+  });
+
   it("reports waiting on a question as requires_action", async () => {
     scriptTurns(async function* (options) {
       await options.onElicitation!(

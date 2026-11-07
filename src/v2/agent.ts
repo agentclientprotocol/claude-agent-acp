@@ -19,6 +19,7 @@ import { ClaudeAcpAgent, type AcpClient, type Logger } from "../acp-agent.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import type { AcpPermissionRequest } from "../permissions/presentation.js";
 import { stateUpdate, V2Background } from "./background.js";
+import { v2ElicitationRequest } from "./elicitation.js";
 import { v1InitializeRequest, v2InitializeResponse } from "./initialize.js";
 import { v1PermissionResponse, v2PermissionRequest } from "./permission.js";
 import { v2Foreground, v2Prompt } from "./prompt.js";
@@ -442,19 +443,14 @@ class V2ClientConnection implements AcpClient {
     return v1PermissionResponse(response);
   }
 
-  // Elicitation is the same in v1 and v2.
   createElicitation(
     params: CreateElicitationRequest,
     signal?: AbortSignal,
   ): Promise<CreateElicitationResponse> {
-    return this.ctx.request(
-      v2.methods.client.elicitation.create,
-      // The v1 types accept a property schema with any tag; the v2 types accept
-      // one only in a received value. As on v1, an MCP server's schema is
-      // relayed here unchanged, so this cast does not check it.
-      params as v2.CreateElicitationRequest,
-      { cancellationSignal: signal, stopWaitingOnCancel: true },
-    );
+    return this.ctx.request(v2.methods.client.elicitation.create, v2ElicitationRequest(params), {
+      cancellationSignal: signal,
+      stopWaitingOnCancel: true,
+    });
   }
 
   completeElicitation(params: CompleteElicitationNotification): Promise<void> {
