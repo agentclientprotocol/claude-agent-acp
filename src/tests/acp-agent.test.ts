@@ -13858,7 +13858,7 @@ describe("MCP server startup failures", () => {
     );
     expect(lines).toHaveLength(1);
     expect(lines[0].content.text).toBe(
-      '**MCP server "client-fs" failed to start:** Its tools are unavailable in this session. Run /mcp for the error.',
+      '\n\n> **MCP server "client-fs" failed to start:** Its tools are unavailable in this session. Run /mcp for the error.\n\n',
     );
   });
 });
