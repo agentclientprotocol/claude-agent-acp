@@ -167,7 +167,10 @@ afterEach(async () => {
 function connectRouter(protocols?: AcpProtocols): v2.Stream {
   const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
   const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
-  acpProtocolRouter(undefined, (agent) => agents.push(agent), protocols).connect({
+  acpProtocolRouter(undefined, (agent) => agents.push(agent), protocols, {
+    v2Core: process.env.V2_CORE_UNDER_TEST === "native" ? "native" : "bridge",
+    onNativeAgent: (agent) => agents.push(agent as unknown as ClaudeAcpAgent),
+  }).connect({
     readable: toAgent.readable,
     writable: toClient.writable,
   });

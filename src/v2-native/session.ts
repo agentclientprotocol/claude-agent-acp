@@ -389,8 +389,8 @@ export class NativeSession implements RequestTarget {
         // in. A prompt Claude Code reported `started` for is inserted already.
         if ("isReplay" in message && message.isReplay) {
           if (message.uuid && message.parent_tool_use_id === null) {
-            this.openTurn(message.uuid);
             this.inserted(message.uuid);
+            this.openTurn(message.uuid);
           }
           return;
         }
@@ -424,8 +424,10 @@ export class NativeSession implements RequestTarget {
     const uuid = frame.command_uuid;
     switch (frame.state) {
       case "started":
-        this.openTurn(uuid);
+        // The prompt's `user_message` comes before the turn's `running`, as
+        // on the bridge. v2 allows either order.
         this.inserted(uuid);
+        this.openTurn(uuid);
         return;
       case "cancelled":
         this.cancelCovered.delete(uuid);

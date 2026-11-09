@@ -379,7 +379,7 @@ describe("native ACP v2 core", () => {
     const kinds = client.sessionUpdates
       .map((update) => update.sessionUpdate)
       .filter((kind) => kind !== "available_commands_update");
-    expect(kinds).toEqual(["state_update", "user_message", "agent_message_chunk", "state_update"]);
+    expect(kinds).toEqual(["user_message", "state_update", "agent_message_chunk", "state_update"]);
     expect(client.sessionUpdates.at(-1)).toEqual({
       sessionUpdate: "state_update",
       state: "idle",
