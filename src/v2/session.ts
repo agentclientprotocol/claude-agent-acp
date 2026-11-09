@@ -164,6 +164,7 @@ export class V2Session implements RequestTarget {
   /** Set by `session/close`, or when the query ends: nothing more goes out. */
   private closed = false;
   private closing: Promise<void> | undefined;
+  /** Set by {@link start}. */
   private query: Query | undefined;
   readonly output: SessionOutput;
   /** Usage, quota, notices, compactions and the title (see {@link SessionReports}). */
@@ -416,9 +417,10 @@ export class V2Session implements RequestTarget {
         .then(() => this.interrupting)
         .then(async () => {
           if (answered()) return;
-          if (guarded && this.query) {
+          if (guarded) {
             try {
-              await guarded(this.query);
+              // Set by `start`, which runs before the agent lists the session.
+              await guarded(this.query!);
             } catch (error) {
               this.failPrompt(uuid, error);
               return;
