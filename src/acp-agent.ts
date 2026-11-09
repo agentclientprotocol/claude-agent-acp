@@ -350,7 +350,7 @@ import {
   observeExitPlanToolResults,
   planModeUpdate,
 } from "./exit-plan.js";
-import { DEFAULT_AGENT_ID } from "./session-config-ids.js";
+import { AGENT_CONFIG_ID, DEFAULT_AGENT_ID } from "./session-config-ids.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
 import {
   markerTagText,
@@ -396,7 +396,6 @@ import {
   buildEffortConfigOption,
   EFFORT_CONFIG_ID,
   effortFlagSettings,
-  effortLevelName,
   mergeEffortSettings,
   settingsEffortForModel,
 } from "./session-effort.js";
@@ -410,6 +409,7 @@ import {
   type UltracodeOptionState,
 } from "./session-ultracode.js";
 import { STARTUP_FAILURE_RESULTS_ENV, startupFailureError } from "./startup-failure.js";
+import { subagentHookOptions } from "./subagent-configuration.js";
 
 export { EFFORT_CONFIG_ID, settingsEffortForModel } from "./session-effort.js";
 export {
@@ -9999,50 +9999,11 @@ export class ClaudeAcpAgent {
         .catch((error) =>
           this.logger.error(`Session ${sessionId}: failed to report subagent cwd: ${error}`),
         );
-      const options: SessionConfigOption[] = [];
-      if (input.permission_mode) {
-        const mode = session.modes.availableModes.find((mode) => mode.id === input.permission_mode);
-        options.push(
-          SessionModeManager.configOption({
-            currentModeId: input.permission_mode,
-            availableModes: [mode ?? { id: input.permission_mode, name: input.permission_mode }],
-          }),
-        );
-      }
-      const switchedModel =
-        input.hook_event_name === "PostModelSwitch"
-          ? responseModelEntry(input.to_model, this.subagentModels(sessionId))
-          : undefined;
-      // The entry of the root session's `model` option, as for a child response.
-      if (switchedModel) options.push(childModelOption(switchedModel));
-      if (input.effort?.level) {
-        options.push({
-          id: EFFORT_CONFIG_ID,
-          name: "Effort",
-          description: "Current reasoning effort",
-          category: "thought_level",
-          type: "select",
-          currentValue: input.effort.level,
-          options: [{ value: input.effort.level, name: effortLevelName(input.effort.level) }],
-        });
-      }
-      if (input.agent_type) {
-        const agent = session.agents.find((agent) => agent.name === input.agent_type);
-        options.push({
-          id: AGENT_CONFIG_ID,
-          name: "Agent",
-          description: "Subagent type",
-          type: "select",
-          currentValue: input.agent_type,
-          options: [
-            {
-              value: input.agent_type,
-              name: input.agent_type,
-              ...(agent?.description ? { description: agent.description } : {}),
-            },
-          ],
-        });
-      }
+      const options = subagentHookOptions(input, {
+        availableModes: session.modes.availableModes,
+        models: this.subagentModels(sessionId),
+        agents: session.agents,
+      });
       await session.nativeSubagentRuntime
         ?.reportConfiguration(input.agent_id, options)
         .catch((error) =>
@@ -12413,11 +12374,15 @@ export const BUILTIN_AGENT_NAMES = new Set([
  *  creation. */
 export async function discoverCustomAgents(q: Query): Promise<AgentInfo[]> {
   try {
-    const agents = await q.supportedAgents();
-    return agents.filter((a) => !BUILTIN_AGENT_NAMES.has(a.name) && a.name !== DEFAULT_AGENT_ID);
+    return customAgents(await q.supportedAgents());
   } catch {
     return [];
   }
+}
+
+/** The configured agents of `agents`: neither a built-in subagent nor the "default" sentinel. */
+export function customAgents(agents: readonly AgentInfo[]): AgentInfo[] {
+  return agents.filter((a) => !BUILTIN_AGENT_NAMES.has(a.name) && a.name !== DEFAULT_AGENT_ID);
 }
 
 /** Stable ids for the session config options surfaced via `configOptions`.
@@ -12425,7 +12390,7 @@ export async function discoverCustomAgents(q: Query): Promise<AgentInfo[]> {
  *  handlers in `setSessionConfigOption`/`applyConfigOptionValue` reference the
  *  same identifiers and can't drift apart. */
 export { MODE_CONFIG_ID };
-export const AGENT_CONFIG_ID = "agent";
+export { AGENT_CONFIG_ID };
 export const FAST_MODE_CONFIG_ID = "fast";
 
 /** Select-fallback values used when the client has not opted into boolean

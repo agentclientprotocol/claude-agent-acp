@@ -66,6 +66,8 @@ export type OutputRoute = (notification: AcpSessionNotification) => AcpSessionNo
 export interface ReplayHooks {
   /** Rewrites each replayed update, as {@link OutputRoute} does live. */
   route: OutputRoute;
+  /** A message of the history is about to replay, such as a child's response with its model. */
+  replaying?(message: SessionMessage): void;
   /** A message of the history was replayed, such as one that launched subagents. */
   replayed(message: SessionMessage): void;
   /**
@@ -251,9 +253,16 @@ export class SessionOutput {
       ? message.tool_use_id
       : message.parent_tool_use_id;
     if (toolCallId === null || !this.emittedToolCalls.has(toolCallId)) return;
+    // A subagent's beat, on its own session, names the Agent call that runs
+    // it, as on the bridge. A tool call is never its own parent.
+    const parentToolUseId =
+      this.subagent && message.parent_tool_use_id !== toolCallId
+        ? (message.parent_tool_use_id ?? undefined)
+        : undefined;
     const beat = new AcpToolCallRenderer(V2_TOOL_CALL_CAPABILITIES).progress({
       toolCallId,
       toolName: message.tool_name,
+      parentToolUseId,
       elapsedTimeSeconds: message.elapsed_time_seconds,
       subagentType: message.subagent_type,
       subagentRetry: message.subagent_retry,
@@ -348,6 +357,7 @@ export class SessionOutput {
           });
           continue;
         }
+        hooks?.replaying?.(message);
         const inner = message.message as { id?: string; content?: unknown };
         if (message.type === "assistant" && Array.isArray(inner.content)) {
           this.content(inner.content as AssistantContent, "assistant", null, {
@@ -501,28 +511,35 @@ export class SessionOutput {
   private emit(notifications: AcpSessionNotification[]): void {
     // A replay routes only what its hooks ask: the live routing tracks live calls.
     const route = this.replayCleared !== undefined ? this.replayHooks?.route : this.route;
-    for (const { update } of route ? notifications.flatMap(route) : notifications) {
-      const replaying = this.replayCleared !== undefined;
-      if (update.sessionUpdate === "agent_message_chunk") {
-        this.agentText = true;
-        if (!replaying) this.onAgentText?.(update.content);
-      }
-      for (const v2Update of this.translator.updates(this.sessionId, update, replaying)) {
-        const clear = this.replayCleared && replayClear(this.replayCleared, v2Update);
-        if (clear) this.send(clear);
-        if (v2Update.sessionUpdate === "tool_call_update" && !replaying) {
-          const { toolCallId, status } = v2Update as { toolCallId: string; status?: string | null };
-          if (status != null) {
-            if (FINAL_STATUSES.has(status)) {
-              this.unfinished.delete(toolCallId);
-              this.dispatched.delete(toolCallId);
-            } else {
-              this.unfinished.add(toolCallId);
-            }
+    // Each update is routed once the ones before it went out: a route can
+    // send updates of its own, such as a child's announcement or a
+    // hand-back's two messages, which then keep their place.
+    for (const notification of notifications) {
+      for (const { update } of route ? route(notification) : [notification]) this.sendOne(update);
+    }
+  }
+
+  private sendOne(update: AcpSessionNotification["update"]): void {
+    const replaying = this.replayCleared !== undefined;
+    if (update.sessionUpdate === "agent_message_chunk") {
+      this.agentText = true;
+      if (!replaying) this.onAgentText?.(update.content);
+    }
+    for (const v2Update of this.translator.updates(this.sessionId, update, replaying)) {
+      const clear = this.replayCleared && replayClear(this.replayCleared, v2Update);
+      if (clear) this.send(clear);
+      if (v2Update.sessionUpdate === "tool_call_update" && !replaying) {
+        const { toolCallId, status } = v2Update as { toolCallId: string; status?: string | null };
+        if (status != null) {
+          if (FINAL_STATUSES.has(status)) {
+            this.unfinished.delete(toolCallId);
+            this.dispatched.delete(toolCallId);
+          } else {
+            this.unfinished.add(toolCallId);
           }
         }
-        this.send(v2Update);
       }
+      this.send(v2Update);
     }
   }
 }

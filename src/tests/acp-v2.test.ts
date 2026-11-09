@@ -861,6 +861,54 @@ function transcriptEntry(type: "user" | "assistant", uuid: string, message: unkn
   return { type, uuid, session_id: "session", parent_tool_use_id: null, message };
 }
 
+/** A record of a Claude Code transcript file, as Claude Code writes it. */
+function transcriptRecord(
+  sessionId: string,
+  uuid: string,
+  parentUuid: string | null,
+  message: { role: string } & Record<string, unknown>,
+  fields: Record<string, unknown> = {},
+) {
+  return {
+    type: message.role,
+    uuid,
+    parentUuid,
+    sessionId,
+    cwd,
+    version: "2.0.0",
+    isSidechain: false,
+    userType: "external",
+    timestamp: "2026-09-24T00:00:00.000Z",
+    message,
+    ...fields,
+  };
+}
+
+/**
+ * Writes the history that Claude Code keeps of a session: its transcript
+ * (`root`), and the subagent `agentId`'s own transcript (`records`) beside
+ * it, with the metadata file that names the subagent's launch (`meta`).
+ */
+async function writeSubagentHistory(
+  sessionId: string,
+  root: Array<Record<string, unknown>>,
+  agentId: string,
+  meta: Record<string, unknown>,
+  records: Array<Record<string, unknown>>,
+) {
+  const project = path.join(tempDir, "claude", "projects", "-project");
+  const subagents = path.join(project, sessionId, "subagents");
+  await mkdir(subagents, { recursive: true });
+  const lines = (entries: Array<Record<string, unknown>>) =>
+    entries.map((entry) => JSON.stringify(entry) + "\n").join("");
+  await writeFile(path.join(project, `${sessionId}.jsonl`), lines(root));
+  await writeFile(
+    path.join(subagents, `agent-${agentId}.jsonl`),
+    lines(records.map((record) => ({ ...record, isSidechain: true, agentId }))),
+  );
+  await writeFile(path.join(subagents, `agent-${agentId}.meta.json`), JSON.stringify(meta));
+}
+
 function stream(options: Options, event: Record<string, unknown>) {
   return {
     type: "stream_event",
@@ -1412,44 +1460,20 @@ describe("ACP v2 prompts", () => {
     await client.app.connectWith(connectRouter(), async (agent) => {
       await initializeV2(agent);
       const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
-      // Claude Code keeps the subagent's history in its own transcript, beside
-      // the session's, with a metadata file that names its launch.
-      const project = path.join(tempDir, "claude", "projects", "-project");
-      const subagents = path.join(project, sessionId, "subagents");
-      await mkdir(subagents, { recursive: true });
-      const entry = (uuid: string, parentUuid: string | null, message: unknown, sidechain = true) =>
-        JSON.stringify({
-          type: (message as { role: string }).role,
-          uuid,
-          parentUuid,
-          sessionId,
-          cwd,
-          version: "2.0.0",
-          isSidechain: sidechain,
-          ...(sidechain ? { agentId: "abc123" } : {}),
-          userType: "external",
-          timestamp: "2026-09-24T00:00:00.000Z",
-          message,
-        });
-      await writeFile(
-        path.join(project, `${sessionId}.jsonl`),
-        entry("r1", null, { role: "user", content: "Explore it" }, false) + "\n",
-      );
-      await writeFile(
-        path.join(subagents, "agent-abc123.jsonl"),
+      await writeSubagentHistory(
+        sessionId,
+        [transcriptRecord(sessionId, "r1", null, { role: "user", content: "Explore it" })],
+        "abc123",
+        { agentType: "Explore", name: "scout", toolUseId: "toolu_agent" },
         [
-          entry("c1", null, { role: "user", content: "Look around" }),
-          entry("c2", "c1", {
+          transcriptRecord(sessionId, "c1", null, { role: "user", content: "Look around" }),
+          transcriptRecord(sessionId, "c2", "c1", {
             id: "msg_child",
             role: "assistant",
             model: "claude-haiku-4-5",
             content: [{ type: "text", text: "Child report." }],
           }),
-        ].join("\n") + "\n",
-      );
-      await writeFile(
-        path.join(subagents, "agent-abc123.meta.json"),
-        JSON.stringify({ agentType: "Explore", name: "scout", toolUseId: "toolu_agent" }),
+        ],
       );
       vi.mocked(getSessionMessages).mockResolvedValueOnce([
         transcriptEntry("assistant", randomUUID(), {
@@ -1524,6 +1548,133 @@ describe("ACP v2 prompts", () => {
           update.sessionUpdate === "subagent_update" && (update as any).capabilities != null,
       ),
     ).toEqual([]);
+  });
+
+  it("replays a SendMessage call's delivery, a hand-back and a child's model change as live", async () => {
+    scriptTurns();
+    const client = v2Client();
+    let root = "";
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      root = sessionId;
+      const response = (uuid: string, parent: string, model: string, content: unknown[]) =>
+        transcriptRecord(sessionId, uuid, parent, {
+          id: `msg_${uuid}`,
+          role: "assistant",
+          model,
+          content,
+        });
+      await writeSubagentHistory(
+        sessionId,
+        [transcriptRecord(sessionId, "r1", null, { role: "user", content: "Explore it" })],
+        "abc123",
+        { agentType: "Explore", name: "scout", toolUseId: "toolu_agent" },
+        [
+          transcriptRecord(sessionId, "c1", null, { role: "user", content: "Look around" }),
+          response("c2", "c1", "claude-haiku-4-5", [
+            {
+              type: "tool_use",
+              id: "toolu_handback",
+              name: "SubagentHandback",
+              input: { message: "Found it." },
+            },
+          ]),
+          transcriptRecord(sessionId, "c3", "c2", {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: "toolu_handback", content: "Delivered" }],
+          }),
+          // Claude Code frames a SendMessage call's message for the child's model.
+          transcriptRecord(
+            sessionId,
+            "c4",
+            "c3",
+            {
+              role: "user",
+              content:
+                "The coordinator sent a message while you were working:\nLook again\n\nAddress this before completing your current task.",
+            },
+            { isMeta: true, origin: { kind: "coordinator" } },
+          ),
+          response("c5", "c4", "claude-sonnet-4-6", [{ type: "text", text: "Still fine." }]),
+        ],
+      );
+      vi.mocked(getSessionMessages).mockResolvedValueOnce([
+        transcriptEntry("assistant", randomUUID(), {
+          id: "msg_agent",
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_agent",
+              name: "Agent",
+              input: { name: "scout", subagent_type: "Explore", prompt: "Look around" },
+            },
+          ],
+        }),
+        transcriptEntry("user", randomUUID(), {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "toolu_agent", content: "Delivered." }],
+        }),
+        transcriptEntry("assistant", randomUUID(), {
+          id: "msg_send",
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_send",
+              name: "SendMessage",
+              input: { to: "scout", message: "Look again" },
+            },
+          ],
+        }),
+        transcriptEntry("user", randomUUID(), {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "toolu_send", content: "Message sent" }],
+        }),
+      ] as unknown as Awaited<ReturnType<typeof getSessionMessages>>);
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+      await client.authUpdate(1);
+    });
+
+    const messages = client.sessionUpdates.flatMap(({ sessionId, update }) => {
+      if (update.sessionUpdate !== "session_message") return [];
+      const name = (id: string | null | undefined) => (id === root ? "root" : id);
+      const { messageId, senderSessionId, recipientSessionId } = update as {
+        messageId: string;
+        senderSessionId?: string;
+        recipientSessionId: string;
+      };
+      return [
+        `${name(sessionId)} ${messageId} ${name(senderSessionId)} -> ${name(recipientSessionId)}`,
+      ];
+    });
+    // The hand-back is the child's message to its parent, so the launch's
+    // result is no reply. The delivered message replaces its call.
+    expect(messages).toEqual([
+      "root toolu_agent root -> abc123",
+      "abc123 toolu_agent root -> abc123",
+      "abc123 toolu_handback abc123 -> root",
+      "root toolu_handback abc123 -> root",
+      "abc123 toolu_send root -> abc123",
+      "root toolu_send root -> abc123",
+    ]);
+    expect(client.updates("tool_call_update")).toEqual([]);
+    // The child's model goes again when a response changes it.
+    expect(
+      client.sessionUpdates.flatMap(({ sessionId, update }) =>
+        sessionId === "abc123" && update.sessionUpdate === "config_option_update"
+          ? [(update as { configOptions: Array<{ currentValue: unknown }> }).configOptions[0]!]
+          : [],
+      ),
+    ).toEqual([
+      expect.objectContaining({ currentValue: "claude-haiku-4-5" }),
+      expect.objectContaining({ currentValue: "claude-sonnet-4-6" }),
+    ]);
   });
 
   it("ends a resume with replay with one end event for a client with loadReplayEnd", async () => {
@@ -4418,6 +4569,279 @@ describe("ACP v2 requests that subagents make", () => {
       stopReason: "error",
       error: { code: -32603, message: "The model is overloaded" },
       background: [],
+    });
+  });
+
+  describe("a subagent's session", () => {
+    /** Runs the hooks of `event` for a hook input of a subagent, as Claude Code does. */
+    async function runHooks(options: Options, event: string, input: Record<string, unknown>) {
+      const hooks = (options.hooks ?? {}) as Record<
+        string,
+        NonNullable<Options["hooks"]>["PreToolUse"]
+      >;
+      for (const matcher of hooks?.[event] ?? []) {
+        for (const hook of matcher.hooks) {
+          await hook(
+            {
+              hook_event_name: event,
+              session_id: options.sessionId!,
+              transcript_path: "",
+              cwd,
+              ...input,
+            } as never,
+            input.tool_use_id as string | undefined,
+            { signal: new AbortController().signal },
+          );
+        }
+      }
+    }
+
+    /** Claude Code's report of the end of a run of the subagent `taskId`. */
+    const taskNotification = (
+      options: Options,
+      taskId: string,
+      fields: Record<string, unknown>,
+    ) => ({
+      type: "system",
+      subtype: "task_notification",
+      task_id: taskId,
+      tool_use_id: `toolu_${taskId}`,
+      status: "completed",
+      summary: "Done",
+      output_file: "",
+      uuid: randomUUID(),
+      session_id: options.sessionId,
+      ...fields,
+    });
+
+    /** A message of the subagent that the Agent call `parent` launched. */
+    const childMessage = (options: Options, message: Record<string, unknown>, parent: string) => ({
+      ...message,
+      parent_tool_use_id: parent,
+    });
+
+    /** The session messages, as `<session> <messageId> <sender> -> <recipient> <text>`. */
+    const sessionMessages = (client: ReturnType<typeof v2Client>, root: string) =>
+      client.sessionUpdates.flatMap(({ sessionId, update }) => {
+        if (update.sessionUpdate !== "session_message") return [];
+        const name = (id: string | null | undefined) => (id === root ? "root" : id);
+        const { messageId, senderSessionId, recipientSessionId, content } = update as {
+          messageId: string;
+          senderSessionId?: string;
+          recipientSessionId: string;
+          content: Array<{ text: string }>;
+        };
+        return [
+          `${name(sessionId)} ${messageId} ${name(senderSessionId)} -> ${name(recipientSessionId)} ${content[0]?.text}`,
+        ];
+      });
+
+    /** The tool calls the client was shown, by id. */
+    const shownToolCalls = (client: ReturnType<typeof v2Client>) => [
+      ...new Set(
+        client.sessionUpdates.flatMap(({ update }) =>
+          update.sessionUpdate === "tool_call_update"
+            ? [(update as { toolCallId: string }).toolCallId]
+            : [],
+        ),
+      ),
+    ];
+
+    it("reports the mode, effort and agent type of a subagent's hooks, with its model, as its configuration", async () => {
+      scriptTurns(async function* (options) {
+        yield toolUseMessage(options, "toolu_agent-1", "Agent", {
+          description: "Explore the project",
+          prompt: "Look around",
+          subagent_type: "Explore",
+        });
+        yield taskStarted(options, "agent-1", { prompt: "Look around" });
+        await runHooks(options, "PostToolUse", {
+          agent_id: "agent-1",
+          agent_type: "Explore",
+          permission_mode: "acceptEdits",
+          effort: { level: "high" },
+          tool_name: "Read",
+          tool_input: {},
+          tool_response: {},
+          tool_use_id: "toolu_read",
+        });
+        yield childMessage(options, assistantText(options, "Done.", "msg_child"), "toolu_agent-1");
+        yield taskNotification(options, "agent-1", {});
+        yield result(options);
+        yield idleState(options);
+      });
+      const client = await promptToIdle(v2Client());
+
+      const configurations = client.sessionUpdates.flatMap(({ sessionId, update }) =>
+        sessionId === "agent-1" && update.sessionUpdate === "config_option_update"
+          ? [
+              (
+                update as { configOptions: Array<{ configId: string; currentValue: unknown }> }
+              ).configOptions.map(({ configId, currentValue }) => `${configId}=${currentValue}`),
+            ]
+          : [],
+      );
+      // The hook's options, then all of them again with the model of the
+      // child's response, the mode first.
+      expect(configurations).toEqual([
+        ["mode=acceptEdits", "effort=high", "agent=Explore"],
+        ["mode=acceptEdits", "model=claude-sonnet-4-6", "effort=high", "agent=Explore"],
+      ]);
+    });
+
+    it("sends a SendMessage call's message and a SubagentHandback call's report as session messages, instead of the calls", async () => {
+      scriptTurns(async function* (options) {
+        yield toolUseMessage(options, "toolu_agent-1", "Agent", {
+          description: "Explore the project",
+          prompt: "Look around",
+        });
+        yield taskStarted(options, "agent-1", { prompt: "Look around" });
+        yield toolUseMessage(
+          options,
+          "toolu_handback",
+          "SubagentHandback",
+          { message: "Found it." },
+          "toolu_agent-1",
+        );
+        yield childMessage(
+          options,
+          toolResultMessage(options, "toolu_handback", { content: "Delivered" }),
+          "toolu_agent-1",
+        );
+        yield taskNotification(options, "agent-1", {});
+        // The run handed back its report: its result is no reply.
+        yield toolResultMessage(options, "toolu_agent-1", {
+          content: [{ type: "text", text: "The report was delivered as a message." }],
+        });
+        yield toolUseMessage(options, "toolu_send", "SendMessage", {
+          to: "agent-1",
+          message: "Look again",
+        });
+        yield taskStarted(options, "agent-1", {
+          tool_use_id: "toolu_send",
+          prompt: "Look again",
+          is_backgrounded: true,
+        });
+        yield toolResultMessage(options, "toolu_send", { content: "Message sent" });
+        yield taskNotification(options, "agent-1", {
+          tool_use_id: "toolu_send",
+        });
+        yield result(options);
+        yield idleState(options);
+      });
+      const client = await promptToIdle(v2Client());
+      const root = client.sessionUpdates.find(
+        ({ update }) => update.sessionUpdate === "user_message",
+      )!.sessionId;
+
+      expect(sessionMessages(client, root)).toEqual([
+        "root toolu_agent-1 root -> agent-1 Look around",
+        "agent-1 toolu_agent-1 root -> agent-1 Look around",
+        "agent-1 toolu_handback agent-1 -> root Found it.",
+        "root toolu_handback agent-1 -> root Found it.",
+        "root toolu_send root -> agent-1 Look again",
+        "agent-1 toolu_send root -> agent-1 Look again",
+      ]);
+      expect(shownToolCalls(client)).toEqual([]);
+    });
+
+    it("shows a SendMessage call whose message reached no child session as a tool call", async () => {
+      scriptTurns(async function* (options) {
+        yield toolUseMessage(options, "toolu_send", "SendMessage", {
+          to: "team-lead",
+          message: "Status?",
+        });
+        yield toolResultMessage(options, "toolu_send", { content: "Message sent" });
+        yield result(options);
+        yield idleState(options);
+      });
+      const client = await promptToIdle(v2Client());
+
+      expect(client.updates("tool_call_update")).toContainEqual(
+        expect.objectContaining({ toolCallId: "toolu_send", status: "completed" }),
+      );
+      expect(client.updates("session_message")).toEqual([]);
+    });
+
+    it("restores a subagent that a SendMessage call resumes from the session's subagent history", async () => {
+      scriptTurns(async function* (options) {
+        // Claude Code no longer tracks the agent, from before a restart:
+        // its history names the call that launched it from the root.
+        const sessionId = options.sessionId!;
+        await writeSubagentHistory(
+          sessionId,
+          [
+            transcriptRecord(sessionId, "r1", null, {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool_use",
+                  id: "toolu_old",
+                  name: "Agent",
+                  input: { name: "scout", prompt: "Look around" },
+                },
+              ],
+            }),
+          ],
+          "abc123",
+          { agentType: "Explore", name: "scout", toolUseId: "toolu_old" },
+          [transcriptRecord(sessionId, "c1", null, { role: "user", content: "Look around" })],
+        );
+        yield toolUseMessage(options, "toolu_send", "SendMessage", {
+          to: "scout",
+          message: "Look again",
+        });
+        yield taskStarted(options, "abc123", {
+          tool_use_id: "toolu_send",
+          prompt: "Look again",
+          subagent_type: "Explore",
+          is_backgrounded: true,
+        });
+        // The resumed run's messages carry the call that launched it.
+        yield childMessage(
+          options,
+          assistantText(options, "Still fine.", "msg_child"),
+          "toolu_old",
+        );
+        yield toolResultMessage(options, "toolu_send", { content: "Message sent" });
+        yield taskNotification(options, "abc123", {
+          tool_use_id: "toolu_send",
+        });
+        yield result(options);
+        yield idleState(options);
+      });
+      const client = await promptToIdle(v2Client());
+      const sessionId = client.sessionUpdates.find(
+        ({ update }) => update.sessionUpdate === "user_message",
+      )!.sessionId;
+
+      expect(
+        client.sessionUpdates.flatMap(({ sessionId: on, update }) => {
+          const where = on === sessionId ? "root" : on;
+          if (update.sessionUpdate === "subagent_update") {
+            const { title, state } = update as { title?: string; state?: { state: string } };
+            return [`${where} subagent_update ${title ?? ""} ${state?.state ?? ""}`];
+          }
+          if (on === sessionId) {
+            return update.sessionUpdate === "session_message" ? [`${where} session_message`] : [];
+          }
+          return update.sessionUpdate === "state_update"
+            ? []
+            : [`${where} ${update.sessionUpdate}`];
+        }),
+      ).toEqual([
+        "root subagent_update scout running",
+        "root session_message",
+        "abc123 session_message",
+        "abc123 config_option_update",
+        "abc123 agent_message_chunk",
+        "root subagent_update  idle",
+      ]);
+      expect(sessionMessages(client, sessionId)).toEqual([
+        "root toolu_send root -> abc123 Look again",
+        "abc123 toolu_send root -> abc123 Look again",
+      ]);
+      expect(shownToolCalls(client)).toEqual([]);
     });
   });
 

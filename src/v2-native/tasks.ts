@@ -22,7 +22,8 @@
  *   prompt is the parent's outgoing `session_message` and the child's
  *   incoming one, and a foreground child's answer is its reply to the parent.
  *   The call of a child that was never exposed is shown with its final
- *   status.
+ *   status. A SendMessage call whose message reaches an announced child,
+ *   and a child's SubagentHandback call, are session messages too.
  * - The work waits on a subagent that is not `is_backgrounded`, and on the
  *   ones that it waits on: their requests block it (`requires_action`), and
  *   a cancel of it withdraws them. A subagent in the background is listed in
@@ -40,9 +41,14 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { RequestError } from "@agentclientprotocol/sdk/unstable";
+import { RequestError, type SessionModeState } from "@agentclientprotocol/sdk/unstable";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
-import type { SDKMessage, SDKUserMessage, SessionMessage } from "@anthropic-ai/claude-agent-sdk";
+import type {
+  HookInput,
+  SDKMessage,
+  SDKUserMessage,
+  SessionMessage,
+} from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "../acp-agent.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import { backgroundBashTaskFromToolResult } from "../async-tasks.js";
@@ -50,22 +56,29 @@ import { BackgroundOutputTail, type BackgroundOutput } from "../background-outpu
 import type { BackgroundItem, WorkStateName } from "../background-work.js";
 import {
   childModelOption,
+  HANDBACK_TOOL,
+  handbackMessage,
   isNativeSubagentControlTool,
   launchReply,
   linkedSessionMessages,
   mergeSubagentIdentity,
   responseModelEntry,
+  resumedNativeSubagentId,
   rfdLabels,
+  sendMessageResume,
   subagentIdentity,
   unexposedControlFallback,
+  type HistoricalSubagent,
   type SubagentIdentity,
   type SubagentModels,
 } from "../native-subagents.js";
+import { subagentLineage } from "../subagent-history.js";
 import { withRunningTerminal, withRunningToolCall } from "../tool-calls/background.js";
 import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { AcpToolCallRenderer } from "../tool-calls/renderer.js";
 import type { V2Background } from "../v2/background.js";
 import type { V2UpdateTranslator } from "../v2/update-translator.js";
+import { ChildConfigurations } from "./child-config.js";
 import { SessionOutput } from "./stream.js";
 import { SubagentReplay } from "./subagent-replay.js";
 
@@ -89,6 +102,8 @@ export interface TaskHost {
   foregroundRequestsChanged(): void;
   /** The entries of the root session's `model` option, for a child's `model`. */
   models(): SubagentModels;
+  /** The root session's modes, for a child's `mode`. */
+  modes(): SessionModeState["availableModes"];
   stopTask(taskId: string): Promise<void>;
 }
 
@@ -145,8 +160,8 @@ type Child = {
   parentSessionId: string;
   /** The Agent call of its current run, whose id its messages carry. */
   launchToolUseId: string | undefined;
-  /** What `task_started` said of it. */
-  task: { description?: string; prompt?: string; subagentType?: string };
+  /** What `task_started` said of it, or the subagent history of a restored child. */
+  task: { name?: string; description?: string; prompt?: string; subagentType?: string };
   announced: boolean;
   /**
    * The subagent that launched it, when that one is not announced yet and no
@@ -168,15 +183,22 @@ type Child = {
   cwd: string | undefined;
   /** Its output, once it is announced. */
   output: SessionOutput | undefined;
-  /** The `model` option the client holds for it, as JSON. */
-  model: string | undefined;
   /** The ids of the messages delegated to it. */
   promptIds: Set<string>;
+  /** The calls that delegated to it, whose runs ended: a late SendMessage result resumes nothing. */
+  endedRuns: Set<string>;
+  /** The calls that delegated to it, whose runs handed back a report: their results are no reply. */
+  handedBack: Set<string>;
   /** Its tool calls that ended with a stop of its run: Claude Code's later results are dropped. */
   stopped: Set<string>;
 };
 
 type ToolResultBlock = { type: "tool_result"; tool_use_id: string; is_error?: boolean };
+
+type ToolCallUpdate = Extract<
+  AcpSessionNotification["update"],
+  { sessionUpdate: "tool_call" | "tool_call_update" }
+>;
 
 /** A task of `background_tasks_changed`. */
 type LevelTask = { ambient: boolean; taskType: string; description: string; parentTaskId?: string };
@@ -189,6 +211,9 @@ const TASK_TOOLS = new Set(["Monitor", "Workflow"]);
 
 /** The most messages that wait for the announcement of one child. */
 const MAX_PENDING_MESSAGES = 256;
+
+/** The most children not announced yet whose hooks wait for them, as on the bridge. */
+const MAX_PENDING_HOOKS = 64;
 
 const FINAL_STATUSES = new Set<unknown>(["completed", "failed", "cancelled"]);
 
@@ -243,8 +268,30 @@ export class SessionTasks {
   >();
   /** The tool calls that returned: their tasks no longer hold their work. */
   private readonly returned = new Set<string>();
-  /** What a `SubagentStart` hook reported before the child was announced, by agent id. */
-  private readonly startedHooks = new Map<string, { cwd: string; agentType: string }>();
+  /** What a subagent's hooks reported before the child was announced, by agent id. */
+  private readonly startedHooks = new Map<string, { cwd?: string; agentType?: string }>();
+  /** The children's configurations (see `child-config.ts`). */
+  readonly configs: ChildConfigurations;
+  /**
+   * The SendMessage calls, which the client is not shown until their final
+   * update, with their first report and the session that made them. A message
+   * that reaches an announced child replaces its call.
+   */
+  private readonly hiddenSendMessages = new Map<
+    string,
+    { initial: AcpSessionNotification; sender: string; delivered: boolean }
+  >();
+  /**
+   * The SubagentHandback calls of announced children, which the client is not
+   * shown until their final update, with their first report, the report from
+   * their input, and the call that delegated the run.
+   */
+  private readonly handbacks = new Map<
+    string,
+    { initial: AcpSessionNotification; message?: string; delegationId?: string }
+  >();
+  /** The restore of a subagent from the session's history, while it reads it (see {@link restore}). */
+  private restoring: Promise<void> | undefined;
 
   constructor(
     private readonly host: TaskHost,
@@ -252,6 +299,11 @@ export class SessionTasks {
     private readonly rootOutput: SessionOutput,
   ) {
     rootOutput.route = (notification) => this.route(rootOutput, notification, undefined);
+    this.configs = new ChildConfigurations({
+      modes: () => host.modes(),
+      models: () => host.models(),
+      announced: (agentId) => this.hasChild(agentId),
+    });
     // Every state of a session that reports its background work carries a list.
     if (host.reportsBackground) {
       host.background.changed({ sessionId: host.sessionId, items: [], state: undefined });
@@ -286,10 +338,21 @@ export class SessionTasks {
       case "stream_event":
       case "assistant":
       case "user":
+      case "tool_progress":
         return this.childMessage(message);
       default:
         return false;
     }
+  }
+
+  /**
+   * The restore of a subagent that {@link handle} started, once: the session
+   * handles its next message after it, so the child's traffic finds it.
+   */
+  restored(): Promise<void> | undefined {
+    const restoring = this.restoring;
+    this.restoring = undefined;
+    return restoring;
   }
 
   /**
@@ -305,6 +368,9 @@ export class SessionTasks {
     ) as unknown as ToolResultBlock[];
     for (const { tool_use_id } of results) this.returned.add(tool_use_id);
     const toolUses = output.toolUses();
+    // Before the result's own updates: a SendMessage call whose message
+    // reached its child is that message.
+    this.sendMessageResumed(message, results, toolUses);
 
     const command = backgroundBashTaskFromToolResult(
       content,
@@ -512,14 +578,28 @@ export class SessionTasks {
     else this.rootOutput.permissionDenied(message);
   }
 
-  /** A `SubagentStart` hook: the child's working directory and type. */
-  subagentStarted(agentId: string, cwd: string, agentType: string): void {
+  /**
+   * A hook of the subagent `input.agent_id`, as the bridge reads them
+   * (`subagentConfigurationHook`): its `cwd` is the child's working
+   * directory, such as its worktree, and its configuration goes to the
+   * child's session (see `child-config.ts`). What a hook reports before the
+   * child's announcement goes with it.
+   */
+  subagentHook(input: HookInput): void {
+    const agentId = input.agent_id;
+    if (agentId === undefined) return;
     const child = this.children.get(agentId);
-    if (!child?.announced) {
-      this.startedHooks.set(agentId, { cwd, agentType });
-      return;
+    if (child?.announced) {
+      if (path.isAbsolute(input.cwd)) this.reportCwd(child, input.cwd);
+    } else if (this.startedHooks.has(agentId) || this.startedHooks.size < MAX_PENDING_HOOKS) {
+      const started = this.startedHooks.get(agentId) ?? {};
+      if (path.isAbsolute(input.cwd)) started.cwd = input.cwd;
+      if (input.agent_type) started.agentType = input.agent_type;
+      this.startedHooks.set(agentId, started);
     }
-    this.reportCwd(child, cwd);
+    if (this.configs.take(agentId, this.configs.hookOptions(input)) && child?.announced) {
+      this.publishConfiguration(child, undefined);
+    }
   }
 
   // --- Background work ----------------------------------------------------------
@@ -697,6 +777,11 @@ export class SessionTasks {
         child.launchToolUseId = toolUseId;
       }
       this.startRun(child, prompt, toolUseId);
+    } else if (toolUseId !== undefined && this.senderByToolUse.has(toolUseId)) {
+      // A SendMessage call resumed an agent that this process does not know,
+      // such as one from before a restart.
+      this.restoring = this.restore(message.task_id, prompt, toolUseId);
+      return;
     } else {
       // A child's parent is the subagent that launched it. One Claude Code
       // no longer tracks, such as one from before a restart, cannot be
@@ -705,31 +790,11 @@ export class SessionTasks {
         this.host.foregroundRequestsChanged();
         return;
       }
-      child = {
-        sessionId: message.task_id,
-        parentSessionId: this.host.sessionId,
-        launchToolUseId: toolUseId,
-        task: {
-          ...(nonBlank(message.description) ? { description: message.description } : {}),
-          ...(prompt ? { prompt } : {}),
-          ...(nonBlank(message.subagent_type) ? { subagentType: message.subagent_type } : {}),
-        },
-        announced: false,
-        awaitedParent: undefined,
-        pending: toolUseId !== undefined ? (this.pendingByLaunch.get(toolUseId) ?? []) : [],
-        title: undefined,
-        description: undefined,
-        working: true,
-        reportedState: undefined,
-        outcome: undefined,
-        openRequests: 0,
-        cwd: undefined,
-        output: undefined,
-        model: undefined,
-        promptIds: new Set(),
-        stopped: new Set(),
-      };
-      this.children.set(child.sessionId, child);
+      child = this.newChild(message.task_id, toolUseId, {
+        ...(nonBlank(message.description) ? { description: message.description } : {}),
+        ...(prompt ? { prompt } : {}),
+        ...(nonBlank(message.subagent_type) ? { subagentType: message.subagent_type } : {}),
+      });
       if (toolUseId !== undefined) {
         this.pendingByLaunch.delete(toolUseId);
         this.childByToolUse.set(toolUseId, child);
@@ -883,6 +948,100 @@ export class SessionTasks {
 
   // --- Children ---------------------------------------------------------------------
 
+  /** A new child, not announced, which runs; the messages of its launch that came wait for it. */
+  private newChild(
+    sessionId: string,
+    launchToolUseId: string | undefined,
+    task: Child["task"],
+  ): Child {
+    const child: Child = {
+      sessionId,
+      parentSessionId: this.host.sessionId,
+      launchToolUseId,
+      task,
+      announced: false,
+      awaitedParent: undefined,
+      pending:
+        launchToolUseId !== undefined ? (this.pendingByLaunch.get(launchToolUseId) ?? []) : [],
+      title: undefined,
+      description: undefined,
+      working: true,
+      reportedState: undefined,
+      outcome: undefined,
+      openRequests: 0,
+      cwd: undefined,
+      output: undefined,
+      promptIds: new Set(),
+      stopped: new Set(),
+      endedRuns: new Set(),
+      handedBack: new Set(),
+    };
+    this.children.set(sessionId, child);
+    return child;
+  }
+
+  /**
+   * Restores the agent `agentId`, which the SendMessage call `toolUseId`
+   * resumed with `prompt`, as the bridge does (`NativeSubagentRuntime.restore`):
+   * the process does not know it, because it ran before the session was
+   * resumed. The session's subagent history (`subagentLineage`) gives the
+   * call that launched it and its ancestors. Claude Code sends the resumed
+   * run's messages under that launch call's id. Before the agent's traffic,
+   * the RFD requires its ancestors, parent before child, so each one that is
+   * not announced is, with no state, since nothing says that it runs. Then
+   * the agent, running, and the SendMessage call's message to it. The RFD
+   * forbids guessing a parent, so an agent that the history cannot place
+   * stays unexposed, its traffic the root's.
+   */
+  private async restore(
+    agentId: string,
+    prompt: string | undefined,
+    toolUseId: string,
+  ): Promise<void> {
+    const lineage: HistoricalSubagent[] = await subagentLineage(
+      this.host.sessionId,
+      agentId,
+      this.host.logger,
+    ).catch((error: unknown) => {
+      this.host.logger.error(`Subagent ${agentId}: reading its history failed`, error);
+      return [];
+    });
+    // The session handles no message while the history is read (see `restored`).
+    if (this.closed || this.children.has(agentId) || lineage.at(-1)?.agentId !== agentId) {
+      this.host.foregroundRequestsChanged();
+      return;
+    }
+    for (const entry of lineage) {
+      if (this.children.get(entry.agentId)?.announced) continue;
+      const child = this.newChild(entry.agentId, entry.launchId, {
+        ...(entry.name ? { name: entry.name } : {}),
+        ...(entry.description ? { description: entry.description } : {}),
+        ...(entry.agentType ? { subagentType: entry.agentType } : {}),
+      });
+      this.childByToolUse.set(entry.launchId, child);
+      // A hook of the resumed agent may have reported a newer `cwd`.
+      if (entry.cwd && this.startedHooks.get(entry.agentId)?.cwd === undefined) {
+        this.startedHooks.set(entry.agentId, {
+          ...this.startedHooks.get(entry.agentId),
+          cwd: entry.cwd,
+        });
+      }
+      const parent = entry.parentAgentId ?? this.host.sessionId;
+      if (entry.agentId === agentId) {
+        this.announce(child, parent);
+      } else {
+        child.working = false;
+        this.open(child, parent);
+        this.host.send({ sessionId: parent, update: this.announcement(child, false) });
+      }
+    }
+    const child = this.children.get(agentId)!;
+    this.childByToolUse.set(toolUseId, child);
+    child.launchToolUseId = toolUseId;
+    this.startRun(child, prompt, toolUseId);
+    this.host.foregroundRequestsChanged();
+  }
+
   /**
    * A message of a subagent, by its `parent_tool_use_id`: it goes to the
    * child's stream, or waits for the child's announcement. A message of an
@@ -918,6 +1077,9 @@ export class SessionTasks {
         this.reportModel(child, message.message.model);
         output.assistant(message);
         return;
+      case "tool_progress":
+        output.toolProgress(message);
+        return;
       case "user": {
         // Its prompts are the delegations, which go out as session messages.
         // Its other text is Claude Code's, such as "[Request interrupted by
@@ -939,13 +1101,41 @@ export class SessionTasks {
    * the messages that came before.
    */
   private announce(child: Child, parentSessionId: string): void {
+    const identity = this.open(child, parentSessionId);
+    child.reportedState = "running";
+    const state = stateObject("running", undefined);
+    this.host.send({ sessionId: parentSessionId, update: { ...this.announcement(child), state } });
+    this.host.send({
+      sessionId: child.sessionId,
+      update: { sessionUpdate: "state_update", ...state } as v2.SessionUpdate,
+    });
+    const prompt = child.task.prompt ?? identity?.prompt;
+    if (prompt) this.sendPrompt(child, prompt, child.launchToolUseId, parentSessionId, true);
+    // What its hooks reported before, as on the bridge: after the prompt.
+    this.publishConfiguration(child, undefined);
+    const pending = child.pending;
+    child.pending = [];
+    for (const message of pending) this.deliver(child, message);
+    for (const waiting of [...this.children.values()]) {
+      if (!waiting.announced && waiting.awaitedParent === child.sessionId) {
+        waiting.awaitedParent = undefined;
+        this.announce(waiting, child.sessionId);
+      }
+    }
+  }
+
+  /**
+   * Makes `child` a session of `parentSessionId`, with its parent's labels
+   * for it, its `cwd` and its output. Returns the identity of its launch.
+   */
+  private open(child: Child, parentSessionId: string): SubagentIdentity | undefined {
     const launch =
       child.launchToolUseId !== undefined ? this.launches.get(child.launchToolUseId) : undefined;
     const identity = launch?.identity;
     const hook = this.startedHooks.get(child.sessionId);
     this.startedHooks.delete(child.sessionId);
     const labels = rfdLabels(
-      identity?.name,
+      identity?.name ?? child.task.name,
       identity?.subagentType ?? child.task.subagentType ?? hook?.agentType,
       identity?.description ?? child.task.description,
     );
@@ -953,7 +1143,7 @@ export class SessionTasks {
     child.title = labels.title;
     child.description = labels.description;
     const parentCwd = this.cwdOf(parentSessionId);
-    child.cwd = hook && !sameDirectory(hook.cwd, parentCwd) ? hook.cwd : undefined;
+    child.cwd = hook?.cwd && !sameDirectory(hook.cwd, parentCwd) ? hook.cwd : undefined;
     const output = new SessionOutput(
       child.sessionId,
       child.cwd ?? parentCwd,
@@ -965,24 +1155,7 @@ export class SessionTasks {
     output.route = (notification) => this.route(output, notification, child);
     child.output = output;
     child.announced = true;
-    child.reportedState = "running";
-    const state = stateObject("running", undefined);
-    this.host.send({ sessionId: parentSessionId, update: { ...this.announcement(child), state } });
-    this.host.send({
-      sessionId: child.sessionId,
-      update: { sessionUpdate: "state_update", ...state } as v2.SessionUpdate,
-    });
-    const prompt = child.task.prompt ?? identity?.prompt;
-    if (prompt) this.sendPrompt(child, prompt, child.launchToolUseId, parentSessionId, true);
-    const pending = child.pending;
-    child.pending = [];
-    for (const message of pending) this.deliver(child, message);
-    for (const waiting of [...this.children.values()]) {
-      if (!waiting.announced && waiting.awaitedParent === child.sessionId) {
-        waiting.awaitedParent = undefined;
-        this.announce(waiting, child.sessionId);
-      }
-    }
+    return identity;
   }
 
   /**
@@ -1038,6 +1211,10 @@ export class SessionTasks {
     if (child?.stopped.has(update.toolCallId)) return [];
     const toolName = (update._meta?.claudeCode as { toolName?: unknown } | undefined)?.toolName;
     if (toolName === "SendMessage") this.senderByToolUse.set(update.toolCallId, output.sessionId);
+    const message =
+      this.sendMessageUpdate(output, notification, toolName) ??
+      (child ? this.handbackUpdate(child, notification, toolName) : undefined);
+    if (message) return message;
     let launch = this.launches.get(update.toolCallId);
     if (!launch) {
       if (!isNativeSubagentControlTool(toolName)) return [notification];
@@ -1080,7 +1257,14 @@ export class SessionTasks {
     if (!FINAL_STATUSES.has(update.status) || launch.ended) return [];
     launch.ended = true;
     if (child?.announced) {
-      if (update.status !== "completed" || launch.background) return [];
+      // A run that handed back its report has none in its result.
+      if (
+        update.status !== "completed" ||
+        launch.background ||
+        child.handedBack.has(launch.toolUseId)
+      ) {
+        return [];
+      }
       const reply = launchReply(launch.toolUseId, child.sessionId, child.parentSessionId, update);
       return reply ? [reply] : [];
     }
@@ -1090,9 +1274,112 @@ export class SessionTasks {
     return [unexposedControlFallback(launch.initial, notification, launch.output.sessionId)];
   }
 
+  /**
+   * An update of a SendMessage call, which its message replaces once it
+   * reaches an announced child (see {@link startRun}): the sender's outgoing
+   * view and the child's incoming one. Claude Code reports that delivery
+   * before the call's final update. A call whose message reached no announced
+   * child, such as one to the parent, is shown after all, with its final
+   * status, as on the bridge. Undefined for any other update.
+   */
+  private sendMessageUpdate(
+    output: SessionOutput,
+    notification: AcpSessionNotification,
+    toolName: unknown,
+  ): AcpSessionNotification[] | undefined {
+    const update = notification.update as ToolCallUpdate;
+    let call = this.hiddenSendMessages.get(update.toolCallId);
+    if (!call) {
+      if (update.sessionUpdate !== "tool_call" || toolName !== "SendMessage") return undefined;
+      call = { initial: notification, sender: output.sessionId, delivered: false };
+      this.hiddenSendMessages.set(update.toolCallId, call);
+    }
+    if (!FINAL_STATUSES.has(update.status)) return [];
+    this.hiddenSendMessages.delete(update.toolCallId);
+    if (call.delivered) return [];
+    return [unexposedControlFallback(call.initial, notification, call.sender)];
+  }
+
+  /**
+   * An update of a SubagentHandback call of the announced `child`, which its
+   * report replaces: the child's message to its parent, the outgoing view on
+   * the child and the incoming one on the parent. Its run's result is then no
+   * reply. A call that failed delivered nothing, so the child is shown the
+   * call after all. Undefined for any other update.
+   */
+  private handbackUpdate(
+    child: Child,
+    notification: AcpSessionNotification,
+    toolName: unknown,
+  ): AcpSessionNotification[] | undefined {
+    const update = notification.update as ToolCallUpdate;
+    let handback = this.handbacks.get(update.toolCallId);
+    if (!handback) {
+      if (toolName !== HANDBACK_TOOL) return undefined;
+      const parentToolUseId = (
+        update._meta?.claudeCode as { parentToolUseId?: string | null } | undefined
+      )?.parentToolUseId;
+      const delegationId = parentToolUseId ?? child.launchToolUseId;
+      handback = {
+        initial: notification,
+        ...(delegationId !== undefined ? { delegationId } : {}),
+      };
+      this.handbacks.set(update.toolCallId, handback);
+    }
+    handback.message = handbackMessage(update.rawInput) ?? handback.message;
+    if (!FINAL_STATUSES.has(update.status)) return [];
+    this.handbacks.delete(update.toolCallId);
+    if (update.status !== "completed" || !handback.message) {
+      return [unexposedControlFallback(handback.initial, notification, child.sessionId)];
+    }
+    if (handback.delegationId !== undefined) child.handedBack.add(handback.delegationId);
+    const [outgoing, incoming] = linkedSessionMessages(
+      update.toolCallId,
+      child.sessionId,
+      child.parentSessionId,
+      handback.message,
+    );
+    // Sent here, in order: an output routes each update once the ones before it went out.
+    child.output!.emitV1([outgoing!]);
+    this.outputOf(child.parentSessionId)?.emitV1([incoming!]);
+    return [];
+  }
+
+  /**
+   * A SendMessage result that reports the agent it resumed (`resumedAgentId`):
+   * the call is the child's delegation, which it takes unless the run of that
+   * call ended already, as on the bridge (`sendMessageResumed`). Claude Code
+   * can resume a child without a new `task_started`.
+   */
+  private sendMessageResumed(
+    message: SDKUserMessage,
+    results: ToolResultBlock[],
+    toolUses: ReturnType<SessionOutput["toolUses"]>,
+  ): void {
+    const agentId = resumedNativeSubagentId(message.tool_use_result);
+    const child = agentId !== undefined ? this.children.get(agentId) : undefined;
+    if (!child?.announced) return;
+    const resume = sendMessageResume(
+      toolUses,
+      child.sessionId,
+      results.map((block) => block.tool_use_id),
+    );
+    if (resume && child.endedRuns.has(resume.toolUseId)) return;
+    if (!this.agents.has(child.sessionId)) {
+      this.agents.set(child.sessionId, { parentTaskId: undefined, background: true });
+    }
+    if (resume) {
+      this.childByToolUse.set(resume.toolUseId, child);
+      child.launchToolUseId = resume.toolUseId;
+    }
+    this.startRun(child, resume?.text, resume?.toolUseId);
+  }
+
   /** A child that ended before its announcement stays unexposed, and is forgotten. */
   private withdrawChild(child: Child): void {
     this.children.delete(child.sessionId);
+    this.configs.forget(child.sessionId);
+    this.startedHooks.delete(child.sessionId);
     for (const [toolUseId, owner] of this.childByToolUse) {
       if (owner === child) this.childByToolUse.delete(toolUseId);
     }
@@ -1109,7 +1396,16 @@ export class SessionTasks {
       this.reportChild(child);
     }
     if (prompt && toolUseId !== undefined) {
-      this.sendPrompt(child, prompt, toolUseId, this.senderByToolUse.get(toolUseId), false);
+      // The message of a SendMessage call that the client is not shown replaces it.
+      const call = this.hiddenSendMessages.get(toolUseId);
+      this.sendPrompt(
+        child,
+        prompt,
+        toolUseId,
+        call?.sender ?? this.senderByToolUse.get(toolUseId),
+        call !== undefined,
+      );
+      if (call) call.delivered = true;
     }
     this.publish();
   }
@@ -1145,6 +1441,7 @@ export class SessionTasks {
     }
     child.working = false;
     child.outcome = outcome;
+    if (child.launchToolUseId !== undefined) child.endedRuns.add(child.launchToolUseId);
     this.reportChild(child);
     this.cancelledAgents.delete(child.sessionId);
   }
@@ -1260,25 +1557,32 @@ export class SessionTasks {
 
   /**
    * Reports the model of a child response as the entry of the root's `model`
-   * option that matches it, else as the id. The child gets no model before
-   * its first response, and the client gets it again only when it changes.
+   * option that matches it, else as the id, in the child's configuration.
+   * The child gets no model before its first response, and the client gets
+   * its configuration again only when it changes.
    */
   private reportModel(child: Child, model: string | undefined): void {
     const entry = responseModelEntry(model, this.host.models());
-    if (!entry) return;
-    const options = [childModelOption(entry)];
-    const json = JSON.stringify(options);
-    if (child.model === json) return;
-    child.model = json;
+    if (!entry || !this.configs.take(child.sessionId, [childModelOption(entry)])) return;
+    this.publishConfiguration(
+      child,
+      child.launchToolUseId !== undefined
+        ? { claudeCode: { parentToolUseId: child.launchToolUseId } }
+        : undefined,
+    );
+  }
+
+  /** Sends the configuration of the announced `child`, when the client does not hold it. */
+  private publishConfiguration(child: Child, meta: Record<string, unknown> | undefined): void {
+    const configOptions = this.configs.unsent(child.sessionId);
+    if (!configOptions) return;
     child.output!.emitV1([
       {
         sessionId: child.sessionId,
         update: {
           sessionUpdate: "config_option_update",
-          configOptions: options,
-          ...(child.launchToolUseId !== undefined
-            ? { _meta: { claudeCode: { parentToolUseId: child.launchToolUseId } } }
-            : {}),
+          configOptions,
+          ...(meta ? { _meta: meta } : {}),
         },
       },
     ]);
@@ -1307,8 +1611,13 @@ export class SessionTasks {
     return this.children.get(sessionId)?.output;
   }
 
+  /**
+   * The announcement of `child`, with its `cancel` capability unless
+   * `cancellable` is false: a restored ancestor, which nothing says runs.
+   */
   private announcement(
     child: Child,
+    cancellable = true,
   ): Extract<v2.SessionUpdate, { sessionUpdate: "subagent_update" }> {
     return {
       sessionUpdate: "subagent_update",
@@ -1317,7 +1626,7 @@ export class SessionTasks {
       ...(child.description !== undefined ? { description: child.description } : {}),
       ...(child.cwd !== undefined ? { cwd: child.cwd } : {}),
       // `session/cancel` of the child stops its run (`stopTask`).
-      capabilities: { cancel: {} },
+      ...(cancellable ? { capabilities: { cancel: {} } } : {}),
     };
   }
 
