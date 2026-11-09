@@ -143,10 +143,16 @@ These are the bridge's rules. A child's messages before its announcement wait fo
 child that ends before it is announced stays unexposed: its Agent call is then shown with its
 final status. A child that its parent waits on (`is_backgrounded` not `true`) is part of the
 parent's foreground work, also before its announcement: its requests block the parent too
-(`requires_action`), and cancelling the parent stops it. A child's unfinished tool calls get
-their final status before its idle (unlike the bridge, see "Intended differences"): `cancelled` when it was stopped, `failed` when it failed, and
-otherwise a tool call that Claude dropped before it ran ends `cancelled`. Claude Code's later
-results for a stopped or failed run's calls are dropped. A child that a task names as its parent
+(`requires_action`), and cancelling the parent stops it. After the parent's `session/cancel`,
+of a foreground child's consolidated messages only the results of the tool calls that the client
+holds go out until its run ends, as for the root. A child's unfinished tool calls get their final
+status before its idle (unlike the bridge, see "Intended differences"): `cancelled` when it was
+stopped, `failed` when it failed or a reset ended it, and otherwise a tool call that Claude
+dropped before it ran ends `cancelled`. Claude Code's later results for a stopped or failed run's
+calls are dropped. When Claude Code mounts a fresh conversation (`conversation_reset`, such as
+for `/clear`), each child that works goes `idle` with no stop reason, since nothing says how its
+run ended, and every child is forgotten, as on the bridge: a later task event of one changes
+nothing. A child that a task names as its parent
 without a launch call is announced only after that parent. A
 background child is listed in its parent's `background` while it works, and cancelling the
 parent leaves it running. The client can only watch a child and cancel its run: prompt, close,
@@ -159,12 +165,20 @@ options, and the client gets all of them again when one changes, the mode first.
 reports before the child's announcement goes after its prompt. The client is not shown a
 SendMessage call: once its message reaches an announced child, it is the sender's outgoing and the
 child's incoming `session_message`. A call whose message reached no child, such as one to the
-parent, is shown with its final status. A child's completed SubagentHandback call is its message
+parent, is shown with its final status. A call whose permission request came before its tool use
+streamed stays shown, as on the bridge, since the request showed it: its updates go out, and its
+message goes to the child only. A child's completed SubagentHandback call is its message
 to its parent, and its run's result is then no reply. Claude Code resumes an agent from before a
-restart under the SendMessage call that resumed it. The child is restored from the session's
+restart under the SendMessage call that resumed it, with a `task_started` or with the call's
+`resumedAgentId` result alone. The child is restored from the session's
 subagent history (`subagentLineage`), as on the bridge: its ancestors are announced first, with
-no state, and the session handles its next message only after the history is read. An agent that
-the history cannot place stays unexposed, as the RFD forbids guessing a parent.
+no state, and the session handles its next message, or the result's own updates, only after the
+history is read. An agent that the history cannot place stays unexposed, as the RFD forbids
+guessing a parent.
+
+After a replay's response, a replayed child whose configuration is not the `model` that the
+replay sent gets it again, as on the bridge: a live child's whole configuration (such as the mode
+that its hooks reported), else the model of its latest response, by the session's model list.
 
 ## Layout
 
@@ -379,7 +393,17 @@ These pieces were extracted so that both cores use the same code:
   request's MCP servers and workspace roots replace the previous ones"). The bridge tears the
   session down and starts a new query, which cancels its running work.
 - A stopped child's unfinished tool calls end before the idle that reports its cancel, as v2 asks
-  of the updates after `session/cancel`. The bridge ends them after the idle.
+  of the updates after `session/cancel`. The bridge ends them after the idle. A child that a
+  `conversation_reset` ends gets its tool calls ended `failed` before its idle too: v2 asks for a
+  final status of a turn's tool calls before its idle. The bridge leaves them open.
+- A SendMessage call that its permission request showed, and whose message goes to the child
+  only, names its sender in the child's `session_message` (`senderSessionId`), as the RFD asks
+  ("Agents **SHOULD** include participant IDs on the first `session_message`"). The bridge leaves
+  the sender out.
+- A resume of a session that is not active replays after Claude Code started, so a replayed
+  child's `model` is the session's model list entry at once. The bridge replays while Claude Code
+  starts, without the list: it sends the model's id, then the entry after the response. The client
+  ends with the same configuration. This is no spec rule: it follows from the order of the setup.
 - While the root's turn waits on foreground subagents, it reports `requires_action` only when each
   of them waits on the user. One that still makes progress keeps the turn `running`, as v2 asks.
   The bridge reports `requires_action` as soon as one of them asks.
@@ -407,24 +431,14 @@ These pieces were extracted so that both cores use the same code:
 
 ## Not served yet
 
-- Subagents:
-  - a SendMessage call that asked for permission: the bridge keeps showing it, since the
-    request showed it; here its message still replaces it
-  - a restore from the history at a SendMessage result's `resumedAgentId` alone, without a
-    `task_started`: the bridge restores the agent then too
-  - after a replay's response, a child's configuration again, when the model list maps its
-    model to another entry or the live child holds another configuration
-  - after the root's `session/cancel`, the consolidated messages of a foreground child still go
-    to its session until it ends. The bridge drops them, apart from the results of the child's
-    tool calls that the client holds, as it does for the root
-- Reports:
-  - the bridge sends API retries and prompt suggestions to AIR only, so v2 clients get neither
-  - `conversation_reset` does not end the session's subagents; the bridge ends them `failed`
-- Resume:
-  - `replayFrom` other than `start`
-- The v1-only features, which the bridge does not serve to v2 clients either: steering
-  (`_session/steering`, whose `steering` marker `v2InitializeResponse` drops), and AIR's async
-  task stop and goal extensions.
+Nothing that the bridge serves to v2 clients. Neither core serves these:
+
+- API retries and prompt suggestions: the bridge sends them to AIR only.
+- A `replayFrom` cursor other than `start`: both cores reject it with -32602, such as "Replaying
+  from a \_message cursor is not supported", as the spec asks of a cursor type that the Agent does
+  not support. Neither replays from another position or resumes without a replay.
+- The v1-only features: steering (`_session/steering`, whose `steering` marker
+  `v2InitializeResponse` drops), and AIR's async task stop and goal extensions.
 
 ## Replacing the bridge
 

@@ -282,6 +282,12 @@ export class SessionTasks {
     { initial: AcpSessionNotification; sender: string; delivered: boolean }
   >();
   /**
+   * The SendMessage calls that a permission request showed before their tool
+   * use streamed: the client holds them, so they stay shown until their final
+   * update, as on the bridge (its `eagerToolCallSessions`).
+   */
+  private readonly shownSendMessages = new Set<string>();
+  /**
    * The SubagentHandback calls of announced children, which the client is not
    * shown until their final update, with their first report, the report from
    * their input, and the call that delegated the run.
@@ -353,6 +359,30 @@ export class SessionTasks {
     const restoring = this.restoring;
     this.restoring = undefined;
     return restoring;
+  }
+
+  /**
+   * Restores the agent that a SendMessage result of `output` resumed
+   * (`resumedAgentId`), when this process does not know it, as the bridge
+   * does (`sendMessageResumed`): Claude Code can resume an agent without a
+   * `task_started`. The caller sends the result's updates after it, so the
+   * restored child takes the call's message. Undefined when nothing is
+   * restored: the agent is known, or no SendMessage call of the session
+   * carried the result.
+   */
+  restoreResumed(output: SessionOutput, message: SDKUserMessage): Promise<void> | undefined {
+    const agentId = resumedNativeSubagentId(message.tool_use_result);
+    const content = message.message.content;
+    if (agentId === undefined || this.children.has(agentId) || !Array.isArray(content)) {
+      return undefined;
+    }
+    const resume = sendMessageResume(
+      output.toolUses(),
+      agentId,
+      content.flatMap((block) => (block.type === "tool_result" ? [block.tool_use_id] : [])),
+    );
+    if (!resume || !this.senderByToolUse.has(resume.toolUseId)) return undefined;
+    return this.restore(agentId, resume.text, resume.toolUseId);
   }
 
   /**
@@ -445,7 +475,11 @@ export class SessionTasks {
 
   /** Reads the subagents that the history `messages` launched, for its replay. */
   loadReplay(messages: SessionMessage[]): Promise<SubagentReplay | undefined> {
-    return SubagentReplay.load(this.host, messages, (sessionId) => this.children.has(sessionId));
+    return SubagentReplay.load(this.host, messages, {
+      tracks: (sessionId) => this.children.has(sessionId),
+      configuration: (sessionId) =>
+        this.hasChild(sessionId) ? this.configs.published(sessionId) : undefined,
+    });
   }
 
   /** Whether a subagent task runs, announced or not, in the foreground or the background. */
@@ -516,7 +550,10 @@ export class SessionTasks {
   /**
    * The root's foreground work is cancelled: so is the work of the subagents
    * that it waits on. Their open requests are withdrawn. Claude Code's
-   * interrupt stops their runs, which then end `cancelled`.
+   * interrupt stops their runs, which then end `cancelled`. Until then, of
+   * their consolidated messages only the results of the tool calls that the
+   * client holds go out, as on the root and on the bridge (see
+   * `SessionOutput.cancelled`).
    */
   cancelForeground(): void {
     this.foregroundCancelled.clear();
@@ -524,6 +561,8 @@ export class SessionTasks {
       if (!this.waitsOn(agentId, undefined)) continue;
       this.withdraw(agentId);
       this.foregroundCancelled.add(agentId);
+      const output = this.children.get(agentId)?.output;
+      if (output) output.cancelled = true;
     }
   }
 
@@ -536,6 +575,7 @@ export class SessionTasks {
     for (const agentId of this.foregroundCancelled) {
       this.cancelledAgents.delete(agentId);
       const child = this.children.get(agentId);
+      if (child?.output) child.output.cancelled = false;
       if (child) this.reportChild(child);
     }
     this.foregroundCancelled.clear();
@@ -581,6 +621,19 @@ export class SessionTasks {
     const child = message.agent_id !== undefined ? this.children.get(message.agent_id) : undefined;
     if (child?.announced) child.output!.permissionDenied(message, child.launchToolUseId);
     else this.rootOutput.permissionDenied(message);
+  }
+
+  /**
+   * A permission request on the session of `output` shows the tool call
+   * `toolCallId` to the client. A SendMessage call whose tool use has not
+   * streamed yet then stays shown: its updates go out, and its message goes
+   * to the child only, as on the bridge. One that already streamed stays
+   * hidden, as the bridge's does.
+   */
+  requestShows(output: SessionOutput, toolName: string, toolCallId: string): void {
+    if (toolName === "SendMessage" && !output.holds(toolCallId)) {
+      this.shownSendMessages.add(toolCallId);
+    }
   }
 
   /**
@@ -724,6 +777,35 @@ export class SessionTasks {
     }
     this.level = new Map();
     this.publish();
+  }
+
+  /**
+   * Claude Code mounted a fresh conversation (`conversation_reset`). Its
+   * subagents end, deeper ones first, as on the bridge (`finishAll`): each
+   * child that works goes `idle` with no stop reason, since nothing says how
+   * its run ended, after its unfinished tool calls end `failed`. Then every
+   * child is forgotten, as the bridge forgets them: a later event of one
+   * changes nothing, and a child not announced yet stays unexposed. Claude
+   * Code's tasks (the live subagents, background commands and other tasks)
+   * stay as its task events report them.
+   */
+  conversationReset(): void {
+    for (const child of [...this.parentsFirst()].reverse()) {
+      if (child.working) this.endRun(child, undefined);
+    }
+    this.publish();
+    for (const child of this.children.values()) this.configs.forget(child.sessionId);
+    this.children.clear();
+    this.childByToolUse.clear();
+    this.launches.clear();
+    this.pendingByLaunch.clear();
+    this.cancelledAgents.clear();
+    this.foregroundCancelled.clear();
+    this.senderByToolUse.clear();
+    this.startedHooks.clear();
+    this.hiddenSendMessages.clear();
+    this.shownSendMessages.clear();
+    this.handbacks.clear();
   }
 
   /**
@@ -1091,7 +1173,10 @@ export class SessionTasks {
         // user]", which the child's session does not show.
         const content = message.message.content;
         if (Array.isArray(content) && content.some((block) => block.type === "tool_result")) {
-          this.toolResults(output, message);
+          // The session handles its next message after the restore (see `restored`).
+          const restoring = this.restoreResumed(output, message);
+          if (restoring) this.restoring = restoring.then(() => this.toolResults(output, message));
+          else this.toolResults(output, message);
         }
         return;
       }
@@ -1293,6 +1378,11 @@ export class SessionTasks {
     toolName: unknown,
   ): AcpSessionNotification[] | undefined {
     const update = notification.update as ToolCallUpdate;
+    // A call that its permission request showed (see `requestShows`).
+    if (this.shownSendMessages.has(update.toolCallId)) {
+      if (FINAL_STATUSES.has(update.status)) this.shownSendMessages.delete(update.toolCallId);
+      return [notification];
+    }
     let call = this.hiddenSendMessages.get(update.toolCallId);
     if (!call) {
       if (update.sessionUpdate !== "tool_call" || toolName !== "SendMessage") return undefined;
@@ -1418,15 +1508,16 @@ export class SessionTasks {
   /**
    * A run of `child` ended: its unfinished tool calls get their final status,
    * except its background work, then its idle goes out, as v2 asks. A stopped
-   * run's end `cancelled` and a failed run's `failed`. At any other end, a
+   * run's end `cancelled`, and a failed run's or an unexplained end's
+   * (`undefined`, an idle with no stop reason) `failed`. At a completed end, a
    * tool call that Claude dropped before it ran ends `cancelled`, as on the
    * root (see `SessionOutput.closeUnfinished`).
    */
-  private endRun(child: Child, outcome: IdleOutcome): void {
+  private endRun(child: Child, outcome: IdleOutcome | undefined): void {
     if (!child.working) {
       // A later report of the same failure can give its error text.
       if (
-        outcome.stopReason === "error" &&
+        outcome?.stopReason === "error" &&
         outcome.error &&
         child.outcome?.stopReason === "error" &&
         !child.outcome.error
@@ -1437,15 +1528,16 @@ export class SessionTasks {
       return;
     }
     const keep = this.backgroundWork(child.sessionId);
-    if (outcome.stopReason === "end_turn") {
+    if (outcome?.stopReason === "end_turn") {
       child.output!.closeUnfinished(false, keep);
     } else {
-      const status = outcome.stopReason === "cancelled" ? "cancelled" : "failed";
+      const status = outcome?.stopReason === "cancelled" ? "cancelled" : "failed";
       const ended = child.output!.finishUnfinished(status, keep, { exitTerminals: true });
       for (const toolCallId of ended) child.stopped.add(toolCallId);
     }
     child.working = false;
     child.outcome = outcome;
+    child.output!.cancelled = false;
     if (child.launchToolUseId !== undefined) child.endedRuns.add(child.launchToolUseId);
     this.reportChild(child);
     this.cancelledAgents.delete(child.sessionId);

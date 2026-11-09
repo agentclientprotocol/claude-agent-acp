@@ -98,12 +98,19 @@ export class SessionOutput {
   private readonly dispatched = new Set<string>();
   /**
    * Whether the output comes from work that a `session/cancel` stopped, until
-   * its idle. As on the bridge, the main conversation's streamed deltas still
-   * go out, and of its consolidated messages only the tool results of the
-   * calls that the client holds, where an error result ends a run that the
-   * cancel aborted (`cancelled`). A subagent's session does not set it.
+   * its idle. As on the bridge, the session's streamed deltas still go out,
+   * and of its consolidated messages only the tool results of the calls that
+   * the client holds, where an error result ends a run that the cancel
+   * aborted (`cancelled`). On the root, this covers the main conversation's
+   * messages. A foreground subagent's session sets it at the root's cancel,
+   * until its run ends (see `SessionTasks.cancelForeground`).
    */
   cancelled = false;
+
+  /** Whether `message` is of the work that a cancel stopped (see {@link cancelled}). */
+  private stoppedWork(message: { parent_tool_use_id: string | null }): boolean {
+    return this.cancelled && (this.subagent || message.parent_tool_use_id === null);
+  }
   /** During {@link replay}, the replayed tool uses, apart from the live ones. */
   private replayToolUses: ToolUseCache | undefined;
   /** During {@link replay}, what the session's subagents ask of it. */
@@ -185,7 +192,7 @@ export class SessionOutput {
           (block) => block.type !== "text" && block.type !== "thinking",
         );
     if (ownText) this.streamedBlocks.length = 0;
-    if (this.cancelled && message.parent_tool_use_id === null) return;
+    if (this.stoppedWork(message)) return;
     this.content(content, "assistant", message.parent_tool_use_id, { messageId });
   }
 
@@ -202,12 +209,11 @@ export class SessionOutput {
     if (!Array.isArray(message.message.content)) return;
     const all = message.message.content.filter((block) => block.type === "tool_result");
     // After a cancel, only the results of the calls that the client holds (see {@link cancelled}).
-    const results =
-      this.cancelled && message.parent_tool_use_id === null
-        ? all.filter((block) =>
-            this.emittedToolCalls.has((block as { tool_use_id: string }).tool_use_id),
-          )
-        : all;
+    const results = this.stoppedWork(message)
+      ? all.filter((block) =>
+          this.emittedToolCalls.has((block as { tool_use_id: string }).tool_use_id),
+        )
+      : all;
     if (results.length === 0) return;
     this.content(
       results,
@@ -246,6 +252,11 @@ export class SessionOutput {
     if (!this.toolCallFields.apply(update)) return;
     this.toolCallFields.pinContent(toolCallId, content);
     this.emit([{ sessionId: this.sessionId, update }]);
+  }
+
+  /** Whether the stream mapped the tool call `toolCallId`, shown or routed away. */
+  holds(toolCallId: string): boolean {
+    return this.emittedToolCalls.has(toolCallId);
   }
 
   /** The tool uses of the session's tool calls, by id. */

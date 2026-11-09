@@ -26,7 +26,9 @@
  * current state goes out again after the response ({@link afterResponse}).
  * A child that the live session still tracks, on a resume of the active
  * session, gets its current state from the resume snapshot instead
- * (`SessionTasks.currentState`).
+ * (`SessionTasks.currentState`). After the response, a child whose
+ * configuration is not the `model` that the replay sent, such as a live child
+ * whose hooks reported its mode, gets it again.
  *
  * A launch without metadata has no known id, so it is not announced: the RFD
  * forbids inventing one. Its Agent call stays an ordinary tool call of the
@@ -35,6 +37,7 @@
  */
 import * as fs from "node:fs";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
+import type { SessionConfigOption } from "@agentclientprotocol/sdk/unstable";
 import type { SessionMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "../acp-agent.js";
 import type { AcpSessionNotification, SubagentState } from "../acp-subagents.js";
@@ -83,6 +86,16 @@ export interface ReplayHost {
   models(): SubagentModels;
 }
 
+/** What the live session knows of the replayed children. */
+export interface LiveChildren {
+  /** Whether the live session tracks the child session `sessionId`. */
+  tracks(sessionId: string): boolean;
+  /** The configuration that the client last got for the live child `sessionId`, if any. */
+  configuration(sessionId: string): SessionConfigOption[] | undefined;
+}
+
+const NO_LIVE_CHILDREN: LiveChildren = { tracks: () => false, configuration: () => undefined };
+
 type ReplayChild = {
   launchId: string;
   sessionId: string;
@@ -99,6 +112,8 @@ type ReplayChild = {
   handedBack?: boolean;
   /** The `model` option entry that the replay sent. */
   model?: ModelEntry;
+  /** The model id of its latest replayed response. */
+  responseModel?: string;
   /** The `cwd` it was announced with, when not its parent's. */
   cwd?: string;
   output?: SessionOutput;
@@ -137,8 +152,7 @@ export class SubagentReplay {
     private readonly history: SubagentHistory,
     /** The transcript of each child, by agent id. */
     private readonly transcripts: Map<string, SessionMessage[]>,
-    /** Whether the live session tracks the child session `sessionId`. */
-    private readonly live: (sessionId: string) => boolean,
+    private readonly live: LiveChildren,
   ) {}
 
   /**
@@ -148,7 +162,7 @@ export class SubagentReplay {
   static async load(
     host: ReplayHost,
     messages: SessionMessage[],
-    live: (sessionId: string) => boolean = () => false,
+    live: LiveChildren = NO_LIVE_CHILDREN,
   ): Promise<SubagentReplay | undefined> {
     if (!messages.some((message) => launchIdsOf(message).length > 0)) return undefined;
     const history = await subagentHistory(host.sessionId);
@@ -204,29 +218,51 @@ export class SubagentReplay {
   }
 
   /**
-   * The current state of each replayed child that the live session does not
-   * track, after the response: its process is gone, so its replayed end. A
-   * `cwd` that is gone, such as a worktree that Claude Code removed, is
-   * cleared.
+   * After the response, as the bridge sends them (`currentStates`): the
+   * current state of each replayed child that the live session does not
+   * track, since its process is gone, so its replayed end. A `cwd` that is
+   * gone, such as a worktree that Claude Code removed, is cleared. Then each
+   * replayed child's configuration, when it is not the `model` that the
+   * replay sent: the live child's, else the model of its latest response, by
+   * the session's model list.
    */
   afterResponse(): void {
     for (const child of this.children.values()) {
-      if (!child.announced || this.live(child.sessionId)) continue;
-      const state = endState(child);
-      this.host.send({
-        sessionId: child.parentSessionId,
-        update: {
-          sessionUpdate: "subagent_update",
-          sessionId: child.sessionId,
-          ...(child.cwd && !isDirectory(child.cwd) ? { cwd: null } : {}),
-          state: state as v2.StateUpdate,
-        },
-      });
-      this.host.send({
-        sessionId: child.sessionId,
-        update: { sessionUpdate: "state_update", ...state } as v2.SessionUpdate,
-      });
+      if (!child.announced) continue;
+      if (!this.live.tracks(child.sessionId)) this.sendEndState(child);
+      this.sendConfiguration(child);
     }
+  }
+
+  private sendConfiguration(child: ReplayChild): void {
+    const entry = responseModelEntry(child.responseModel, this.host.models());
+    const current =
+      this.live.configuration(child.sessionId) ?? (entry ? [childModelOption(entry)] : undefined);
+    const replayed = child.model ? JSON.stringify([childModelOption(child.model)]) : undefined;
+    if (!current || JSON.stringify(current) === replayed) return;
+    child.output!.emitV1([
+      {
+        sessionId: child.sessionId,
+        update: { sessionUpdate: "config_option_update", configOptions: current },
+      },
+    ]);
+  }
+
+  private sendEndState(child: ReplayChild): void {
+    const state = endState(child);
+    this.host.send({
+      sessionId: child.parentSessionId,
+      update: {
+        sessionUpdate: "subagent_update",
+        sessionId: child.sessionId,
+        ...(child.cwd && !isDirectory(child.cwd) ? { cwd: null } : {}),
+        state: state as v2.StateUpdate,
+      },
+    });
+    this.host.send({
+      sessionId: child.sessionId,
+      update: { sessionUpdate: "state_update", ...state } as v2.SessionUpdate,
+    });
   }
 
   private ownerHooks(output: SessionOutput, owner: ReplayChild | undefined): ReplayHooks {
@@ -436,6 +472,7 @@ export class SubagentReplay {
   private sendModel(child: ReplayChild, model: string | undefined): void {
     const entry = responseModelEntry(model, this.host.models());
     if (!entry || !child.output) return;
+    child.responseModel = model;
     if (child.model?.value === entry.value && child.model.name === entry.name) return;
     child.model = entry;
     child.output.emitV1([

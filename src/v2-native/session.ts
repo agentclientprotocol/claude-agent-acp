@@ -726,6 +726,10 @@ export class NativeSession implements RequestTarget {
     return this.config.permissionAllowed(result);
   }
 
+  requestShows(target: RequestTarget, toolName: string, toolCallId: string): void {
+    this.tasks.requestShows(target.output, toolName, toolCallId);
+  }
+
   toolCallSubject<T extends ToolCallUpdate>(sessionId: string, toolCall: T): T {
     return this.connection.translator.toolCallMeta.subject(sessionId, toolCall);
   }
@@ -775,6 +779,8 @@ export class NativeSession implements RequestTarget {
    * empty Task* plan, as the bridge's fresh query sends none.
    */
   private conversationReset(): void {
+    // First, as on the bridge: the subagents of the dropped conversation end.
+    this.tasks.conversationReset();
     this.output.taskState.clear();
     if (!this.clearContext.holdsTurn()) this.output.taskPlanChanged();
     this.reports.conversationReset();
@@ -804,7 +810,35 @@ export class NativeSession implements RequestTarget {
     }
   }
 
-  /** Handles one message. Only a `/mcp` turn's result is awaited (see {@link result}). */
+  /**
+   * Claude Code's tool results. A SendMessage result can restore the agent
+   * that it resumed from the history: the results go out after the restore
+   * (see `SessionTasks.restoreResumed`).
+   */
+  private toolResultMessage(message: SDKUserMessage): void | Promise<void> {
+    const restoring = this.tasks.restoreResumed(this.output, message);
+    if (restoring) return restoring.then(() => this.toolResults(message));
+    this.toolResults(message);
+  }
+
+  private toolResults(message: SDKUserMessage): void {
+    if (message.parent_tool_use_id !== null) {
+      this.tasks.toolResults(this.output, message);
+      return;
+    }
+    // The rewrite applies to the updates of this message only.
+    this.output.rewrite = this.clearContext.toolResults(message);
+    try {
+      this.tasks.toolResults(this.output, message);
+    } finally {
+      this.output.rewrite = undefined;
+    }
+  }
+
+  /**
+   * Handles one message. Only a `/mcp` turn's result and a subagent's restore
+   * from the history are awaited (see {@link result} and `SessionTasks.restored`).
+   */
   private handle(message: SDKMessage): void | Promise<void> {
     if ((message as { type: string }).type === "command_lifecycle") {
       this.lifecycle(message as unknown as CommandLifecycleFrame);
@@ -849,18 +883,7 @@ export class NativeSession implements RequestTarget {
           return;
         }
         if (this.stopped.drops(message)) return;
-        if (message.parent_tool_use_id !== null) {
-          this.tasks.toolResults(this.output, message);
-          return;
-        }
-        // The rewrite applies to the updates of this message only.
-        this.output.rewrite = this.clearContext.toolResults(message);
-        try {
-          this.tasks.toolResults(this.output, message);
-        } finally {
-          this.output.rewrite = undefined;
-        }
-        return;
+        return this.toolResultMessage(message);
       case "result":
         return this.result(message);
       case "system":
