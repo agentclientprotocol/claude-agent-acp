@@ -95,6 +95,10 @@ close, resume, delete and config changes on it fail with -32602.
 - `src/v2-native/permissions.ts`: `canUseTool` as v2 permission requests, on the session of the
   agent that asks.
 - `src/v2-native/config.ts`: the mode and model config options.
+- `src/v2-native/auth.ts`: `_auth/status_update`, gateway `auth/login`, `auth/logout`, and
+  `providers/*`, on the v1 core's state rules (`AuthStatusReporter`, `providers.ts`). The
+  identity is read after `initialize`, from each session's account, after a login or logout, and
+  at the start of each prompt, as on the bridge.
 
 About 2,600 lines in total. The native core shares these with v1 and the bridge:
 
@@ -108,12 +112,17 @@ About 2,600 lines in total. The native core shares these with v1 and the bridge:
 - the background command helpers: `backgroundBashTaskFromToolResult`, `withRunningTerminal`,
   `withRunningToolCall`, `BackgroundOutputTail`
 
-This change extracted three pieces so that both cores use the same code:
+These pieces were extracted so that both cores use the same code:
 
 - `V2UpdateTranslator` and `replayClear` (`v2/update-translator.ts`), taken from the bridge's
   client connection
 - `terminalAuthMethods` (`auth-methods.ts`), taken from `ClaudeAcpAgent.initialize`
 - `sdkMcpServers` (`mcp-servers.ts`), taken from `ClaudeAcpAgent.createSession`
+- `AuthStatusReporter` and `cliLogout` (`auth-status-reporter.ts`): the `authStatus` state, the
+  `claude auth status` probe and the `_auth/status_update` pushes, taken from `ClaudeAcpAgent`
+- the provider routing (`providers.ts`): `ProviderConfig`, the gateway login methods and their
+  validation, the `providers/list` response, `providers/set` validation and model listing, and
+  `createEnvForProvider`, taken from `ClaudeAcpAgent`
 
 ## How it is checked
 
@@ -145,9 +154,9 @@ This change extracted three pieces so that both cores use the same code:
 
 - Session methods:
   - `session/fork` (not advertised)
-  - `providers/*`
-  - gateway auth and `_auth/status_update`
-  - `auth/login` (only terminal logins are advertised)
+- A gateway login, `providers/set`, `providers/disable` or `auth/logout` routes only the sessions
+  started after it. The bridge recreates the queries of live sessions between turns; on the
+  native core they keep their route until they are closed and resumed.
 - Elicitation (and so `requires_action` for a question):
   - AskUserQuestion (the tool is disallowed)
   - MCP elicitation (the SDK declines)

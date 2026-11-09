@@ -126,6 +126,15 @@ vi.mock("../tools.js", async () => ({
   registerHookCallback: vi.fn(),
 }));
 
+// `claude auth status --json`, which the auth status probe runs, reports no login.
+vi.mock("node:child_process", async () => ({
+  ...(await vi.importActual<typeof import("node:child_process")>("node:child_process")),
+  execFile: vi.fn((...invocation: unknown[]) => {
+    const callback = invocation.at(-1) as (...args: unknown[]) => void;
+    callback(null, { stdout: JSON.stringify({ loggedIn: false }), stderr: "" });
+  }),
+}));
+
 const agents: AgentHandle[] = [];
 let tempDir: string;
 let cwd: string;
@@ -335,6 +344,31 @@ describe("native ACP v2 core", () => {
     expect((response.authMethods ?? []).map((method) => method.methodId)).toContain(
       "console-login",
     );
+  });
+
+  it("routes the sessions started after a gateway login through the gateway", async () => {
+    const client = nativeClient();
+    const baseUrl = "https://gateway.example.com";
+    await client.connect(async (agent) => {
+      await agent.request(v2.methods.agent.initialize, {
+        protocolVersion: v2.PROTOCOL_VERSION,
+        info: { name: "native-test-client", version: "1.0.0" },
+        capabilities: { auth: { _meta: { gateway: true } } },
+      });
+      await agent.request(v2.methods.agent.auth.login, {
+        methodId: "gateway",
+        _meta: { gateway: { baseUrl, headers: { "x-team": "acp" } } },
+      });
+      await agent.request(v2.methods.agent.session.new, { cwd });
+    });
+
+    const { env, settings } = sdk.processes[0].options;
+    expect(env).toMatchObject({
+      ANTHROPIC_BASE_URL: baseUrl,
+      ANTHROPIC_CUSTOM_HEADERS: "x-team: acp",
+    });
+    // In the settings tier too, so a settings.json env cannot restore another route.
+    expect(settings).toMatchObject({ apiKeyHelper: "", env: { ANTHROPIC_BASE_URL: baseUrl } });
   });
 
   it("answers session/new with the mode and model options and the commands", async () => {

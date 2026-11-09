@@ -12,11 +12,9 @@
  *
  * Opt in with `CLAUDE_AGENT_ACP_V2_CORE=native` (see `serve.ts`).
  */
-import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { promisify } from "node:util";
 import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import {
@@ -29,7 +27,6 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import packageJson from "../../package.json" with { type: "json" };
 import type { Logger } from "../acp-agent.js";
-import { terminalAuthMethods } from "../auth-methods.js";
 import { claudeCliPath } from "../claude-cli.js";
 import { clientSystemPrompt, sdkSystemPrompt } from "../client-system-prompt.js";
 import { sdkMcpServers } from "../mcp-servers.js";
@@ -40,15 +37,14 @@ import { SettingsManager } from "../settings.js";
 import { STARTUP_FAILURE_RESULTS_ENV, startupFailureError } from "../startup-failure.js";
 import { createPostToolUseHook } from "../tools.js";
 import { Pushable } from "../utils.js";
-import { v2AuthMethod, V2_SESSION_CAPABILITIES } from "../v2/initialize.js";
+import { V2_SESSION_CAPABILITIES } from "../v2/initialize.js";
 import { v1NewSessionRequest, v2AvailableCommands } from "../v2/session.js";
 import { V2UpdateTranslator } from "../v2/update-translator.js";
+import { NativeAuth } from "./auth.js";
 import { SessionConfig } from "./config.js";
 import { canUseTool } from "./permissions.js";
 import { NativeSession, type SessionConnection } from "./session.js";
 import { restrictedChild } from "./tasks.js";
-
-const execFileAsync = promisify(execFile);
 
 /** The sessions per `session/list` page. */
 const SESSION_LIST_PAGE_SIZE = 1000;
@@ -72,14 +68,13 @@ export function nativeV2AgentApp(
         onAgent(agent);
       })
       .onRequest(v2.methods.agent.initialize, ({ params }) => agent.initialize(params))
-      .onRequest(v2.methods.agent.auth.login, ({ params }) => {
-        // Every method this core advertises is a terminal login, which the client runs.
-        throw RequestError.invalidParams(
-          { methodId: params.methodId },
-          `${params.methodId} is a terminal login: run it in a terminal, then retry the request`,
-        );
-      })
-      .onRequest(v2.methods.agent.auth.logout, () => agent.logout())
+      .onRequest(v2.methods.agent.auth.login, ({ params }) => agent.auth.login(params))
+      .onRequest(v2.methods.agent.auth.logout, () => agent.auth.logout())
+      .onRequest(v2.methods.agent.providers.list, () => agent.auth.listProviders())
+      .onRequest(v2.methods.agent.providers.set, ({ params }) => agent.auth.setProvider(params))
+      .onRequest(v2.methods.agent.providers.disable, ({ params }) =>
+        agent.auth.disableProvider(params),
+      )
       .onRequest(v2.methods.agent.session.new, ({ params }) => agent.newSession(params))
       .onRequest(v2.methods.agent.session.resume, ({ params }) => agent.resumeSession(params))
       .onRequest(v2.methods.agent.session.list, ({ params }) => agent.listSessions(params))
@@ -88,9 +83,7 @@ export function nativeV2AgentApp(
       .onRequest(v2.methods.agent.session.setConfigOption, ({ params }) =>
         agent.setConfigOption(params),
       )
-      .onRequest(v2.methods.agent.session.prompt, ({ params }) =>
-        agent.session(params.sessionId, "prompt").prompt(params),
-      )
+      .onRequest(v2.methods.agent.session.prompt, ({ params }) => agent.prompt(params))
       .onRequest(v2.methods.agent.terminal.cancel, ({ params }) =>
         agent.cancelItem(params.sessionId, { terminalId: params.terminalId }),
       )
@@ -113,11 +106,14 @@ const NATIVE_SESSION_CAPABILITIES: v2.SessionCapabilities = Object.fromEntries(
 class NativeV2Agent implements AgentHandle, SessionConnection {
   readonly sessions = new Map<string, NativeSession>();
   readonly translator = new V2UpdateTranslator();
+  readonly auth: NativeAuth;
 
   constructor(
     private readonly ctx: v2.AgentContext,
     readonly logger: Logger,
-  ) {}
+  ) {
+    this.auth = new NativeAuth(ctx, logger);
+  }
 
   // --- SessionConnection ---------------------------------------------------
 
@@ -142,35 +138,27 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     // A later `session/resume` starts the session again from its transcript.
     this.sessions.delete(sessionId);
     this.translator.forget(sessionId);
+    this.auth.sessionEnded(sessionId);
   }
 
   // --- Requests --------------------------------------------------------------
 
   initialize(request: v2.InitializeRequest): v2.InitializeResponse {
-    const capabilities = request.capabilities;
+    const { authMethods, _meta } = this.auth.initialize(request.capabilities);
     return {
       protocolVersion: v2.PROTOCOL_VERSION,
       info: { name: packageJson.name, title: "Claude Agent", version: packageJson.version },
-      capabilities: { session: NATIVE_SESSION_CAPABILITIES },
-      // v2 advertises terminal logins only to a client with `auth.terminal`.
-      authMethods:
-        capabilities?.auth?.terminal != null
-          ? terminalAuthMethods({ terminal: true, metaTerminal: false }).map(v2AuthMethod)
-          : [],
+      // `providers/list`, `set`, and `disable`, served for every client.
+      capabilities: { session: NATIVE_SESSION_CAPABILITIES, providers: {}, _meta },
+      authMethods,
     };
   }
 
-  async logout(): Promise<v2.LogoutAuthResponse> {
-    // The credentials live in the CLI's store, which only the CLI can clear.
-    try {
-      await execFileAsync(await claudeCliPath(), ["auth", "logout"]);
-    } catch (error) {
-      throw RequestError.internalError(
-        undefined,
-        `claude auth logout failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-    return {};
+  /** `session/prompt`. Each prompt reads the auth identity again, as on v1. */
+  prompt(params: v2.PromptRequest): Promise<v2.PromptResponse> {
+    const session = this.session(params.sessionId, "prompt");
+    this.auth.promptStarted(params.sessionId);
+    return session.prompt(params);
   }
 
   async newSession(params: v2.NewSessionRequest): Promise<v2.NewSessionResponse> {
@@ -258,6 +246,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     await session.close();
     if (this.sessions.get(sessionId) === session) this.sessions.delete(sessionId);
     this.translator.forget(sessionId);
+    this.auth.sessionEnded(sessionId);
     return {};
   }
 
@@ -374,6 +363,9 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       { allowBypass, allowAuto },
     );
     settings.dispose();
+    // The settings keep the values they read: their cwd and key helper.
+    const authStarted = this.auth.sessionStarting(settings);
+    const routing = this.auth.routing();
 
     const clientPrompt = clientSystemPrompt(request.systemPrompt);
     const input = new Pushable<SDKUserMessage>();
@@ -389,6 +381,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
         ? sdkSystemPrompt(clientPrompt, undefined)
         : { type: "preset", preset: "claude_code" },
       settingSources: ["user", "project", "local"],
+      ...(routing.settings ? { settings: routing.settings } : {}),
       cwd: request.cwd,
       additionalDirectories: request.additionalDirectories ?? [],
       includePartialMessages: true,
@@ -432,6 +425,8 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       },
       env: {
         ...process.env,
+        // The gateway login or the provider (see `auth.ts`).
+        ...routing.env,
         // `session_state_changed`, which is the session's state.
         CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
         ...STARTUP_FAILURE_RESULTS_ENV,
@@ -453,7 +448,8 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       }
       throw startupFailureError(error) ?? error;
     }
-    const models = initialization.models;
+    authStarted(sessionId, initialization.account);
+    const models = routing.models(initialization.models);
     const currentModel =
       models.find((model) => model.value === "default")?.value ?? models[0]?.value ?? "default";
     const availableModes = buildAvailableModes({ allowBypass, allowAuto });

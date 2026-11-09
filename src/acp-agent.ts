@@ -19,7 +19,6 @@ import {
   ListProvidersRequest,
   ListProvidersResponse,
   McpServer,
-  LlmProtocol,
   ListSessionsRequest,
   ListSessionsResponse,
   LoadSessionRequest,
@@ -31,7 +30,6 @@ import {
   NewSessionResponse,
   PromptRequest,
   PromptResponse,
-  ProviderInfo,
   ReadTextFileRequest,
   ReadTextFileResponse,
   RequestError,
@@ -58,12 +56,10 @@ import {
 } from "@agentclientprotocol/sdk/unstable";
 import type { ForegroundEvents, StopReason, TurnEvents, TurnOutcome } from "./turn-events.js";
 import {
-  AccountInfo,
   AgentInfo,
   CanUseTool,
   FastModeDisabledReason,
   FastModeState,
-  filterEscalatingDefaultMode,
   getSessionMessages,
   HookCallback,
   listSessions,
@@ -78,7 +74,6 @@ import {
   PreToolUseHookInput,
   Query,
   query,
-  resolveSettings,
   SDKAssistantMessageError,
   SDKActiveGoalMessage,
   SDKMessage,
@@ -171,29 +166,24 @@ import {
   SessionBackgroundWork,
 } from "./background-work.js";
 import {
-  AUTH_STATUS_PROBE_TIMEOUT_MS,
   AUTH_STATUS_UPDATE_METHOD,
   type AuthStatus,
   type AuthStatusKind,
   authStatusCapability,
   fromAccountInfo,
-  fromCliStatus,
   gatewayAuthStatus,
-  mergeAuthStatus,
   notLoggedInAuthStatus,
-  sameAuthStatus,
 } from "./auth-status.js";
+import { AuthStatusReporter, cliLogout } from "./auth-status-reporter.js";
 import { terminalAuthMethods as authMethodsForTerminal } from "./auth-methods.js";
 import { sdkMcpServers } from "./mcp-servers.js";
 import { claudeCliPath } from "./claude-cli.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
-import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { promisify } from "node:util";
 import packageJson from "../package.json" with { type: "json" };
 import {
   applyAskElicitationResponse,
@@ -373,12 +363,18 @@ import {
   type SessionModelState,
 } from "./session-model.js";
 import {
-  GatewayListingError,
-  listBedrockModels,
-  listGatewayModels,
-  PROVIDER_AUTH_TOKEN_PLACEHOLDER,
-  selectBedrockRegion,
-} from "./gateway-models.js";
+  createEnvForProvider,
+  defaultProviderConfig,
+  gatewayRequestToProviderConfig,
+  type GatewayAuthRequest,
+  isGatewayAuthMethod,
+  listProvidersResponse,
+  PROVIDER_ID,
+  type ProviderConfig,
+  providerConfigFromSetRequest,
+  validatedGatewayAuthRequest,
+  withListedModels,
+} from "./providers.js";
 import {
   buildEffortConfigOption,
   EFFORT_CONFIG_ID,
@@ -405,8 +401,6 @@ export {
   MODEL_CONFIG_ID,
   resolveModelPreference,
 } from "./session-model.js";
-
-const execFileAsync = promisify(execFile);
 
 /** Claude CLI emits this synthetic result when an interrupted cycle ends on
  *  queued user input before producing any assistant content. It is a hand-off
@@ -1908,80 +1902,9 @@ function withoutEffort(params: NewSessionRequest): NewSessionRequest {
   return { ...params, _meta: { ...meta, claudeCode: { ...meta.claudeCode, options } } };
 }
 
-/**
- * Extra metadata for 'gateway' authentication requests.
- */
-type GatewayAuthMeta = {
-  /**
-   * These parameters are mapped to environment variables to:
-   * - Redirect API calls via baseUrl
-   * - Inject custom headers
-   * - Bypass the default Claude login requirement
-   *
-   * Both members are optional in the type because the payload arrives
-   * unvalidated from the client. `authenticate` rejects a request that lacks a
-   * usable `baseUrl`.
-   */
-  gateway?: {
-    baseUrl?: string;
-    headers?: Record<string, string>;
-  };
-};
-
-type GatewayAuthRequest = AuthenticateRequest & { _meta?: GatewayAuthMeta };
-
 /** The JSON-RPC code ACP assigns to `authRequired`. Read from the SDK so it
  *  cannot drift from the errors this agent throws. */
 const AUTH_REQUIRED_CODE = RequestError.authRequired().code;
-
-const SUPPORTED_PROTOCOLS: LlmProtocol[] = ["anthropic", "bedrock", "vertex"];
-const PROVIDER_ID = "main";
-const DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com";
-const DEFAULT_VERTEX_BASE_URL = "https://aiplatform.googleapis.com";
-
-/**
- * Vertex needs project + region that the standard `providers/set` payload
- * (`apiType`/`baseUrl`/`headers`) does not model, so clients pass them through
- * `_meta.claudeCode.vertex`. Required only when `apiType === "vertex"`.
- */
-type SetProviderMeta = {
-  claudeCode?: {
-    vertex?: {
-      projectId: string;
-      region: string;
-    };
-  };
-};
-
-/**
- * Resolved, non-secret + secret routing config for the `main` provider. This is
- * the shared shape produced by both `providers/set` and the legacy gateway auth
- * path, and consumed by {@link createEnvForProvider}. `null` means the provider
- * is unconfigured (no client-managed routing in effect).
- */
-type ProviderConfig = {
-  apiType: LlmProtocol;
-  baseUrl: string;
-  headers: Record<string, string>;
-  /** Present only for `apiType === "vertex"`. */
-  vertex?: {
-    projectId: string;
-    region: string;
-  };
-  /**
-   * Model ids an `anthropic` or `bedrock` gateway listed when it was set via
-   * `providers/set`; the model picker offers only these. Absent when the
-   * listing failed or the config came from elsewhere (gateway `authenticate`),
-   * so nothing is narrowed.
-   */
-  listedModels?: string[];
-  /**
-   * The cross-region prefix of the model ids a `bedrock` gateway
-   * listed (`eu` for `eu.anthropic.claude-sonnet-5`), passed to the CLI as
-   * `ANTHROPIC_BEDROCK_REGION_PREFIX` so it calls the models under that prefix.
-   */
-  bedrockRegionPrefix?: string;
-};
 
 export type { ToolUpdateMeta } from "./tool-calls/renderer.js";
 
@@ -2749,31 +2672,22 @@ export class ClaudeAcpAgent {
   /** Per session: queue that runs mode/config changes and query restarts one at a time. */
   private readonly configurationChanges = new Map<string, Promise<void>>();
   private readonly exitPlan: ExitPlanCoordinator<Session, Turn>;
-  /** Last auth identity reported to the client, connection-scoped like
-   *  `authenticate`/`logout`. Undefined means "not determined yet". */
-  currentAuthStatus?: AuthStatus;
-  private authStatusSettings?: {
-    manager: SettingsManager;
-    override?: Settings;
-    env?: Options["env"];
-  };
-  private authStatusHelper?: string;
-  /** In-flight `claude auth status --json` probe, shared by every caller so
-   *  a concurrent `initialize` and start-of-prompt read never spawn two CLI
-   *  processes. */
-  private cliAuthProbe: Promise<AuthStatus | undefined> | null = null;
-  /** Counts auth-affecting events (`authenticate`, `logout`) on this
-   *  connection. A probe records it at start and publishes only if it has not
-   *  moved, so a slow read can never overwrite a newer login or logout. */
-  private authEpoch = 0;
-  /** Keeps the "session account told us nothing" note to one line per process
-   *  instead of one per session. */
-  private loggedUninformativeAccount = false;
-  /** Same, for the "client provider override active" note. */
-  private loggedOverriddenAccount = false;
-  /** Same, for the "the CLI probe timed out" warning: a wedged CLI stays wedged
-   *  and would otherwise warn once per probe, i.e. once per user prompt. */
-  private loggedProbeTimeout = false;
+  /** The connection's `authStatus` state and pushes, connection-scoped like
+   *  `authenticate`/`logout`. */
+  private readonly authStatus = new AuthStatusReporter({
+    push: (authStatus) => this.client.extNotification(AUTH_STATUS_UPDATE_METHOD, { authStatus }),
+    logger: {
+      log: (...args) => this.logger.log(...args),
+      error: (...args) => this.logger.error(...args),
+    },
+    gatewayLogin: () => this.gatewayAuthRequest !== undefined,
+    providerOverride: () => this.providerConfig !== undefined,
+    onProbe: (kind) => this.markSessionsWhoseAccountKindChanged(kind),
+  });
+  /** Last auth identity reported to the client. Undefined means "not determined yet". */
+  get currentAuthStatus(): AuthStatus | undefined {
+    return this.authStatus.current;
+  }
   /** Grace period before a `session/cancel` forces a wedged prompt loop to
    *  return "cancelled". See {@link DEFAULT_FORCE_CANCEL_GRACE_MS}. Mutable so
    *  tests can shrink it. */
@@ -2937,7 +2851,7 @@ export class ClaudeAcpAgent {
     // lands it calls `setAuthStatus`, which pushes `_auth/status_update` — the
     // connection's first push, and unconditional, because nothing was reported
     // before it. It is therefore sent after this response, never before it.
-    void this.probeCliAuthStatus();
+    void this.authStatus.probe();
 
     // Bypasses standard auth by routing requests through a custom Anthropic-protocol gateway.
     // Only offered when the client advertises `auth._meta.gateway` capability.
@@ -3269,39 +3183,17 @@ export class ClaudeAcpAgent {
 
   /**
    * `authenticate` — the legacy gateway methods store a provider override that
-   * every later session reads. Validate the payload here, with the same base
-   * URL rule as `providers/set`. An unchecked payload either throws a
-   * `TypeError` deep in session creation, or installs an empty base URL that
-   * silently turns the `--hide-claude-auth` subscription guard off.
-   *
-   * A call that carries no gateway payload at all keeps its historical
-   * meaning: it installs no override and succeeds. That has always been a
-   * no-op here, and a client that probes the method this way must keep
-   * working. Only a payload that IS present has to be usable.
+   * every later session reads, once {@link validatedGatewayAuthRequest} accepts
+   * its payload.
    */
   async authenticate(_params: AuthenticateRequest): Promise<void> {
-    if (_params.methodId === "gateway" || _params.methodId === "gateway-bedrock") {
-      const gateway = (_params as GatewayAuthRequest)._meta?.gateway;
-      if (gateway !== undefined && gateway !== null) {
-        if (typeof gateway !== "object" || !isValidBaseUrl(gateway.baseUrl)) {
-          throw RequestError.invalidParams(
-            { baseUrl: (gateway as { baseUrl?: unknown }).baseUrl },
-            "`_meta.gateway.baseUrl` must be a non-empty absolute http(s) URL.",
-          );
-        }
-        if (gateway.headers !== undefined && typeof gateway.headers !== "object") {
-          throw RequestError.invalidParams(
-            undefined,
-            "`_meta.gateway.headers` must be an object of header names to values.",
-          );
-        }
-      }
-      this.gatewayAuthRequest = _params as GatewayAuthRequest;
+    if (isGatewayAuthMethod(_params.methodId)) {
+      this.gatewayAuthRequest = validatedGatewayAuthRequest(_params);
       // The gateway holds the credentials from here on, so it replaces
       // whatever the CLI store reported. Bumping the epoch discards any probe
       // that started before this login: its answer is now stale.
-      this.authEpoch += 1;
-      this.setAuthStatus(
+      this.authStatus.changed();
+      this.authStatus.set(
         gatewayAuthStatus(gatewayRequestToProviderConfig(this.gatewayAuthRequest)?.baseUrl),
       );
       return;
@@ -3312,205 +3204,9 @@ export class ClaudeAcpAgent {
     );
   }
 
-  /**
-   * Stores `next` and pushes it to the client.
-   *
-   * A push goes out only when the payload changed. The identity is read on many
-   * occasions — each session create, each guarded turn, the start of each user
-   * prompt — and almost all of them see the same login. Clients replace their
-   * whole state on each update and tolerate duplicates, so a repeat is
-   * harmless, but it is also pure noise; {@link sameAuthStatus} drops it.
-   *
-   * What the agent owes is truth — a stale or uninformative source must not
-   * reach here at all (see the epoch check in the probe and the guards at
-   * session create).
-   */
+  /** Stores `next` and pushes it to the client when it changed (see {@link AuthStatusReporter.set}). */
   setAuthStatus(next: AuthStatus | undefined): void {
-    if (!next) {
-      return;
-    }
-    if (sameAuthStatus(this.currentAuthStatus, next)) {
-      return;
-    }
-    this.currentAuthStatus = next;
-    // ACP notifications get no reply, and clients that do not know the method
-    // drop it silently — send unconditionally and never fail a caller on it.
-    void Promise.resolve()
-      .then(() => this.client.extNotification(AUTH_STATUS_UPDATE_METHOD, { authStatus: next }))
-      .catch((error) => {
-        this.logger.error("Failed to send _auth/status_update:", error);
-      });
-  }
-
-  /**
-   * Report the identity behind a session's `AccountInfo`.
-   *
-   * `AccountInfo` is richer than the CLI probe (it is what the live query
-   * actually authenticates with). Called before the `--hide-claude-auth` guard
-   * may refuse the session or the turn: that flag blocks the *use* of a
-   * subscription, it does not make the state secret, and a refusal is when the
-   * client most needs to know the account it was refused for.
-   *
-   * Two cases skip it:
-   *
-   * - ACP gateway *authentication* (`gatewayAuthRequest`): the gateway, not
-   *   this account, is the agent-owned identity — already reported as
-   *   `kind: "gateway"` by `authenticate`.
-   * - A client-driven provider override (`providers/set`): the session then
-   *   routes through the client's endpoint and `AccountInfo` describes that
-   *   route (e.g. `apiProvider: "gateway"`), which is NOT agent-owned state.
-   *   `authStatus` reports the agent's own login only, so the CLI probe —
-   *   which reads the credential store the override never touches — stays
-   *   authoritative.
-   *
-   * An account with no identity signal (e.g. `{apiProvider: "firstParty"}`
-   * under an apiKeyHelper) means "nothing to add", not "logged out" — keep
-   * what the CLI probe already established instead of overwriting it.
-   */
-  private useAuthStatusSettings(
-    manager: SettingsManager,
-    settingsOverride?: Settings,
-    launchEnv?: Options["env"],
-  ): void {
-    const helper = manager.getApiKeyHelper(settingsOverride);
-    const changed =
-      manager.getCwd() !== (this.authStatusSettings?.manager.getCwd() ?? process.cwd()) ||
-      helper !== this.authStatusHelper ||
-      JSON.stringify(launchEnv) !== JSON.stringify(this.authStatusSettings?.env);
-    this.authStatusSettings = { manager, override: settingsOverride, env: launchEnv };
-    this.authStatusHelper = helper;
-    if (changed) {
-      // The epoch bump discards any probe that read the old context, and the
-      // session account may carry no identity signal (an apiKeyHelper), so
-      // only a probe in the new context can classify it.
-      this.authEpoch += 1;
-      void this.probeCliAuthStatus({ fresh: true });
-    }
-  }
-
-  private publishSessionAccountIdentity(
-    account: AccountInfo | undefined,
-    apiKeyHelper?: string,
-  ): void {
-    if (this.providerConfig) {
-      if (!this.loggedOverriddenAccount) {
-        this.loggedOverriddenAccount = true;
-        this.logger.log(
-          "[authStatus] client provider override active; keeping agent-owned probe state",
-        );
-      }
-      return;
-    }
-    if (this.gatewayAuthRequest) {
-      return;
-    }
-    const fromSession = fromAccountInfo(account, apiKeyHelper);
-    if (fromSession) {
-      this.setAuthStatus(fromSession);
-    } else if (!this.loggedUninformativeAccount) {
-      this.loggedUninformativeAccount = true;
-      this.logger.log("[authStatus] session account carries no identity signal; keeping probe");
-    }
-  }
-
-  /** Shares one in-flight `claude auth status --json` run between callers. The
-   *  promise is released once settled so a later call re-probes instead of
-   *  replaying a stale verdict. `fresh` forces a new run even when one is in
-   *  flight — `logout` needs a read that started after the credentials were
-   *  cleared. */
-  private probeCliAuthStatus(options?: { fresh?: boolean }): Promise<AuthStatus | undefined> {
-    if (!options?.fresh && this.cliAuthProbe) {
-      return this.cliAuthProbe;
-    }
-    const probe = this.runCliAuthProbe();
-    this.cliAuthProbe = probe;
-    void probe.finally(() => {
-      if (this.cliAuthProbe === probe) {
-        this.cliAuthProbe = null;
-      }
-    });
-    return probe;
-  }
-
-  /** Never rejects: an unavailable CLI means "not reported", not an error. */
-  private async runCliAuthProbe(): Promise<AuthStatus | undefined> {
-    // Monotonicity: a read that started before the connection's latest
-    // auth-affecting event describes a world that no longer exists. Remember
-    // which one this read belongs to and drop the answer if it moved on.
-    const epoch = this.authEpoch;
-    const context = this.authStatusSettings;
-    const apiKeyHelper = context?.manager.getApiKeyHelper(context.override);
-    // ACP gateway auth bypasses the CLI credential store entirely, so the
-    // probe would report an identity that is not the one being used. A mere
-    // client provider override (`providers/set`) does NOT skip the probe: it
-    // reroutes traffic without touching the credential store, and the store is
-    // exactly the agent-owned login `authStatus` reports.
-    if (this.gatewayAuthRequest) {
-      return this.currentAuthStatus;
-    }
-    let stdout: string;
-    try {
-      const cliPath = await claudeCliPath();
-      const args = ["auth", "status", "--json"];
-      // `--settings` is a global CLI option: after the `auth status` subcommand the CLI rejects
-      // it with "unknown option '--settings'", so it has to come first.
-      if (context?.override) args.unshift("--settings", JSON.stringify(context.override));
-      ({ stdout } = await execFileAsync(cliPath, args, {
-        timeout: AUTH_STATUS_PROBE_TIMEOUT_MS,
-        cwd: context?.manager.getCwd() ?? process.cwd(),
-        env: context?.env ? { ...process.env, ...context.env } : process.env,
-      }));
-    } catch (error) {
-      const failed = error as { stdout?: unknown; killed?: boolean; signal?: unknown } | null;
-      // Node killed the child on the timeout. Whatever it printed so far is a
-      // truncated fragment, never valid JSON: report nothing and keep the last
-      // known state, so nothing regresses and no push goes out.
-      if (failed?.killed === true && failed.signal) {
-        if (!this.loggedProbeTimeout) {
-          this.loggedProbeTimeout = true;
-          this.logger.error(
-            "claude auth status did not answer within 5 s; the identity is not refreshed",
-          );
-        }
-        return this.currentAuthStatus;
-      }
-      // The logged-out case exits 1 while still printing valid JSON, so the
-      // stdout of a failed exec is parsed just like a successful one.
-      if (typeof failed?.stdout !== "string" || failed.stdout.trim().length === 0) {
-        this.logger.error(
-          "claude auth status failed:",
-          error instanceof Error ? error.message : String(error),
-        );
-        return undefined;
-      }
-      stdout = failed.stdout;
-    }
-    let status = fromCliStatus(stdout, apiKeyHelper);
-    if (!context && status?.kind === "api_key" && status.detail === "API key helper") {
-      try {
-        const resolved = await resolveSettings({ cwd: process.cwd() });
-        status = fromCliStatus(stdout, filterEscalatingDefaultMode(resolved).apiKeyHelper);
-      } catch {
-        this.logger.error("Could not resolve auth source settings");
-      }
-    }
-    if (!status) {
-      this.logger.error("claude auth status returned unparseable output");
-      return undefined;
-    }
-    if (epoch !== this.authEpoch) {
-      // An `authenticate` or `logout` landed while this probe was running; the
-      // newer state wins and this answer is discarded, never published.
-      this.logger.log("[authStatus] discarding a probe that predates the latest auth change");
-      return this.currentAuthStatus;
-    }
-    // The CLI probe can be poorer than the session `AccountInfo` for the very
-    // same login (no organization, say). Keep those extra fields rather than
-    // regressing the payload; a different identity replaces it wholesale.
-    const merged = mergeAuthStatus(this.currentAuthStatus, status);
-    this.setAuthStatus(merged);
-    this.markSessionsWhoseAccountKindChanged(status.kind);
-    return merged;
+    this.authStatus.set(next);
   }
 
   /**
@@ -3549,70 +3245,20 @@ export class ClaudeAcpAgent {
   }
 
   async unstable_listProviders(_params: ListProvidersRequest): Promise<ListProvidersResponse> {
-    const config = this.providerConfig ?? this.defaultProviderConfig();
+    const config = this.providerConfig ?? defaultProviderConfig(this.gatewayAuthRequest);
     this.logger.log(
       `[providers/list] apiType=${config.apiType} baseUrl=${config.baseUrl} overridden=${this.providerConfig !== undefined}`,
     );
-    const provider: ProviderInfo = {
-      providerId: PROVIDER_ID,
-      supported: SUPPORTED_PROTOCOLS,
-      required: false,
-      current: { apiType: config.apiType, baseUrl: config.baseUrl },
-    };
-    return { providers: [provider] };
+    return listProvidersResponse(config);
   }
 
   /**
-   * `providers/set` — replace the full configuration for the `main` provider.
-   * Rejects unknown IDs, unsupported protocols, and empty/invalid base URLs with
-   * `invalid_params`. Config is process-scoped and applies to sessions created or
-   * loaded after this call.
+   * `providers/set` — replace the full configuration for the `main` provider
+   * (validated by {@link providerConfigFromSetRequest}). Config is
+   * process-scoped and applies to sessions created or loaded after this call.
    */
   async unstable_setProvider(params: SetProviderRequest): Promise<SetProviderResponse> {
-    if (params.providerId !== PROVIDER_ID) {
-      throw RequestError.invalidParams(
-        { providerId: params.providerId },
-        `Unknown provider ID "${params.providerId}"; expected "${PROVIDER_ID}".`,
-      );
-    }
-    if (!SUPPORTED_PROTOCOLS.includes(params.apiType)) {
-      throw RequestError.invalidParams(
-        { apiType: params.apiType, supported: SUPPORTED_PROTOCOLS },
-        `Unsupported apiType "${params.apiType}" for provider "${PROVIDER_ID}".`,
-      );
-    }
-    if (!isValidBaseUrl(params.baseUrl)) {
-      throw RequestError.invalidParams(
-        { baseUrl: params.baseUrl },
-        "baseUrl must be a non-empty absolute http(s) URL.",
-      );
-    }
-
-    const config: ProviderConfig = {
-      apiType: params.apiType,
-      baseUrl: params.baseUrl,
-      headers: params.headers ?? {},
-    };
-
-    // Vertex requires project + region, which the standard payload cannot
-    // carry, so they arrive via `_meta.claudeCode.vertex`.
-    if (params.apiType === "vertex") {
-      const vertex = (params._meta as SetProviderMeta | undefined)?.claudeCode?.vertex;
-      if (
-        !vertex ||
-        typeof vertex.projectId !== "string" ||
-        vertex.projectId.trim() === "" ||
-        typeof vertex.region !== "string" ||
-        vertex.region.trim() === ""
-      ) {
-        throw RequestError.invalidParams(
-          undefined,
-          "vertex apiType requires non-empty `_meta.claudeCode.vertex.projectId` and `_meta.claudeCode.vertex.region`.",
-        );
-      }
-      config.vertex = { projectId: vertex.projectId, region: vertex.region };
-    }
-
+    const config = providerConfigFromSetRequest(params);
     this.logger.log(
       `[providers/set] apiType=${config.apiType} baseUrl=${config.baseUrl} sessions=${Object.keys(this.sessions).length}`,
     );
@@ -3633,76 +3279,8 @@ export class ClaudeAcpAgent {
     return {};
   }
 
-  /**
-   * The model ids the gateway in `config` lists, read before `providers/set`
-   * returns so the sessions it recreates already offer only those, and for
-   * `bedrock` the region prefix picked from them. Setting the same gateway
-   * again reuses the previous listing. `vertex` gateways are not listed.
-   * Throws a {@link GatewayListingError} when the listing fails.
-   */
-  private async listProviderModels(
-    config: ProviderConfig,
-  ): Promise<Pick<ProviderConfig, "listedModels" | "bedrockRegionPrefix">> {
-    // Reuse needs the very same headers, so a rotated token lists again, and a
-    // failed listing then fails that `providers/set`. Deliberate: AIR keeps its
-    // proxy key for the IDE's lifetime and does not rotate it.
-    const current = this.providerConfig;
-    if (
-      current?.listedModels &&
-      current.apiType === config.apiType &&
-      current.baseUrl === config.baseUrl &&
-      sameHeaders(current.headers, config.headers)
-    ) {
-      return {
-        listedModels: current.listedModels,
-        bedrockRegionPrefix: current.bedrockRegionPrefix,
-      };
-    }
-    if (config.apiType === "anthropic") {
-      return { listedModels: await listGatewayModels(config.baseUrl, config.headers, this.logger) };
-    }
-    if (config.apiType === "bedrock") {
-      const modelIds = await listBedrockModels(config.baseUrl, config.headers, this.logger);
-      if (!modelIds) return {};
-      const region = selectBedrockRegion(modelIds);
-      if (region.modelIds.length < modelIds.length) {
-        this.logger.log(
-          `[providers/set] Bedrock models span several region prefixes; using ${region.regionPrefix} and dropping ${modelIds.length - region.modelIds.length} id(s) of other prefixes`,
-        );
-      }
-      return { listedModels: region.modelIds, bedrockRegionPrefix: region.regionPrefix };
-    }
-    return {};
-  }
-
   resolveProviderConfig(): ProviderConfig | null {
     return this.providerConfig ?? gatewayRequestToProviderConfig(this.gatewayAuthRequest);
-  }
-
-  private defaultProviderConfig(): ProviderConfig {
-    const gatewayConfig = gatewayRequestToProviderConfig(this.gatewayAuthRequest);
-    if (gatewayConfig) {
-      return gatewayConfig;
-    }
-    if (process.env.CLAUDE_CODE_USE_BEDROCK) {
-      return {
-        apiType: "bedrock",
-        baseUrl: process.env.ANTHROPIC_BEDROCK_BASE_URL ?? "https://bedrock-runtime.amazonaws.com",
-        headers: {},
-      };
-    }
-    if (process.env.CLAUDE_CODE_USE_VERTEX) {
-      return {
-        apiType: "vertex",
-        baseUrl: process.env.ANTHROPIC_VERTEX_BASE_URL ?? DEFAULT_VERTEX_BASE_URL,
-        headers: {},
-      };
-    }
-    return {
-      apiType: "anthropic",
-      baseUrl: process.env.ANTHROPIC_BASE_URL ?? DEFAULT_ANTHROPIC_BASE_URL,
-      headers: {},
-    };
   }
 
   async logout(_params: LogoutRequest): Promise<void> {
@@ -3718,7 +3296,7 @@ export class ClaudeAcpAgent {
     this.providerConfig = undefined;
     // Any probe already running read the pre-logout world; the bump makes its
     // answer unpublishable so it cannot resurrect the identity being cleared.
-    this.authEpoch += 1;
+    this.authStatus.changed();
     // Learned context windows are per-account state too: 1M-context
     // entitlement is gated per org/tier, and an OAuth re-login is invisible to
     // the env-derived provider cache key, so windows learned under the old
@@ -3726,21 +3304,9 @@ export class ClaudeAcpAgent {
     // re-learning on each model's next turn.
     contextWindowCache.clear();
 
-    // For the Claude/Console login methods the credentials live in the native
-    // CLI's store (keychain or config dir), which only the binary can clear.
-    // `claude auth logout` is non-interactive and idempotent.
+    // The Claude and Console logins live in the CLI's store.
     try {
-      const cliPath = await claudeCliPath();
-      await execFileAsync(cliPath, ["auth", "logout"]);
-    } catch (error) {
-      const stderr =
-        typeof error === "object" && error && "stderr" in error
-          ? String((error as { stderr: unknown }).stderr).trim()
-          : undefined;
-      throw RequestError.internalError(
-        { stderr: stderr || undefined },
-        `claude auth logout failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      await cliLogout();
     } finally {
       // The cleared provider or gateway routing is baked into the env of every
       // live query, so recreate them the way `providers/disable` does: after
@@ -3758,8 +3324,8 @@ export class ClaudeAcpAgent {
     // credentials were cleared, so it never joins a probe that is already in
     // flight. If it can't be read, the logout still happened — drop the
     // now-stale identity instead of reporting it further.
-    if (!(await this.probeCliAuthStatus({ fresh: true }))) {
-      this.setAuthStatus(notLoggedInAuthStatus());
+    if (!(await this.authStatus.probe({ fresh: true }))) {
+      this.authStatus.set(notLoggedInAuthStatus());
     }
   }
 
@@ -3861,12 +3427,12 @@ export class ClaudeAcpAgent {
     // that finds the new credential must not be the one the refusal skipped.
     // The guard itself consumes the result only at the next turn boundary (see
     // `markSessionsWhoseAccountKindChanged`).
-    this.useAuthStatusSettings(
+    this.authStatus.useSettings(
       session.settingsManager,
       session.effortSettingsOverride,
       (session.creationParams?._meta as NewSessionMeta | undefined)?.claudeCode?.options?.env,
     );
-    void this.probeCliAuthStatus();
+    void this.authStatus.probe();
     const signOutRespawn = this.respawnSignedOutSession(params.sessionId, session);
     if (signOutRespawn) {
       await signOutRespawn;
@@ -4315,7 +3881,7 @@ export class ClaudeAcpAgent {
       // The guard reads the account anyway; reuse that read to keep the
       // reported identity current, refusal or not.
       onAccount: (account) =>
-        this.publishSessionAccountIdentity(
+        this.authStatus.publishSessionAccount(
           account,
           session.settingsManager.getApiKeyHelper(session.effortSettingsOverride),
         ),
@@ -12354,8 +11920,12 @@ export class ClaudeAcpAgent {
       prompt: input,
       options,
     });
-    this.useAuthStatusSettings(settingsManager, configuredSettingsObject, userProvidedOptions?.env);
-    const authSettingsEpoch = this.authEpoch;
+    this.authStatus.useSettings(
+      settingsManager,
+      configuredSettingsObject,
+      userProvidedOptions?.env,
+    );
+    const authSettingsEpoch = this.authStatus.epoch;
     timing.phase("prepare-query");
 
     // `query()` spawns the CLI at once. Any throw between here and the
@@ -12381,8 +11951,8 @@ export class ClaudeAcpAgent {
       // Publish the identity BEFORE the guard can refuse this session. A
       // refusal is exactly when the client most needs to know which account it
       // was refused for.
-      if (authSettingsEpoch === this.authEpoch) {
-        this.publishSessionAccountIdentity(
+      if (authSettingsEpoch === this.authStatus.epoch) {
+        this.authStatus.publishSessionAccount(
           initializationResult.account,
           settingsManager.getApiKeyHelper(configuredSettingsObject),
         );
@@ -12728,20 +12298,7 @@ export class ClaudeAcpAgent {
       // and logout apply in the order they arrived. A failed listing fails this
       // `providers/set` before the provider replaces the current one.
       if (config) {
-        try {
-          Object.assign(config, await this.listProviderModels(config));
-        } catch (error) {
-          if (error instanceof GatewayListingError) {
-            throw RequestError.internalError(
-              { providerId: PROVIDER_ID, apiType: config.apiType, baseUrl: config.baseUrl },
-              `Model discovery for provider "${PROVIDER_ID}" failed: ${error.message}`,
-            );
-          }
-          throw error;
-        }
-        this.logger.log(
-          `[providers/set] listedModels=${config.listedModels?.length ?? "none"} bedrockRegionPrefix=${config.bedrockRegionPrefix ?? "none"}`,
-        );
+        await withListedModels(config, this.providerConfig, this.logger);
       }
       const sessions = Object.entries(this.sessions);
       const activeTurns = sessions.flatMap(([, session]) =>
@@ -13320,116 +12877,6 @@ function snapshotFromUsage(usage: {
     cache_read_input_tokens: usage.cache_read_input_tokens ?? 0,
     cache_creation_input_tokens: usage.cache_creation_input_tokens ?? 0,
   };
-}
-
-/**
- * Adapt a legacy gateway `authenticate` request into the shared
- * {@link ProviderConfig} shape. Returns `null` when no gateway request is
- * present. `methodId` selects the protocol: `gateway-bedrock` → bedrock,
- * otherwise anthropic.
- */
-function gatewayRequestToProviderConfig(request?: GatewayAuthRequest): ProviderConfig | null {
-  // `authenticate` validates the payload before it stores one, so a stored
-  // request always carries a usable gateway. Re-check the shape here anyway:
-  // this function decides whether a provider override is active, and the
-  // `--hide-claude-auth` guard is off while one is.
-  const gateway = request?._meta?.gateway;
-  if (!gateway || !isValidBaseUrl(gateway.baseUrl)) {
-    return null;
-  }
-  return {
-    apiType: request?.methodId === "gateway-bedrock" ? "bedrock" : "anthropic",
-    baseUrl: gateway.baseUrl,
-    headers: gateway.headers ?? {},
-  };
-}
-
-/**
- * Map a resolved provider config into the Claude Code env vars that redirect API
- * traffic and inject headers. Returns an empty object when routing is
- * unconfigured. The token/bypass placeholders (`" "`) are required so the CLI
- * skips its normal login/credential checks when a gateway is in use.
- */
-function createEnvForProvider(config: ProviderConfig | null): Record<string, string> {
-  if (!config) {
-    return {};
-  }
-  const resetRouting = {
-    ANTHROPIC_BASE_URL: "",
-    ANTHROPIC_BEDROCK_BASE_URL: "",
-    ANTHROPIC_VERTEX_BASE_URL: "",
-    CLAUDE_CODE_USE_BEDROCK: "0",
-    CLAUDE_CODE_USE_VERTEX: "0",
-    ANTHROPIC_VERTEX_PROJECT_ID: "",
-    CLOUD_ML_REGION: "",
-    AWS_REGION: "",
-    ANTHROPIC_API_KEY: "",
-    ANTHROPIC_AUTH_TOKEN: "",
-    CLAUDE_CODE_OAUTH_TOKEN: "",
-  };
-  const customHeaders = Object.entries(config.headers)
-    .map(([key, value]) => `${key}: ${value}`)
-    .join("\n");
-
-  if (config.apiType === "bedrock") {
-    return {
-      ...resetRouting,
-      CLAUDE_CODE_USE_BEDROCK: "1",
-      AWS_BEARER_TOKEN_BEDROCK: PROVIDER_AUTH_TOKEN_PLACEHOLDER, // Bypass local AWS credential checks
-      ANTHROPIC_BEDROCK_BASE_URL: config.baseUrl,
-      ANTHROPIC_CUSTOM_HEADERS: customHeaders,
-      ...(config.bedrockRegionPrefix
-        ? { ANTHROPIC_BEDROCK_REGION_PREFIX: config.bedrockRegionPrefix }
-        : {}),
-    };
-  }
-
-  if (config.apiType === "vertex") {
-    // `config.vertex` is guaranteed present for vertex by `unstable_setProvider`
-    // validation; fall back to empty strings defensively.
-    // Leaving ANTHROPIC_VERTEX_BASE_URL empty for the default endpoint lets
-    // Claude Code use its native Vertex endpoint/model resolution. Supplying
-    // even the default host marks the session as a custom Vertex deployment and
-    // can hide otherwise-valid models.
-    return {
-      ...resetRouting,
-      CLAUDE_CODE_USE_VERTEX: "1",
-      ...(config.baseUrl !== DEFAULT_VERTEX_BASE_URL
-        ? { ANTHROPIC_VERTEX_BASE_URL: config.baseUrl }
-        : {}),
-      ANTHROPIC_VERTEX_PROJECT_ID: config.vertex?.projectId ?? "",
-      CLOUD_ML_REGION: config.vertex?.region ?? "",
-      ANTHROPIC_CUSTOM_HEADERS: customHeaders,
-    };
-  }
-
-  return {
-    ...resetRouting,
-    ANTHROPIC_BASE_URL: config.baseUrl,
-    ANTHROPIC_CUSTOM_HEADERS: customHeaders,
-    ANTHROPIC_AUTH_TOKEN: PROVIDER_AUTH_TOKEN_PLACEHOLDER, // Bypass local Claude login checks
-  };
-}
-
-function sameHeaders(a: Record<string, string>, b: Record<string, string>): boolean {
-  const aKeys = Object.keys(a);
-  return aKeys.length === Object.keys(b).length && aKeys.every((key) => b[key] === a[key]);
-}
-
-/**
- * Validate a provider base URL: must be a non-empty absolute http(s) URL.
- */
-function isValidBaseUrl(baseUrl: string | undefined): baseUrl is string {
-  if (typeof baseUrl !== "string" || baseUrl.trim() === "") {
-    return false;
-  }
-  let parsed: URL;
-  try {
-    parsed = new URL(baseUrl);
-  } catch {
-    return false;
-  }
-  return parsed.protocol === "http:" || parsed.protocol === "https:";
 }
 
 // `supportedAgents()` always returns Claude Code's built-in subagents — the
