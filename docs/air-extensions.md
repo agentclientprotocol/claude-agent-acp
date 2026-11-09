@@ -145,6 +145,16 @@ The agent list does not depend on the capabilities that AIR declares, except `se
 An extension is active only when the client declared its capability. The client does not declare `sessionBatchGet`, `sessionArchive`, `sessionRename`, `sessionListSubscribe` and `sessionWorktrees`.
 The response to a client that is not AIR has no `_meta.jetbrains` key.
 
+### ACP v2
+
+The default v2 core (`src/v2-native/`) serves an AIR client only the extensions that ACP v2 does not cover.
+Its `initialize` response lists `agentFileChangeReport` and `recommendedValue`.
+It also serves the [permission presentation](#permission-presentation), the [question custom answers](#question-custom-answers), the [predicted follow-up prompt](#predicted-follow-up-prompt), and [load replay end](#load-replay-end).
+The [agent file-change report](#agent-file-change-report) goes out at the end of the turn that serves the prompt, before the turn's idle `state_update`, because a v2 `session/prompt` is answered when Claude Code takes the prompt in.
+ACP v2 covers subagents, background work, file plans, patches, compaction, the system prompt, and turn failures itself, so the v2 core serves no `nativeSubagentSessions`, `backgroundSubagents`, `asyncTasks`, `planFile`, `diffPatch`, `contextCompaction`, `customInstructions`, or `sessionFailure`.
+It does not serve the [tool call contract](#tool-call-contract) yet.
+`CLAUDE_AGENT_ACP_V2_CORE=bridge` serves AIR v2 with the v1 core instead. See `docs/v2-native-core.md`.
+
 ### Capabilities
 
 | Capability               | Advertised          | What the adapter does when the client declares it                                                               | Section                                                 |
@@ -1062,7 +1072,8 @@ The adapter ignores a malformed request and a repeated request id.
 
 ### Report
 
-The adapter sends one `session_info_update` before the `PromptResponse`:
+The adapter sends one `session_info_update` before the `PromptResponse`.
+On ACP v2 it comes before the idle `state_update` of the turn that serves the prompt (see [ACP v2](#acp-v2)):
 
 ```json
 {

@@ -8,7 +8,9 @@
  * none of that: each session mirrors its Claude Code query (see
  * `session.ts`). It shares the protocol-neutral pieces with v1: the SDK
  * message mapping, tool call rendering, permission options, and the mode
- * catalog. What it does not serve yet is listed in `docs/v2-native-core.md`.
+ * catalog. It serves a JetBrains AIR client the AIR extensions that v2 does
+ * not cover (see `air.ts`). What it does not serve yet is listed in
+ * `docs/v2-native-core.md`.
  *
  * The default v2 core. `CLAUDE_AGENT_ACP_V2_CORE=bridge` selects the bridge
  * instead (see `serve.ts`).
@@ -54,6 +56,7 @@ import { Pushable } from "../utils.js";
 import { V2_SESSION_CAPABILITIES } from "../v2/initialize.js";
 import { v1ForkSessionRequest, v1NewSessionRequest } from "../v2/session.js";
 import { V2UpdateTranslator } from "../v2/update-translator.js";
+import { airInitializeMeta, airSupport, NO_AIR, type AirSupport } from "./air.js";
 import { NativeAuth } from "./auth.js";
 import { subagentHooks } from "./child-config.js";
 import { modelSwitchHook, SessionConfig } from "./config.js";
@@ -145,6 +148,8 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
   private clientCapabilities: v2.ClientCapabilities | null | undefined;
   /** The elicitation modes that the client advertised in `initialize`. */
   elicitation: ElicitationSupport = { form: false, url: false };
+  /** The AIR extensions that the client takes (see `air.ts`). */
+  air: AirSupport = NO_AIR;
 
   constructor(
     private readonly ctx: v2.AgentContext,
@@ -234,8 +239,8 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
   // --- Requests --------------------------------------------------------------
 
   /**
-   * The bridge's handshake, without the AIR extensions, which this core does
-   * not serve (see docs/v2-native-core.md).
+   * The bridge's handshake. An AIR client gets the AIR capabilities that this
+   * core serves in the response's `_meta` (see `air.ts`).
    */
   initialize(request: v2.InitializeRequest): v2.InitializeResponse {
     this.clientCapabilities = request.capabilities;
@@ -243,8 +248,11 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       form: request.capabilities?.elicitation?.form != null,
       url: request.capabilities?.elicitation?.url != null,
     };
+    this.air = airSupport(request.capabilities);
     const { authMethods, _meta } = this.auth.initialize(request.capabilities);
+    const airMeta = airInitializeMeta(this.air);
     return {
+      ...(airMeta ? { _meta: airMeta } : {}),
       protocolVersion: v2.PROTOCOL_VERSION,
       info: { name: packageJson.name, title: "Claude Agent", version: packageJson.version },
       capabilities: {
@@ -629,6 +637,10 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     // Claude Code's interrupt stops background tasks, so `session/cancel`
     // could not leave listed work running, and the session lists none.
     const perTaskStopAffordance = client?.perTaskStopAffordance !== false;
+    const additionalDirectories = [
+      ...(client?.additionalDirectories ?? []),
+      ...(request.additionalDirectories ?? []),
+    ];
     const session = new NativeSession(
       sessionId,
       request.cwd,
@@ -636,6 +648,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       this,
       input,
       perTaskStopAffordance,
+      additionalDirectories,
     );
     const elicitationOptions = session.elicitations.queryOptions();
     const subagent = subagentHooks((input) => session.tasks.subagentHook(input));
@@ -647,7 +660,14 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       // client stops one at a time: `session/cancel` must leave listed work
       // running. Before the client's options, as on the bridge.
       perTaskStopAffordance: true,
+      // AIR's predicted follow-up prompt (see `reports.ts`), as on v1. Only
+      // AIR gets it, so no other client's session spends a request on it.
+      // Before the client's options: `promptSuggestions: false` turns it off.
+      ...(this.air.client ? { promptSuggestions: true } : {}),
       ...client,
+      // The checkpoints that AIR's file-change reports read (see
+      // `file-changes.ts`), only for a client that declared them, as on v1.
+      ...(this.air.fileChangeReport ? { enableFileCheckpointing: true } : {}),
       // Claude Code applies the env of settings.json after the process env:
       // the route goes into the programmatic settings too.
       ...(routing.settings
@@ -660,10 +680,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
           }
         : configured && { settings: configured }),
       cwd: request.cwd,
-      additionalDirectories: [
-        ...(client?.additionalDirectories ?? []),
-        ...(request.additionalDirectories ?? []),
-      ],
+      additionalDirectories,
       includePartialMessages: true,
       // A subagent's text, for its own session's stream (see `tasks.ts`).
       forwardSubagentText: true,
@@ -762,27 +779,35 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       settings.dispose();
       throw error;
     }
-    // Does not throw: a failed sync of the mode is logged
-    // (`SessionModeManager.initialize`), and a failed read of the agents or
-    // of ultracode leaves them out.
-    const config = await SessionConfig.start(
-      sessionId,
-      q,
-      { mode, builtInDefault, allowBypass, allowAuto },
-      models.models,
-      models.modelInfos,
-      models.currentModelInfo,
-      {
-        fastMode: {
-          state: initialization.fast_mode_state,
-          disabledReason: initialization.fast_mode_disabled_reason,
+    // A failed sync of the mode is logged (`SessionModeManager.initialize`),
+    // and a failed read of the agents or of ultracode leaves them out. Only
+    // the effort that `recommendedValue` sets can fail the start.
+    let config;
+    try {
+      config = await SessionConfig.start(
+        sessionId,
+        q,
+        { mode, builtInDefault, allowBypass, allowAuto },
+        models.models,
+        models.modelInfos,
+        models.currentModelInfo,
+        {
+          fastMode: {
+            state: initialization.fast_mode_state,
+            disabledReason: initialization.fast_mode_disabled_reason,
+          },
+          client,
+          effortSettings: () => mergeEffortSettings(settings.getSettings(), configured),
+          recommendedValue: this.air.recommendedValue,
         },
-        client,
-        effortSettings: () => mergeEffortSettings(settings.getSettings(), configured),
-      },
-      (notification) => session.output.emitV1([notification]),
-      this.logger,
-    );
+        (notification) => session.output.emitV1([notification]),
+        this.logger,
+      );
+    } catch (error) {
+      q.close();
+      settings.dispose();
+      throw error;
+    }
     session.reports.configure({
       settings,
       env: options.env ?? {},

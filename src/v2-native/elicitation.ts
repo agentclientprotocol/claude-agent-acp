@@ -42,6 +42,8 @@ export interface ElicitationHost {
   readonly logger: Logger;
   /** The modes that the client advertised in `initialize`. */
   readonly support: ElicitationSupport;
+  /** The client is JetBrains AIR: AskUserQuestion's "Other" fields carry AIR's custom answer marker. */
+  readonly airClient: boolean;
   createElicitation(
     request: CreateElicitationRequest,
     signal: AbortSignal,
@@ -115,6 +117,7 @@ export class SessionElicitations {
       return answerAskUserQuestion(toolInput, {
         sessionId: target.sessionId,
         toolUseID: options.toolUseID,
+        airClient: this.host.airClient,
         reportUnanswered: () => this.reportUnanswered,
         logger: this.host.logger,
         elicit: this.elicit(target, options.signal),

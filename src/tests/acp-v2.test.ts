@@ -422,10 +422,14 @@ describe("ACP protocol routing", () => {
     });
 
     // The v2 app registers neither `_session/async_task/stop` nor `_session/goal`.
-    // With `v2Core: "native"` too, the bridge serves an AIR client, so the
-    // other AIR extensions stay.
+    // The bridge keeps the other AIR extensions. The native core lists only
+    // those that v2 does not cover (see "AIR clients" in docs/v2-native-core.md).
     const air = (response._meta as any)?.jetbrains?.air;
-    expect(air.capabilities).toContain("sessionFailure");
+    if (NATIVE_CORE) {
+      expect(air.capabilities).toEqual(["agentFileChangeReport", "recommendedValue"]);
+    } else {
+      expect(air.capabilities).toContain("sessionFailure");
+    }
     expect(air.capabilities).not.toContain("asyncTasks");
     expect(air).not.toHaveProperty("goal");
   });
@@ -2242,9 +2246,13 @@ describe("ACP v2 prompts", () => {
         _meta: { jetbrains: { air: { version: 1, loadReplayEnd: true } } },
       },
     });
-    // The bridge, which serves an AIR client also with `v2Core: "native"`,
-    // gives it AIR's subagent form, which reports no `background` list.
-    expect(atResponse.at(-1)?.update).toEqual({ sessionUpdate: "state_update", state: "idle" });
+    // The bridge gives an AIR client AIR's subagent form, which reports no
+    // `background` list. The native core serves AIR v2's own.
+    expect(atResponse.at(-1)?.update).toEqual({
+      sessionUpdate: "state_update",
+      state: "idle",
+      ...(NATIVE_CORE ? { background: [] } : {}),
+    });
     expect(client.sessionUpdates.filter(isEnd)).toHaveLength(1);
   });
 

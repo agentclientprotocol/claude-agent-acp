@@ -10,8 +10,10 @@
  * modules (`session-config-options.ts`, `session-effort.ts`,
  * `session-fast-mode.ts`, `session-ultracode.ts`, `session-model.ts`,
  * `session-mode.ts`). Fast mode and ultracode are boolean options: every v2
- * client takes them. The options carry no AIR `recommendedValue`, as this
- * core serves no AIR extension.
+ * client takes them. For an AIR client that declares `recommendedValue`, the
+ * model and effort options carry no `default` row and name a recommendation
+ * (`_meta.jetbrains.air.recommendedValue`), and the effort they show is set
+ * on the query at the start and at each model switch, as on v1.
  *
  * The mode follows `SessionModeManager`: a model whose `ModelInfo` does not
  * report `supportsAutoMode` runs `auto` as `acceptEdits`, with a notice,
@@ -94,8 +96,6 @@ type ConfigQuery = Pick<
 
 /** Every v2 client takes boolean config options. */
 const BOOLEAN_OPTIONS = true;
-/** The AIR `recommendedValue` presentation, which this core does not serve. */
-const RECOMMENDED_VALUE = false;
 
 /** The session's options and what they are built from, as `SessionModeManager` reads and updates them. */
 type ConfigSession = SessionMode & {
@@ -113,6 +113,8 @@ export interface ConfigSetup {
   client: { effort?: string; agent?: string } | undefined;
   /** The settings that effort resolves from (`mergeEffortSettings`), read at each model switch. */
   effortSettings(): Settings;
+  /** The client declared AIR's `recommendedValue` (see the module doc). */
+  recommendedValue: boolean;
 }
 
 export class SessionConfig {
@@ -148,6 +150,8 @@ export class SessionConfig {
       configOptions: SessionConfigOption[];
     },
     private readonly effortSettings: () => Settings,
+    /** The client declared AIR's `recommendedValue` (see the module doc). */
+    private readonly recommendedValue: boolean,
     /** Sends an update of the session, such as the Auto mode fallback's notice. */
     private readonly notify: (notification: SessionNotification) => void,
     private readonly logger: Logger,
@@ -246,7 +250,7 @@ export class SessionConfig {
         useBooleanOption: BOOLEAN_OPTIONS,
         disabledReason: fastModeDisabledReason,
       },
-      { useRecommendedValue: RECOMMENDED_VALUE },
+      { useRecommendedValue: setup.recommendedValue },
       {
         supported:
           ultracodeReport?.available ?? ultracodeSupported(workflowsEnabled, currentModelInfo),
@@ -254,12 +258,20 @@ export class SessionConfig {
         useBooleanOption: BOOLEAN_OPTIONS,
       },
     );
+    const shownEffort = configOptions.find(
+      (option) => option.id === EFFORT_CONFIG_ID,
+    )?.currentValue;
     // The client's effort is a pin when the model offers it.
     const pinned =
-      clientEffort !== undefined &&
-      configOptions.find((option) => option.id === EFFORT_CONFIG_ID)?.currentValue === clientEffort
-        ? clientEffort
-        : undefined;
+      clientEffort !== undefined && shownEffort === clientEffort ? clientEffort : undefined;
+    // With `recommendedValue`, the shown effort is a concrete level, which
+    // Claude Code's own default need not be: it is set on the query, as on
+    // v1. A failure fails the session's start, as on v1.
+    const applied =
+      setup.recommendedValue && typeof shownEffort === "string" ? shownEffort : pinned;
+    if (setup.recommendedValue && typeof shownEffort === "string") {
+      await query.applyFlagSettings(effortFlagSettings(shownEffort, ultracodeEnabled));
+    }
     return new SessionConfig(
       sessionId,
       query,
@@ -269,7 +281,7 @@ export class SessionConfig {
       {
         agents,
         currentAgent,
-        effort: { pinned, applied: pinned },
+        effort: { pinned, applied },
         fastModeEnabled,
         fastModeDisabledReason,
         ultracodeEnabled,
@@ -277,6 +289,7 @@ export class SessionConfig {
         configOptions,
       },
       setup.effortSettings,
+      setup.recommendedValue,
       notify,
       logger,
       autoModeFallbackWarningPending,
@@ -612,7 +625,7 @@ export class SessionConfig {
       newModelInfo: info,
       modelId: value,
       settings: this.effortSettings(),
-      useRecommendedValue: RECOMMENDED_VALUE,
+      useRecommendedValue: this.recommendedValue,
     });
     const options = buildConfigOptions(
       this.session.modes,
@@ -627,7 +640,7 @@ export class SessionConfig {
         useBooleanOption: BOOLEAN_OPTIONS,
         disabledReason: this.fastModeDisabledReason,
       },
-      { useRecommendedValue: RECOMMENDED_VALUE },
+      { useRecommendedValue: this.recommendedValue },
       {
         supported: ultracodeSupported(this.ultracodeWorkflowsEnabled, info),
         enabled: this.ultracodeEnabled,
@@ -638,7 +651,7 @@ export class SessionConfig {
       effortSwitch,
       options.find((option) => option.id === EFFORT_CONFIG_ID),
       this.ultracodeEnabled,
-      RECOMMENDED_VALUE,
+      this.recommendedValue,
       (settings) => this.session.query.applyFlagSettings(settings),
     );
     this.effort = effort.state;

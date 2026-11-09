@@ -12,6 +12,7 @@ import { previewPatchContent } from "../diff.js";
 import { normalizeDurablePermissionChangeSet } from "../permissions/normalization.js";
 import { buildClaudePermissionOptions } from "../permissions/options.js";
 import {
+  airPermissionMeta,
   buildClaudePermissionPresentation,
   permissionToolCallMeta,
 } from "../permissions/presentation.js";
@@ -25,6 +26,12 @@ const V2_CAPABILITIES = ClientCapabilities.from(undefined, { v2: true });
 
 /** What a permission check needs of its root session. */
 export interface PermissionHost {
+  /**
+   * The client is JetBrains AIR: a request carries the AIR permission
+   * presentation, and its tool call the AIR `_meta.claudeCode` (see
+   * `permissionToolCallMeta`).
+   */
+  readonly airClient: boolean;
   /** The ids of the modes that the session offers. */
   availableModes(): string[];
   /**
@@ -131,11 +138,20 @@ export function canUseTool(host: PermissionHost): CanUseTool {
       decisionReason,
       defaultToNo,
     });
+    // The tool call keeps the v2 rendering that the stream gave it. An AIR
+    // client also gets the heading and explanation in AIR's `_meta`.
+    if (host.airClient && presentation.title) {
+      presentation._meta = airPermissionMeta({
+        title: presentation.title,
+        description: presentation.description,
+        defaultToNo,
+      });
+    }
     const toolCallMeta = permissionToolCallMeta({
       toolName,
       parentToolUseId: target.parentToolUseId,
       mcpServer,
-      airClient: false,
+      airClient: host.airClient,
     });
     if (toolCallMeta) presentation.toolCall._meta = toolCallMeta;
     const contextReset = host.contextReset(agentID);
