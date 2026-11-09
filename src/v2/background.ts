@@ -9,8 +9,27 @@
  * of its state (`subagent_update.state`).
  */
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
-import type { BackgroundItem, BackgroundReport, WorkStateName } from "../background-work.js";
 import type { V2Terminals } from "./terminal.js";
+
+/** An item of a `background` list. */
+export type BackgroundItem =
+  | { type: "terminal"; terminalId: string }
+  | { type: "tool_call"; toolCallId: string }
+  | { type: "subagent"; sessionId: string }
+  | { type: "_claude/task"; taskId: string; description: string };
+
+/** The work state of a session, as its `state_update` names it. */
+export type WorkStateName = "idle" | "running" | "requires_action" | "unknown";
+
+/** A new list of the session `sessionId`, with what its repeated state needs. */
+export interface BackgroundReport {
+  sessionId: string;
+  items: BackgroundItem[];
+  /** The session's work state now, or undefined when it has none yet. */
+  state: WorkStateName | undefined;
+  /** The parent of a subagent session, which mirrors the child's state. */
+  parentSessionId?: string;
+}
 
 /** `state` as the current work state of a session, with no stop reason. */
 function currentState(state: WorkStateName): v2.StateUpdate {

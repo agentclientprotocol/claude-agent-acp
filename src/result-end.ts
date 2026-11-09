@@ -1,7 +1,6 @@
 /**
- * How Claude Code's `result` ends the work that it reports, protocol-neutral:
- * the rules of the v1 core's autonomous cycles (`autonomousCycleEnd`), which
- * the native ACP v2 core reads every turn's result with (`v2-native/outcome.ts`).
+ * How Claude Code's `result` ends the work that it reports: the rules that the
+ * ACP v2 core reads every turn's result with (`v2-native/outcome.ts`).
  */
 import type { SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
 

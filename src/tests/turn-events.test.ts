@@ -4,12 +4,9 @@
  * Claude Code: it echoes each prompt, then runs the turn's script.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type {
-  RequestPermissionRequest,
-  SessionNotification,
-} from "@agentclientprotocol/sdk/unstable";
+import type { SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import type { AcpClient, ClaudeAcpAgent } from "../acp-agent.js";
-import type { ForegroundEvents, TurnEvents } from "../turn-events.js";
+import type { TurnEvents } from "../turn-events.js";
 import { DEFAULT_CONTEXT_USAGE } from "./helpers.js";
 import { randomUUID } from "node:crypto";
 
@@ -195,41 +192,19 @@ function system(subtype: string, sessionId: string, fields: Record<string, unkno
 
 describe("turn events", () => {
   let agent: ClaudeAcpAgent;
-  let permissionRequests: RequestPermissionRequest[];
-  /** The user answers a request for this tool call only once it resolves. */
-  let backgroundAnswer: PromiseWithResolvers<void>;
   /** Sees each session update; the agent waits until it returns. */
   let onSessionUpdate: (notification: SessionNotification) => Promise<void> | void;
-  /** What the agent reported of the session's foreground work. */
-  let foreground: string[];
 
   beforeEach(async () => {
     vi.resetModules();
-    permissionRequests = [];
-    backgroundAnswer = Promise.withResolvers<void>();
     onSessionUpdate = () => {};
-    foreground = [];
     const { ClaudeAcpAgent } = await import("../acp-agent.js");
-    const foregroundEvents: ForegroundEvents = {
-      running: () => foreground.push("running"),
-      awaitingUser: () => foreground.push("awaitingUser"),
-      ended: (outcome) => foreground.push(`ended ${outcome.stopReason}`),
-      failed: () => foreground.push("failed"),
-    };
     agent = new ClaudeAcpAgent(
       {
         sessionUpdate: async (notification: SessionNotification) => onSessionUpdate(notification),
         extNotification: async () => {},
-        requestPermission: async (request: RequestPermissionRequest) => {
-          permissionRequests.push(request);
-          await new Promise((resolve) => setTimeout(resolve, 1));
-          if (request.toolCall.toolCallId === "toolu_background") await backgroundAnswer.promise;
-          const allow = request.options.find((option) => option.kind === "allow_once");
-          return { outcome: { outcome: "selected", optionId: allow!.optionId } };
-        },
       } as unknown as AcpClient,
       undefined,
-      { foreground: () => foregroundEvents },
     );
   });
 
@@ -330,172 +305,6 @@ describe("turn events", () => {
       "first ended end_turn",
       expect.stringMatching(/^second inserted /),
       "second ended end_turn",
-    ]);
-  });
-
-  it("reports waiting on a permission request, then resuming", async () => {
-    scriptTurns([
-      async function* (options) {
-        await options.canUseTool(
-          "Bash",
-          { command: "ls" },
-          { signal: new AbortController().signal, suggestions: [], toolUseID: "toolu_ls" },
-        );
-        yield {
-          type: "user",
-          message: {
-            role: "user",
-            content: [{ type: "tool_result", tool_use_id: "toolu_ls", content: "README.md" }],
-          },
-          parent_tool_use_id: null,
-          uuid: randomUUID(),
-          session_id: options.sessionId!,
-        };
-        yield result(options.sessionId!);
-      },
-    ]);
-    const sessionId = await newSession();
-    const turn = recordEvents();
-
-    await agent.startTurn(prompt(sessionId, "list files"), turn.events);
-    await turn.done;
-
-    expect(permissionRequests).toHaveLength(1);
-    expect(turn.log.slice(1)).toEqual(["ended end_turn"]);
-    expect(foreground).toEqual(["running", "awaitingUser", "running", "ended end_turn"]);
-  });
-
-  it("reports waiting on a request that Claude Code opens for a started turn before its echo", async () => {
-    let whileOpen: string[] = [];
-    scriptQuery(async function* (input, options) {
-      const { value } = await input.next();
-      yield lifecycle(value.uuid, "started", options.sessionId!);
-      // Claude Code asks for the prompt before the consumer reaches its echo.
-      // The user answers it only once the test resolves `backgroundAnswer`.
-      const decision = options.canUseTool!(
-        "Bash",
-        { command: "ls" },
-        { signal: new AbortController().signal, suggestions: [], toolUseID: "toolu_background" },
-      );
-      await vi.waitFor(() => expect(permissionRequests).toHaveLength(1));
-      whileOpen = [...foreground];
-      backgroundAnswer.resolve();
-      await decision;
-      yield echo(value, options.sessionId!);
-      yield {
-        type: "user",
-        message: {
-          role: "user",
-          content: [{ type: "tool_result", tool_use_id: "toolu_background", content: "README.md" }],
-        },
-        parent_tool_use_id: null,
-        uuid: randomUUID(),
-        session_id: options.sessionId!,
-      };
-      yield result(options.sessionId!);
-      await input.next();
-    });
-    const sessionId = await newSession();
-    const turn = recordEvents();
-
-    await agent.startTurn(prompt(sessionId, "list files"), turn.events);
-    await turn.done;
-
-    expect(whileOpen).toEqual(["running", "awaitingUser"]);
-    expect(foreground).toEqual(["running", "awaitingUser", "running", "ended end_turn"]);
-  });
-
-  it("reports work that starts while a request is open as waiting at once", async () => {
-    let atStart: string[] = [];
-    scriptQuery(async function* (input, options) {
-      const { value } = await input.next();
-      // A request that no work opened, such as a background task's. The user
-      // answers it only once the test resolves `backgroundAnswer`.
-      const background = options.canUseTool!(
-        "Bash",
-        { command: "sleep 60" },
-        { signal: new AbortController().signal, suggestions: [], toolUseID: "toolu_background" },
-      );
-      await vi.waitFor(() => expect(permissionRequests).toHaveLength(1));
-      yield lifecycle(value.uuid, "started", options.sessionId!);
-      // Before the prompt's echo, which would report the request too.
-      atStart = [...foreground];
-      backgroundAnswer.resolve();
-      await background;
-      yield echo(value, options.sessionId!);
-      yield result(options.sessionId!);
-      await input.next();
-    });
-    const sessionId = await newSession();
-    const turn = recordEvents();
-
-    await agent.startTurn(prompt(sessionId, "list files"), turn.events);
-    await turn.done;
-
-    expect(atStart).toEqual(["running", "awaitingUser"]);
-  });
-
-  it("awaits the user while any request in the session is open, also one opened before the turn", async () => {
-    const first = recordEvents();
-    const second = recordEvents();
-    let backgroundRequest: Promise<unknown> | undefined;
-    let atStart: string[] = [];
-    let afterOwnAnswer: string[] | undefined;
-    scriptTurns([
-      async function* (options) {
-        yield result(options.sessionId!);
-        await first.done;
-        // A request that no active turn opened, such as a background task's.
-        backgroundRequest = options.canUseTool(
-          "Bash",
-          { command: "sleep 60" },
-          { signal: new AbortController().signal, suggestions: [], toolUseID: "toolu_background" },
-        );
-      },
-      async function* (options) {
-        atStart = [...foreground];
-        await options.canUseTool(
-          "Bash",
-          { command: "ls" },
-          { signal: new AbortController().signal, suggestions: [], toolUseID: "toolu_ls" },
-        );
-        afterOwnAnswer = [...foreground];
-        await backgroundRequest;
-        yield {
-          type: "user",
-          message: {
-            role: "user",
-            content: [{ type: "tool_result", tool_use_id: "toolu_ls", content: "README.md" }],
-          },
-          parent_tool_use_id: null,
-          uuid: randomUUID(),
-          session_id: options.sessionId!,
-        };
-        yield result(options.sessionId!);
-      },
-    ]);
-    const sessionId = await newSession();
-
-    await agent.startTurn(prompt(sessionId, "start a background task"), first.events);
-    await vi.waitFor(() => expect(permissionRequests).toHaveLength(1));
-    await agent.startTurn(prompt(sessionId, "list files"), second.events);
-    await vi.waitFor(() => expect(afterOwnAnswer).toBeDefined());
-    backgroundAnswer.resolve();
-    await second.done;
-
-    expect(first.log.slice(1)).toEqual(["ended end_turn"]);
-    // The first turn's work ended before the background request opened, and
-    // the second turn waits from insertion, through its own answered request,
-    // until the earlier request is answered too.
-    const firstWork = ["running", "ended end_turn"];
-    expect(atStart).toEqual([...firstWork, "running", "awaitingUser"]);
-    expect(afterOwnAnswer).toEqual([...firstWork, "running", "awaitingUser"]);
-    expect(foreground).toEqual([
-      ...firstWork,
-      "running",
-      "awaitingUser",
-      "running",
-      "ended end_turn",
     ]);
   });
 

@@ -93,7 +93,7 @@ export function mockSessionState(
     toolUseCache: {},
     emittedToolCalls: new Set(),
     liveBackgroundTasks: new Map(),
-    background: new SessionBackgroundWork(sessionId, false),
+    background: new SessionBackgroundWork(sessionId),
     emittedAssistantText: false,
     owedTrailingIdles: 0,
     messageIdToUuid: new Map(),

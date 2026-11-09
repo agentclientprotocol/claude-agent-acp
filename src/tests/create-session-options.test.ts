@@ -176,25 +176,19 @@ describe("createSession options merging", () => {
     });
   });
 
-  it("registers the PreToolUse hook of the change previews only on a v2 connection", async () => {
+  it("registers no PreToolUse hook of change previews", async () => {
     await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
     // A v1 client gets the input's diff, so Claude Code waits on no hook.
     expect(capturedOptions!.hooks?.PreToolUse).toBeUndefined();
-
-    const v2Agent = new ClaudeAcpAgent(createMockClient(), undefined, { v2: true });
-    await v2Agent.newSession({ cwd: process.cwd(), mcpServers: [] });
-    expect(capturedOptions!.hooks?.PreToolUse).toEqual([
-      { matcher: "Edit|Write", hooks: [expect.any(Function)] },
-    ]);
   });
 
-  it.each([false, true])("reports child settings through registered hooks (v2: %s)", async (v2) => {
+  it("reports child settings through registered hooks", async () => {
     const updates: AcpSessionNotification[] = [];
     const client = createMockClient();
     client.sessionUpdate = async (notification) => {
       updates.push(notification);
     };
-    const observedAgent = new ClaudeAcpAgent(client, undefined, { v2 });
+    const observedAgent = new ClaudeAcpAgent(client);
     await observedAgent.initialize({ protocolVersion: 1, clientCapabilities: { subagents: {} } });
     const { sessionId } = await observedAgent.newSession({ cwd: process.cwd(), mcpServers: [] });
     const session = observedAgent.sessions[sessionId]!;

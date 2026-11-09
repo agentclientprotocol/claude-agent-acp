@@ -53,7 +53,6 @@ import type { Logger } from "../acp-agent.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import { backgroundBashTaskFromToolResult } from "../async-tasks.js";
 import { BackgroundOutputTail, type BackgroundOutput } from "../background-output.js";
-import type { BackgroundItem, WorkStateName } from "../background-work.js";
 import {
   childModelOption,
   HANDBACK_TOOL,
@@ -76,7 +75,7 @@ import { subagentLineage } from "../subagent-history.js";
 import { withRunningTerminal, withRunningToolCall } from "../tool-calls/background.js";
 import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { AcpToolCallRenderer } from "../tool-calls/renderer.js";
-import type { V2Background } from "../v2/background.js";
+import type { BackgroundItem, V2Background, WorkStateName } from "../v2/background.js";
 import type { V2UpdateTranslator } from "../v2/update-translator.js";
 import { ChildConfigurations } from "./child-config.js";
 import { SessionOutput } from "./stream.js";
@@ -212,7 +211,7 @@ const TASK_TOOLS = new Set(["Monitor", "Workflow"]);
 /** The most messages that wait for the announcement of one child. */
 const MAX_PENDING_MESSAGES = 256;
 
-/** The most children not announced yet whose hooks wait for them, as on the bridge. */
+/** The most children not announced yet whose hooks wait for them. */
 const MAX_PENDING_HOOKS = 64;
 
 const FINAL_STATUSES = new Set<unknown>(["completed", "failed", "cancelled"]);
@@ -289,7 +288,7 @@ export class SessionTasks {
   /**
    * The SendMessage calls that a permission request showed before their tool
    * use streamed: the client holds them, so they stay shown until their final
-   * update, as on the bridge (its `eagerToolCallSessions`).
+   * update, as on v1 (its `eagerToolCallSessions`).
    */
   private readonly shownSendMessages = new Set<string>();
   /**
@@ -368,7 +367,7 @@ export class SessionTasks {
 
   /**
    * Restores the agent that a SendMessage result of `output` resumed
-   * (`resumedAgentId`), when this process does not know it, as the bridge
+   * (`resumedAgentId`), when this process does not know it, as the v1 core
    * does (`sendMessageResumed`): Claude Code can resume an agent without a
    * `task_started`. The caller sends the result's updates after it, so the
    * restored child takes the call's message. Undefined when nothing is
@@ -557,8 +556,7 @@ export class SessionTasks {
    * that it waits on. Their open requests are withdrawn. Claude Code's
    * interrupt stops their runs, which then end `cancelled`. Until then, of
    * their consolidated messages only the results of the tool calls that the
-   * client holds go out, as on the root and on the bridge (see
-   * `SessionOutput.cancelled`). A foreground subagent that Claude Code
+   * client holds go out, as on the root (see `SessionOutput.cancelled`). A foreground subagent that Claude Code
    * reports after the cancel, until {@link foregroundCancelEnded}, is
    * stopped work too: Claude Code started it before the interrupt, and the
    * session reads its `task_started` only after the cancel.
@@ -640,8 +638,7 @@ export class SessionTasks {
    * A permission request on the session of `output` shows the tool call
    * `toolCallId` to the client. A SendMessage call whose tool use has not
    * streamed yet then stays shown: its updates go out, and its message goes
-   * to the child only, as on the bridge. One that already streamed stays
-   * hidden, as the bridge's does.
+   * to the child only. One that already streamed stays hidden.
    */
   requestShows(output: SessionOutput, toolName: string, toolCallId: string): void {
     if (toolName === "SendMessage" && !output.holds(toolCallId)) {
@@ -650,7 +647,7 @@ export class SessionTasks {
   }
 
   /**
-   * A hook of the subagent `input.agent_id`, as the bridge reads them
+   * A hook of the subagent `input.agent_id`, as the v1 core reads them
    * (`subagentConfigurationHook`): its `cwd` is the child's working
    * directory, such as its worktree, and its configuration goes to the
    * child's session (see `child-config.ts`). What a hook reports before the
@@ -794,10 +791,10 @@ export class SessionTasks {
 
   /**
    * Claude Code mounted a fresh conversation (`conversation_reset`). Its
-   * subagents end, deeper ones first, as on the bridge (`finishAll`): each
+   * subagents end, deeper ones first, as on v1 (`finishAll`): each
    * child that works goes `idle` with no stop reason, since nothing says how
    * its run ended, after its unfinished tool calls end `failed`. Then every
-   * child is forgotten, as the bridge forgets them: a later event of one
+   * child is forgotten: a later event of one
    * changes nothing, and a child not announced yet stays unexposed. Claude
    * Code's tasks (the live subagents, background commands and other tasks)
    * stay as its task events report them.
@@ -1085,7 +1082,7 @@ export class SessionTasks {
 
   /**
    * Restores the agent `agentId`, which the SendMessage call `toolUseId`
-   * resumed with `prompt`, as the bridge does (`NativeSubagentRuntime.restore`):
+   * resumed with `prompt`, as the v1 core does (`NativeSubagentRuntime.restore`):
    * the process does not know it, because it ran before the session was
    * resumed. The session's subagent history (`subagentLineage`) gives the
    * call that launched it and its ancestors. Claude Code sends the resumed
@@ -1217,7 +1214,7 @@ export class SessionTasks {
     });
     const prompt = child.task.prompt ?? identity?.prompt;
     if (prompt) this.sendPrompt(child, prompt, child.launchToolUseId, parentSessionId, true);
-    // What its hooks reported before, as on the bridge: after the prompt.
+    // What its hooks reported before, after the prompt.
     this.publishConfiguration(child, undefined);
     const pending = child.pending;
     child.pending = [];
@@ -1388,7 +1385,7 @@ export class SessionTasks {
    * view and the child's incoming one. Claude Code reports that delivery
    * before the call's final update. A call whose message reached no announced
    * child, such as one to the parent, is shown after all, with its final
-   * status, as on the bridge. Undefined for any other update.
+   * status. Undefined for any other update.
    */
   private sendMessageUpdate(
     output: SessionOutput,
@@ -1461,7 +1458,7 @@ export class SessionTasks {
   /**
    * A SendMessage result that reports the agent it resumed (`resumedAgentId`):
    * the call is the child's delegation, which it takes unless the run of that
-   * call ended already, as on the bridge (`sendMessageResumed`). Claude Code
+   * call ended already, as on v1 (`sendMessageResumed`). Claude Code
    * can resume a child without a new `task_started`.
    */
   private sendMessageResumed(
