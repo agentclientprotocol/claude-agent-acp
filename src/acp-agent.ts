@@ -5917,7 +5917,9 @@ export class ClaudeAcpAgent {
         const pause = messageLoopYielder.maybeYield();
         if (pause) await pause;
         // The last message may have changed the background work, and its
-        // updates are sent, so the list follows them.
+        // updates are sent, so the list follows them. A task that needs a
+        // tool call of its own gets it first, so the list can name it.
+        for (const call of session.background.adoptTasks(session)) await sendUpdate(call);
         this.backgroundWork.sync(params.sessionId, session, this.foregroundState(params.sessionId));
         pendingNext ??= session.query
           .next()

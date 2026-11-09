@@ -19,9 +19,10 @@
  *   backgrounded MCP call: that tool call, kept `in_progress` (or `paused`)
  *   from its tool result until its task ends (`Session.backgroundToolCalls`).
  * - Any other task, once its `task_started` came and the tool call that
- *   started it, if any, returned: a `_claude/task` item with the task's id
- *   and description. For example, a task whose tool call ended before the
- *   task joined the level.
+ *   started it, if any, returned: a tool call that the adapter starts for
+ *   it (see `SessionBackgroundWork.adoptTasks`). For example, a task that a
+ *   hook started, or one whose tool call ended before the task joined the
+ *   level.
  *
  * Only a session whose interrupt spares background tasks reports its lists
  * (`Session.reportsBackground`): `session/cancel` must leave listed work
@@ -40,8 +41,7 @@ import { textContent } from "./tool-calls/content.js";
 export type BackgroundItem =
   | { type: "terminal"; terminalId: string }
   | { type: "tool_call"; toolCallId: string }
-  | { type: "subagent"; sessionId: string }
-  | { type: "_claude/task"; taskId: string; description: string };
+  | { type: "subagent"; sessionId: string };
 
 /** The display terminal of a command that went to the background (see `Session.backgroundTerminals`). */
 export interface BackgroundTerminal {
@@ -58,8 +58,14 @@ export interface BackgroundTerminal {
 /** A tool call whose task runs on in the background (see `Session.backgroundToolCalls`). */
 export interface BackgroundToolCall {
   toolCallId: string;
-  /** The tool use of the call, which Claude Code no longer caches after its result. */
-  toolUse: { name: string; input: unknown };
+  /**
+   * The tool use of the call, which Claude Code no longer caches after its
+   * result. Undefined for a call that the adapter started for a task (see
+   * `SessionBackgroundWork.adoptTasks`), which has `title` instead.
+   */
+  toolUse?: { name: string; input: unknown };
+  /** The title of a call that the adapter started for a task: the task's description. */
+  title?: string;
   /** The subagent tool call that made the call, if any. */
   parentToolUseId?: string;
   paused?: boolean;
@@ -379,6 +385,47 @@ export class SessionBackgroundWork {
   }
 
   /**
+   * Starts a tool call for each live task that no terminal or tool call
+   * stands for yet, and returns the `tool_call`s to send: v2 lists background work only by an entity
+   * the client knows. Such a task is one that no tool call started, such as
+   * one a hook started, or one whose tool call returned, with its final
+   * status, before the task started. The call has the task's description as
+   * its title, is `in_progress`, and ends with the task (see `taskEnded`). A
+   * task that an announced subagent session runs gets its call on that
+   * session's stream. Ambient tasks are housekeeping and get no call.
+   *
+   * The agent sends them before each list it publishes, so the call comes
+   * before the first list that names it, as v2 requires.
+   */
+  adoptTasks(owner: BackgroundOwner): AcpSessionNotification[] {
+    if (!this.reported) return [];
+    const started: AcpSessionNotification[] = [];
+    const children = new Map(
+      [...(owner.nativeSubagentsByTaskId ?? [])].filter(([, child]) => child.announced),
+    );
+    for (const [taskId, task] of this.level) {
+      if (task.ambient || this.toolCalls.has(taskId) || this.terminals.has(taskId)) continue;
+      // A command without a terminal yet is one that foreground work waits on.
+      // A subagent is listed as its session.
+      if (task.taskType === "local_bash" || task.taskType === "local_agent") continue;
+      // A task joins the level before its `task_started`, and before the tool
+      // call that starts it returns. Until both, the task is unknown or part
+      // of that tool call.
+      const live = owner.liveBackgroundTasks.get(taskId);
+      if (!live || (live.parentToolUseId && !this.returned.has(live.parentToolUseId))) continue;
+      const parent = task.parentTaskId ? children.get(task.parentTaskId) : undefined;
+      const toolCall: BackgroundToolCall = {
+        toolCallId: adoptedToolCallId(taskId),
+        title: task.description,
+        ...(parent?.parentToolUseId ? { parentToolUseId: parent.parentToolUseId } : {}),
+      };
+      this.toolCalls.set(taskId, toolCall);
+      started.push(adoptedToolCall(this.sessionId, toolCall));
+    }
+    return started;
+  }
+
+  /**
    * The `background` list of the root session and of each of its announced
    * subagent sessions, with what their repeated states need, deeper sessions
    * first and the root last: a child's own list goes out before its parent's
@@ -389,7 +436,6 @@ export class SessionBackgroundWork {
     const children = [...(owner.nativeSubagentsByTaskId ?? [])].filter(
       ([, child]) => child.announced,
     );
-    const childByTask = new Map(children);
     const childByToolUse = new Map(
       children.flatMap(([, child]) =>
         child.parentToolUseId ? [[child.parentToolUseId, child] as const] : [],
@@ -418,20 +464,10 @@ export class SessionBackgroundWork {
         const session = ownerOf(terminal.parentToolUseId);
         if (session)
           lists.get(session)!.push({ type: "terminal", terminalId: terminal.toolCallId });
-        continue;
       }
-      // A command without a terminal yet is one that foreground work waits on.
-      // A subagent is listed below, as its session.
-      if (task.taskType === "local_bash" || task.taskType === "local_agent") continue;
-      // A task joins the level before its `task_started`, and before the tool
-      // call that starts it returns. Until both, the task is unknown or part
-      // of that tool call.
-      const live = owner.liveBackgroundTasks.get(taskId);
-      if (!live || (live.parentToolUseId && !this.returned.has(live.parentToolUseId))) continue;
-      const parent = task.parentTaskId ? childByTask.get(task.parentTaskId) : undefined;
-      lists
-        .get(parent?.sessionId ?? this.sessionId)!
-        .push({ type: "_claude/task", taskId, description: task.description });
+      // Any other task is listed by the tool call that `adoptTasks` starts
+      // for it, or is not background work. A subagent is listed below, as
+      // its session.
     }
     // A child is listed in its parent's list while it works in the background,
     // and while it is idle with background work of its own. Deeper children
@@ -477,7 +513,9 @@ export class SessionBackgroundWork {
     return [...this.toolCalls]
       .filter(([, toolCall]) => toolCallIds.includes(toolCall.toolCallId))
       .map(([taskId, toolCall]) => {
-        const update = renderer.toolCall({ id: toolCall.toolCallId, ...toolCall.toolUse }, { cwd });
+        const update = toolCall.toolUse
+          ? renderer.toolCall({ id: toolCall.toolCallId, ...toolCall.toolUse }, { cwd })
+          : adoptedToolCall(this.sessionId, toolCall).update;
         const status = toolCall.paused ? V2_PAUSED : "in_progress";
         return {
           sessionId: this.sessionId,
@@ -612,6 +650,31 @@ function toolCallUpdate(
         ? { _meta: { claudeCode: { parentToolUseId: toolCall.parentToolUseId } } }
         : {}),
     },
+  };
+}
+
+/**
+ * The id of the tool call that the adapter starts for the task `taskId`.
+ * Claude Code's tool use ids start with `toolu_`, so it names no other call.
+ */
+function adoptedToolCallId(taskId: string): string {
+  return `task_${taskId}`;
+}
+
+/** The `tool_call` that the adapter starts for a task (see `SessionBackgroundWork.adoptTasks`). */
+function adoptedToolCall(sessionId: string, toolCall: BackgroundToolCall): AcpSessionNotification {
+  return {
+    sessionId,
+    update: {
+      sessionUpdate: "tool_call",
+      toolCallId: toolCall.toolCallId,
+      title: toolCall.title ?? "Background task",
+      kind: "other",
+      status: toolCall.paused ? V2_PAUSED : "in_progress",
+      ...(toolCall.parentToolUseId
+        ? { _meta: { claudeCode: { parentToolUseId: toolCall.parentToolUseId } } }
+        : {}),
+    } as AcpSessionNotification["update"],
   };
 }
 

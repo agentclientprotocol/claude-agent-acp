@@ -4524,6 +4524,56 @@ describe("ACP v2 requests that subagents make", () => {
       ]);
     });
 
+    it("starts a subagent's task without a tool call on the subagent's stream, and lists it there", async () => {
+      const workflow = {
+        task_id: "wf1",
+        task_type: "local_workflow",
+        description: "Review",
+        parent_task_id: "agent-1",
+      };
+      scriptTurns(async function* (options) {
+        yield agentUse(options);
+        yield level(options, [agent1]);
+        yield taskStarted(options, "agent-1", { prompt: "Look around", is_backgrounded: true });
+        yield result(options);
+        yield idleState(options);
+        yield level(options, [agent1, workflow]);
+        yield {
+          type: "system",
+          subtype: "task_started",
+          ...workflow,
+          uuid: randomUUID(),
+          session_id: options.sessionId,
+        };
+      });
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+        await vi.waitFor(() =>
+          expect(
+            client.sessionUpdates
+              .filter(
+                ({ sessionId, update }) =>
+                  sessionId === "agent-1" && update.sessionUpdate === "state_update",
+              )
+              .at(-1)?.update,
+          ).toMatchObject({ background: [{ type: "tool_call", toolCallId: "task_wf1" }] }),
+        );
+      });
+
+      expect(
+        client.sessionUpdates.filter(
+          ({ update }) =>
+            update.sessionUpdate === "tool_call_update" && update.toolCallId === "task_wf1",
+        )[0],
+      ).toMatchObject({
+        sessionId: "agent-1",
+        update: { title: "Review", kind: "other", status: "in_progress" },
+      });
+    });
+
     it("keeps an idle subagent listed while its own command runs in the background", async () => {
       const childMessage = (options: Options, message: Record<string, unknown>) => ({
         ...message,
@@ -6349,31 +6399,126 @@ describe("ACP v2 terminal of a command in the background", () => {
         ]);
       });
 
-      it("lists a task whose call returned before the task started as a _claude/task item", async () => {
-        scriptTurns(async function* (options) {
-          yield toolUseMessage(options, "toolu_mcp", "mcp__ci__watch", { job: "build" });
-          yield toolResultMessage(options, "toolu_mcp", { content: "Watching the build." });
-          // The call's task joins the level and starts after the call returned,
-          // so the call ended and cannot be listed.
-          const task = { task_id: "mcp1", task_type: "mcp_task", description: "Watch the build" };
-          yield level(options, [task]);
-          yield taskEvent(options, "task_started", { ...task, tool_use_id: "toolu_mcp" });
-          yield result(options);
-          yield idleState(options);
-        });
-        const client = await promptUntil("idle end_turn [_claude/task]");
+      /** The adapter's own call for the task `mcp1`, which an MCP call started
+       *  but which started only after that call returned with its final status. */
+      async function* lateTaskStarts(options: Options) {
+        yield toolUseMessage(options, "toolu_mcp", "mcp__ci__watch", { job: "build" });
+        yield toolResultMessage(options, "toolu_mcp", { content: "Watching the build." });
+        const task = { task_id: "mcp1", task_type: "mcp_task", description: "Watch the build" };
+        yield level(options, [task]);
+        yield taskEvent(options, "task_started", { ...task, tool_use_id: "toolu_mcp" });
+        yield result(options);
+        yield idleState(options);
+      }
 
-        expect(client.updates("state_update").at(-1)).toMatchObject({
-          background: [{ type: "_claude/task", taskId: "mcp1", description: "Watch the build" }],
+      it("starts a tool call for a task whose call returned before the task started, and lists it", async () => {
+        scriptTurns(lateTaskStarts);
+        const client = await promptUntil("idle end_turn [task_mcp1]");
+
+        const updates = client.sessionUpdates.map(({ update }) => update);
+        const started = updates.findIndex(
+          (update) =>
+            update.sessionUpdate === "tool_call_update" && update.toolCallId === "task_mcp1",
+        );
+        const listed = updates.findIndex(
+          (update) =>
+            update.sessionUpdate === "state_update" &&
+            JSON.stringify(update).includes('"task_mcp1"'),
+        );
+        expect(updates[started]).toMatchObject({
+          title: "Watch the build",
+          kind: "other",
+          status: "in_progress",
         });
+        expect(started).toBeLessThan(listed);
+        // The call that started the task keeps its final status.
+        expect(
+          updates
+            .filter(
+              (update) =>
+                update.sessionUpdate === "tool_call_update" &&
+                update.toolCallId === "toolu_mcp" &&
+                update.status !== undefined,
+            )
+            .map((update) => (update as { status?: unknown }).status)
+            .at(-1),
+        ).toBe("completed");
+      });
+
+      it("stops such a task on tool_call/cancel, and reports its call cancelled", async () => {
+        const stopped = Promise.withResolvers<string>();
+        sdk.stopTask = async (taskId) => stopped.resolve(taskId);
+        scriptTurns(async function* (options) {
+          yield* lateTaskStarts(options);
+          await stopped.promise;
+          yield taskEvent(options, "task_notification", {
+            task_id: "mcp1",
+            tool_use_id: "toolu_mcp",
+            status: "stopped",
+            summary: "Stopped",
+          });
+          yield level(options, []);
+        });
+        const client = await promptUntil(
+          "idle end_turn [task_mcp1]",
+          async (agent, sessionId, client) => {
+            await expect(
+              agent.request(v2.methods.agent.toolCall.cancel, {
+                sessionId,
+                toolCallId: "task_mcp1",
+              }),
+            ).resolves.toEqual({});
+            expect(await stopped.promise).toBe("mcp1");
+            await vi.waitFor(() => expect(backgroundTrace(client)).toContain("idle []"));
+          },
+        );
+
+        const statuses = client.sessionUpdates.flatMap(({ update }) =>
+          update.sessionUpdate === "tool_call_update" &&
+          update.toolCallId === "task_mcp1" &&
+          update.status
+            ? [String(update.status)]
+            : [],
+        );
+        expect(statuses).toEqual(["in_progress", "cancelled"]);
+      });
+
+      it("sends such a task's call before the state snapshot of session/resume", async () => {
+        scriptTurns(lateTaskStarts);
+        let resumed: v2.SessionUpdate[] = [];
+        await promptUntil("idle end_turn [task_mcp1]", async (agent, sessionId, client) => {
+          const before = client.sessionUpdates.length;
+          await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+          resumed = client.sessionUpdates.slice(before).map(({ update }) => update);
+        });
+
+        expect(resumed).toEqual([
+          expect.objectContaining({
+            sessionUpdate: "tool_call_update",
+            toolCallId: "task_mcp1",
+            title: "Watch the build",
+            kind: "other",
+            status: "in_progress",
+          }),
+          {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "task_mcp1",
+            capabilities: { cancel: {} },
+          },
+          {
+            sessionUpdate: "state_update",
+            state: "idle",
+            background: [{ type: "tool_call", toolCallId: "task_mcp1" }],
+          },
+        ]);
       });
 
       // No tool call started these, such as tasks that a hook started.
       it.each([
         {
           task: workflow,
-          trace: ["running []", "running [_claude/task]", "idle end_turn [_claude/task]"],
-          background: [{ type: "_claude/task", taskId: "wf1", description: "Review" }],
+          trace: ["running []", "running [task_wf1]", "idle end_turn [task_wf1]"],
+          background: [{ type: "tool_call", toolCallId: "task_wf1" }],
         },
         // A watcher Claude Code started by itself is housekeeping.
         {
@@ -6382,7 +6527,7 @@ describe("ACP v2 terminal of a command in the background", () => {
           background: [],
         },
       ])(
-        "lists a $task.task_type task without such a call unless it is ambient",
+        "starts and lists a tool call for a $task.task_type task without such a call unless it is ambient",
         async ({ task, trace, background }) => {
           scriptTurns(async function* (options) {
             yield level(options, [task]);
