@@ -40,6 +40,7 @@ import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
 import { AcpToolCallRenderer, V2_CANCELLED } from "../tool-calls/renderer.js";
 import { changedTaskPlanEntries, unregisterHookCallback, type TaskState } from "../tools.js";
+import { recordStreamedDelta, unstreamedRemainder, type StreamedBlock } from "../streamed-text.js";
 import { replayClear, type V2UpdateTranslator } from "../v2/update-translator.js";
 
 /** Every v2 client gets the same tool call reports: v2 diffs and display terminals. */
@@ -83,8 +84,8 @@ export class SessionOutput {
   private readonly streamedToolInputs: StreamedToolInputCache = new Map();
   /** The session's Task* list (TaskCreate, TaskUpdate, TaskList), sent as plan updates. */
   readonly taskState: TaskState = new Map();
-  /** The API ids of the assistant messages whose text streamed as deltas. */
-  private readonly streamedMessages = new Set<string>();
+  /** The text and thinking that streamed as deltas since the last message started or ended. */
+  private readonly streamedBlocks: StreamedBlock[] = [];
   /** The id of the assistant message that is streaming. */
   private streamingMessageId: string | undefined;
   /** Whether any agent text went out since {@link resetAgentText}. */
@@ -94,8 +95,11 @@ export class SessionOutput {
   /** The open tool calls whose tool use reached a complete assistant message: Claude Code runs them. */
   private readonly dispatched = new Set<string>();
   /**
-   * Whether the tool results come from work that a `session/cancel` stopped:
-   * an error result then ends a run that the cancel aborted (`cancelled`).
+   * Whether the output comes from work that a `session/cancel` stopped, until
+   * its idle. As on the bridge, the main conversation's streamed deltas still
+   * go out, and of its consolidated messages only the tool results of the
+   * calls that the client holds, where an error result ends a run that the
+   * cancel aborted (`cancelled`). A subagent's session does not set it.
    */
   cancelled = false;
   /** During {@link replay}, the replayed tool uses, apart from the live ones. */
@@ -130,8 +134,11 @@ export class SessionOutput {
     if (message.parent_tool_use_id !== null && !this.subagent) return;
     if (message.event.type === "message_start") {
       this.streamingMessageId = message.event.message.id;
-      this.streamedMessages.add(message.event.message.id);
+      // A message that never reached its consolidated message, such as one an
+      // interrupt cut short, leaves its record behind.
+      this.streamedBlocks.length = 0;
     }
+    recordStreamedDelta(this.streamedBlocks, message.event);
     this.emit(
       streamEventToAcpNotifications(
         message,
@@ -152,30 +159,27 @@ export class SessionOutput {
   }
 
   /**
-   * A consolidated assistant message. Its text and thinking streamed already
-   * when the message's stream started (`message_start` with the same id),
-   * so only its other blocks go out: a tool use then gets its complete input.
-   * A message that never streamed (a gateway without streaming) goes out
-   * whole. A subagent's message on the root session goes without its text,
-   * which belongs to the subagent's own session.
-   *
-   * A stream that an interrupt cut short leaves its tail out. The v1 core
-   * diffs the text against the deltas to send that tail
-   * (`unstreamedRemainder`); this core does not.
+   * A consolidated assistant message. Of its text and thinking, only what did
+   * not stream as deltas goes out, as on the bridge (`unstreamedRemainder`):
+   * the tail of a block whose stream was cut short, or the whole message when
+   * it never streamed (a gateway without streaming). Its tool uses then get
+   * their complete input. A subagent's message on the root session goes
+   * without its text, which belongs to the subagent's own session. After a
+   * cancel, the stopped work's message is dropped (see {@link cancelled}).
    */
   assistant(message: SDKAssistantMessage): void {
     const messageId = messageIdForGrouping(message);
     for (const block of message.message.content) {
       if (block.type === "tool_use") this.dispatched.add(block.id);
     }
-    const streamed =
-      message.message.id !== undefined && this.streamedMessages.delete(message.message.id);
-    const dropText = streamed || (message.parent_tool_use_id !== null && !this.subagent);
-    const content = dropText
-      ? message.message.content.filter(
+    const ownText = message.parent_tool_use_id === null || this.subagent;
+    const content = ownText
+      ? unstreamedRemainder(message.message.content, this.streamedBlocks)
+      : message.message.content.filter(
           (block) => block.type !== "text" && block.type !== "thinking",
-        )
-      : message.message.content;
+        );
+    if (ownText) this.streamedBlocks.length = 0;
+    if (this.cancelled && message.parent_tool_use_id === null) return;
     this.content(content, "assistant", message.parent_tool_use_id, { messageId });
   }
 
@@ -190,14 +194,22 @@ export class SessionOutput {
     transform: (notification: AcpSessionNotification) => AcpSessionNotification = (n) => n,
   ): void {
     if (!Array.isArray(message.message.content)) return;
-    const results = message.message.content.filter((block) => block.type === "tool_result");
+    const all = message.message.content.filter((block) => block.type === "tool_result");
+    // After a cancel, only the results of the calls that the client holds (see {@link cancelled}).
+    const results =
+      this.cancelled && message.parent_tool_use_id === null
+        ? all.filter((block) =>
+            this.emittedToolCalls.has((block as { tool_use_id: string }).tool_use_id),
+          )
+        : all;
     if (results.length === 0) return;
     this.content(
       results,
       "user",
       message.parent_tool_use_id,
       {
-        toolUseResult: message.tool_use_result,
+        // `tool_use_result` describes the one result of its message.
+        toolUseResult: results.length === all.length ? message.tool_use_result : undefined,
         toolResultMeta: (message as { tool_result_meta?: unknown }).tool_result_meta,
         cancelled: this.cancelled,
       },

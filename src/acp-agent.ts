@@ -410,6 +410,7 @@ import {
   type UltracodeOptionState,
 } from "./session-ultracode.js";
 import { STARTUP_FAILURE_RESULTS_ENV, startupFailureError } from "./startup-failure.js";
+import { recordStreamedDelta, unstreamedRemainder, type StreamedBlock } from "./streamed-text.js";
 
 export { EFFORT_CONFIG_ID, settingsEffortForModel } from "./session-effort.js";
 export {
@@ -1853,56 +1854,6 @@ function withoutEffort(params: NewSessionRequest): NewSessionRequest {
 const AUTH_REQUIRED_CODE = RequestError.authRequired().code;
 
 export type { ToolUpdateMeta } from "./tool-calls/renderer.js";
-
-/** Text or thinking that streamed live as deltas, accumulated per block. */
-type StreamedBlock = { index: number; type: "text" | "thinking"; text: string };
-
-/**
- * The blocks of a consolidated assistant message without the text that
- * already streamed as deltas.
- *
- * Each assembled text/thinking block is diffed against the streamed blocks in
- * document order: nothing is left if it streamed in full (the common case),
- * the whole block if it never streamed (a non-streaming gateway), and just the
- * tail if the stream was cut short mid-block. Matching on content rather than
- * the message id keeps the dedupe robust for gateways without a stable id.
- * Tool-use and other blocks pass through untouched.
- */
-function unstreamedRemainder<Block extends { type: string }>(
-  blocks: Block[],
-  streamedBlocks: StreamedBlock[],
-): Block[] {
-  const kept: Block[] = [];
-  let streamPos = 0;
-  for (const item of blocks) {
-    if (item.type !== "text" && item.type !== "thinking") {
-      kept.push(item);
-      continue;
-    }
-    const block = item as Block & { text?: string; thinking?: string };
-    const full = (item.type === "text" ? block.text : block.thinking) ?? "";
-    // Empty assembled blocks carry nothing: drop them.
-    if (full.length === 0) continue;
-    // A streamed block of the same type whose text is a prefix of this one
-    // was already delivered, at least partly. A non-empty streamed text is
-    // required so an empty or aborted streamed block does not swallow it.
-    const streamed = streamedBlocks[streamPos];
-    if (
-      streamed &&
-      streamed.type === item.type &&
-      streamed.text.length > 0 &&
-      full.startsWith(streamed.text)
-    ) {
-      streamPos++;
-      const remainder = full.slice(streamed.text.length);
-      if (remainder.length === 0) continue;
-      kept.push({ ...item, [item.type === "text" ? "text" : "thinking"]: remainder });
-      continue;
-    }
-    kept.push(item);
-  }
-  return kept;
-}
 
 /** Attributes a report to the Agent/Task tool call of the subagent that made it. */
 function stampParentToolUseId(update: SessionNotification["update"], parentToolUseId: string) {
@@ -7340,32 +7291,7 @@ export class ClaudeAcpAgent {
             // already reached the client as chunks and forward only the
             // remainder. Each stream (top level or one subagent) keeps its own
             // record, so a subagent cannot attribute content to another stream.
-            // Contiguous deltas of the same block (same index and type) extend
-            // the current entry; anything else opens a new one.
-            if (message.event.type === "content_block_delta") {
-              const delta = message.event.delta;
-              const chunk =
-                delta.type === "text_delta"
-                  ? { type: "text" as const, text: delta.text }
-                  : delta.type === "thinking_delta"
-                    ? { type: "thinking" as const, text: delta.thinking }
-                    : undefined;
-              // Skip empty deltas (some gateways emit empty thinking chunks —
-              // #793): appending "" is a no-op, but pushing a "" entry would
-              // create a block the consolidated handler's `text.length > 0`
-              // guard can never consume, stalling the diff cursor and
-              // re-emitting the next block as a duplicate.
-              if (chunk?.text) {
-                const index = message.event.index;
-                const streamedBlocks = streamedBlocksOf(message.parent_tool_use_id);
-                const last = streamedBlocks[streamedBlocks.length - 1];
-                if (last && last.index === index && last.type === chunk.type) {
-                  last.text += chunk.text;
-                } else {
-                  streamedBlocks.push({ index, type: chunk.type, text: chunk.text });
-                }
-              }
-            }
+            recordStreamedDelta(streamedBlocksOf(message.parent_tool_use_id), message.event);
             // The stream sees a tool_use first, so the tool's PostToolUse hook
             // is registered here, and publishes through this client: a
             // subagent's hook update must reach the child session too.

@@ -857,7 +857,7 @@ export class NativeSession implements RequestTarget {
         sessionUpdate: "state_update",
         state: "idle",
         ...(this.cancelledWork
-          ? { stopReason: "cancelled" as const }
+          ? idleOutcome(undefined, true, undefined, this.turnCommand !== undefined)
           : {
               stopReason: "error" as const,
               error: { code: failure.code, message: failure.message },
@@ -962,7 +962,12 @@ export class NativeSession implements RequestTarget {
         return {
           sessionUpdate: "state_update",
           state,
-          ...idleOutcome(this.lastEnd, this.cancelledWork, this.turnReport),
+          ...idleOutcome(
+            this.lastEnd,
+            this.cancelledWork,
+            this.turnReport,
+            this.turnCommand !== undefined,
+          ),
         };
     }
   }
