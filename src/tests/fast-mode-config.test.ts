@@ -11,9 +11,8 @@ import {
   FAST_MODE_CONFIG_ID,
   FAST_MODE_ON,
   FAST_MODE_OFF,
-  ClaudeAcpAgent,
-  type AcpClient,
-} from "../acp-agent.js";
+} from "../session-config-options.js";
+import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
 
 const MODES = {
   currentModeId: "default",
