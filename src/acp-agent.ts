@@ -80,7 +80,6 @@ import {
   SDKSystemMessage,
   SessionMessage,
   SDKUserMessage,
-  SDKUserMessageReplay,
   Settings,
   SlashCommand,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -253,6 +252,17 @@ import {
   shouldHideClaudeAuth,
   warnClaudeSubscriptionGuardDegraded,
 } from "./hide-claude-auth.js";
+import {
+  adapterRemoteControlCommand,
+  claudeCodeOffersCommand,
+  isRemoteHumanMessage,
+  parseRemoteControlCommand,
+  REMOTE_CONTROL_COMMAND_NAME,
+  type RemoteControlCommand,
+  type RemoteControlQuery,
+  runRemoteControlCommand,
+  supportsRemoteControl,
+} from "./remote-control.js";
 import {
   AGENT_FILE_CHANGE_REPORT_CAPABILITY,
   agentFileChangeReportMeta,
@@ -608,66 +618,6 @@ async function structuredUsageMarkdown(
     logger.error(`Structured /usage failed; preserving Claude Code output: ${error}`);
     return null;
   }
-}
-
-/** Runtime Remote Control control exposed by the pinned Agent SDK. Like
- *  `mcpAuthenticate`, it is not in the public `Query` declaration yet. The CLI's
- *  own `/remote-control` is terminal-bound and not offered to SDK hosts, so the
- *  adapter handles the command itself and answers with the session URL. */
-type RemoteControlQuery = Query & {
-  enableRemoteControl(
-    enabled: boolean,
-    name?: string,
-  ): Promise<{ session_url?: string; connect_url?: string }>;
-};
-
-function supportsRemoteControl(query: Query): query is RemoteControlQuery {
-  return typeof (query as Partial<RemoteControlQuery>).enableRemoteControl === "function";
-}
-
-const REMOTE_CONTROL_COMMAND_NAME = "remote-control";
-
-type RemoteControlCommand = { action: "connect"; name?: string } | { action: "disconnect" };
-
-/** Parses `/remote-control [name]` and `/remote-control off` from a single-text
- *  prompt. Connecting is idempotent, so the command never needs to know whether
- *  Remote Control is already on. */
-function parseRemoteControlCommand(prompt: PromptRequest["prompt"]): RemoteControlCommand | null {
-  const [first] = prompt;
-  if (prompt.length !== 1 || first?.type !== "text") return null;
-  const match = /^\/remote-control(?:\s+([\s\S]*))?$/.exec(first.text.trim());
-  if (!match) return null;
-  const argument = match[1]?.trim();
-  if (argument?.toLowerCase() === "off") return { action: "disconnect" };
-  return argument ? { action: "connect", name: argument } : { action: "connect" };
-}
-
-/** A top-level message a person typed in another client of the session, such
- *  as claude.ai or the Claude mobile app over Remote Control. Tool results and
- *  the CLI's own synthetic messages are user-role too, but carry no human
- *  origin. */
-function isRemoteHumanMessage(message: SDKUserMessage | SDKUserMessageReplay): boolean {
-  return (
-    message.type === "user" &&
-    message.origin?.kind === "human" &&
-    message.parent_tool_use_id === null &&
-    !message.isSynthetic
-  );
-}
-
-/** Whether Claude Code offers a slash command of this name to an ACP client.
- *  This is the rule `getAvailableSlashCommands` applies when it lists the
- *  commands, so the adapter stands in for the command exactly when the client
- *  sees the adapter's entry: Claude Code's terminal-bound commands are not
- *  offered, and a user's own command or skill of the name is never shadowed. */
-function claudeCodeOffersCommand(
-  commands: readonly SlashCommand[],
-  terminalCommands: readonly string[] | undefined,
-  name: string,
-): boolean {
-  return commands.some(
-    (command) => command.name === name && !terminalCommands?.includes(command.name),
-  );
 }
 
 /** Error surfaced when the SDK declares a turn over (`session_state_changed:
@@ -3269,16 +3219,16 @@ export class ClaudeAcpAgent {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
 
-    const remoteControlCommand = parseRemoteControlCommand(params.prompt);
-    if (
-      remoteControlCommand &&
-      supportsRemoteControl(session.query) &&
-      !claudeCodeOffersCommand(
-        await session.query.supportedCommands(),
-        session.terminalSlashCommands,
-        REMOTE_CONTROL_COMMAND_NAME,
-      )
-    ) {
+    // Only a prompt that is the command awaits here: an await on every prompt
+    // would let other work run between its checks and its turn's enqueue.
+    const remoteControl = parseRemoteControlCommand(params.prompt)
+      ? await adapterRemoteControlCommand(
+          params.prompt,
+          session.query,
+          session.terminalSlashCommands,
+        )
+      : null;
+    if (remoteControl) {
       // The reply bypasses the turn queue, so it would land inside the output of
       // a turn that is still running, and v2 would report no `running` state
       // around it. Refuse instead of interleaving. `foregroundWork` also covers
@@ -3307,11 +3257,7 @@ export class ClaudeAcpAgent {
       // The request goes over the network. Until it and its reply are done,
       // `remoteControlCommand` holds back the prompts that follow, which would
       // otherwise start a turn that the reply lands in.
-      const command = this.runRemoteControlCommand(
-        params.sessionId,
-        session.query,
-        remoteControlCommand,
-      );
+      const command = this.runRemoteControlCommand(params.sessionId, remoteControl);
       session.remoteControlCommand = command;
       try {
         await command;
@@ -3429,32 +3375,14 @@ export class ClaudeAcpAgent {
     );
   }
 
-  /** Connects Remote Control (again, if it is already on) or disconnects it. */
+  /** Runs the command, and sends its reply (see `runRemoteControlCommand`). */
   private async runRemoteControlCommand(
     sessionId: string,
-    query: RemoteControlQuery,
-    command: RemoteControlCommand,
+    { query, command }: { query: RemoteControlQuery; command: RemoteControlCommand },
   ): Promise<void> {
-    let text: string;
-    if (command.action === "disconnect") {
-      try {
-        await query.enableRemoteControl(false);
-        text = "Remote Control is off. Run /remote-control to reconnect.";
-      } catch (error) {
-        this.logger.error(`Failed to disable Remote Control: ${error}`);
-        text = `Could not stop Remote Control: ${error instanceof Error ? error.message : error}`;
-      }
-    } else {
-      try {
-        const result = await query.enableRemoteControl(true, command.name);
-        text = result.session_url
-          ? `Remote Control is active. Continue this session from claude.ai/code or the Claude mobile app:\n\n${result.session_url}\n\nRun /remote-control off to disconnect.`
-          : "Remote Control is active, but Claude Code did not return a session URL.";
-      } catch (error) {
-        this.logger.error(`Failed to enable Remote Control: ${error}`);
-        text = `Could not start Remote Control: ${error instanceof Error ? error.message : error}`;
-      }
-    }
+    const text = await runRemoteControlCommand(query, command, (message) =>
+      this.logger.error(message),
+    );
     await this.client.sessionUpdate({
       sessionId,
       update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },

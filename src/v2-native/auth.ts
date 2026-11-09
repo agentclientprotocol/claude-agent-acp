@@ -8,13 +8,16 @@
  * `initialize`, from each session's account, after a login or a logout, and at
  * the start of each prompt (see `auth-status.ts`).
  *
- * A gateway login or provider change routes the sessions started after it.
- * Unlike the bridge, it does not recreate the queries of live sessions: they
- * keep their route until they are closed and resumed.
+ * A gateway login routes the sessions started after it, as on the bridge.
+ * `providers/set`, `providers/disable`, and a logout that drops a provider or
+ * a gateway login also route the live sessions: each one's query restarts at
+ * its next turn boundary (see `restarts.ts`), and the request answers once
+ * they did.
  */
 import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { AccountInfo, ModelInfo, Settings } from "@anthropic-ai/claude-agent-sdk";
+import type { AuthStatusKind } from "../auth-status.js";
 import type { Logger } from "../acp-agent.js";
 import { terminalAuthMethods } from "../auth-methods.js";
 import {
@@ -58,11 +61,21 @@ export interface SessionRouting {
   narrowsModels: boolean;
 }
 
+/** What the auth state tells the rest of the core. */
+export interface AuthEvents {
+  /** The route of live sessions changed: resolves once each one follows it. */
+  routeChanged(): Promise<void>;
+  /** An auth status probe read the identity `kind`. */
+  probed(kind: AuthStatusKind): void;
+}
+
 export class NativeAuth {
   private gatewayLogin?: GatewayAuthRequest;
   private provider?: ProviderConfig;
   /** Runs `providers/set` and `providers/disable` one at a time, in arrival order. */
   private providerUpdate: Promise<unknown> = Promise.resolve();
+  /** How many of {@link providerUpdate} have not settled. */
+  private providerUpdates = 0;
   /** The settings of each live session, for the probe at the start of its prompts. */
   private readonly sessionSettings = new Map<string, AuthStatusSettings>();
   private readonly status: AuthStatusReporter;
@@ -70,12 +83,14 @@ export class NativeAuth {
   constructor(
     ctx: v2.AgentContext,
     private readonly logger: Logger,
+    private readonly events: AuthEvents,
   ) {
     this.status = new AuthStatusReporter({
       push: (authStatus) => ctx.notify(AUTH_STATUS_UPDATE_METHOD, { authStatus }),
       logger,
       gatewayLogin: () => this.gatewayLogin !== undefined,
       providerOverride: () => this.provider !== undefined,
+      onProbe: (kind) => events.probed(kind),
     });
   }
 
@@ -131,15 +146,23 @@ export class NativeAuth {
    * survives it).
    */
   async logout(): Promise<v2.LogoutAuthResponse> {
+    // A `providers/set` that is still listing would set a provider too.
+    const routed = this.overridesRoute() || this.providerUpdates > 0;
     this.gatewayLogin = undefined;
     this.status.changed();
-    // After a `providers/set` that is still listing, which would set it again.
     await this.updateProvider(async () => {
       this.provider = undefined;
     });
     // The windows learned under this login must not seed sessions under the next.
     clearContextWindowCache();
-    await cliLogout();
+    try {
+      await cliLogout();
+    } finally {
+      // The live sessions leave the dropped route, also when the CLI logout
+      // failed. A plain CLI login needs no restart: the running CLI picks up
+      // the logout by itself.
+      if (routed) await this.events.routeChanged();
+    }
     // The read starts after the credentials were cleared, so it does not join
     // a probe in flight. If it cannot read them, the logout still happened.
     if (!(await this.status.probe({ fresh: true }))) {
@@ -157,6 +180,7 @@ export class NativeAuth {
     await this.updateProvider(async () => {
       this.provider = await withListedModels(config, this.provider, this.logger);
     });
+    await this.events.routeChanged();
     return {};
   }
 
@@ -166,8 +190,19 @@ export class NativeAuth {
       await this.updateProvider(async () => {
         this.provider = undefined;
       });
+      await this.events.routeChanged();
     }
     return {};
+  }
+
+  /** Whether a provider or a gateway login routes the traffic, rather than the CLI's own login. */
+  overridesRoute(): boolean {
+    return (this.provider ?? gatewayRequestToProviderConfig(this.gatewayLogin)) != null;
+  }
+
+  /** Settles once the provider changes that came so far have applied. */
+  async routeSettled(): Promise<void> {
+    await this.providerUpdate.catch(() => undefined);
   }
 
   /** The route of a session that starts now: the provider, else the gateway login. */
@@ -213,6 +248,14 @@ export class NativeAuth {
     void this.status.probe();
   }
 
+  /** Reports the account that the query of `sessionId` cached, as the identity. */
+  publishAccount(sessionId: string, account: AccountInfo): void {
+    this.status.publishSessionAccount(
+      account,
+      this.sessionSettings.get(sessionId)?.getApiKeyHelper(),
+    );
+  }
+
   sessionEnded(sessionId: string): void {
     this.sessionSettings.delete(sessionId);
   }
@@ -220,6 +263,11 @@ export class NativeAuth {
   private updateProvider(update: () => Promise<void>): Promise<void> {
     const next = this.providerUpdate.catch(() => undefined).then(update);
     this.providerUpdate = next;
+    this.providerUpdates++;
+    const settled = () => {
+      this.providerUpdates--;
+    };
+    next.then(settled, settled);
     return next;
   }
 }

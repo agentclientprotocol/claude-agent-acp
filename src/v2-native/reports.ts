@@ -163,6 +163,14 @@ export class SessionReports {
     );
   }
 
+  /**
+   * The session's query restarted with the same MCP servers (see
+   * `restarts.ts`): a server already reported is not reported again.
+   */
+  restartedFrom(previous: SessionReports): void {
+    for (const server of previous.reportedMcpServers) this.reportedMcpServers.add(server);
+  }
+
   /** The session's MCP servers changed, as a resume of the active session asks. */
   mcpServersChanged(names: readonly string[]): void {
     this.clientMcpServers = new Set(names);

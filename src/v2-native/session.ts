@@ -76,6 +76,7 @@ import { StoppedWork } from "./stopped-work.js";
 import { SessionReports } from "./reports.js";
 import { SessionElicitations } from "./elicitation.js";
 import { SessionOutput } from "./stream.js";
+import { SessionRemoteControl } from "./remote-control.js";
 import { SessionTasks, type RequestTarget } from "./tasks.js";
 
 /** What a session needs of its connection. */
@@ -97,6 +98,8 @@ export interface SessionConnection {
   completeElicitation(params: CompleteElicitationNotification): Promise<void>;
   /** The session's query ended on its own: the session is no longer active. */
   ended(sessionId: string): void;
+  /** A turn of the session failed for a missing login (`authRequired`). */
+  signedOut(sessionId: string): void;
 }
 
 type PendingPrompt = {
@@ -175,6 +178,13 @@ export class NativeSession implements RequestTarget {
   private turnLocalCommand: { command: McpCommand; abort: AbortController } | undefined;
   /** The JSON of the query's MCP servers. */
   private mcpServers = "";
+  /** The adapter's `/remote-control`, and messages typed in other clients. */
+  private readonly remoteControl: SessionRemoteControl;
+  /** Who waits for {@link turnBoundary}, with whether it counts subagents. */
+  private readonly boundaryWaiters: Array<{
+    subagents: boolean;
+    resolve: (reached: boolean) => void;
+  }> = [];
 
   constructor(
     readonly sessionId: string,
@@ -269,6 +279,20 @@ export class NativeSession implements RequestTarget {
       target: (agentId) => this.target(agentId),
       query: () => this.query,
     });
+    this.remoteControl = new SessionRemoteControl({
+      logger: connection.logger,
+      query: () => this.query,
+      terminalCommands: () => this.commands.terminal(),
+      idle: () => this.turnBoundary(false),
+      begin: (uuid) => {
+        this.inserted(uuid);
+        this.openTurn(undefined);
+      },
+      end: (text, messageId) => {
+        this.output.agentMessage(text, messageId);
+        this.closeTurn();
+      },
+    });
   }
 
   /**
@@ -341,19 +365,74 @@ export class NativeSession implements RequestTarget {
     const message = { ...promptToClaude(request), uuid };
     const localCommand = this.commands.localCommand(request.prompt);
     if (localCommand) this.localCommands.set(uuid, localCommand);
+    const remoteControl = this.remoteControl.mayRun(request.prompt);
     return new Promise((resolve, reject) => {
       const pending: PendingPrompt = { prompt: params.prompt, pushed: false, resolve, reject };
       this.pending.set(uuid, pending);
+      // A cancel or close answered it before it went out.
+      const answered = () => this.pending.get(uuid) !== pending || this.closed;
       this.pushes = this.pushes
         .then(() => this.interrupting)
-        .then(() => {
-          // A cancel or close answered it before it went out.
-          if (this.pending.get(uuid) !== pending || this.closed) return;
+        .then(async () => {
+          if (answered()) return;
+          // The prompts after the adapter's `/remote-control` wait for it.
+          if (remoteControl) {
+            try {
+              if (await this.remoteControl.run(request.prompt, uuid, () => !answered())) return;
+            } catch (error) {
+              this.failPrompt(uuid, error);
+              return;
+            }
+            if (answered()) return;
+          }
           pending.pushed = true;
+          this.remoteControl.pushed(uuid);
           this.input.push(message);
           this.reports.promptQueued(request.prompt);
         });
     });
+  }
+
+  /**
+   * Whether no work runs that a restart of the query would cut: no turn is
+   * open, no prompt waits in Claude Code's queue, and, with `subagents`, no
+   * subagent runs.
+   */
+  atTurnBoundary(subagents: boolean): boolean {
+    return (
+      !this.closed &&
+      !this.foreground &&
+      ![...this.pending.values()].some((prompt) => prompt.pushed) &&
+      !(subagents && this.tasks.hasLiveSubagents())
+    );
+  }
+
+  /**
+   * Resolves `true` at the next turn boundary (see {@link atTurnBoundary}),
+   * at once if the session is at one, and `false` once the session closed.
+   */
+  turnBoundary(subagents: boolean): Promise<boolean> {
+    if (this.closed) return Promise.resolve(false);
+    if (this.atTurnBoundary(subagents)) return Promise.resolve(true);
+    return new Promise((resolve) => this.boundaryWaiters.push({ subagents, resolve }));
+  }
+
+  private checkBoundary(): void {
+    for (const waiter of [...this.boundaryWaiters]) {
+      if (!this.closed && !this.atTurnBoundary(waiter.subagents)) continue;
+      this.boundaryWaiters.splice(this.boundaryWaiters.indexOf(waiter), 1);
+      waiter.resolve(!this.closed);
+    }
+  }
+
+  /** Whether `prompt` may be the adapter's `/remote-control` (see `remote-control.ts`). */
+  mayRunRemoteControl(prompt: v2.ContentBlock[]): boolean {
+    return this.remoteControl.mayRun(prompt);
+  }
+
+  /** The query, for the subscription guard's read of its cached account. */
+  claudeQuery(): Query | undefined {
+    return this.query;
   }
 
   /**
@@ -377,8 +456,12 @@ export class NativeSession implements RequestTarget {
       this.pushes = this.pushes
         .then(() => this.interrupting)
         .then(() => {
-          if (this.closed) resolve();
-          else this.input.push(message);
+          if (this.closed) {
+            resolve();
+            return;
+          }
+          this.remoteControl.pushed(message.uuid);
+          this.input.push(message);
         });
     });
   }
@@ -498,11 +581,28 @@ export class NativeSession implements RequestTarget {
       this.closeTurn();
       this.failPending(RequestError.requestCancelled());
       this.closed = true;
+      this.checkBoundary();
       this.endReports();
       this.input.end();
       this.query?.close();
     })();
     return this.closing;
+  }
+
+  /**
+   * Ends the session's query, which a new one replaced (see `restarts.ts`).
+   * The session is idle then. Its background work ends with the query: its
+   * terminals exit and its listed tool calls end before the list drops them,
+   * as when a query ends. Then it closes as {@link close} does.
+   */
+  retire(): Promise<void> {
+    if (!this.closed && !this.closing) {
+      this.tasks.queryEnded({
+        code: RequestError.internalError().code,
+        message: "The session's query restarted",
+      });
+    }
+    return this.close();
   }
 
   // --- Permission requests -----------------------------------------------
@@ -669,6 +769,7 @@ export class NativeSession implements RequestTarget {
             error,
           );
         }
+        this.checkBoundary();
       }
       this.ended(undefined);
     } catch (error) {
@@ -712,6 +813,9 @@ export class NativeSession implements RequestTarget {
         // in. A prompt Claude Code reported `started` for is inserted already.
         if ("isReplay" in message && message.isReplay) {
           if (message.uuid && message.parent_tool_use_id === null) {
+            // A message typed in another client of the session, as on the bridge.
+            const remote = this.remoteControl.remoteMessage(message);
+            if (remote !== undefined) this.output.userMessage(remote, message.uuid);
             this.promptStarted(message.uuid);
           }
           return;
@@ -1000,6 +1104,7 @@ export class NativeSession implements RequestTarget {
       });
     }
     this.closed = true;
+    this.checkBoundary();
     this.connection.ended(this.sessionId);
   }
 
@@ -1062,6 +1167,7 @@ export class NativeSession implements RequestTarget {
     this.ownCommandDone = undefined;
     ownCommandDone?.();
     this.turnLocalCommand = undefined;
+    this.checkBoundary();
   }
 
   /**
@@ -1088,7 +1194,12 @@ export class NativeSession implements RequestTarget {
     // if the work goes on after all, such as when the interrupt fails.
     if (withdrawnByCancel && state === "running") return;
     this.reportedState = state;
-    this.send(this.stateUpdate(state));
+    const update = this.stateUpdate(state);
+    this.send(update);
+    const error = (update as { error?: { code?: unknown } }).error;
+    if (state === "idle" && error?.code === RequestError.authRequired().code) {
+      this.connection.signedOut(this.sessionId);
+    }
   }
 
   private stateUpdate(state: ForegroundState): v2.SessionUpdate {
@@ -1128,6 +1239,7 @@ export class NativeSession implements RequestTarget {
     this.pending.delete(uuid);
     this.localCommands.delete(uuid);
     prompt.reject(error);
+    this.checkBoundary();
     return true;
   }
 
