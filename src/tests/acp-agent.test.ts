@@ -23,6 +23,7 @@ import {
   WriteTextFileResponse,
 } from "@agentclientprotocol/sdk/unstable";
 import type { AcpSessionNotification } from "../acp-subagents.js";
+import type { SessionCronSummary } from "@anthropic-ai/claude-agent-sdk";
 import { NativeSubagentRuntime } from "../native-subagents.js";
 import { nodeToWebWritable, nodeToWebReadable } from "../utils.js";
 import {
@@ -118,6 +119,79 @@ import type {
   BetaCodeExecutionToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { validateRecorded } from "./acp-scenarios/schema.js";
+
+describe("session schedule updates", () => {
+  const schedules: SessionCronSummary[] = [
+    {
+      id: "cron-1",
+      schedule: "0 9 * * 1-5",
+      recurring: true,
+      prompt: "Check the logs",
+    },
+  ];
+
+  it("sends changed complete lists, including empty, and repeats a live snapshot after load", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: AcpSessionNotification) => {
+          updates.push(notification);
+        },
+      } as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { _meta: { asyncTaskDetails: { schedules: true } } },
+    });
+    agent.sessions["test-session"] = mockSessionState();
+    const publish = (list: SessionCronSummary[]) =>
+      (
+        agent as unknown as {
+          publishSessionSchedules: (id: string, list: SessionCronSummary[]) => Promise<void>;
+        }
+      ).publishSessionSchedules("test-session", list);
+    await publish(schedules);
+    await publish([...schedules]);
+    await publish([]);
+    await publish([]);
+    expect(
+      updates
+        .filter((n) => n.update.sessionUpdate === "session_schedules_update")
+        .map((n) => n.update),
+    ).toEqual([
+      { sessionUpdate: "session_schedules_update", schedules },
+      { sessionUpdate: "session_schedules_update", schedules: [] },
+    ]);
+    await publish(schedules);
+    await (
+      agent as unknown as { repeatSessionSchedules: (id: string) => Promise<void> }
+    ).repeatSessionSchedules("test-session");
+    expect(
+      updates.filter((n) => n.update.sessionUpdate === "session_schedules_update"),
+    ).toHaveLength(4);
+  });
+
+  it("keeps schedules private without negotiation", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: AcpSessionNotification) => {
+          updates.push(notification);
+        },
+      } as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    agent.sessions["test-session"] = mockSessionState();
+    await (
+      agent as unknown as {
+        publishSessionSchedules: (id: string, list: SessionCronSummary[]) => Promise<void>;
+      }
+    ).publishSessionSchedules("test-session", schedules);
+    expect(updates.some((n) => n.update.sessionUpdate === "session_schedules_update")).toBe(false);
+  });
+});
 
 /** The capabilities of an AIR client. Only AIR gets the AIR extensions of
  *  `docs/air-extensions.md`. */
@@ -30922,5 +30996,25 @@ describe("permission_denied", () => {
     );
 
     expect(denials(updates)).toHaveLength(1);
+  });
+});
+
+describe("asyncTaskDetails negotiation", () => {
+  function agent() {
+    return new ClaudeAcpAgent({ sessionUpdate: async () => {} } as unknown as AcpClient, {
+      log: () => {},
+      error: () => {},
+    });
+  }
+
+  it("advertises schedules only to a client that asks for it", async () => {
+    const asked = await agent().initialize({
+      protocolVersion: 1,
+      clientCapabilities: { _meta: { asyncTaskDetails: { schedules: true } } },
+    });
+    expect(asked._meta?.asyncTaskDetails).toEqual({ schedules: true });
+
+    const silent = await agent().initialize({ protocolVersion: 1, clientCapabilities: {} });
+    expect(silent._meta).not.toHaveProperty("asyncTaskDetails");
   });
 });

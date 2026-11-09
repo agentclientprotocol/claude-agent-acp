@@ -106,13 +106,20 @@ export type AsyncTaskStateUpdate = {
   _meta?: Record<string, unknown> | null;
 };
 
+export type SessionSchedulesUpdate = {
+  sessionUpdate: "session_schedules_update";
+  schedules: import("@anthropic-ai/claude-agent-sdk").SessionCronSummary[];
+  _meta?: Record<string, unknown> | null;
+};
+
 export type AcpSessionUpdate =
   | SessionNotification["update"]
   | SubagentSpawnedUpdate
   | SubagentStateUpdate
   | AsyncTaskSpawnedUpdate
   | AsyncTaskProgressUpdate
-  | AsyncTaskStateUpdate;
+  | AsyncTaskStateUpdate
+  | SessionSchedulesUpdate;
 
 export type AcpSessionNotification = Omit<SessionNotification, "update"> & {
   update: AcpSessionUpdate;
