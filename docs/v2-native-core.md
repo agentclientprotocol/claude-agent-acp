@@ -1,9 +1,8 @@
 # The native ACP v2 core
 
-Status: the default v2 core, for every client but JetBrains AIR. A v2 client whose `initialize`
-declares `_meta.jetbrains.air` gets the bridge, which serves it the AIR extensions (see
-"Not served yet"). `CLAUDE_AGENT_ACP_V2_CORE=bridge` serves every v2 client with the bridge, as a
-fallback until the bridge is deleted.
+Status: the default v2 core, for every v2 client, JetBrains AIR too. It serves AIR the AIR
+extensions that ACP v2 does not cover (see "AIR clients"). `CLAUDE_AGENT_ACP_V2_CORE=bridge`
+serves every v2 client with the bridge, as a fallback until the bridge is deleted.
 
 ## Why
 
@@ -185,6 +184,56 @@ After a replay's response, a replayed child whose configuration is not the `mode
 replay sent gets it again, as on the bridge: a live child's whole configuration (such as the mode
 that its hooks reported), else the model of its latest response, by the session's model list.
 
+## AIR clients
+
+A v2 client that declares `_meta.jetbrains.air` in `initialize` gets the AIR extensions of
+`docs/air-extensions.md` that ACP v2 does not cover, with the wire output that the v1 core gives
+AIR. `src/v2-native/air.ts` reads what the client declared, and every other client gets none of
+them. The `initialize` response lists the served capabilities that AIR's agent declaration
+lists: `_meta.jetbrains.air.capabilities` is `["agentFileChangeReport", "recommendedValue"]`.
+
+- `recommendedValue`, when declared: the model and effort options lose their `default` rows and
+  carry `_meta.jetbrains.air.recommendedValue` (`config.ts`, on the shared
+  `buildConfigOptions`). The shown effort is set on the query at the session's start and at each
+  model switch (`settleEffortAfterModelSwitch`), as on v1. A failed set at the start fails the
+  setup request, as on v1.
+- The permission presentation: each permission request carries
+  `_meta.jetbrains.air.permission` with its `title`, `description` and `defaultToNo`, next to
+  v2's own `title` and `description`. Its tool call's `_meta.claudeCode` follows AIR's rule
+  (`permissionToolCallMeta`): no `toolName` and no `parentToolUseId`. The tool call keeps the v2
+  rendering that the stream gives it.
+- AskUserQuestion's "Other" fields carry AIR's custom answer marker (`customAnswer`, and the
+  legacy root key).
+- The predicted follow-up prompt (`reports.ts`, on the shared `PromptSuggestions`): the query
+  runs with `promptSuggestions: true` before the client's options, and the one prediction after
+  a result goes out as `session_info_update._meta.promptSuggestions`. A client prompt and a
+  `conversation_reset` clear it with `suggestions: []`, and a prediction that the next prompt
+  outran is dropped. Unlike v1, a client that is not AIR gets no `promptSuggestions` option, as
+  it would get no prediction.
+- `agentFileChangeReport`, when declared (`file-changes.ts`, on the shared reporter of
+  `file-change-audit.ts`): the query runs with file checkpointing, and a `session/prompt` whose
+  `_meta.jetbrains.air.agentFileChangeReportRequest` is valid gets one report. v1 sends it before
+  the prompt's response, at the turn's end. A v2 prompt is answered at its insertion, so the
+  report goes out at the end of the turn that serves the prompt, before that turn's idle: the
+  session reads the prompt's checkpoint (up to 2 seconds), and the idle waits for it. A turn that
+  ends `cancelled` reports `unavailable` with `cancelled`. Any other turn that ends with an error
+  or without a result reports `unavailable` with `providerError`. A prompt that a cancel answers with -32800 before its
+  insertion reports `cancelled`, and one that fails otherwise `providerError`.
+- `loadReplayEnd`, when declared (`setup.ts`): the update that ends a replay. The agent does not
+  advertise it, as on v1.
+
+These AIR extensions are not served, because ACP v2 covers them: the subagent form and
+`nativeSubagentSessions` (v2 subagent sessions), `backgroundSubagents` and `asyncTasks` (v2
+`background` lists), `planFile` (v2 file plans), `diffPatch` (v2 patch content),
+`contextCompaction` (v2 compaction updates), `customInstructions` (v2 `systemPrompt`), and
+`sessionFailure` records and their API retry warnings (an idle with `stopReason: "error"` and
+its `error`). The goal and async task stop extensions are v1 only.
+
+Not served yet: the AIR tool call contract (`commandTitle`, `subagent`, `skill`, `mcp` and
+`is_mcp_tool_call` keys, `rawInputRendering`, and the AIR shapes of `rawInput`, `rawOutput` and
+exit codes), which the shared renderer gives only with `air.client`, and the `kind` and
+`skillPath` keys of modes and skill commands. Neither core serves `sessionIndex` on v2.
+
 ## Layout
 
 - `src/v2-native/agent.ts`: the request handlers, session setup, and the SDK `query` options.
@@ -242,6 +291,9 @@ that its hooks reported), else the model of its latest response, by the session'
   when the query serves Remote Control.
 - `src/v2-native/file-preview.ts`: the PreToolUse hook that shows an Edit's or Write's exact
   patch before it runs.
+- `src/v2-native/air.ts`: the AIR extensions that the client takes, and the AIR capabilities of
+  the `initialize` response (see "AIR clients").
+- `src/v2-native/file-changes.ts`: AIR's file-change reports of a session's turns.
 - `src/v2-native/auth.ts`: `_auth/status_update`, gateway `auth/login`, `auth/logout`, and
   `providers/*`, on the v1 core's state rules (`AuthStatusReporter`, `providers.ts`). The
   identity is read after `initialize`, from each session's account, after a login or logout, and
@@ -387,13 +439,11 @@ These pieces were extracted so that both cores use the same code:
   the Agent MUST send an idle `state_update`"). Seen with `scripts/compare-v2-cores.mjs`
   (`cancel-at-start`).
 
-- The native core serves no AIR extension, so `acpProtocolRouter` (`serve.ts`) gives a v2 AIR
-  client the bridge, also with `v2Core: "native"`. On the native core, an AIR client would lose
-  what the bridge serves it: `sessionFailure` records (with the "Retrying Claude" API retry
-  warnings), prompt suggestions, file change reports (`agentFileChangeReport`), the AIR
-  permission presentation and `recommendedValue`, and AIR's subagent form, which reports no
-  `background` list. The native core's own `loadReplayEnd` event (`setup.ts`) is not reached
-  through the router.
+- A v2 AIR client gets only the AIR extensions that v2 does not cover (see "AIR clients"). The
+  bridge serves it the v1 core's AIR extensions: `sessionFailure` records (with the "Retrying
+  Claude" API retry warnings) and AIR's subagent form, which reports no `background` list, and
+  the AIR tool call contract. The native core serves v2's subagent sessions, `background` lists
+  and failed idles instead.
 - `/remote-control` runs as a local command of its own turn, as v2 asks: `running`, the reply,
   then `idle` with `end_turn`. Sent while Claude works, it waits for the work to end, and the
   prompts after it wait for it: v2 asks to hold a prompt, not to reject it, while foreground work
@@ -442,11 +492,12 @@ These pieces were extracted so that both cores use the same code:
 
 ## Not served yet
 
-The AIR extensions: a v2 AIR client gets the bridge for them (see "Intended differences").
-Nothing else that the bridge serves to v2 clients. Neither core serves these:
+To an AIR client: the AIR tool call contract and the `kind` and `skillPath` keys (see "AIR
+clients"). Nothing else that the bridge serves to v2 clients. Neither core serves
+these:
 
-- API retries and prompt suggestions to a client that is not AIR: the bridge sends them to AIR
-  only.
+- API retries and prompt suggestions to a client that is not AIR: both cores send prompt
+  suggestions to AIR only, and the bridge sends API retries to AIR only.
 - A `replayFrom` cursor other than `start`: both cores reject it with -32602, such as "Replaying
   from a \_message cursor is not supported", as the spec asks of a cursor type that the Agent does
   not support. Neither replays from another position or resumes without a replay.
@@ -462,8 +513,8 @@ Nothing else that the bridge serves to v2 clients. Neither core serves these:
 2. Port the gaps one feature at a time, each in a module that the native core owns. Some are
    typed for v1 (`native-subagents.ts`, `background-work.ts`).
 3. Done: `native` is the default v2 core, and both cores stay on the v2 tests and scenarios.
-   `CLAUDE_AGENT_ACP_V2_CORE=bridge` selects the bridge. A v2 AIR client still gets the bridge,
-   until the native core serves the AIR extensions or AIR serves v2 without them.
+   `CLAUDE_AGENT_ACP_V2_CORE=bridge` selects the bridge. A v2 AIR client gets the native core
+   too, with the AIR extensions that v2 does not cover (see "AIR clients").
 4. Later: delete the bridge. That is `v2/agent.ts`, `v2/prompt.ts`, `v2/background.ts`, the
    v1 request conversions, and the v2 paths of `ClaudeAcpAgent`. Those paths are the `v2` option, the
    `foreground` and `background` hooks, `ForegroundEvents`, `foregroundWork`, and the

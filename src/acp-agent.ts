@@ -96,7 +96,7 @@ import {
   toGoalSnapshot,
 } from "./goal-extension.js";
 import { blobResourceToClaude } from "./blob-resources.js";
-import { promptSuggestionsMeta, promptSuggestionText } from "./prompt-suggestions.js";
+import { PromptSuggestions } from "./prompt-suggestions.js";
 import { sanitizeTitle, SessionTitles } from "./session-titles.js";
 import {
   AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
@@ -1018,15 +1018,8 @@ export type Session = {
   /** Last goal snapshot sent to the ACP client, used to roll back an
    *  optimistic `/goal` update when the command itself fails. */
   lastPublishedGoal?: GoalSnapshot | null;
-  /** Last follow-up prompt sent to the ACP client (`null` after a clear), so an
-   *  unchanged prediction is not re-notified. Undefined until the first push. */
-  lastPublishedPromptSuggestion?: string | null;
-  /** Whether an arriving `prompt_suggestion` still answers the turn the user is
-   *  waiting on: set at a turn's result, cleared when the next prompt arrives.
-   *  A prediction the user outran — the next prompt was sent before the
-   *  prediction was read off the stream — follows a turn that is already
-   *  answered, so it is dropped instead of published mid-turn. */
-  promptSuggestionExpected?: boolean;
+  /** The follow-up prompt the client holds, for an AIR client only. */
+  promptSuggestions?: PromptSuggestions;
   /** Count of result messages the consumer should treat as orphans and skip
    *  (not promote/attribute to the current head). When cancel() settles+removes
    *  a queued turn, that turn's user message was already pushed to the SDK, so
@@ -3294,11 +3287,8 @@ export class ClaudeAcpAgent {
       // the usage limit) from leaving the stale prediction in the composer. A
       // session that holds no prediction needs no clear, and the prompt path
       // then keeps the ordering it has without this feature.
-      if (session.lastPublishedPromptSuggestion != null) {
-        await this.publishPromptSuggestion(params.sessionId, null);
-      } else {
-        session.promptSuggestionExpected = false;
-      }
+      const cleared = session.promptSuggestions?.clear();
+      if (cleared) await this.publishPromptSuggestion(params.sessionId, cleared);
     }
 
     // A `/remote-control` command still in flight answers into the session's
@@ -3642,27 +3632,18 @@ export class ClaudeAcpAgent {
   }
 
   /**
-   * Publishes the follow-up prompt the CLI predicted for the next turn, or
-   * `null` to clear the one the client holds. Only AIR renders it, so only AIR
-   * gets the key; see `docs/air-extensions.md`.
+   * Sends the `_meta` of a session's {@link PromptSuggestions}: the follow-up
+   * prompt the CLI predicted for the next turn, or the clear of the one the
+   * client holds. Only AIR renders it, so only an AIR session has the state;
+   * see `docs/air-extensions.md`.
    */
-  private async publishPromptSuggestion(sessionId: string, text: string | null): Promise<void> {
-    const session = this.sessions[sessionId];
-    if (!session) return;
-    // A clear ends the window the turn's result opened: whatever prediction is
-    // still in flight answers a turn the user has already moved past.
-    if (text === null) session.promptSuggestionExpected = false;
-    // A session that never published one holds nothing, so a clear before the
-    // first prediction is already true on the client and goes nowhere.
-    if ((session.lastPublishedPromptSuggestion ?? null) === text) return;
-    if (!this.toolCallCapabilities.air.client) return;
-    session.lastPublishedPromptSuggestion = text;
+  private async publishPromptSuggestion(
+    sessionId: string,
+    meta: Record<string, unknown>,
+  ): Promise<void> {
     await this.client.sessionUpdate({
       sessionId,
-      update: {
-        sessionUpdate: "session_info_update",
-        _meta: promptSuggestionsMeta(text),
-      },
+      update: { sessionUpdate: "session_info_update", _meta: meta },
     });
   }
 
@@ -6308,7 +6289,7 @@ export class ClaudeAcpAgent {
             session.modelRequestSinceResult = false;
             // The CLI predicts the next prompt right after this result, so a
             // `prompt_suggestion` from here on belongs to the turn just ended.
-            session.promptSuggestionExpected = true;
+            session.promptSuggestions?.resultArrived();
             // The result ends the model turn. A background task that still
             // waits for its tool call id gets its spawn now, without the id.
             await asyncTasks.releaseHeld();
@@ -7867,7 +7848,8 @@ export class ClaudeAcpAgent {
             session.titles.reset();
             // The follow-up prompt was predicted from the transcript the reset
             // dropped, so it no longer follows from anything.
-            await this.publishPromptSuggestion(params.sessionId, null);
+            const cleared = session.promptSuggestions?.clear();
+            if (cleared) await this.publishPromptSuggestion(params.sessionId, cleared);
             // The recorded request and TTL describe the dropped conversation.
             session.idleCompaction?.reset();
             break;
@@ -7878,12 +7860,8 @@ export class ClaudeAcpAgent {
             // The CLI predicts the next prompt after the turn's `result`. AIR
             // shows it as gray text in an empty composer; Tab fills the
             // composer, and nothing is sent until the user sends it.
-            if (!session.promptSuggestionExpected) break;
-            session.promptSuggestionExpected = false;
-            await this.publishPromptSuggestion(
-              params.sessionId,
-              promptSuggestionText(message.suggestion),
-            );
+            const suggested = session.promptSuggestions?.suggested(message.suggestion);
+            if (suggested) await this.publishPromptSuggestion(params.sessionId, suggested);
             break;
           }
           case "auth_status":
@@ -11540,6 +11518,9 @@ export class ClaudeAcpAgent {
           settingsManager.getApiKeyHelper(configuredSettingsObject),
         )?.kind,
         fileChangeReporter,
+        ...(this.toolCallCapabilities.air.client
+          ? { promptSuggestions: new PromptSuggestions() }
+          : {}),
       };
       const registered = this.sessions[sessionId];
       registered.idleCompaction = new IdleCompaction(

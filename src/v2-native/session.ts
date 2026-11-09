@@ -62,7 +62,10 @@ import { MODEL_CONFIG_ID } from "../session-model.js";
 import { modelRefusalFallback, noticeUpdate } from "../session-notices.js";
 import { planModeUpdate } from "../exit-plan.js";
 import type { ClearContextReset } from "../clear-context-coordinator.js";
+import { agentFileChangeReportMeta } from "../file-change-audit.js";
+import type { AirSupport } from "./air.js";
 import { ClearContext } from "./clear-context.js";
+import { TurnFileChanges } from "./file-changes.js";
 import { SessionCommands } from "./commands.js";
 import type { SessionConfig } from "./config.js";
 import {
@@ -83,6 +86,8 @@ import { SessionTasks, type RequestTarget } from "./tasks.js";
 export interface SessionConnection {
   readonly logger: Logger;
   readonly translator: V2UpdateTranslator;
+  /** The AIR extensions that the client takes, read at `initialize` (see `air.ts`). */
+  readonly air: AirSupport;
   /** Sends an update of the session. Updates go out in the order of the calls. */
   send(notification: v2.UpdateSessionNotification): void;
   requestPermission(
@@ -169,6 +174,8 @@ export class NativeSession implements RequestTarget {
   private readonly background: V2Background;
   readonly tasks: SessionTasks;
   readonly elicitations: SessionElicitations;
+  /** AIR's file-change reports, when the client declared them (see `file-changes.ts`). */
+  private readonly fileChanges: TurnFileChanges | undefined;
   config!: SessionConfig;
   commands!: SessionCommands;
   /** ExitPlanMode's "clear context" option (see {@link ClearContext}). */
@@ -195,6 +202,12 @@ export class NativeSession implements RequestTarget {
     private readonly input: Pushable<SDKUserMessage>,
     /** Whether Claude Code's interrupt spares background tasks (see {@link SessionTasks}). */
     reportsBackground = true,
+    /**
+     * The query's additional directories: the request's and those of the
+     * client's `_meta.claudeCode.options`. A file-change report lists paths
+     * in them and in `cwd`.
+     */
+    workspaceDirectories: readonly string[] = additionalDirectories,
   ) {
     this.output = new SessionOutput(
       sessionId,
@@ -220,12 +233,23 @@ export class NativeSession implements RequestTarget {
     this.reports = new SessionReports({
       sessionId,
       logger: connection.logger,
+      airClient: connection.air.client,
       emit: (notifications) => this.output.emitV1(notifications),
       isBusy: () => this.foreground || this.pending.size > 0 || this.requests.size > 0,
       compact: () => this.compact(),
       titledSession: () => (this.query && !this.closed ? titled : undefined),
     });
     this.output.onAgentText = (content) => this.reports.agentText(content);
+    this.fileChanges = TurnFileChanges.create(connection.air.fileChangeReport, {
+      cwd,
+      additionalDirectories: [...workspaceDirectories],
+      publish: async (report) =>
+        this.send({
+          sessionUpdate: "session_info_update",
+          _meta: agentFileChangeReportMeta(report),
+        }),
+      logError: (message) => connection.logger.error(`Session ${sessionId}: ${message}`),
+    });
     this.clearContext = new ClearContext(
       {
         push: (text, uuid) => this.pushOwnPrompt(text, uuid),
@@ -274,6 +298,7 @@ export class NativeSession implements RequestTarget {
       sessionId,
       logger: connection.logger,
       support: connection.elicitation,
+      airClient: connection.air.client,
       createElicitation: (request, signal) =>
         unlessWithdrawn(signal, () => connection.createElicitation(request, signal)),
       completeElicitation: (params) => connection.completeElicitation(params),
@@ -380,6 +405,7 @@ export class NativeSession implements RequestTarget {
     if (!guarded) sent();
     const uuid = randomUUID();
     const message = { ...promptToClaude(request), uuid };
+    this.fileChanges?.requested(uuid, params._meta);
     const localCommand = this.commands.localCommand(request.prompt);
     if (localCommand) this.localCommands.set(uuid, localCommand);
     return new Promise((resolve, reject) => {
@@ -628,6 +654,10 @@ export class NativeSession implements RequestTarget {
 
   // --- Permission requests -----------------------------------------------
 
+  get airClient(): boolean {
+    return this.connection.air.client;
+  }
+
   availableModes(): string[] {
     return this.config.availableModeIds();
   }
@@ -836,14 +866,17 @@ export class NativeSession implements RequestTarget {
   }
 
   /**
-   * Handles one message. Only a `/mcp` turn's result and a subagent's restore
-   * from the history are awaited (see {@link result} and `SessionTasks.restored`).
+   * Handles one message. Only a `/mcp` turn's result, a result whose turn
+   * reads file-change reports, and a subagent's restore from the history are
+   * awaited (see {@link result}, {@link endTurn} and `SessionTasks.restored`).
    */
   private handle(message: SDKMessage): void | Promise<void> {
     if ((message as { type: string }).type === "command_lifecycle") {
       this.lifecycle(message as unknown as CommandLifecycleFrame);
       return;
     }
+    // Before the tasks take a subagent's messages: its file edits are the turn's.
+    this.fileChanges?.message(message);
     // Task events, and a subagent's messages, which go to its session.
     // A subagent that a task restores from the history is read before the next message.
     if (this.tasks.handle(message)) return this.tasks.restored();
@@ -1027,6 +1060,7 @@ export class NativeSession implements RequestTarget {
     const prompt = this.pending.get(uuid);
     if (!prompt) return;
     this.pending.delete(uuid);
+    this.fileChanges?.promptStarted(uuid);
     this.send({ sessionUpdate: "user_message", messageId: uuid, content: prompt.prompt });
     prompt.resolve({ messageId: uuid });
   }
@@ -1097,12 +1131,25 @@ export class NativeSession implements RequestTarget {
           )
           .then((text) => {
             this.output.agentMessage(text, message.uuid);
-            this.closeTurn();
+            return this.endTurn();
           });
       }
       this.output.agentMessage(message.result, message.uuid);
     }
-    this.closeTurn();
+    return this.endTurn();
+  }
+
+  /**
+   * Ends the open turn at its result. The file-change reports that its
+   * prompts asked for go out first (see `file-changes.ts`). `consume` waits
+   * for them, so the idle follows them.
+   */
+  private endTurn(): void | Promise<void> {
+    if (!this.foreground || this.clearContext.holdsTurn()) return;
+    const { stopReason } = idleOutcome(this.lastEnd, this.cancelledWork, this.turnReport);
+    const reporting = this.fileChanges?.turnEnding(stopReason, this.query);
+    if (!reporting) return this.closeTurn();
+    return reporting.then(() => this.closeTurn());
   }
 
   /**
@@ -1147,6 +1194,7 @@ export class NativeSession implements RequestTarget {
       // Cancelled work that ended with the query was still cancelled.
       if (this.cancelledWork) this.output.closeUnfinished(true);
       else this.output.finishUnfinished("failed");
+      this.fileChanges?.turnClosed(this.cancelledWork);
       this.foreground = false;
       this.reportedState = "idle";
       this.send({
@@ -1213,6 +1261,7 @@ export class NativeSession implements RequestTarget {
     }
     this.reports.turnEnded();
     this.elicitations.turnEnded();
+    this.fileChanges?.turnClosed(cancelled);
     this.foreground = false;
     this.reportState();
     this.cancelledWork = false;
@@ -1295,6 +1344,7 @@ export class NativeSession implements RequestTarget {
     if (!prompt) return false;
     this.pending.delete(uuid);
     this.localCommands.delete(uuid);
+    this.fileChanges?.promptFailed(uuid, error);
     prompt.reject(error);
     this.checkBoundary();
     return true;

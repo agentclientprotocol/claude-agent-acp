@@ -1,12 +1,13 @@
 /**
  * The reports of a native v2 session that are not Claude's output: the
  * context window and cost (`usage_update`), Claude Code's warnings and MCP startup failures (`notice`), compactions
- * (`compaction_update`), the title (`session_info_update`), and the
- * adapter's own idle compaction.
+ * (`compaction_update`), the title (`session_info_update`), the predicted
+ * follow-up prompt of an AIR client (`session_info_update._meta.promptSuggestions`),
+ * and the adapter's own idle compaction.
  *
  * They are built as the v1 core builds them, from the shared modules
  * (`session-usage.ts`, `session-notices.ts`, `context-compaction.ts`,
- * `session-titles.ts`, `idle-compaction.ts`), and go out through the
+ * `session-titles.ts`, `prompt-suggestions.ts`, `idle-compaction.ts`), and go out through the
  * session's v1-to-v2 translation. The session tells it where its turns start
  * and end.
  */
@@ -34,6 +35,7 @@ import {
   readContextWindow,
 } from "../context-window.js";
 import { IdleCompaction } from "../idle-compaction.js";
+import { PromptSuggestions } from "../prompt-suggestions.js";
 import {
   informationalNotice,
   mcpServerStartupNotice,
@@ -60,6 +62,8 @@ type UsageUpdate = Extract<AcpSessionNotification["update"], { sessionUpdate: "u
 export interface ReportsHost {
   readonly sessionId: string;
   readonly logger: Logger;
+  /** The client is JetBrains AIR, the only one that gets the predicted follow-up prompt. */
+  readonly airClient: boolean;
   /** Sends v1-shaped updates of the session, in the order of the calls. */
   emit(notifications: AcpSessionNotification[]): void;
   /** For the idle compaction: whether the session is busy, and its `/compact`. */
@@ -126,8 +130,11 @@ export class SessionReports {
   private disposed = false;
   /** The context used after the last main-thread request. */
   private contextUsed: number | undefined;
+  /** The follow-up prompt the client holds, for an AIR client only. */
+  private suggestions: PromptSuggestions | undefined;
 
   constructor(private readonly host: ReportsHost) {
+    this.suggestions = host.airClient ? new PromptSuggestions() : undefined;
     this.titles = new SessionTitles(
       {
         client: { sessionUpdate: async (notification) => host.emit([notification]) },
@@ -174,10 +181,12 @@ export class SessionReports {
 
   /**
    * The session's query restarted with the same MCP servers (see
-   * `restarts.ts`): a server already reported is not reported again.
+   * `restarts.ts`): a server already reported is not reported again, and the
+   * prediction the client holds is still cleared at the next prompt.
    */
   restartedFrom(previous: SessionReports): void {
     for (const server of previous.reportedMcpServers) this.reportedMcpServers.add(server);
+    this.suggestions = previous.suggestions;
   }
 
   /** The session's MCP servers changed, as a resume of the active session asks. */
@@ -237,6 +246,10 @@ export class SessionReports {
   promptSent(prompt: PromptRequest["prompt"]): void {
     this.idleCompaction?.disarm("prompt");
     this.titles.onPrompt(prompt);
+    // The prediction is spent: the user sent it or something else. A turn
+    // that predicts nothing (plan mode, an API error, the usage limit) then
+    // leaves no stale prediction in the composer.
+    this.sendSuggestion(this.suggestions?.clear());
   }
 
   /** The client prompt went to Claude Code, which may title the session from it. */
@@ -294,6 +307,8 @@ export class SessionReports {
     this.contextUsed = 0;
     this.titles.reset();
     this.idleCompaction?.reset();
+    // The prediction came from the transcript that the reset dropped.
+    this.sendSuggestion(this.suggestions?.clear());
   }
 
   /** Sends the usage of an empty context, as a fresh context for an approved plan starts. */
@@ -383,8 +398,12 @@ export class SessionReports {
     if (message.message.model) this.lastModel = message.message.model;
   }
 
-  /** A result: its cost, and the model's context window. The idle's quota is `outcome.ts`'s. */
+  /**
+   * A result: its cost, and the model's context window. The idle's quota is
+   * `outcome.ts`'s. The CLI predicts the next prompt right after it.
+   */
   result(message: SDKResultMessage): void {
+    this.suggestions?.resultArrived();
     const matching = this.lastModel
       ? getMatchingModelUsage(message.modelUsage, this.lastModel)
       : undefined;
@@ -405,11 +424,15 @@ export class SessionReports {
   }
 
   /**
-   * The messages that only report: Claude Code's notices, compaction states
-   * and rate limits. Returns whether `message` was one.
+   * The messages that only report: Claude Code's notices, compaction states,
+   * rate limits and predicted prompts. Returns whether `message` was one.
    */
   handle(message: SDKMessage): boolean {
     switch (message.type) {
+      case "prompt_suggestion":
+        // AIR shows it as gray text in an empty composer, which Tab fills.
+        this.sendSuggestion(this.suggestions?.suggested(message.suggestion));
+        return true;
       case "rate_limit_event":
         this.idleCompaction?.noteRateLimit(message.rate_limit_info);
         // Sent before the turn's first usage: it goes out with that usage.
@@ -530,6 +553,17 @@ export class SessionReports {
       this.reportedMcpServers.add(server.name);
       this.host.emit([{ sessionId: this.host.sessionId, update: noticeUpdate(notice) }]);
     }
+  }
+
+  /** Sends the `_meta` of {@link PromptSuggestions}, when it has one. */
+  private sendSuggestion(meta: Record<string, unknown> | undefined): void {
+    if (!meta) return;
+    this.host.emit([
+      {
+        sessionId: this.host.sessionId,
+        update: { sessionUpdate: "session_info_update", _meta: meta },
+      },
+    ]);
   }
 
   /**

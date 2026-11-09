@@ -9,7 +9,7 @@
  * `session_state_changed`.
  */
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -41,6 +41,9 @@ type FakeClaudeCode = {
   setModel: ReturnType<typeof vi.fn>;
   stopTask: ReturnType<typeof vi.fn>;
   close: ReturnType<typeof vi.fn>;
+  applyFlagSettings: ReturnType<typeof vi.fn>;
+  /** The dry-run rewind of a prompt's checkpoint: the files it changed. */
+  rewindFiles: ReturnType<typeof vi.fn>;
 };
 
 const DEFAULT_MODELS: Array<Record<string, unknown>> = [
@@ -100,6 +103,8 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         setModel: vi.fn(async () => {}),
         stopTask: vi.fn(async () => {}),
         close: vi.fn(() => push({ value: undefined, done: true })),
+        applyFlagSettings: vi.fn(async () => {}),
+        rewindFiles: vi.fn(async () => ({ canRewind: true, filesChanged: [] })),
       };
       sdk.processes.push(fake);
       const messages: AsyncGenerator<Record<string, unknown>> = {
@@ -134,6 +139,8 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         setModel: fake.setModel,
         stopTask: fake.stopTask,
         close: fake.close,
+        applyFlagSettings: fake.applyFlagSettings,
+        rewindFiles: fake.rewindFiles,
         mcpServerStatus: async () => sdk.mcpServers,
         // A server that needs OAuth: Claude Code returns its authorization URL.
         mcpAuthenticate: async () => ({
@@ -2837,6 +2844,372 @@ describe("native ACP v2 core", () => {
     });
   });
 
+  describe("a JetBrains AIR client", () => {
+    /** The capabilities of an AIR client that declares `capabilities`. */
+    const air = (...capabilities: string[]) =>
+      ({ _meta: { jetbrains: { air: { version: 1, capabilities } } } }) as v2.ClientCapabilities;
+    const airMeta = (payload: Record<string, unknown>) => ({
+      jetbrains: { air: { version: 1, ...payload } },
+    });
+
+    it.each([
+      [
+        "an AIR client the AIR capabilities that v2 does not cover",
+        air("loadReplayEnd"),
+        airMeta({ capabilities: ["agentFileChangeReport", "recommendedValue"] }),
+      ],
+      ["any other client no AIR key", {}, undefined],
+    ])("advertises to %s", async (_, capabilities, expected) => {
+      const client = nativeClient();
+      const response = await client.connect((agent) =>
+        agent.request(v2.methods.agent.initialize, {
+          protocolVersion: v2.PROTOCOL_VERSION,
+          info: { name: "native-test-client", version: "1.0.0" },
+          capabilities,
+        }),
+      );
+      expect(response._meta).toEqual(expected);
+    });
+
+    it.each([
+      ["declares recommendedValue", air("recommendedValue"), true],
+      ["is AIR without recommendedValue", air(), false],
+      ["is not AIR", {}, false],
+    ])(
+      "names the recommended model and effort only for a client that %s, and applies the effort",
+      async (_, capabilities, recommended) => {
+        const levels = ["low", "medium", "high"];
+        sdk.models = [
+          {
+            value: "default",
+            displayName: "Default",
+            description: "Recommended",
+            resolvedModel: "claude-opus-5",
+            supportsEffort: true,
+            supportedEffortLevels: levels,
+          },
+          {
+            value: "opus",
+            displayName: "Opus",
+            description: "Most capable",
+            resolvedModel: "claude-opus-5",
+            supportsEffort: true,
+            supportedEffortLevels: levels,
+          },
+        ];
+        const client = nativeClient();
+        const { response, claude } = await client.connect((agent) =>
+          openSession(agent, capabilities),
+        );
+
+        const option = (configId: string) =>
+          response.configOptions?.find((entry) => entry.configId === configId) as {
+            currentValue: unknown;
+            options: Array<{ value: string }>;
+            _meta?: unknown;
+          };
+        const values = (configId: string) => option(configId).options.map((entry) => entry.value);
+        if (recommended) {
+          expect(values("model")).toEqual(["opus"]);
+          expect(option("model")).toMatchObject({
+            currentValue: "opus",
+            _meta: airMeta({ recommendedValue: "opus" }),
+          });
+          expect(values("effort")).toEqual(levels);
+          expect(option("effort")).toMatchObject({
+            currentValue: "medium",
+            _meta: airMeta({ recommendedValue: "medium" }),
+          });
+          // The shown effort is the one Claude uses.
+          expect(claude.applyFlagSettings).toHaveBeenCalledWith({ effortLevel: "medium" });
+        } else {
+          expect(values("model")).toContain("default");
+          expect(option("model")._meta).toBeUndefined();
+          expect(values("effort")).toEqual(["default", ...levels]);
+          expect(option("effort")._meta).toBeUndefined();
+          expect(claude.applyFlagSettings).not.toHaveBeenCalled();
+        }
+      },
+    );
+
+    it.each([
+      ["an AIR client the AIR presentation", air(), true],
+      ["any other client none", {}, false],
+    ])("gives a permission request of %s", async (_, capabilities, airClient) => {
+      const client = nativeClient();
+      await client.connect(async (agent) => {
+        const { claude } = await openSession(agent, capabilities);
+        // A subagent's request, on its session, of a tool that the stream did not show yet.
+        claude.send(cycleStart());
+        claude.send(subagent("child", "toolu_launch").launch());
+        claude.send(subagent("child", "toolu_launch").started());
+        await vi.waitFor(() => expect(client.states()).toEqual(["running"]));
+        await askPermission(
+          claude,
+          "mcp__docs__search",
+          { query: "x" },
+          {
+            agentID: "child",
+            mcpServer: { name: "docs", source: "sdk" },
+            decisionReason: "Asks every time",
+          },
+        );
+      });
+
+      const request = client.permissionRequests[0];
+      expect(request.sessionId).toBe("child");
+      const subject = request.subject as { toolCall: { _meta?: unknown } };
+      const mcpServer = { name: "docs", source: "sdk" };
+      if (airClient) {
+        expect(request._meta).toEqual(
+          airMeta({
+            permission: {
+              version: 1,
+              title: request.title,
+              description: "Reason: Asks every time",
+            },
+          }),
+        );
+        // AIR's rule (`permissionToolCallMeta`): no Agent call of the subagent.
+        expect(subject.toolCall._meta).toEqual({ claudeCode: { mcpServer } });
+      } else {
+        expect(request._meta).toBeUndefined();
+        expect(subject.toolCall._meta).toEqual({
+          claudeCode: { parentToolUseId: "toolu_launch", mcpServer },
+        });
+      }
+    });
+
+    it.each([
+      ["an AIR client", air(), true],
+      ["any other client", {}, false],
+    ])(
+      "marks AskUserQuestion's custom answer field for %s only",
+      async (_, capabilities, marked) => {
+        const client = nativeClient({
+          answerElicitation: () => ({ action: "accept", content: {} }),
+        });
+        await client.connect(async (agent) => {
+          const { claude } = await openSession(agent, {
+            ...capabilities,
+            elicitation: { form: {} },
+          });
+          await claude.options.canUseTool!(
+            "AskUserQuestion",
+            {
+              questions: [
+                {
+                  question: "Which package?",
+                  header: "Package",
+                  options: [{ label: "core" }, { label: "cli" }],
+                  multiSelect: false,
+                },
+              ],
+            },
+            {
+              signal: new AbortController().signal,
+              toolUseID: "toolu_ask",
+              requestId: "r1",
+              suggestions: [],
+            },
+          );
+        });
+
+        const properties = Object.values(
+          (client.elicitations[0] as { requestedSchema: { properties: Record<string, unknown> } })
+            .requestedSchema.properties,
+        ) as Array<{ _meta?: unknown }>;
+        const markers = properties.flatMap((property) => (property._meta ? [property._meta] : []));
+        expect(markers).toEqual(
+          marked
+            ? [
+                {
+                  _askUserQuestionCustomAnswer: { questionId: "question_0", isCustomAnswer: true },
+                  ...airMeta({
+                    customAnswer: { questionId: "question_0", isCustomAnswer: true },
+                  }),
+                },
+              ]
+            : [],
+        );
+      },
+    );
+
+    it.each([
+      ["an AIR client", air(), true],
+      ["any other client", {}, false],
+    ])(
+      "sends %s the predicted follow-up prompt, cleared at the next prompt and at a reset",
+      async (_, capabilities, predicted) => {
+        const client = nativeClient();
+        const suggestion = (text: string) => ({
+          type: "prompt_suggestion",
+          suggestion: text,
+          uuid: randomUUID(),
+          session_id: "session",
+        });
+        const { claude, sessionId } = await client.connect(async (agent) => {
+          const { response, claude } = await openSession(agent, capabilities);
+          const prompt = async (index: number) => {
+            const answer = agent.request(v2.methods.agent.session.prompt, {
+              sessionId: response.sessionId,
+              prompt: PROMPT,
+            });
+            claude.send(echo(await claude.prompt(index)));
+            await answer;
+          };
+          await prompt(0);
+          claude.send(result());
+          claude.send(suggestion("Run the tests"));
+          claude.send(sessionState("idle"));
+          await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+          await prompt(1);
+          // A prediction that the next prompt outran: no result opened its window.
+          claude.send(suggestion("Stale"));
+          claude.send(result());
+          claude.send(suggestion("Commit"));
+          claude.send({
+            type: "conversation_reset",
+            new_conversation_id: randomUUID(),
+            uuid: randomUUID(),
+            trigger: "clear",
+            timestamp: new Date().toISOString(),
+            session_id: "session",
+          });
+          claude.send(sessionState("idle"));
+          await vi.waitFor(() =>
+            expect(client.states()).toEqual(["running", "idle", "running", "idle"]),
+          );
+          return { claude, sessionId: response.sessionId };
+        });
+
+        const sent = updatesOf(client.notifications, sessionId).flatMap((update) => {
+          const meta = update._meta as { promptSuggestions?: { suggestions: unknown } } | null;
+          return update.sessionUpdate === "session_info_update" && meta?.promptSuggestions
+            ? [meta.promptSuggestions.suggestions]
+            : [];
+        });
+        expect(sent).toEqual(
+          predicted ? [[{ text: "Run the tests" }], [], [{ text: "Commit" }], []] : [],
+        );
+        expect(claude.options.promptSuggestions).toBe(predicted ? true : undefined);
+      },
+    );
+
+    it("leaves the predicted prompt off when the client's options turn it off", async () => {
+      const client = nativeClient();
+      await client.connect(async (agent) => {
+        await agent.request(v2.methods.agent.initialize, {
+          protocolVersion: v2.PROTOCOL_VERSION,
+          info: { name: "native-test-client", version: "1.0.0" },
+          capabilities: air(),
+        });
+        await agent.request(v2.methods.agent.session.new, {
+          cwd,
+          _meta: { claudeCode: { options: { promptSuggestions: false } } },
+        });
+      });
+      expect(sdk.processes[0].options.promptSuggestions).toBe(false);
+    });
+
+    describe("the agent file-change report", () => {
+      const requestMeta = (requestId: string) => ({
+        jetbrains: { air: { agentFileChangeReportRequest: { version: 1, requestId } } },
+      });
+      const reports = (updates: v2.SessionUpdate[]) =>
+        updates.flatMap((update) => {
+          const report = (update._meta as any)?.jetbrains?.air?.agentFileChangeReport;
+          return update.sessionUpdate === "session_info_update" && report ? [report] : [];
+        });
+
+      it("lists the files of the prompt's checkpoint at its turn's end, before the idle", async () => {
+        const client = nativeClient();
+        const changed = path.join(await realpath(cwd), "src", "App.ts");
+        const { claude, sessionId, uuid } = await client.connect(async (agent) => {
+          const { response, claude } = await openSession(agent, air("agentFileChangeReport"));
+          claude.rewindFiles.mockResolvedValue({ canRewind: true, filesChanged: [changed] });
+          const answer = agent.request(v2.methods.agent.session.prompt, {
+            sessionId: response.sessionId,
+            prompt: PROMPT,
+            _meta: requestMeta("r-1"),
+          });
+          const prompt = await claude.prompt(0);
+          claude.send(echo(prompt));
+          await answer;
+          claude.send(result());
+          await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+          return { claude, sessionId: response.sessionId, uuid: prompt.uuid };
+        });
+
+        expect(claude.options.enableFileCheckpointing).toBe(true);
+        expect(claude.rewindFiles).toHaveBeenCalledWith(uuid, { dryRun: true });
+        const updates = updatesOf(client.notifications, sessionId);
+        expect(reports(updates)).toEqual([
+          {
+            version: 1,
+            requestId: "r-1",
+            status: "reported",
+            paths: [changed],
+            declaredComplete: false,
+            truncated: false,
+          },
+        ]);
+        const reportAt = updates.findIndex((update) => reports([update]).length > 0);
+        const idleAt = updates.findIndex(
+          (update) =>
+            update.sessionUpdate === "state_update" &&
+            (update as { state: string }).state === "idle",
+        );
+        expect(reportAt).toBeLessThan(idleAt);
+      });
+
+      it("reports a prompt that a cancel ended unavailable, without reading a checkpoint", async () => {
+        const client = nativeClient();
+        const { claude, sessionId } = await client.connect(async (agent) => {
+          const { response, claude } = await openSession(agent, air("agentFileChangeReport"));
+          const answer = agent.request(v2.methods.agent.session.prompt, {
+            sessionId: response.sessionId,
+            prompt: PROMPT,
+            _meta: requestMeta("r-1"),
+          });
+          await claude.prompt(0);
+          await agent.notify(v2.methods.agent.session.cancel, { sessionId: response.sessionId });
+          await expect(answer).rejects.toMatchObject({ code: -32800 });
+          return { claude, sessionId: response.sessionId };
+        });
+
+        expect(claude.rewindFiles).not.toHaveBeenCalled();
+        expect(reports(updatesOf(client.notifications, sessionId))).toEqual([
+          { version: 1, requestId: "r-1", status: "unavailable", reason: "cancelled" },
+        ]);
+      });
+
+      it.each([
+        ["an AIR client without the capability", air()],
+        ["any other client", {}],
+      ])("sends %s no report and keeps checkpoints off", async (_, capabilities) => {
+        const client = nativeClient();
+        const claude = await client.connect(async (agent) => {
+          const { response, claude } = await openSession(agent, capabilities);
+          const answer = agent.request(v2.methods.agent.session.prompt, {
+            sessionId: response.sessionId,
+            prompt: PROMPT,
+            _meta: requestMeta("r-1"),
+          });
+          claude.send(echo(await claude.prompt(0)));
+          await answer;
+          claude.send(result());
+          await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+          return claude;
+        });
+
+        expect(claude.options.enableFileCheckpointing).toBeUndefined();
+        expect(claude.rewindFiles).not.toHaveBeenCalled();
+        expect(reports(client.sessionUpdates)).toEqual([]);
+      });
+    });
+  });
+
   it("reads which v2 core to serve from CLAUDE_AGENT_ACP_V2_CORE", () => {
     expect(v2CoreFromEnv(undefined)).toBe("native");
     expect(v2CoreFromEnv("")).toBe("native");
@@ -2850,9 +3223,8 @@ describe("native ACP v2 core", () => {
     { v2Core: undefined, client: "a plain", capabilities: {}, served: "native" },
     { v2Core: "native", client: "a plain", capabilities: {}, served: "native" },
     { v2Core: "bridge", client: "a plain", capabilities: {}, served: "bridge" },
-    // The native core serves no AIR extension, so AIR keeps the bridge's.
-    { v2Core: undefined, client: "an AIR", capabilities: AIR_CAPABILITIES, served: "bridge" },
-    { v2Core: "native", client: "an AIR", capabilities: AIR_CAPABILITIES, served: "bridge" },
+    { v2Core: undefined, client: "an AIR", capabilities: AIR_CAPABILITIES, served: "native" },
+    { v2Core: "bridge", client: "an AIR", capabilities: AIR_CAPABILITIES, served: "bridge" },
   ] as const)(
     "serves $client v2 client with the $served core when v2Core is $v2Core",
     async ({ v2Core, capabilities, served }) => {
