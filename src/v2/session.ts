@@ -61,6 +61,7 @@ import type { V2UpdateTranslator } from "./update-translator.js";
 import { MODEL_CONFIG_ID } from "../session-model.js";
 import { modelRefusalFallback, noticeUpdate } from "../session-notices.js";
 import { planModeUpdate } from "../exit-plan.js";
+import { resetPlanUpdates } from "../plans.js";
 import type { ClearContextReset } from "../clear-context-coordinator.js";
 import { agentFileChangeReportMeta } from "../file-change-audit.js";
 import type { AirSupport } from "./air.js";
@@ -804,16 +805,22 @@ export class V2Session implements RequestTarget {
   /**
    * Claude Code mounted a fresh conversation (such as for `/clear`), whose
    * Task* ids and task store are independent of the previous transcript. The
-   * client's plan of Task* entries is cleared before a
-   * follow-up prompt can republish stale tasks, and the title and the idle
-   * compaction start over. The fresh context of an approved plan sends no
-   * empty Task* plan.
+   * old conversation's plans are removed (`plan_removed` of the checklist and
+   * of the approved ExitPlanMode plan) before a follow-up prompt can
+   * republish stale tasks, and the title and the idle compaction start over.
+   * The fresh context of an approved plan removes no plan: that plan becomes
+   * the session's plan in it.
    */
   private conversationReset(): void {
     // First, the subagents of the dropped conversation end.
     this.tasks.conversationReset();
     this.output.taskState.clear();
-    if (!this.clearContext.holdsTurn()) this.output.taskPlanChanged();
+    if (!this.clearContext.holdsTurn()) {
+      // Every v2 client has plan operations. v2 publishes an approved plan
+      // under the plain `plan-mode` id, also to AIR (see `planModeUpdate`).
+      const updates = resetPlanUpdates(true, false);
+      this.output.emitV1(updates.map((update) => ({ sessionId: this.sessionId, update })));
+    }
     this.reports.conversationReset();
     // A fresh context for an approved plan: the plan goes out in it.
     this.clearContext.conversationReset();

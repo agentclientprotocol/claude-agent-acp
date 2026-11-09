@@ -3748,8 +3748,7 @@ describe("ACP v2 prompts", () => {
       await client.authUpdate(1);
     });
 
-    const plans = client.updates("plan_update");
-    expect(plans.at(-2)).toEqual({
+    expect(client.updates("plan_update").at(-1)).toEqual({
       sessionUpdate: "plan_update",
       plan: {
         type: "items",
@@ -3757,10 +3756,10 @@ describe("ACP v2 prompts", () => {
         entries: [{ content: "Run tests", status: "pending", priority: "medium" }],
       },
     });
-    expect(plans.at(-1)).toEqual({
-      sessionUpdate: "plan_update",
-      plan: { type: "items", planId: "plan", entries: [] },
-    });
+    expect(client.updates("plan_removed")).toEqual([
+      { sessionUpdate: "plan_removed", planId: "plan" },
+      { sessionUpdate: "plan_removed", planId: "plan-mode" },
+    ]);
   });
 
   it.each([
