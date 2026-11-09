@@ -1270,6 +1270,25 @@ describe("ACP v2 core", () => {
     expect(error).toMatchObject({ code: -32002 });
   });
 
+  it("closes a session that session/delete found still starting", async () => {
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      await openSession(agent);
+      const started = Promise.withResolvers<void>();
+      sdk.startGate = started.promise;
+      const sessionId = randomUUID();
+      const resume = agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+      await vi.waitFor(() => expect(sdk.processes).toHaveLength(2));
+      const deleted = agent.request(v2.methods.agent.session.delete, { sessionId });
+      // The delete reaches the agent while the start waits.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      started.resolve();
+      await resume;
+      await deleted;
+      expect(sdk.processes[1].close).toHaveBeenCalled();
+    });
+  });
+
   it("answers a session/close that comes during a resume's replay after the resume, and sends nothing after it", async () => {
     const client = v2Client();
     const read = Promise.withResolvers<never[]>();

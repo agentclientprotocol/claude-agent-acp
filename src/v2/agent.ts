@@ -474,6 +474,8 @@ class V2Agent implements AgentHandle, SessionConnection {
   /** Deleting a session that does not exist succeeds, as v2 asks. */
   async deleteSession({ sessionId }: v2.DeleteSessionRequest): Promise<v2.DeleteSessionResponse> {
     if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "delete");
+    // A resume that runs, or its start, may make the session live.
+    await this.setupSettled(sessionId);
     const live = this.sessions.get(sessionId);
     if (live || this.stopped.has(sessionId)) await this.closeSession({ sessionId });
     try {
