@@ -392,6 +392,7 @@ import {
   type GatewayAuthRequest,
   isGatewayAuthMethod,
   listProvidersResponse,
+  loggableBaseUrl,
   PROVIDER_ID,
   type ProviderConfig,
   providerConfigFromSetRequest,
@@ -2948,7 +2949,7 @@ export class ClaudeAcpAgent {
   async unstable_listProviders(_params: ListProvidersRequest): Promise<ListProvidersResponse> {
     const config = this.providerConfig ?? defaultProviderConfig(this.gatewayAuthRequest);
     this.logger.log(
-      `[providers/list] apiType=${config.apiType} baseUrl=${config.baseUrl} overridden=${this.providerConfig !== undefined}`,
+      `[providers/list] apiType=${config.apiType} baseUrl=${loggableBaseUrl(config.baseUrl)} overridden=${this.providerConfig !== undefined}`,
     );
     return listProvidersResponse(config);
   }
@@ -2961,7 +2962,7 @@ export class ClaudeAcpAgent {
   async unstable_setProvider(params: SetProviderRequest): Promise<SetProviderResponse> {
     const config = providerConfigFromSetRequest(params);
     this.logger.log(
-      `[providers/set] apiType=${config.apiType} baseUrl=${config.baseUrl} sessions=${Object.keys(this.sessions).length}`,
+      `[providers/set] apiType=${config.apiType} baseUrl=${loggableBaseUrl(config.baseUrl)} sessions=${Object.keys(this.sessions).length}`,
     );
     await this.enqueueProviderUpdate(config);
     return {};
@@ -10600,7 +10601,7 @@ export class ClaudeAcpAgent {
     // are distinguished exactly as the CLI will see them.
     const providerCacheKey = providerCacheKeyFor(env);
     this.logger.log(
-      `[session/query] sessionId=${sessionId} resume=${creationOpts?.resume ?? "none"} apiType=${resolvedProvider?.apiType ?? "native"} baseUrl=${resolvedProvider?.baseUrl ?? "native"}`,
+      `[session/query] sessionId=${sessionId} resume=${creationOpts?.resume ?? "none"} apiType=${resolvedProvider?.apiType ?? "native"} baseUrl=${loggableBaseUrl(resolvedProvider?.baseUrl)}`,
     );
 
     // Both forms of native subagent sessions report the configuration of a child.

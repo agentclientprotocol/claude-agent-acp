@@ -1,5 +1,6 @@
 import { describe, expect, it, Mock, vi, afterEach, beforeEach } from "vitest";
 import { AcpClient, ClaudeAcpAgent } from "../acp-agent.js";
+import { loggableBaseUrl } from "../providers.js";
 
 const mockQuery = vi.hoisted(() =>
   vi.fn(() => ({
@@ -920,5 +921,16 @@ describe("providers", () => {
       await agent.unstable_setProvider(provider);
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
+  });
+});
+
+describe("loggableBaseUrl", () => {
+  it.each([
+    ["https://user:secret@gateway.example.com/v1?key=abc", "https://gateway.example.com"],
+    ["https://gateway.example.com:8443/proxy/sk-123", "https://gateway.example.com:8443"],
+    ["not a url", "invalid"],
+    [undefined, "native"],
+  ])("logs %s as %s", (baseUrl, logged) => {
+    expect(loggableBaseUrl(baseUrl)).toBe(logged);
   });
 });

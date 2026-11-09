@@ -193,6 +193,20 @@ function sameHeaders(a: Record<string, string>, b: Record<string, string>): bool
 }
 
 /**
+ * A provider base URL as logs may show it: its origin only. The URL can come
+ * from the env or the client and can carry credentials (`https://user:key@host`)
+ * or a key in its path or query, so a log line must not print it whole.
+ */
+export function loggableBaseUrl(baseUrl: string | undefined): string {
+  if (baseUrl === undefined) return "native";
+  try {
+    return new URL(baseUrl).origin;
+  } catch {
+    return "invalid";
+  }
+}
+
+/**
  * Validate a provider base URL: must be a non-empty absolute http(s) URL.
  */
 export function isValidBaseUrl(baseUrl: string | undefined): baseUrl is string {
