@@ -7,8 +7,7 @@
  * `session.ts`). It shares the protocol-neutral pieces with v1: the SDK
  * message mapping, tool call rendering, permission options, and the mode
  * catalog. It serves a JetBrains AIR client the AIR extensions that v2 does
- * not cover (see `air.ts`). What it does not serve yet is listed in
- * `docs/acp-v2.md`.
+ * not cover (see `air.ts`).
  */
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";

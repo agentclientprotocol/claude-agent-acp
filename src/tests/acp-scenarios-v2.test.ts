@@ -62,8 +62,8 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const PASSES = "passes";
 
 /**
- * The scenarios that stop on the v2 surface, each with the reason, which names
- * the step of `docs/acp-v2.md` that removes it. Every other scenario passes.
+ * The scenarios that stop on the v2 surface, each with the reason. Every
+ * other scenario passes.
  */
 const V2_STOPS: Record<string, string> = {};
 

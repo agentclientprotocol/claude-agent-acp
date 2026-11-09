@@ -144,7 +144,7 @@ with replay, `session/close`, `session/prompt`, `session/cancel`), `session/dele
 compaction, display terminals for commands, permission requests, elicitation, providers, auth, and
 [subagents](#subagent-sessions). Steering is v1 only for now.
 
-v2 is served by [the v2 agent](docs/acp-v2.md), which runs straight on Claude
+v2 is served by the v2 agent in `src/v2/`, which runs straight on Claude
 Code instead of translating to v1. A v2 client that declares JetBrains AIR
 (`_meta.jetbrains.air`) also gets the AIR extensions that ACP v2 does not cover.
 

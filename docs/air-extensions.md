@@ -153,7 +153,6 @@ It also serves the [permission presentation](#permission-presentation), the [que
 The [agent file-change report](#agent-file-change-report) goes out at the end of the turn that serves the prompt, before the turn's idle `state_update`, because a v2 `session/prompt` is answered when Claude Code takes the prompt in.
 ACP v2 covers subagents, background work, file plans, patches, compaction, the system prompt, and turn failures itself, so the v2 core serves no `nativeSubagentSessions`, `backgroundSubagents`, `asyncTasks`, `planFile`, `diffPatch`, `contextCompaction`, `customInstructions`, or `sessionFailure`.
 It does not serve the [tool call contract](#tool-call-contract) yet.
-See `docs/acp-v2.md`.
 
 ### Capabilities
 

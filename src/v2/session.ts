@@ -998,8 +998,7 @@ export class V2Session implements RequestTarget {
 
   /**
    * The messages that report on the session rather than carry Claude's
-   * output (see {@link SessionReports}). Not reported yet: the rest (see
-   * docs/acp-v2.md).
+   * output (see {@link SessionReports}).
    */
   private report(message: SDKMessage): void {
     if (message.type === "tool_progress") {
