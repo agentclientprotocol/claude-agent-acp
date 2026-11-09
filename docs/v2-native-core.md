@@ -201,7 +201,11 @@ the history cannot place stays unexposed, as the RFD forbids guessing a parent.
   that does not support it. A model switch that the adapter did not make (`PostModelSwitch`, such
   as a typed `/model`, or a refusal fallback) updates the options. Claude Code's
   `fast_mode_state` (on `init` and on results of prompts) updates the Fast mode option, with a
-  notice when it turns off a Fast mode the user had on.
+  notice when it turns off a Fast mode the user had on. A value that names no entry is rejected
+  with -32602 ("Invalid value for config option model: not-a-model") and changes nothing, as on
+  the bridge and v1, which share `configOptionValue`. A model alias names an entry only by whole
+  words (`resolveModelPreference`): `opus`, `opusplan`, `claude-sonnet-5[1m]` and provider ids
+  such as `us.anthropic.claude-sonnet-5-v1:0` do, `not-a-model`, `son` and `foo-sonnet` do not.
 - `src/v2-native/clear-context.ts`: ExitPlanMode's "Yes, clear context" option, offered to the
   root's plan as on the bridge. The answer interrupts the cycle, and the turn stays open: the
   session sends Claude Code `/clear`, then sets the chosen mode and sends "Implement the following

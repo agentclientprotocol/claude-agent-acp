@@ -330,18 +330,28 @@ describe("session config options", () => {
       expect(modelOption?.currentValue).toBe("claude-sonnet-4-6");
     });
 
-    it("throws for completely invalid model value", async () => {
-      await expect(
-        agent.setSessionConfigOption({
-          sessionId: SESSION_ID,
-          configId: "model",
-          value: "gpt-4",
-        }),
-      ).rejects.toMatchObject({
-        code: -32602,
-        message: expect.stringContaining("Invalid value for config option model: gpt-4"),
-      });
-    });
+    // "a" is a substring of "Claude", "son" of "sonnet": only whole words match.
+    it.each(["gpt-4", "not-a-model", "son", "foo-sonnet"])(
+      "rejects the model %s and leaves the model as it was",
+      async (value) => {
+        await expect(
+          agent.setSessionConfigOption({ sessionId: SESSION_ID, configId: "model", value }),
+        ).rejects.toMatchObject({
+          code: -32602,
+          message: expect.stringContaining(`Invalid value for config option model: ${value}`),
+        });
+
+        expect(setModelSpy).not.toHaveBeenCalled();
+        const session = (
+          agent as unknown as {
+            sessions: Record<string, { configOptions: typeof MOCK_CONFIG_OPTIONS }>;
+          }
+        ).sessions[SESSION_ID];
+        expect(session.configOptions.find((o) => o.id === "model")?.currentValue).toBe(
+          "claude-opus-4-5",
+        );
+      },
+    );
 
     it("rejects a non-string value for a select option with invalid params", async () => {
       await expect(
