@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ModelInfo, Options } from "@anthropic-ai/claude-agent-sdk";
-import { ClaudeAcpAgent, FAST_MODE_CONFIG_ID } from "../acp-agent.js";
+import { ClaudeAcpAgent, FAST_MODE_CONFIG_ID } from "../v1/acp-agent.js";
 import type { AcpClient } from "../acp-client.js";
 import { AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY } from "../air-extension.js";
 import { initializeClient, makeMockQuery } from "./helpers.js";

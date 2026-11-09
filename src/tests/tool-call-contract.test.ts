@@ -7,7 +7,7 @@ import { AcpClient } from "../acp-client.js";
 import { toAcpNotifications, ToolUseCache } from "../sdk-to-acp.js";
 import { ClientCapabilities as ToolCallCapabilities } from "../tool-calls/client-capabilities.js";
 import { backgroundedBashToolCall, withRunningTerminal } from "../tool-calls/background.js";
-import { ChangedMetaFilter } from "../tool-calls/changed-meta-filter.js";
+import { ChangedMetaFilter } from "../v1/tool-calls/changed-meta-filter.js";
 import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
 import { AcpToolCallRenderer, mcpToolName } from "../tool-calls/renderer.js";
 import { changedTaskPlanEntries, createTaskHook, type TaskState } from "../tools.js";

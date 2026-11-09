@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../v1/acp-agent.js";
 import type { AcpClient } from "../acp-client.js";
 import { makeMockQuery } from "./helpers.js";
 
@@ -85,7 +85,7 @@ describe("ClaudeAcpAgent settings", () => {
 
     const { getCapturedOptions } = mockQuery();
 
-    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
     const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
     const response = await (agent as any).createSession({
@@ -129,7 +129,7 @@ describe("ClaudeAcpAgent settings", () => {
           applyFlagSettings,
         }),
       );
-      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
       const agent = new ClaudeAcpAgent(createMockClient());
       if (recommended) {
         (agent as any).clientCapabilities = {
@@ -180,7 +180,7 @@ describe("ClaudeAcpAgent settings", () => {
         applyFlagSettings,
       }),
     );
-    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
     const agent = new ClaudeAcpAgent(createMockClient());
     (agent as any).clientCapabilities = {
       _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
@@ -227,7 +227,7 @@ describe("ClaudeAcpAgent settings", () => {
         applyFlagSettings,
       }),
     );
-    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
     const agent = new ClaudeAcpAgent(createMockClient());
     (agent as any).clientCapabilities = {
       _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
@@ -271,7 +271,7 @@ describe("ClaudeAcpAgent settings", () => {
 
     const { getCapturedOptions } = mockQuery();
 
-    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
     const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
     const response = await (agent as any).createSession({
@@ -296,7 +296,7 @@ describe("ClaudeAcpAgent settings", () => {
 
     const { getCapturedOptions } = mockQuery();
 
-    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
     const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
     const response = await (agent as any).createSession({
@@ -319,7 +319,7 @@ describe("ClaudeAcpAgent settings", () => {
 
     const { getCapturedOptions } = mockQuery();
 
-    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
     const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
     (agent as any).logger = { log: () => {}, error: () => {} };
 
@@ -363,7 +363,7 @@ describe("ClaudeAcpAgent settings", () => {
 
       const { getCapturedOptions } = mockQuery();
 
-      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
       const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
       (agent as any).logger = { log: () => {}, error: () => {} };
 
@@ -388,7 +388,7 @@ describe("ClaudeAcpAgent settings", () => {
 
     const { getCapturedOptions } = mockQuery();
 
-    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
     const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
     const response = await (agent as any).createSession({
@@ -414,7 +414,7 @@ describe("ClaudeAcpAgent settings", () => {
 
     mockQuery();
 
-    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
     const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
     (agent as any).logger = { log: () => {}, error: () => {} };
 
@@ -448,7 +448,7 @@ describe("ClaudeAcpAgent settings", () => {
       );
 
       const { getCapturedOptions, setModelSpy } = mockQuery(models);
-      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
       const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
       (agent as any).logger = { log: () => {}, error: () => {} };
       return { agent, projectDir, getCapturedOptions, setModelSpy };
@@ -647,7 +647,7 @@ describe("ClaudeAcpAgent settings", () => {
 
     const { getCapturedOptions } = mockQuery();
 
-    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
     const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
     const response = await (agent as any).createSession({
@@ -674,7 +674,7 @@ describe("ClaudeAcpAgent settings", () => {
 
     const { setModelSpy } = mockQuery();
 
-    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
     const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
     const response = await (agent as any).createSession({
@@ -729,7 +729,7 @@ describe("ClaudeAcpAgent settings", () => {
         },
       ]);
 
-      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
       const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
       const response = await (agent as any).createSession({
@@ -756,7 +756,7 @@ describe("ClaudeAcpAgent settings", () => {
         },
       ]);
 
-      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
       const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
       const response = await (agent as any).createSession({
@@ -808,7 +808,7 @@ describe("ClaudeAcpAgent settings", () => {
         { value: "claude-haiku-4-5", displayName: "Claude Haiku", description: "Fast" },
       ]);
 
-      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
       const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
       const response = await (agent as any).createSession({
@@ -845,7 +845,7 @@ describe("ClaudeAcpAgent settings", () => {
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
       try {
-        const { ClaudeAcpAgent } = await import("../acp-agent.js");
+        const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
         const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
         const response = await (agent as any).createSession({
@@ -892,7 +892,7 @@ describe("ClaudeAcpAgent settings", () => {
         },
       ]);
 
-      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
       const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
       const response = await (agent as any).createSession({
@@ -957,7 +957,7 @@ describe("ClaudeAcpAgent settings", () => {
         { value: "haiku", displayName: "Haiku", description: "Fast" },
       ]);
 
-      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
       const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
       const response = await (agent as any).createSession({
@@ -997,7 +997,7 @@ describe("ClaudeAcpAgent settings", () => {
         { value: "haiku", displayName: "Haiku", description: "Fast" },
       ]);
 
-      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
       const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
       const response = await (agent as any).createSession({
@@ -1029,7 +1029,7 @@ describe("ClaudeAcpAgent settings", () => {
         { value: "haiku", displayName: "Haiku", description: "Fast" },
       ]);
 
-      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
       const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
       const response = await (agent as any).createSession({
@@ -1051,7 +1051,7 @@ describe("ClaudeAcpAgent settings", () => {
         { value: "haiku", displayName: "Haiku", description: "Fast" },
       ]);
 
-      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
       const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
       const response = await (agent as any).createSession({
@@ -1085,7 +1085,7 @@ describe("ClaudeAcpAgent settings", () => {
         { value: "haiku", displayName: "Haiku", description: "Fast" },
       ]);
 
-      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
       const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
       const response = await (agent as any).createSession({
@@ -1136,7 +1136,7 @@ describe("ClaudeAcpAgent settings", () => {
         },
       ]);
 
-      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
       const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
       const response = await (agent as any).createSession({
@@ -1197,7 +1197,7 @@ describe("ClaudeAcpAgent settings", () => {
         },
       ]);
 
-      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
       const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
       const response = await (agent as any).createSession({
@@ -1249,7 +1249,7 @@ describe("ClaudeAcpAgent settings", () => {
           },
         ]);
 
-        const { ClaudeAcpAgent } = await import("../acp-agent.js");
+        const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
         const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
         const response = await (agent as any).createSession({
@@ -1304,7 +1304,7 @@ describe("ClaudeAcpAgent settings", () => {
           },
         ]);
 
-        const { ClaudeAcpAgent } = await import("../acp-agent.js");
+        const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
         const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
         const response = await (agent as any).createSession({
@@ -1355,7 +1355,7 @@ describe("ClaudeAcpAgent settings", () => {
         { value: "sonnet", displayName: "Sonnet", description: "Claude Sonnet 4.6" },
       ]);
 
-      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
       const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
       const response = await (agent as any).createSession({
@@ -1410,7 +1410,7 @@ describe("ClaudeAcpAgent settings", () => {
       }) as any;
     });
 
-    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
     const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
     const response = await (agent as any).createSession({
@@ -1451,7 +1451,7 @@ describe("ClaudeAcpAgent settings", () => {
     });
 
     try {
-      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
       const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
       const response = await (agent as any).createSession({
@@ -1502,7 +1502,7 @@ describe("ClaudeAcpAgent settings", () => {
       }) as any;
     });
 
-    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
     const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
     const response = await (agent as any).createSession({

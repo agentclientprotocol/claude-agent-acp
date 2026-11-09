@@ -33,7 +33,7 @@ export const ZERO_USAGE = Object.freeze({
 export const DEFAULT_CONTEXT_WINDOW = 200000;
 
 /** `_meta.quota` for work that spent `usage` in its main agent loop and
- *  `modelUsage` by model (see `turnQuotaMeta` in `acp-agent.ts`). */
+ *  `modelUsage` by model (see `turnQuotaMeta` in `v1/acp-agent.ts`). */
 export function quotaMeta(usage: AccumulatedUsage, modelUsage: ModelTokenTally | undefined) {
   return {
     quota: {

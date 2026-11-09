@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
-import { ClaudeAcpAgent } from "../acp-agent.js";
+import { ClaudeAcpAgent } from "../v1/acp-agent.js";
 import type { AcpClient } from "../acp-client.js";
 import { promptSuggestionsMeta, promptSuggestionText } from "../prompt-suggestions.js";
 import { Pushable } from "../utils.js";

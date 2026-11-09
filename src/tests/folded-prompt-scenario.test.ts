@@ -170,7 +170,7 @@ beforeAll(async () => {
   vi.stubEnv("CLAUDE_CODE_EXECUTABLE", "/usr/bin/false");
   configDir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-scenario-config-"));
   vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
-  const { ClaudeAcpAgent } = await import("../acp-agent.js");
+  const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
   for (const profile of runProfiles) {
     resetIds();
     const run = await unlessHung(runScenario(ClaudeAcpAgent, profile, scenario));

@@ -6,7 +6,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { messageIdForGrouping } from "../sdk-to-acp.js";
 import { forkSession } from "../fork-session.js";
-import { encodeProjectPath } from "../session-index/project-dirs.js";
+import { encodeProjectPath } from "../v1/session-index/project-dirs.js";
 
 // Use the real SDK against temporary transcripts, without starting Claude Code.
 let root: string;

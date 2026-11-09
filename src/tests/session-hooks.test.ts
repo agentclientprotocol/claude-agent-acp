@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { NewSessionRequest } from "@agentclientprotocol/sdk/unstable";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { ClaudeAcpAgent } from "../acp-agent.js";
+import { ClaudeAcpAgent } from "../v1/acp-agent.js";
 import type { AcpClient } from "../acp-client.js";
 
 function sse(type: string, data: object): string {

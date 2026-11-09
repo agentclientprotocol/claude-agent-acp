@@ -42,7 +42,7 @@ import {
   discoverCustomAgents,
   runPromptWithCancellation,
   type SteerRequest,
-} from "../acp-agent.js";
+} from "../v1/acp-agent.js";
 import {
   toAcpNotifications,
   streamEventToAcpNotifications,
@@ -59,7 +59,7 @@ import {
 import type { AcpClient } from "../acp-client.js";
 import type { SDKMessageFilter } from "../new-session-meta.js";
 import { SessionTitles } from "../session-titles.js";
-import { SessionBackgroundWork } from "../background-work.js";
+import { SessionBackgroundWork } from "../v1/background-work.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "../usage-markdown.js";
 import { Pushable } from "../utils.js";
 import { heldRequest, initializeClient, makeMockQuery } from "./helpers.js";
@@ -95,7 +95,7 @@ import {
   goalUpdateFromPrompt,
   parseGoalRequest,
   toGoalSnapshot,
-} from "../goal-extension.js";
+} from "../v1/goal-extension.js";
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@anthropic-ai/claude-agent-sdk")>();

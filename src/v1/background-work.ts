@@ -4,7 +4,7 @@
  * command through its async tasks): the display terminal of each command
  * runs from its Bash tool result until its task ends.
  */
-import type { AcpSessionNotification } from "./acp-subagents.js";
+import type { AcpSessionNotification } from "../acp-subagents.js";
 
 /** The display terminal of a command that went to the background. */
 export interface BackgroundTerminal {

@@ -1,5 +1,5 @@
 import { describe, expect, it, Mock, vi, afterEach, beforeEach } from "vitest";
-import { ClaudeAcpAgent } from "../acp-agent.js";
+import { ClaudeAcpAgent } from "../v1/acp-agent.js";
 import { AcpClient } from "../acp-client.js";
 import { loggableBaseUrl } from "../providers.js";
 

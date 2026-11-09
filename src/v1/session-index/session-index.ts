@@ -21,7 +21,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { sanitizeTitle } from "../session-titles.js";
+import { sanitizeTitle } from "../../session-titles.js";
 import { effectiveTitle, visibleTitle } from "./archive-title.js";
 import {
   canonicalPath,

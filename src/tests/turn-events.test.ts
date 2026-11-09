@@ -5,9 +5,9 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionNotification } from "@agentclientprotocol/sdk/unstable";
-import type { ClaudeAcpAgent } from "../acp-agent.js";
+import type { ClaudeAcpAgent } from "../v1/acp-agent.js";
 import type { AcpClient } from "../acp-client.js";
-import type { TurnEvents } from "../turn-events.js";
+import type { TurnEvents } from "../v1/turn-events.js";
 import { DEFAULT_CONTEXT_USAGE } from "./helpers.js";
 import { randomUUID } from "node:crypto";
 
@@ -199,7 +199,7 @@ describe("turn events", () => {
   beforeEach(async () => {
     vi.resetModules();
     onSessionUpdate = () => {};
-    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
     agent = new ClaudeAcpAgent(
       {
         sessionUpdate: async (notification: SessionNotification) => onSessionUpdate(notification),
