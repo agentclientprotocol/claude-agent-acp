@@ -276,6 +276,7 @@ import {
   informationalNotice,
   MAX_NOTICE_TITLE_LENGTH,
   mcpServerStartupNotice,
+  modelRefusalFallback,
   normalizeNoticeText,
   noticeOrTranscriptUpdate,
   sentenceCase,
@@ -370,7 +371,6 @@ import {
 } from "./session-mode.js";
 import {
   applyAvailableModelsAllowlist,
-  buildModelConfigOption,
   getAvailableModels,
   MODEL_CONFIG_ID,
   modelDisplayName,
@@ -378,6 +378,7 @@ import {
   narrowToGatewayModels,
   resolveModelPreference,
   type SessionModelState,
+  withCurrentModelInfo,
 } from "./session-model.js";
 import {
   createEnvForProvider,
@@ -393,25 +394,68 @@ import {
   withListedModels,
 } from "./providers.js";
 import {
-  buildEffortConfigOption,
   EFFORT_CONFIG_ID,
   effortFlagSettings,
+  effortForModelSwitch,
   effortLevelName,
   mergeEffortSettings,
+  settleEffortAfterModelSwitch,
   settingsEffortForModel,
 } from "./session-effort.js";
 import {
   createUltracodeConfigOption,
   readUltracodeSettings,
-  resolveUltracodeEnabled,
   ULTRACODE_CONFIG_ID,
   ultracodeSupported,
   ultracodeWorkflowsEnabled,
   type UltracodeOptionState,
 } from "./session-ultracode.js";
+import {
+  AGENT_CONFIG_ID,
+  buildConfigOptions,
+  clientSupportsBooleanConfigOptions,
+  clientSupportsRecommendedConfigValue,
+  configOptionValue,
+  discoverCustomAgents,
+} from "./session-config-options.js";
+import {
+  createFastModeConfigOption,
+  FAST_MODE_CONFIG_ID,
+  fastModeStateChange,
+  fastModeStateEnabled,
+  normalizeFastModeDisabledReason,
+  type FastModeOptionState,
+} from "./session-fast-mode.js";
+import {
+  cacheResultContextWindow,
+  clearContextWindowCache,
+  immediateContextWindow,
+  providerCacheKeyFor,
+  readContextWindow,
+} from "./context-window.js";
 import { STARTUP_FAILURE_RESULTS_ENV, startupFailureError } from "./startup-failure.js";
 import { recordStreamedDelta, unstreamedRemainder, type StreamedBlock } from "./streamed-text.js";
 
+export {
+  AGENT_CONFIG_ID,
+  BUILTIN_AGENT_NAMES,
+  buildConfigOptions,
+  clientSupportsBooleanConfigOptions,
+  clientSupportsRecommendedConfigValue,
+  type ConfigOptionPresentation,
+  discoverCustomAgents,
+  MODE_CONFIG_ID,
+} from "./session-config-options.js";
+export {
+  createFastModeConfigOption,
+  FAST_MODE_CONFIG_ID,
+  FAST_MODE_OFF,
+  FAST_MODE_ON,
+  fastModeStateEnabled,
+  type FastModeOptionState,
+  normalizeFastModeDisabledReason,
+  resolveFastModeEnabled,
+} from "./session-fast-mode.js";
 export { EFFORT_CONFIG_ID, settingsEffortForModel } from "./session-effort.js";
 export {
   applyAvailableModelsAllowlist,
@@ -3078,7 +3122,7 @@ export class ClaudeAcpAgent {
     // the env-derived provider cache key, so windows learned under the old
     // login must not seed sessions under the next. Worst case of clearing is
     // re-learning on each model's next turn.
-    contextWindowCache.clear();
+    clearContextWindowCache();
 
     // The Claude and Console logins live in the CLI's store.
     try {
@@ -6226,42 +6270,13 @@ export class ClaudeAcpAgent {
                 break;
               }
               case "model_refusal_fallback": {
-                // The SDK retried a refused turn on the fallback model and made
-                // the swap persistent for the session. Without a notice the
-                // user just sees regenerated output; without the state sync the
-                // client's model picker (and the model-dependent options
-                // rebuilt from it) keeps advertising a model the session is no
-                // longer running.
-                //
-                // Current CLIs only emit direction "retry" (persistent swap).
-                // "revert"/"sticky" are retained in the SDK enum for older
-                // CLIs, where "revert" marked a turn-only fallback — for that
-                // direction the session stays on the original model, so skip
-                // the persistent-swap claim and the state sync.
-                //
-                // `scope` (CLI 2.1.232+) marks WHERE the fallback happened:
-                // "local" means a subagent / side-question / background fork
-                // response fell back and the session model is unchanged, so
-                // syncing the picker would advertise a model the session
-                // isn't running. Absent scope means an older CLI, where every
-                // retry was a session-level swap — treat as "session".
-                const local = message.scope === "local";
-                const persistent = message.direction !== "revert" && !local;
-                const category = message.api_refusal_category
-                  ? ` (${message.api_refusal_category})`
-                  : "";
-                const outcome = persistent
-                  ? `The session will continue on ${message.fallback_model}.`
-                  : local
-                    ? `Only that response came from ${message.fallback_model}; the session stays on ${message.original_model}.`
-                    : `The session stays on ${message.original_model}.`;
-                const fallbackSummary =
-                  `${message.original_model} declined this request${category}; ` +
-                  `retried with ${message.fallback_model}. ${outcome}`;
-                const explanation = message.api_refusal_explanation || undefined;
-                const fallbackNotice = explanation
-                  ? `${fallbackSummary}\n\n${explanation}`
-                  : fallbackSummary;
+                // The SDK retried a refused turn on the fallback model. Without
+                // a notice the user just sees regenerated output; without the
+                // state sync the client's model picker (and the model-dependent
+                // options rebuilt from it) keeps advertising a model the
+                // session is no longer running (see `modelRefusalFallback`).
+                const fallback = modelRefusalFallback(message);
+                const { summary: fallbackSummary, explanation } = fallback;
                 // A silent model swap is a session-level advisory, not something the model said.
                 // Clients on the ACP notice contract get it as a `notice`; clients that negotiated
                 // AIR typed records get it as one of those; the rest keep the bold-label transcript
@@ -6271,30 +6286,24 @@ export class ClaudeAcpAgent {
                     explanation !== undefined &&
                     fallbackSummary.length + 2 + explanation.length > MAX_NOTICE_TITLE_LENGTH;
                   await publishSessionFailure("advisory", {
-                    title: useDetails ? fallbackSummary : fallbackNotice,
+                    title: useDetails
+                      ? fallbackSummary
+                      : explanation
+                        ? `${fallbackSummary}\n\n${explanation}`
+                        : fallbackSummary,
                     ...(useDetails ? { details: explanation } : {}),
                   });
                 } else {
-                  // A title must stand alone: the one-line summary when it is
-                  // short enough, else a generic title with everything in the
-                  // description (the same cap the AIR lane applies above).
-                  const notice =
-                    fallbackSummary.length > MAX_NOTICE_TITLE_LENGTH
-                      ? { title: "Model fallback", description: fallbackNotice }
-                      : {
-                          title: fallbackSummary,
-                          ...(explanation ? { description: explanation } : {}),
-                        };
                   await sendUpdate({
                     sessionId: params.sessionId,
                     update: noticeOrTranscriptUpdate(
-                      { severity: "warning", ...notice },
+                      fallback.notice,
                       supportsNotices,
-                      `**Model fallback:** ${fallbackNotice}`,
+                      fallback.transcript,
                     ),
                   });
                 }
-                if (persistent) {
+                if (fallback.persistent) {
                   await this.syncModelAfterExternalSwitch(
                     params.sessionId,
                     session,
@@ -6584,29 +6593,14 @@ export class ClaudeAcpAgent {
               ) {
                 session.contextWindowSize = matchingModelUsage.usage.contextWindow;
                 session.contextWindowAuthoritative = true;
-                // Authoritative: fold it into the cross-session cache keyed on
-                // (this session's provider, the resolved model id —
-                // matchingModelUsage.key, e.g. "claude-sonnet-5[1m]") so a later
-                // session/new or switch on the same provider that resolves to
-                // this model seeds the correct window synchronously, with no
-                // getContextUsage IPC.
-                cacheContextWindow(
-                  contextWindowCacheKey(session.providerCacheKey, matchingModelUsage.key),
+                // Authoritative: fold it into the cross-session cache (see
+                // `cacheResultContextWindow`).
+                cacheResultContextWindow(
+                  session.providerCacheKey,
+                  matchingModelUsage.key,
+                  lastAssistantModel,
                   matchingModelUsage.usage.contextWindow,
                 );
-                // Also cache under the assistant message's own (bare) spelling.
-                // Seed-time reads fall back to a picker value / verbatim live id
-                // when a row carries no resolvedModel (the synthesized
-                // out-of-allowlist resume row sets it undefined on purpose), and
-                // those spellings match `.model` from the assistant message, not
-                // the decorated modelUsage key — without this entry such rows
-                // could never hit the cache.
-                if (lastAssistantModel && lastAssistantModel !== matchingModelUsage.key) {
-                  cacheContextWindow(
-                    contextWindowCacheKey(session.providerCacheKey, lastAssistantModel),
-                    matchingModelUsage.usage.contextWindow,
-                  );
-                }
               }
 
               session.lastTotalCostUsd = message.total_cost_usd;
@@ -8785,77 +8779,16 @@ export class ClaudeAcpAgent {
     if (!option) {
       throw RequestError.invalidParams(undefined, `Unknown config option: ${params.configId}`);
     }
-    // The value must match the type the option was advertised with: a
-    // `type: "boolean"` option takes `true`/`false`, not "on"/"off", and a
-    // `type: "select"` option takes a string.
-    const expectedType = option.type === "boolean" ? "boolean" : "string";
-    if (typeof params.value !== expectedType) {
-      throw RequestError.invalidParams(
-        { configId: params.configId, value: params.value },
-        `Config option ${params.configId} takes a ${expectedType} value, but received: ${JSON.stringify(params.value)}`,
-      );
-    }
-
-    // Fast mode and ultracode carry a boolean value (for Clients that opted
-    // into boolean config options) or the "on"/"off" select fallback, so they
-    // bypass the
-    // string-only validation the select-style options below rely on.
-    if (params.configId === FAST_MODE_CONFIG_ID) {
-      await this.applyFastMode(session, resolveFastModeEnabled(params));
-      return { configOptions: session.configOptions };
-    }
-    if (params.configId === ULTRACODE_CONFIG_ID) {
-      await this.applyUltracode(session, resolveUltracodeEnabled(params));
-      return { configOptions: session.configOptions };
-    }
-
-    if (typeof params.value !== "string") {
-      throw RequestError.invalidParams(
-        undefined,
-        `Invalid value for config option ${params.configId}: ${params.value}`,
-      );
-    }
-
-    const allValues =
-      "options" in option && Array.isArray(option.options)
-        ? option.options.flatMap((o) => ("options" in o ? o.options : [o]))
-        : [];
-    let validValue = allValues.find((o) => o.value === params.value);
-
-    // For model options, fall back to resolveModelPreference when the exact
-    // value doesn't match.  This lets callers use human-friendly aliases like
-    // "opus" or "sonnet" instead of full model IDs like "claude-opus-4-6".
-    // Resolve against session.modelInfos first: those entries carry
-    // `resolvedModel`, so a full model id (in either hint spelling) lands on
-    // the right row via the exact tier instead of a fuzzier one picking a
-    // same-family sibling from a different context lane. The options-derived
-    // list (which never carries `resolvedModel`) remains as a fallback for
-    // resolutions that don't map back onto a selectable option (e.g. a fuzzy
-    // hit on an out-of-picker verbatim entry).
-    if (!validValue && params.configId === MODEL_CONFIG_ID) {
-      const toOptionValue = (resolved: ModelInfo | null) =>
-        resolved ? allValues.find((o) => o.value === resolved.value) : undefined;
-      validValue = toOptionValue(resolveModelPreference(session.modelInfos, params.value));
-      if (!validValue) {
-        const optionInfos: ModelInfo[] = allValues.map((o) => ({
-          value: o.value,
-          displayName: o.name,
-          description: o.description ?? "",
-        }));
-        validValue = toOptionValue(resolveModelPreference(optionInfos, params.value));
+    const selected = configOptionValue(option, params, session.modelInfos);
+    if ("enabled" in selected) {
+      if (params.configId === FAST_MODE_CONFIG_ID) {
+        await this.applyFastMode(session, selected.enabled);
+      } else {
+        await this.applyUltracode(session, selected.enabled);
       }
+      return { configOptions: session.configOptions };
     }
-
-    if (!validValue) {
-      throw RequestError.invalidParams(
-        undefined,
-        `Invalid value for config option ${params.configId}: ${params.value}`,
-      );
-    }
-
-    // Use the canonical option value so downstream code always receives the
-    // model ID rather than the caller-supplied alias.
-    const resolvedValue = validValue.value;
+    const resolvedValue = selected.value;
 
     let effectiveValue = resolvedValue;
     if (params.configId === MODE_CONFIG_ID) {
@@ -10564,21 +10497,12 @@ export class ClaudeAcpAgent {
   }
 
   /**
-   * Refine a heuristic context window with `getContextUsage().rawMaxTokens`,
-   * without blocking the caller. The text heuristic misses natively-1M models
-   * whose picker rows carry no "1m" token (e.g. `sonnet`, and since CLI
-   * 2.1.283 `opus`/`default`), so those would otherwise show 200k until the
-   * first result's modelUsage arrives.
-   *
-   * Never awaited: SDK control requests are serialized, so awaiting here
-   * would delay session/new or a model switch (~15s on older CLIs, issues
-   * #886/#880; ~0.5s on 2.1.283). Requests the `summary` detail instead of
-   * the default `full` breakdown, which issues one `messages/count_tokens`
-   * call per category (~18 for a bare session) and hit rate limits on every
-   * model switch; `summary` answers locally with the same `rawMaxTokens`.
-   *
-   * Does not write `contextWindowCache` (that stays keyed to the
-   * `result.modelUsage` spellings) — a later result still overwrites this.
+   * Refine a heuristic context window with `getContextUsage().rawMaxTokens`
+   * (`readContextWindow`), without blocking the caller. The text heuristic
+   * misses natively-1M models whose picker rows carry no "1m" token (e.g.
+   * `sonnet`, and since CLI 2.1.283 `opus`/`default`), so those would
+   * otherwise show 200k until the first result's modelUsage arrives. A later
+   * result still overwrites this.
    */
   private refreshContextWindowInBackground(sessionId: string, session: Session): void {
     if (session.contextWindowAuthoritative) return;
@@ -10590,12 +10514,12 @@ export class ClaudeAcpAgent {
       session.models.currentModelId === modelId;
     // A synchronous throw must not fail the caller either.
     Promise.resolve()
-      .then(() => query.getContextUsage({ detail: "summary" }))
+      .then(() => readContextWindow(query))
       .then(
-        (usage) => {
+        (window) => {
           if (!stillCurrent() || session.contextWindowAuthoritative) return;
-          if (!(usage.rawMaxTokens > 0)) return;
-          session.contextWindowSize = usage.rawMaxTokens;
+          if (window === undefined) return;
+          session.contextWindowSize = window;
           session.contextWindowAuthoritative = true;
         },
         (error) => {
@@ -10646,44 +10570,25 @@ export class ClaudeAcpAgent {
       }
 
       // Rebuild config options since effort levels depend on the selected
-      // model. The effort seed depends on who owns the choice: a user pin
-      // made through the ACP picker this session lives at the SDK's flag
-      // layer and follows the session across switches, so carry it forward.
-      // Otherwise the CLI resolves effort itself from the persisted settings
-      // — the NEW model's `modelSettings` entry first (the CLI persists
-      // /effort per model), then the legacy top-level value — so display
-      // what it will actually run instead of dragging the old model's value
-      // along.
+      // model (see `effortForModelSwitch`).
       const effortOpt = session.configOptions.find((o) => o.id === EFFORT_CONFIG_ID);
-      const currentEffort =
-        typeof effortOpt?.currentValue === "string" ? effortOpt.currentValue : undefined;
       const useRecommendedValue = clientSupportsRecommendedConfigValue(this.clientCapabilities);
-      const pinnedEffort = session.effortPinnedLevel;
-      const effortWasPinned = pinnedEffort !== undefined;
-      const appliedEffortBeforeSwitch =
-        session.appliedEffortLevel ??
-        (useRecommendedValue && typeof currentEffort === "string" && currentEffort !== "default"
-          ? currentEffort
-          : pinnedEffort);
-      const effortPinnedForNewModel =
-        effortWasPinned &&
-        newModelInfo?.supportsEffort === true &&
-        newModelInfo.supportedEffortLevels?.some((level) => level === pinnedEffort) === true;
-      const seedEffort = effortPinnedForNewModel
-        ? pinnedEffort
-        : settingsEffortForModel(
-            mergeEffortSettings(
-              session.settingsManager.getSettings(),
-              session.effortSettingsOverride,
-            ),
-            newModelInfo,
-            value,
-          );
+      const effortSwitch = effortForModelSwitch({
+        state: { pinned: session.effortPinnedLevel, applied: session.appliedEffortLevel },
+        displayed: typeof effortOpt?.currentValue === "string" ? effortOpt.currentValue : undefined,
+        newModelInfo,
+        modelId: value,
+        settings: mergeEffortSettings(
+          session.settingsManager.getSettings(),
+          session.effortSettingsOverride,
+        ),
+        useRecommendedValue,
+      });
       session.configOptions = buildConfigOptions(
         session.modes,
         session.models,
         session.modelInfos,
-        seedEffort,
+        effortSwitch.seed,
         session.agents,
         session.currentAgent,
         {
@@ -10707,70 +10612,27 @@ export class ClaudeAcpAgent {
         },
       );
 
-      // Opted-in clients apply the concrete displayed effort on every switch,
-      // including settings-derived values, so a previous automatic flag cannot
-      // shadow the new model's settings. This does not create a user pin.
-      // For legacy clients, sync only when a user pin changed across the
-      // switch — i.e. the new model clamped it away (buildConfigOptions
-      // validated the seed against the new model's levels), where the flag
-      // must be cleared too or the SDK would keep running the old pin
-      // invisibly. Settings-derived seeds are display-only: the CLI resolves
-      // persisted effort itself, and pinning it at the flag layer would
-      // shadow the per-model values on every later switch.
-      const shouldSyncEffort = useRecommendedValue || (effortWasPinned && !effortPinnedForNewModel);
-      if (shouldSyncEffort) {
-        const newEffortOpt = session.configOptions.find((o) => o.id === EFFORT_CONFIG_ID);
-        const newEffort =
-          typeof newEffortOpt?.currentValue === "string" ? newEffortOpt.currentValue : undefined;
-        try {
-          await session.query.applyFlagSettings(
-            // A legacy client's unpinned effort is display-only: the CLI
-            // resolves the persisted value for the new model. When an old
-            // user pin is no longer supported, clear the flag layer instead
-            // of replacing it with that displayed value. Opted-in clients
-            // deliberately apply their concrete displayed effort.
-            effortFlagSettings(
-              useRecommendedValue ? newEffort : undefined,
-              session.ultracodeEnabled,
-            ),
-          );
-          session.effortPinnedLevel = effortPinnedForNewModel ? pinnedEffort : undefined;
-          session.appliedEffortLevel =
-            useRecommendedValue && newEffort !== "default" ? newEffort : undefined;
-        } catch (error) {
-          // setModel has already succeeded. Effort synchronization is a
-          // secondary, best-effort operation: propagating this error would
-          // make the RPC report failure (or suppress an external-switch
-          // notification) even though the SDK is already on the new model.
-          // Preserve the old SDK/pin bookkeeping and never advertise the
-          // unapplied value: restore the last applied value when the new model
-          // can select it, otherwise omit the effort option until a later
-          // successful switch rebuilds it.
-          session.effortPinnedLevel = pinnedEffort;
-          session.appliedEffortLevel = appliedEffortBeforeSwitch;
-          const appliedValueStillSelectable =
-            appliedEffortBeforeSwitch !== undefined &&
-            newEffortOpt?.type === "select" &&
-            newEffortOpt.options.some((option) =>
-              "value" in option
-                ? option.value === appliedEffortBeforeSwitch
-                : option.options.some((nested) => nested.value === appliedEffortBeforeSwitch),
-            );
-          if (newEffortOpt?.type === "select" && appliedValueStillSelectable) {
-            newEffortOpt.currentValue = appliedEffortBeforeSwitch;
-          } else {
-            session.configOptions = session.configOptions.filter(
-              (option) => option.id !== EFFORT_CONFIG_ID,
-            );
-          }
-          this.logger.error(
-            `Failed to synchronize effort after model switch to "${value}":`,
-            error,
-          );
-        }
-      } else if (effortPinnedForNewModel) {
-        session.effortPinnedLevel = pinnedEffort;
-        session.appliedEffortLevel = pinnedEffort;
+      // setModel has already succeeded, so a failed effort sync is logged:
+      // propagating it would make the RPC report failure (or suppress an
+      // external-switch notification) even though the SDK is already on the
+      // new model.
+      const effort = await settleEffortAfterModelSwitch(
+        effortSwitch,
+        session.configOptions.find((o) => o.id === EFFORT_CONFIG_ID),
+        session.ultracodeEnabled,
+        useRecommendedValue,
+        (settings) => session.query.applyFlagSettings(settings),
+      );
+      session.effortPinnedLevel = effort.state.pinned;
+      session.appliedEffortLevel = effort.state.applied;
+      session.configOptions = session.configOptions.flatMap((option) =>
+        option.id !== EFFORT_CONFIG_ID ? [option] : effort.option ? [effort.option] : [],
+      );
+      if ("error" in effort) {
+        this.logger.error(
+          `Failed to synchronize effort after model switch to "${value}":`,
+          effort.error,
+        );
       }
 
       // Emit current_mode_update only after session.modes AND
@@ -10903,67 +10765,39 @@ export class ClaudeAcpAgent {
    *  `fast_mode_state` (delivered on `system`/init and on user-turn `result`s).
    *  The SDK can flip fast mode independently of the user — e.g. back to `on`
    *  once a rate-limit `cooldown` clears — so we mirror definitive on/off
-   *  changes into the config option and notify the client.
+   *  changes into the config option and notify the client (see
+   *  {@link fastModeStateChange}).
    *
-   *  Guards, in order:
-   *   - absent state: nothing to reconcile.
-   *   - no Fast mode option: the current model doesn't support fast mode, so the
-   *     reported state reflects capability, not the user's intent. Leave the
-   *     retained setting untouched so it's correct when a supporting model is
-   *     reselected (the source of the earlier intent-clobber bug was mutating it
-   *     here).
-   *   - `cooldown`: a transient suspension of an already-enabled fast mode.
-   *     Leave the toggle as-is rather than flapping it — and never let a stray
-   *     cooldown spuriously enable a toggle the user has off.
-   *
-   *  `reason` is the SDK's `fast_mode_disabled_reason`, reported alongside the
-   *  state. Only explainable reasons are retained (see
-   *  {@link normalizeFastModeDisabledReason}), so the comparison below tracks
-   *  exactly what the user can see: a routine `sdk_opt_in_required` report on
-   *  every turn's result can't churn the option, while a real blocker updates
-   *  the description even when the toggle's own value is unchanged. */
+   *  Without a Fast mode option the current model doesn't support fast mode,
+   *  so the reported state reflects capability, not the user's intent. The
+   *  retained setting stays untouched so it's correct when a supporting model
+   *  is reselected (the source of the earlier intent-clobber bug was mutating
+   *  it here). */
   private async syncFastModeState(
     sessionId: string,
     session: Session,
     state: FastModeState | undefined,
     reason?: FastModeDisabledReason,
   ): Promise<void> {
-    if (state === undefined) {
-      return;
-    }
     if (!session.configOptions.some((o) => o.id === FAST_MODE_CONFIG_ID)) {
       return;
     }
-    if (state === "cooldown") {
-      return;
-    }
-    const enabled = state === "on";
-    // A reason only describes an off state; drop any that rides an `on` report
-    // so it can't decorate the option the next time fast mode goes off.
-    const nextReason = enabled ? undefined : normalizeFastModeDisabledReason(reason);
-    if (enabled === session.fastModeEnabled && nextReason === session.fastModeDisabledReason) {
-      return;
-    }
-    // The user asked for Fast mode and the SDK is telling us it can't serve it.
-    // The description carries the same explanation, but a toggle silently
-    // snapping back is the case worth saying out loud once, at the flip.
-    const explanation =
-      nextReason !== undefined ? FAST_MODE_UNAVAILABLE_EXPLANATIONS[nextReason] : undefined;
-    const explain = session.fastModeEnabled && !enabled && explanation !== undefined;
-    session.fastModeEnabled = enabled;
-    session.fastModeDisabledReason = nextReason;
-    this.refreshFastModeOption(session, enabled);
-    if (explain) {
+    const change = fastModeStateChange(
+      { enabled: session.fastModeEnabled, disabledReason: session.fastModeDisabledReason },
+      state,
+      reason,
+    );
+    if (!change) return;
+    session.fastModeEnabled = change.enabled;
+    session.fastModeDisabledReason = change.disabledReason;
+    this.refreshFastModeOption(session, change.enabled);
+    if (change.notice) {
       await this.client.sessionUpdate({
         sessionId,
         update: noticeOrTranscriptUpdate(
-          {
-            severity: "warning",
-            title: "Fast mode turned off",
-            description: `${sentenceCase(explanation)}.`,
-          },
+          change.notice.notice,
           clientSupportsNotices(this.clientCapabilities),
-          `**Fast mode turned off:** ${explanation}.`,
+          change.notice.transcript,
         ),
       });
     }
@@ -11631,41 +11465,13 @@ export class ClaudeAcpAgent {
       timing.phase("models");
 
       // Resolve the current model's capabilities separately from the stable
-      // permission-mode catalog advertised to ACP clients.
-      // A resumed session can be running a model outside the `availableModels`
-      // allowlist (currentModelId is then the verbatim live id, see
-      // `matchResumedModel`); its capabilities are still known to the SDK's
-      // unfiltered list, so fall back to that before treating the model as
-      // unknown — otherwise auto mode would be spuriously clamped and the
-      // Fast-mode/Effort options hidden for a model that supports them.
-      const allowlistedModelInfo = allowedModels.find((m) => m.value === models.currentModelId);
-      const fallbackModelInfo = allowlistedModelInfo
-        ? undefined
-        : (resolveModelPreference(initializationResult.models, models.currentModelId) ?? undefined);
-      const currentModelInfo = allowlistedModelInfo ?? fallbackModelInfo;
-      // Register the fallback-resolved capabilities under the verbatim live id
-      // so every modelInfos consumer (buildConfigOptions' effort lookup, later
-      // rebuilds via session.modelInfos) agrees with the gating below.
-      // `buildModelConfigOption` lists this model as its own entry while it is
-      // current and drops it once the user switches to a listed model; it is
-      // never added to `models.availableModels`. The spread keeps every capability flag
-      // (current and future); the identity fields are overridden because the
-      // fuzzy-matched sibling's resolvedModel/displayName/description can
-      // describe a different context lane and would poison later resolvedModel
-      // matching (syncModelAfterExternalSwitch) and context-window inference
-      // (applyConfigOptionValue) if they traveled under this id.
-      const modelInfos = fallbackModelInfo
-        ? [
-            ...allowedModels,
-            {
-              ...fallbackModelInfo,
-              value: models.currentModelId,
-              displayName: models.currentModelId,
-              description: "",
-              resolvedModel: undefined,
-            },
-          ]
-        : allowedModels;
+      // permission-mode catalog advertised to ACP clients (see
+      // `withCurrentModelInfo`).
+      const { allowlistedModelInfo, currentModelInfo, modelInfos } = withCurrentModelInfo(
+        allowedModels,
+        initializationResult.models,
+        models.currentModelId,
+      );
       const { modes, autoModeFallbackWarningPending } = await this.sessionModes.initialize({
         query: q,
         requestedMode: initialPermissionMode,
@@ -12312,258 +12118,6 @@ function errorKindData(
   errorKind: AgentErrorKind | undefined,
 ): { errorKind: AgentErrorKind } | undefined {
   return errorKind ? { errorKind } : undefined;
-}
-
-// `supportedAgents()` always returns Claude Code's built-in subagents — the
-// ones used for Task-tool delegation (Explore, Plan, etc.) — even when the user
-// has configured none of their own. Those aren't meaningful *main-thread*
-// personas, so we filter them out and only surface the Agent picker when the
-// user (or a plugin/project) has configured custom agents. Update this set if
-// the SDK's built-in roster changes.
-export const BUILTIN_AGENT_NAMES = new Set([
-  "claude",
-  "general-purpose",
-  "Explore",
-  "Plan",
-  "statusline-setup",
-]);
-
-// Value of the synthetic "Default" entry in the agent picker, which maps to the
-// standard Claude Code agent (`applyFlagSettings({ agent: null })`). It is a
-// reserved sentinel: a custom agent named exactly this would collide with it
-// (two options sharing the value, selection silently routing to `null`), so we
-// exclude that name from discovery.
-/** Discover user/plugin/project-configured main-thread agents, excluding the
- *  built-in subagents and the reserved "default" sentinel. Returns an empty
- *  list if discovery fails so a flaky control request never blocks session
- *  creation. */
-export async function discoverCustomAgents(q: Query): Promise<AgentInfo[]> {
-  try {
-    const agents = await q.supportedAgents();
-    return agents.filter((a) => !BUILTIN_AGENT_NAMES.has(a.name) && a.name !== DEFAULT_AGENT_ID);
-  } catch {
-    return [];
-  }
-}
-
-/** Stable ids for the session config options surfaced via `configOptions`.
- *  Centralized so the option declarations in `buildConfigOptions` and the
- *  handlers in `setSessionConfigOption`/`applyConfigOptionValue` reference the
- *  same identifiers and can't drift apart. */
-export { MODE_CONFIG_ID };
-export const AGENT_CONFIG_ID = "agent";
-export const FAST_MODE_CONFIG_ID = "fast";
-
-/** Select-fallback values used when the client has not opted into boolean
- *  config options (see {@link createFastModeConfigOption}). */
-export const FAST_MODE_ON = "on";
-export const FAST_MODE_OFF = "off";
-const FAST_MODE_DESCRIPTION = "Faster responses on supported models";
-
-/** Map the SDK's tri-state `fast_mode_state` onto the boolean config toggle.
- *  `cooldown` (fast mode temporarily suspended after a rate limit, per the SDK
- *  docs) keeps the toggle on so it reflects the user's intent — only an
- *  explicit `off` clears it. */
-export function fastModeStateEnabled(state: FastModeState): boolean {
-  return state !== "off";
-}
-
-/** User-facing explanations for the SDK's `fast_mode_disabled_reason` values
- *  that a user can act on (or at least wants to know about). Deliberately
- *  partial — the omitted reasons are not worth surfacing:
- *   - `sdk_opt_in_required`: every SDK session starts here (the toggle IS the
- *     opt-in), so it describes the default, not a problem.
- *   - `preference`: the user turned Fast mode off themselves.
- *   - `pending`: eligibility is still resolving; the next report supersedes it.
- *   - `unknown`: nothing meaningful to say.
- *  Unknown future reasons fall through the same way (open set — the SDK's docs
- *  say to ignore values you don't handle). */
-const FAST_MODE_UNAVAILABLE_EXPLANATIONS: Partial<Record<FastModeDisabledReason, string>> = {
-  free: "not available on the free plan",
-  extra_usage_disabled: "requires extra usage to be enabled for this account",
-  model_not_allowed: "not available for the selected model",
-  not_first_party: "not available on this API provider",
-  disabled_by_env: "disabled by environment configuration",
-  network_error: "eligibility could not be verified (network error)",
-};
-
-/** Normalize an SDK-reported `fast_mode_disabled_reason` to the one we retain:
- *  a reason we have an explanation for, else `undefined`. Keeping only
- *  explainable reasons means state comparisons (see `syncFastModeState`) track
- *  exactly what the user can see, so routine reports like
- *  `sdk_opt_in_required` never churn the config option. */
-export function normalizeFastModeDisabledReason(
-  reason: FastModeDisabledReason | undefined,
-): FastModeDisabledReason | undefined {
-  return reason && FAST_MODE_UNAVAILABLE_EXPLANATIONS[reason] ? reason : undefined;
-}
-
-/** Whether the Client advertised support for boolean session config options
- *  (`session.configOptions.boolean`). Agents MUST only send `type: "boolean"`
- *  config options to Clients that opt in; otherwise we fall back to a `select`.
- *  See https://agentclientprotocol.com/rfds/boolean-config-option. */
-export function clientSupportsBooleanConfigOptions(
-  clientCapabilities?: ClientCapabilities | null,
-): boolean {
-  return clientCapabilities?.session?.configOptions?.boolean != null;
-}
-
-/** Whether the Client advertised the AIR `recommendedValue` capability for
- *  select-style model and effort options. Missing or malformed AIR metadata
- *  retains the legacy `default` entries. */
-export function clientSupportsRecommendedConfigValue(
-  clientCapabilities?: ClientCapabilities | null,
-): boolean {
-  return clientSupportsAirCapability(clientCapabilities, AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY);
-}
-
-/** Build the Fast mode config option. When the Client supports boolean config
- *  options we expose a native `type: "boolean"` toggle; otherwise we degrade to
- *  a two-value `select` ("on"/"off") so older Clients still get a usable
- *  control.
- *
- *  `disabledReason` (the SDK's `fast_mode_disabled_reason`) is folded into the
- *  description while the toggle reads off, so a user whose account or provider
- *  can't serve Fast mode sees why instead of a switch that silently refuses to
- *  stay on. Ignored while enabled: a reason reported alongside an `on`/`cooldown`
- *  state isn't blocking anything right now. */
-export function createFastModeConfigOption(
-  enabled: boolean,
-  useBooleanOption: boolean,
-  disabledReason?: FastModeDisabledReason,
-): SessionConfigOption {
-  const explanation = enabled
-    ? undefined
-    : disabledReason && FAST_MODE_UNAVAILABLE_EXPLANATIONS[disabledReason];
-  const base = {
-    id: FAST_MODE_CONFIG_ID,
-    name: "Fast mode",
-    description: explanation ? `${FAST_MODE_DESCRIPTION} — ${explanation}` : FAST_MODE_DESCRIPTION,
-    category: "model_config",
-  } as const;
-
-  if (useBooleanOption) {
-    return { ...base, type: "boolean", currentValue: enabled };
-  }
-
-  return {
-    ...base,
-    type: "select",
-    currentValue: enabled ? FAST_MODE_ON : FAST_MODE_OFF,
-    options: [
-      { value: FAST_MODE_ON, name: "On" },
-      { value: FAST_MODE_OFF, name: "Off" },
-    ],
-  };
-}
-
-/** Resolve the requested Fast mode value from a `session/set_config_option`
- *  request. Accepts a native boolean (boolean-capable Clients) or the
- *  "on"/"off" select-fallback strings. */
-export function resolveFastModeEnabled(params: SetSessionConfigOptionRequest): boolean {
-  const value = params.value;
-  if (typeof value === "boolean") {
-    return value;
-  }
-  if (value === FAST_MODE_ON) {
-    return true;
-  }
-  if (value === FAST_MODE_OFF) {
-    return false;
-  }
-  throw RequestError.invalidParams(
-    undefined,
-    `Invalid value for config option ${FAST_MODE_CONFIG_ID}: ${value}`,
-  );
-}
-
-/** Per-model Fast mode state threaded into {@link buildConfigOptions}. The
- *  option is only surfaced when the current model `supported`s fast mode. */
-export type FastModeOptionState = {
-  supported: boolean;
-  enabled: boolean;
-  /** Whether the Client opted into boolean config options. */
-  useBooleanOption: boolean;
-  /** Latest explainable `fast_mode_disabled_reason`, folded into the option's
-   *  description while the toggle reads off. */
-  disabledReason?: FastModeDisabledReason;
-};
-
-export type ConfigOptionPresentation = {
-  /** Replace ambiguous `default` rows with concrete values and advertise the
-   *  SDK/adapter recommendation as `_meta.jetbrains.air.recommendedValue`. */
-  useRecommendedValue: boolean;
-};
-
-export function buildConfigOptions(
-  modes: SessionModeState,
-  models: SessionModelState,
-  modelInfos: ModelInfo[],
-  currentEffortLevel?: string,
-  agents: AgentInfo[] = [],
-  currentAgent: string = DEFAULT_AGENT_ID,
-  fastMode?: FastModeOptionState,
-  presentation?: ConfigOptionPresentation,
-  ultracode?: UltracodeOptionState,
-): SessionConfigOption[] {
-  const options: SessionConfigOption[] = [SessionModeManager.configOption(modes)];
-  // A gateway that lists none of the SDK's models leaves no model to offer, so
-  // there is no model option at all.
-  if (models.availableModels.length > 0) {
-    options.push(
-      buildModelConfigOption(models, modelInfos, presentation?.useRecommendedValue === true),
-    );
-  }
-  const effort = buildEffortConfigOption(
-    modelInfos,
-    models.currentModelId,
-    currentEffortLevel,
-    presentation?.useRecommendedValue === true,
-  );
-  if (effort) options.push(effort);
-
-  // Surface the Fast mode toggle only when the current model supports it. The
-  // option renders as a native boolean toggle for Clients that opted in, and a
-  // two-value select otherwise.
-  if (fastMode?.supported) {
-    options.push(
-      createFastModeConfigOption(
-        fastMode.enabled,
-        fastMode.useBooleanOption,
-        fastMode.disabledReason,
-      ),
-    );
-  }
-
-  // Surface the ultracode toggle only while the CLI can run it: dynamic
-  // workflows are enabled and the current model supports it.
-  if (ultracode?.supported) {
-    options.push(createUltracodeConfigOption(ultracode.enabled, ultracode.useBooleanOption));
-  }
-
-  // Only surface the Agent picker when there's a real choice — i.e. the user
-  // has configured at least one custom agent (built-ins are filtered out in
-  // discoverCustomAgents). With none configured, "Default" would be the only
-  // entry, so we omit the option entirely.
-  if (agents.length > 0) {
-    options.push({
-      id: AGENT_CONFIG_ID,
-      name: "Agent",
-      description: "Main-thread agent persona",
-      type: "select",
-      currentValue: currentAgent,
-      options: [
-        { value: DEFAULT_AGENT_ID, name: "Default", description: "Standard Claude Code agent" },
-        ...agents.map((a) => ({
-          value: a.name,
-          name: a.name,
-          description: a.description || undefined,
-        })),
-      ],
-    });
-  }
-
-  return options;
 }
 
 export function getAvailableSlashCommands(
@@ -13697,109 +13251,6 @@ export function runAcp(logger?: Logger) {
   // `connect` runs the connect handlers before it returns, so `agent` is set.
   const connection = v1AgentApp(logger, (created) => (agent = created)).connect(stream);
   return { connection, agent };
-}
-
-/** Cross-session cache of authoritative context windows, keyed by
- *  `${providerCacheKey}\0${modelId}` (see {@link contextWindowCacheKey}).
- *  The window is a property of (model id, backend): the same resolved model id
- *  (e.g. "claude-sonnet-5[1m]", the spelling of the `result.modelUsage` keys)
- *  can name different context lanes behind different base URLs, routing
- *  headers, or credentials, so the key carries both. Caching it module-level
- *  lets a later session/new or switch that resolves to the same (backend,
- *  model) — in this session or any other, within the adapter's lifetime — seed
- *  the correct window synchronously with no IPC. Keying on the resolved id
- *  (rather than the picker value) means aliases that resolve to the same
- *  concrete model share one entry; the result handler additionally writes the
- *  bare assistant-message spelling so seed-time reads that fall back to a
- *  verbatim live id (rows without `resolvedModel`) can hit too.
- *
- *  Populated authoritatively by each `result.modelUsage` a turn confirms (see
- *  the consumer's result handler). We deliberately never populate it from
- *  `getContextUsage`: its `model` spelling and `rawMaxTokens` can differ from
- *  the `result.modelUsage` key and window (e.g. 967000 vs 1000000 for sonnet),
- *  so it only refines the live session (`refreshContextWindowInBackground`).
- *  Cleared on `logout`: 1M-context entitlement can differ per account/tier, so
- *  windows learned under one login must not seed sessions under the next. */
-const contextWindowCache = new Map<string, number>();
-
-/** The env vars that determine which LLM backend — and which context lane on
- *  it — a query's API traffic reaches: endpoint selection (base URLs and the
- *  Bedrock/Vertex switches with their project/region), routing/beta headers
- *  (an `anthropic-beta: context-1m-…` header flips the same model id at the
- *  same endpoint between context lanes), and credential identity (extended
- *  context is entitlement-gated per account). Used to derive the
- *  provider-cache key from the exact env a query is created with, so
- *  `providers/set` config, per-session `_meta` env overrides, and ambient
- *  process env are all distinguished exactly as the CLI will see them. */
-const PROVIDER_ROUTING_ENV_VARS = [
-  "ANTHROPIC_BASE_URL",
-  "ANTHROPIC_BEDROCK_BASE_URL",
-  "ANTHROPIC_VERTEX_BASE_URL",
-  "CLAUDE_CODE_USE_BEDROCK",
-  "CLAUDE_CODE_USE_VERTEX",
-  "ANTHROPIC_VERTEX_PROJECT_ID",
-  "CLOUD_ML_REGION",
-  "AWS_REGION",
-  "ANTHROPIC_CUSTOM_HEADERS",
-  "ANTHROPIC_API_KEY",
-  "ANTHROPIC_AUTH_TOKEN",
-  "CLAUDE_CODE_OAUTH_TOKEN",
-] as const;
-
-/** Stable identifier for the LLM backend a session's query is created against,
- *  used to scope {@link contextWindowCache} per backend. Positional `\0`-join
- *  of {@link PROVIDER_ROUTING_ENV_VARS} values, so no segment can masquerade
- *  as another and unset vars everywhere yield one stable "default" bucket.
- *  Header/credential values can be secrets; the key only ever lives as an
- *  in-memory Map key and is never logged or surfaced. Over-keying is the safe
- *  side: a var change that didn't really change the backend costs one cache
- *  miss (heuristic seed until the next result), while under-keying would serve
- *  one backend's window for another's. */
-function providerCacheKeyFor(env: Record<string, string | undefined>): string {
-  return PROVIDER_ROUTING_ENV_VARS.map((name) => env[name] ?? "").join("\0");
-}
-
-/** Compose the `contextWindowCache` key from a session's provider key and a
- *  model id. `\0`-joined so the model segment can't collide with a provider
- *  segment. */
-function contextWindowCacheKey(providerCacheKey: string, modelId: string): string {
-  return `${providerCacheKey}\0${modelId}`;
-}
-
-function cacheContextWindow(modelKey: string, window: number): void {
-  if (window > 0) {
-    contextWindowCache.set(modelKey, window);
-  }
-}
-
-/** The context window to report *right now* for a model, with NO IPC on the
- *  critical path: the cached authoritative value if we've learned it (from a
- *  prior turn's `result.modelUsage`, this or any session on the same backend),
- *  else the text heuristic over the model row's identity strings, else the
- *  default. Derives the cache key itself — `modelInfo?.resolvedModel ?? modelId`,
- *  the same rule at every seed site — so read keys can't drift from the write
- *  site's spelling. `authoritative` reports whether the value came from the
- *  cache: an authoritative window can legitimately equal
- *  DEFAULT_CONTEXT_WINDOW, so the value alone can't tell the caller. */
-function immediateContextWindow(
-  providerCacheKey: string,
-  modelId: string,
-  modelInfo?: Pick<ModelInfo, "resolvedModel" | "displayName" | "description">,
-): { size: number; authoritative: boolean } {
-  const cached = contextWindowCache.get(
-    contextWindowCacheKey(providerCacheKey, modelInfo?.resolvedModel ?? modelId),
-  );
-  if (cached !== undefined) return { size: cached, authoritative: true };
-  return {
-    size:
-      inferContextWindowFromModel(
-        modelId,
-        modelInfo?.resolvedModel,
-        modelInfo?.displayName,
-        modelInfo?.description,
-      ) ?? DEFAULT_CONTEXT_WINDOW,
-    authoritative: false,
-  };
 }
 
 /**

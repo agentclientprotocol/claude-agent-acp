@@ -24,6 +24,7 @@ import {
   notLoggedInAuthStatus,
 } from "../auth-status.js";
 import { AuthStatusReporter, cliLogout, type AuthStatusSettings } from "../auth-status-reporter.js";
+import { clearContextWindowCache } from "../context-window.js";
 import {
   createEnvForProvider,
   defaultProviderConfig,
@@ -136,6 +137,8 @@ export class NativeAuth {
     await this.updateProvider(async () => {
       this.provider = undefined;
     });
+    // The windows learned under this login must not seed sessions under the next.
+    clearContextWindowCache();
     await cliLogout();
     // The read starts after the credentials were cleared, so it does not join
     // a probe in flight. If it cannot read them, the logout still happened.

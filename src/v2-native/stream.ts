@@ -108,6 +108,8 @@ export class SessionOutput {
   private replayHooks: ReplayHooks | undefined;
   /** Set by the session's tasks: rewrites the live updates (see {@link OutputRoute}). */
   route: OutputRoute | undefined;
+  /** Set by the session around one message: rewrites its updates before {@link route}. */
+  rewrite: ((notification: AcpSessionNotification) => AcpSessionNotification) | undefined;
 
   constructor(
     readonly sessionId: string,
@@ -513,7 +515,8 @@ export class SessionOutput {
   private emit(notifications: AcpSessionNotification[]): void {
     // A replay routes only what its hooks ask: the live routing tracks live calls.
     const route = this.replayCleared !== undefined ? this.replayHooks?.route : this.route;
-    for (const { update } of route ? notifications.flatMap(route) : notifications) {
+    const rewritten = this.rewrite ? notifications.map(this.rewrite) : notifications;
+    for (const { update } of route ? rewritten.flatMap(route) : rewritten) {
       const replaying = this.replayCleared !== undefined;
       if (update.sessionUpdate === "agent_message_chunk") {
         this.agentText = true;

@@ -972,6 +972,84 @@ describe("native ACP v2 core", () => {
     ).toEqual([]);
   });
 
+  it("ends a turn cancelled when a cancel comes while an approved plan waits for its fresh context", async () => {
+    const client = nativeClient({
+      answerPermission: () => ({
+        outcome: { outcome: "selected", optionId: "exit-plan-clear-auto" },
+      }),
+    });
+    await client.connect(async (agent) => {
+      const { response, claude } = await openSession(agent);
+      const sessionId = response.sessionId;
+      const prompted = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: PROMPT,
+      });
+      claude.send(echo(await claude.prompt(0)));
+      await prompted;
+      claude.send(
+        assistant("msg_plan", [
+          { type: "tool_use", id: "toolu_plan", name: "ExitPlanMode", input: { plan: "Do it" } },
+        ]),
+      );
+      const decision = await askPermission(
+        claude,
+        "ExitPlanMode",
+        { plan: "Do it" },
+        { toolUseID: "toolu_plan" },
+      );
+      expect(decision).toMatchObject({ behavior: "deny", interrupt: true });
+      claude.send({
+        type: "user",
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_plan",
+              content: "User accepted the plan and requested a fresh context",
+              is_error: true,
+            },
+          ],
+        },
+        tool_result_meta: [{ id: "toolu_plan", non_execution_kind: "user-rejected" }],
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+      });
+      claude.send(
+        result({
+          subtype: "error_during_execution",
+          is_error: true,
+          stop_reason: null,
+          errors: ["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],
+        }),
+      );
+      claude.send(sessionState("idle"));
+      // The turn goes on: the session sends `/clear` for the fresh context.
+      const clear = await claude.prompt(1);
+      expect(clear.message.content).toEqual([{ type: "text", text: "/clear" }]);
+      expect(client.states()).toEqual(["running", "requires_action", "running"]);
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+      await vi.waitFor(() =>
+        expect(client.states()).toEqual(["running", "requires_action", "running", "idle"]),
+      );
+      // Claude Code had taken `/clear` in before the interrupt: its run is dropped.
+      claude.send(lifecycle(clear, "started"));
+      claude.send(echo(clear));
+      claude.send(result({ num_turns: 0, stop_reason: null }));
+      claude.send(lifecycle(clear, "completed"));
+      claude.send(sessionState("idle"));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+
+    expect(
+      client.sessionUpdates.filter((update) => update.sessionUpdate === "state_update").at(-1),
+    ).toMatchObject({ state: "idle", stopReason: "cancelled" });
+    expect(client.states()).toEqual(["running", "requires_action", "running", "idle"]);
+    // No plan's prompt went out after the cancel.
+    expect(sdk.processes[0].prompts).toHaveLength(2);
+  });
+
   it("ends a cycle at its own result, not at a placeholder or at the idle of the turn before", async () => {
     const client = nativeClient();
     await client.connect(async (agent) => {

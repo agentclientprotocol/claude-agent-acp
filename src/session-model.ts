@@ -456,6 +456,61 @@ export function narrowToGatewayModels(
     : [];
 }
 
+/**
+ * The capabilities of the session's current model, and the model infos that
+ * every later lookup reads.
+ *
+ * A resumed session can be running a model outside the `availableModels`
+ * allowlist (currentModelId is then the verbatim live id, see
+ * `matchResumedModel`); its capabilities are still known to the SDK's
+ * unfiltered list, so they are resolved from that before the model is treated
+ * as unknown — otherwise auto mode would be spuriously clamped and the
+ * Fast-mode/Effort options hidden for a model that supports them.
+ *
+ * The fallback-resolved capabilities are registered under the verbatim live
+ * id, so every modelInfos consumer (the effort option, later rebuilds) agrees
+ * with that gating. `buildModelConfigOption` lists this model as its own
+ * entry while it is current and drops it once the user switches to a listed
+ * model; it is never added to `availableModels`. The spread keeps every
+ * capability flag (current and future); the identity fields are overridden
+ * because the fuzzy-matched sibling's resolvedModel/displayName/description
+ * can describe a different context lane and would poison later resolvedModel
+ * matching (a model switch that the adapter did not make) and context-window
+ * inference if they traveled under this id. `allowlistedModelInfo` is the
+ * allowlisted entry alone, the only one whose identity strings are a
+ * trustworthy window signal.
+ */
+export function withCurrentModelInfo(
+  allowedModels: ModelInfo[],
+  sdkModels: ModelInfo[],
+  currentModelId: string,
+): {
+  allowlistedModelInfo: ModelInfo | undefined;
+  currentModelInfo: ModelInfo | undefined;
+  modelInfos: ModelInfo[];
+} {
+  const allowlistedModelInfo = allowedModels.find((m) => m.value === currentModelId);
+  const fallbackModelInfo = allowlistedModelInfo
+    ? undefined
+    : (resolveModelPreference(sdkModels, currentModelId) ?? undefined);
+  return {
+    allowlistedModelInfo,
+    currentModelInfo: allowlistedModelInfo ?? fallbackModelInfo,
+    modelInfos: fallbackModelInfo
+      ? [
+          ...allowedModels,
+          {
+            ...fallbackModelInfo,
+            value: currentModelId,
+            displayName: currentModelId,
+            description: "",
+            resolvedModel: undefined,
+          },
+        ]
+      : allowedModels,
+  };
+}
+
 /** Whether a rejected `setModel` was vetoed by a user-configured
  *  PreModelSwitch hook. The CLI's rejection message is the stable,
  *  distinguishable marker ("Model switch blocked by a PreModelSwitch hook:

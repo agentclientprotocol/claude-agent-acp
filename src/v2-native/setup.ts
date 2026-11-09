@@ -28,6 +28,7 @@ import {
   applyAvailableModelsAllowlist,
   getAvailableModels,
   type SessionModelState,
+  withCurrentModelInfo,
 } from "../session-model.js";
 import type { SettingsManager } from "../settings.js";
 
@@ -69,7 +70,9 @@ export function withClientHooks(
  * narrowed by the settings' `availableModels` allowlist and then by the
  * provider (`narrow`), with the current model from `ANTHROPIC_MODEL`, the
  * settings' `model`, or the transcript of a resumed session
- * (`getAvailableModels`, which sets it on the query when needed).
+ * (`getAvailableModels`, which sets it on the query when needed), and the
+ * current model's capabilities, also for a resumed model outside the
+ * allowlist (`withCurrentModelInfo`).
  */
 export async function sessionModels(
   query: Query,
@@ -80,7 +83,12 @@ export async function sessionModels(
   resumed: { model?: string } | undefined,
   sessionId: string,
   logger: Logger,
-): Promise<{ models: SessionModelState; modelInfos: ModelInfo[] }> {
+): Promise<{
+  models: SessionModelState;
+  modelInfos: ModelInfo[];
+  currentModelInfo: ModelInfo | undefined;
+  allowlistedModelInfo: ModelInfo | undefined;
+}> {
   const { availableModels, modelOverrides } = settings.getSettings();
   const allowed = Array.isArray(availableModels)
     ? applyAvailableModelsAllowlist(
@@ -90,10 +98,10 @@ export async function sessionModels(
         settings.getManagedDeniedModels(),
       )
     : sdkModels;
-  const modelInfos = narrow(allowed);
+  const narrowed = narrow(allowed);
   const models = await getAvailableModels(
     query,
-    modelInfos,
+    narrowed,
     sdkModels,
     settings,
     logger,
@@ -102,7 +110,7 @@ export async function sessionModels(
     resumed?.model,
     narrowedByProvider,
   );
-  return { models, modelInfos };
+  return { models, ...withCurrentModelInfo(narrowed, sdkModels, models.currentModelId) };
 }
 
 /**
