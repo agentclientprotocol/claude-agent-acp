@@ -33,6 +33,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import packageJson from "../../package.json" with { type: "json" };
 import { messageIdForGrouping, type Logger } from "../acp-agent.js";
+import { customAgents } from "../session-config-options.js";
 import { claudeCliPath } from "../claude-cli.js";
 import { clientSystemPrompt, sessionSystemPrompt } from "../client-system-prompt.js";
 import type { ElicitationSupport } from "../elicitation.js";
@@ -52,6 +53,7 @@ import { V2_SESSION_CAPABILITIES } from "../v2/initialize.js";
 import { v1ForkSessionRequest, v1NewSessionRequest } from "../v2/session.js";
 import { V2UpdateTranslator } from "../v2/update-translator.js";
 import { NativeAuth } from "./auth.js";
+import { subagentHooks } from "./child-config.js";
 import { modelSwitchHook, SessionConfig } from "./config.js";
 import { fileChangePreviewHook } from "./file-preview.js";
 import { canUseTool, denyingStoppedWork } from "./permissions.js";
@@ -591,6 +593,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       perTaskStopAffordance,
     );
     const elicitationOptions = session.elicitations.queryOptions();
+    const subagent = subagentHooks((input) => session.tasks.subagentHook(input));
     const options: Options = {
       systemPrompt: sessionSystemPrompt(clientPrompt, params._meta?.systemPrompt),
       settingSources: ["user", "project", "local"],
@@ -639,29 +642,24 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
           ? []
           : { type: "preset", preset: "claude_code" }),
       hooks: withClientHooks(client?.hooks, {
-        SubagentStart: [
-          {
-            hooks: [
-              async (input) => {
-                // Its `cwd` is the subagent's, such as its worktree.
-                if (input.hook_event_name === "SubagentStart") {
-                  session.tasks.subagentStarted(input.agent_id, input.cwd, input.agent_type);
-                }
-                return { continue: true };
-              },
-            ],
-          },
-        ],
+        // A subagent's `cwd` (such as its worktree) and configuration, from its hooks.
+        SubagentStart: [subagent.SubagentStart],
+        SubagentStop: [subagent.SubagentStop],
+        PostToolUseFailure: [subagent.PostToolUseFailure],
         // An Edit or Write shows its exact patch before it runs, as on the bridge.
-        PreToolUse: [fileChangePreviewHook(session, this.logger)],
+        PreToolUse: [subagent.PreToolUse, fileChangePreviewHook(session, this.logger)],
         PostToolUse: [
+          subagent.PostToolUse,
           {
             hooks: [
               createPostToolUseHook({ onEnterPlanMode: async () => session.modeChanged("plan") }),
             ],
           },
         ],
-        PostModelSwitch: [modelSwitchHook((model) => session.modelSwitched(model))],
+        PostModelSwitch: [
+          subagent.PostModelSwitch,
+          modelSwitchHook((model) => session.modelSwitched(model)),
+        ],
         ...reportHooks(session),
       }),
       env: {
@@ -699,6 +697,8 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       settings.dispose();
       throw error;
     }
+    // For the description of a child's agent type in its configuration.
+    session.tasks.configs.configureAgents(customAgents(initialization.agents ?? []));
     let models;
     try {
       models = await sessionModels(

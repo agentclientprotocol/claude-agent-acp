@@ -8,6 +8,7 @@ import path from "node:path";
 import type { AcpSessionNotification, SubagentForm, SubagentState } from "./acp-subagents.js";
 import { AIR_SUBAGENT_KEY, airExtensionMeta } from "./air-extension.js";
 import { MODEL_CONFIG_ID } from "./session-model.js";
+import { orderedSubagentConfiguration } from "./subagent-configuration.js";
 import { isFinalToolCallStatus } from "./tool-calls/renderer.js";
 
 /** The work state of a child, as the RFD's `subagent_update.state` carries it. */
@@ -412,14 +413,7 @@ export class NativeSubagentRuntime {
     // so a delayed publication cannot replace newer settings with older ones.
     const publishing = config.publishing.then(async () => {
       if (this.configBySession.get(child.sessionId) !== config || ended()) return;
-      const priority = ["mode", "model", "thought_level", "model_config"];
-      const rank = (option: SessionConfigOption) => {
-        const index = priority.indexOf(option.category ?? "");
-        return index < 0 ? priority.length : index;
-      };
-      const configOptions = [...config.options.values()].sort(
-        (left, right) => rank(left) - rank(right),
-      );
+      const configOptions = orderedSubagentConfiguration(config.options.values());
       const snapshot = JSON.stringify(configOptions);
       if (config.published === snapshot) return;
       await this.publish({

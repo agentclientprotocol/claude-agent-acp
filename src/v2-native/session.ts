@@ -261,6 +261,7 @@ export class NativeSession implements RequestTarget {
         // A cancel withdraws the requests of the subagents that the work waits on.
         foregroundRequestsChanged: () => this.reportState(this.cancelledWork),
         models: () => this.config.subagentModels(),
+        modes: () => this.config.availableModes(),
         stopTask: async (taskId) => {
           await this.query?.stopTask(taskId);
         },
@@ -784,7 +785,8 @@ export class NativeSession implements RequestTarget {
       return;
     }
     // Task events, and a subagent's messages, which go to its session.
-    if (this.tasks.handle(message)) return;
+    // A subagent that a task restores from the history is read before the next message.
+    if (this.tasks.handle(message)) return this.tasks.restored();
     switch (message.type) {
       case "conversation_reset":
         this.conversationReset();

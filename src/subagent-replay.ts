@@ -376,17 +376,7 @@ export class RfdSubagentReplay {
     }
     const missing = this.omitted.size + this.withoutHistory;
     if (missing > 0 && supportsNotices) {
-      await this.publish({
-        sessionId: rootSessionId,
-        update: noticeUpdate({
-          severity: "info",
-          title: "Some subagent history is not available",
-          description:
-            missing === 1
-              ? "The history of 1 subagent of this session could not be restored."
-              : `The history of ${missing} subagents of this session could not be restored.`,
-        }),
-      });
+      await this.publish({ sessionId: rootSessionId, update: missingHistoryNotice(missing) });
     }
   }
 
@@ -498,12 +488,10 @@ export class RfdSubagentReplay {
     message: SessionMessage,
     text: string,
   ): Promise<void> {
-    const names = [child.sessionId, child.record.name, child.input.name];
-    const call = this.sendMessages.find(
-      (candidate) =>
-        candidate.recipientSessionId === undefined &&
-        names.includes(candidate.to) &&
-        text.includes(candidate.message.trim()),
+    const call = deliveredCall(
+      this.sendMessages,
+      [child.sessionId, child.record.name, child.input.name],
+      text,
     );
     if (call) {
       call.recipientSessionId = child.sessionId;
@@ -619,6 +607,38 @@ function isDirectory(dir: string): boolean {
 }
 
 /** A message that a SendMessage call delivered to the child. */
-function isDelivery(message: SessionMessage): boolean {
+export function isDelivery(message: SessionMessage): boolean {
   return (message as { origin?: { kind?: unknown } | null }).origin?.kind === "coordinator";
+}
+
+/**
+ * The SendMessage call of `calls` that a delivered message `text` came from,
+ * for the child that `names` names (its agent id, its name). Claude Code
+ * frames the message for the child's model ("The coordinator sent a message
+ * while you were working:", then the message, then an instruction), so it is
+ * the first undelivered call to the child whose message the text contains.
+ */
+export function deliveredCall<
+  T extends { to: string; message: string; recipientSessionId?: string },
+>(calls: readonly T[], names: readonly unknown[], text: string): T | undefined {
+  return calls.find(
+    (call) =>
+      call.recipientSessionId === undefined &&
+      names.includes(call.to) &&
+      text.includes(call.message.trim()),
+  );
+}
+
+/** The notice that the history of `missing` subagents of a replayed session is not available. */
+export function missingHistoryNotice(
+  missing: number,
+): Extract<AcpSessionNotification["update"], { sessionUpdate: "notice" }> {
+  return noticeUpdate({
+    severity: "info",
+    title: "Some subagent history is not available",
+    description:
+      missing === 1
+        ? "The history of 1 subagent of this session could not be restored."
+        : `The history of ${missing} subagents of this session could not be restored.`,
+  }) as Extract<AcpSessionNotification["update"], { sessionUpdate: "notice" }>;
 }

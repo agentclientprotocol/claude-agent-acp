@@ -87,6 +87,7 @@ const SAME_AS_BRIDGE: string[] = [
   "subagent-agent-async",
   "subagent-native-sessions",
   "subagent-nested",
+  "subagent-late-child-update",
   "subagent-transcript-extension",
   "todo-write",
   "task-create-update",
@@ -105,6 +106,7 @@ const SAME_AS_BRIDGE: string[] = [
   "compaction-legacy",
   "compaction-update",
   "compaction-failed-legacy",
+  "session-load-replay",
 ];
 
 const runs = new Map<string, ScenarioRunV2>();

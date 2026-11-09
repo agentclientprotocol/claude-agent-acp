@@ -15,7 +15,7 @@ import {
   AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
   clientSupportsAirCapability,
 } from "./air-extension.js";
-import { DEFAULT_AGENT_ID } from "./session-config-ids.js";
+import { AGENT_CONFIG_ID, DEFAULT_AGENT_ID } from "./session-config-ids.js";
 import { buildEffortConfigOption } from "./session-effort.js";
 import {
   createFastModeConfigOption,
@@ -62,11 +62,15 @@ export const BUILTIN_AGENT_NAMES = new Set([
  *  creation. */
 export async function discoverCustomAgents(q: Query): Promise<AgentInfo[]> {
   try {
-    const agents = await q.supportedAgents();
-    return agents.filter((a) => !BUILTIN_AGENT_NAMES.has(a.name) && a.name !== DEFAULT_AGENT_ID);
+    return customAgents(await q.supportedAgents());
   } catch {
     return [];
   }
+}
+
+/** The configured agents of `agents`: neither a built-in subagent nor the "default" sentinel. */
+export function customAgents(agents: readonly AgentInfo[]): AgentInfo[] {
+  return agents.filter((a) => !BUILTIN_AGENT_NAMES.has(a.name) && a.name !== DEFAULT_AGENT_ID);
 }
 
 /** Stable ids for the session config options surfaced via `configOptions`.
@@ -74,7 +78,7 @@ export async function discoverCustomAgents(q: Query): Promise<AgentInfo[]> {
  *  handlers in `setSessionConfigOption`/`applyConfigOptionValue` reference the
  *  same identifiers and can't drift apart. */
 export { MODE_CONFIG_ID };
-export const AGENT_CONFIG_ID = "agent";
+export { AGENT_CONFIG_ID };
 
 /** Whether the Client advertised support for boolean session config options
  *  (`session.configOptions.boolean`). Agents MUST only send `type: "boolean"`

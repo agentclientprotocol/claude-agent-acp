@@ -297,6 +297,11 @@ export class SessionConfig {
     return this.session.modes.availableModes.map((mode) => mode.id);
   }
 
+  /** The session's modes, for the name of a subagent's mode. */
+  availableModes(): SessionModeState["availableModes"] {
+    return this.session.modes.availableModes;
+  }
+
   /** The mode the session left when it entered plan mode, while it is in plan. */
   prePlanMode(): string | undefined {
     return this.session.prePlanMode;

@@ -361,7 +361,7 @@ import {
   observeExitPlanToolResults,
   planModeUpdate,
 } from "./exit-plan.js";
-import { DEFAULT_AGENT_ID } from "./session-config-ids.js";
+import { AGENT_CONFIG_ID, DEFAULT_AGENT_ID } from "./session-config-ids.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
 import {
   markerTagText,
@@ -407,7 +407,6 @@ import {
   EFFORT_CONFIG_ID,
   effortFlagSettings,
   effortForModelSwitch,
-  effortLevelName,
   mergeEffortSettings,
   settleEffortAfterModelSwitch,
   settingsEffortForModel,
@@ -421,7 +420,6 @@ import {
   type UltracodeOptionState,
 } from "./session-ultracode.js";
 import {
-  AGENT_CONFIG_ID,
   buildConfigOptions,
   clientSupportsBooleanConfigOptions,
   clientSupportsRecommendedConfigValue,
@@ -445,6 +443,7 @@ import {
 } from "./context-window.js";
 import { STARTUP_FAILURE_RESULTS_ENV, startupFailureError } from "./startup-failure.js";
 import { recordStreamedDelta, unstreamedRemainder, type StreamedBlock } from "./streamed-text.js";
+import { subagentHookOptions } from "./subagent-configuration.js";
 
 export {
   AGENT_CONFIG_ID,
@@ -9786,50 +9785,11 @@ export class ClaudeAcpAgent {
         .catch((error) =>
           this.logger.error(`Session ${sessionId}: failed to report subagent cwd: ${error}`),
         );
-      const options: SessionConfigOption[] = [];
-      if (input.permission_mode) {
-        const mode = session.modes.availableModes.find((mode) => mode.id === input.permission_mode);
-        options.push(
-          SessionModeManager.configOption({
-            currentModeId: input.permission_mode,
-            availableModes: [mode ?? { id: input.permission_mode, name: input.permission_mode }],
-          }),
-        );
-      }
-      const switchedModel =
-        input.hook_event_name === "PostModelSwitch"
-          ? responseModelEntry(input.to_model, this.subagentModels(sessionId))
-          : undefined;
-      // The entry of the root session's `model` option, as for a child response.
-      if (switchedModel) options.push(childModelOption(switchedModel));
-      if (input.effort?.level) {
-        options.push({
-          id: EFFORT_CONFIG_ID,
-          name: "Effort",
-          description: "Current reasoning effort",
-          category: "thought_level",
-          type: "select",
-          currentValue: input.effort.level,
-          options: [{ value: input.effort.level, name: effortLevelName(input.effort.level) }],
-        });
-      }
-      if (input.agent_type) {
-        const agent = session.agents.find((agent) => agent.name === input.agent_type);
-        options.push({
-          id: AGENT_CONFIG_ID,
-          name: "Agent",
-          description: "Subagent type",
-          type: "select",
-          currentValue: input.agent_type,
-          options: [
-            {
-              value: input.agent_type,
-              name: input.agent_type,
-              ...(agent?.description ? { description: agent.description } : {}),
-            },
-          ],
-        });
-      }
+      const options = subagentHookOptions(input, {
+        availableModes: session.modes.availableModes,
+        models: this.subagentModels(sessionId),
+        agents: session.agents,
+      });
       await session.nativeSubagentRuntime
         ?.reportConfiguration(input.agent_id, options)
         .catch((error) =>
