@@ -127,6 +127,12 @@ class V2Agent implements AgentHandle, SessionConnection {
    * until a resume starts it again.
    */
   private readonly stopped = new Map<string, string>();
+  /**
+   * The query starts that run, by session id, until each settles (see
+   * {@link startSession}). A resume, close or dispose of a session waits for
+   * its start, so a second start never replaces a running query.
+   */
+  private readonly starting = new Map<string, Promise<V2Session>>();
   readonly translator = new V2UpdateTranslator();
   readonly auth: V2Auth;
   /** The `--hide-claude-auth` subscription guard (see `subscription-guard.ts`). */
@@ -325,6 +331,9 @@ class V2Agent implements AgentHandle, SessionConnection {
     }
     if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "resume");
     await this.restarts.settled(sessionId);
+    // A concurrent resume of this session started its query: this one then
+    // attaches to the session that it started.
+    await this.startSettled(sessionId);
     let session = this.sessions.get(sessionId);
     let history: Promise<SessionMessage[]> | undefined;
     if (session) {
@@ -419,6 +428,8 @@ class V2Agent implements AgentHandle, SessionConnection {
     if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "close");
     // A restart that runs ends first, so the close ends the session it started.
     await this.restarts.closing(sessionId);
+    // A resume that starts the session: the close ends what it started.
+    await this.startSettled(sessionId);
     this.stopped.delete(sessionId);
     const session = this.sessions.get(sessionId);
     if (session) {
@@ -511,6 +522,7 @@ class V2Agent implements AgentHandle, SessionConnection {
 
   async dispose(): Promise<void> {
     await this.restarts.dispose();
+    await Promise.all([...this.starting.keys()].map((sessionId) => this.startSettled(sessionId)));
     const sessions = [...this.sessions.values()];
     this.sessions.clear();
     this.stopped.clear();
@@ -564,12 +576,43 @@ class V2Agent implements AgentHandle, SessionConnection {
     };
   }
 
+  /** Resolves once no start of `sessionId` runs, whether the starts succeeded or not. */
+  private async startSettled(sessionId: string): Promise<void> {
+    // Each wait can end with another start running, which began after it.
+    let start = this.starting.get(sessionId);
+    while (start) {
+      await start.catch(() => {});
+      start = this.starting.get(sessionId);
+    }
+  }
+
   /**
    * Starts the query of a session: a new one, or `resume` of a stored one
-   * (also a fork's copy). Its options are the client's
+   * (also a fork's copy), and tracks the start in {@link starting} until it
+   * settles. A resume checks that no start of `sessionId` runs right
+   * before, with no await in between. A restart's start is serialized by
+   * `restarts.ts`, which a resume and a close wait for first.
+   */
+  private startSession(
+    sessionId: string,
+    params: v2.NewSessionRequest | v2.ResumeSessionRequest | v2.ForkSessionRequest,
+    resume: string | undefined,
+    history?: Promise<SessionMessage[]>,
+  ): Promise<V2Session> {
+    const start = this.launchSession(sessionId, params, resume, history);
+    this.starting.set(sessionId, start);
+    const settled = () => {
+      if (this.starting.get(sessionId) === start) this.starting.delete(sessionId);
+    };
+    start.then(settled, settled);
+    return start;
+  }
+
+  /**
+   * The query start of {@link startSession}. Its options are the client's
    * `_meta.claudeCode.options` under the ones this core controls.
    */
-  private async startSession(
+  private async launchSession(
     sessionId: string,
     params: v2.NewSessionRequest | v2.ResumeSessionRequest | v2.ForkSessionRequest,
     resume: string | undefined,

@@ -1138,6 +1138,73 @@ describe("ACP v2 core", () => {
     expect(sdk.processes[1].options.resume).toBe(sdk.processes[0].options.sessionId);
   });
 
+  it("starts an inactive session once for concurrent resumes", async () => {
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      await openSession(agent);
+      const started = Promise.withResolvers<void>();
+      sdk.startGate = started.promise;
+      const sessionId = randomUUID();
+      const resumes = [1, 2].map(() =>
+        agent.request(v2.methods.agent.session.resume, { sessionId, cwd }),
+      );
+      await vi.waitFor(() => expect(sdk.processes).toHaveLength(2));
+      started.resolve();
+      await Promise.all(resumes);
+    });
+
+    expect(sdk.processes).toHaveLength(2);
+    expect(sdk.processes[1].close).not.toHaveBeenCalled();
+  });
+
+  it("starts a session again for a resume that waited for a start that failed", async () => {
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      await openSession(agent);
+      const started = Promise.withResolvers<void>();
+      sdk.startGate = started.promise;
+      sdk.startFailure = new Error("Claude Code process exited with code 1");
+      const sessionId = randomUUID();
+      const failed = agent
+        .request(v2.methods.agent.session.resume, { sessionId, cwd })
+        .catch((error: unknown) => error);
+      await vi.waitFor(() => expect(sdk.processes).toHaveLength(2));
+      const resumed = agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+      // The second resume reaches the agent while the first start waits.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      started.resolve();
+      expect(await failed).toMatchObject({ code: -32603 });
+      sdk.startFailure = undefined;
+      await resumed;
+    });
+
+    expect(sdk.processes).toHaveLength(3);
+  });
+
+  it("closes a session that session/close found still starting", async () => {
+    const client = v2Client();
+    const error = await client.connect(async (agent) => {
+      await openSession(agent);
+      const started = Promise.withResolvers<void>();
+      sdk.startGate = started.promise;
+      const sessionId = randomUUID();
+      const resume = agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+      await vi.waitFor(() => expect(sdk.processes).toHaveLength(2));
+      const close = agent.request(v2.methods.agent.session.close, { sessionId });
+      // The close reaches the agent while the start waits.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      started.resolve();
+      await resume;
+      await close;
+      expect(sdk.processes[1].close).toHaveBeenCalled();
+      return agent
+        .request(v2.methods.agent.session.prompt, { sessionId, prompt: PROMPT })
+        .catch((error: unknown) => error);
+    });
+
+    expect(error).toMatchObject({ code: -32002 });
+  });
+
   it("ends the work at the turn's result while background subagents keep Claude Code running", async () => {
     const client = v2Client();
     await client.connect(async (agent) => {
