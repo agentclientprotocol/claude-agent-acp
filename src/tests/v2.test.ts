@@ -3441,26 +3441,76 @@ describe("ACP v2 core", () => {
         ]);
       });
 
-      it("reports a prompt that a cancel ended unavailable, without reading a checkpoint", async () => {
-        const client = v2Client();
-        const { claude, sessionId } = await client.connect(async (agent) => {
-          const { response, claude } = await openSession(agent, air("agentFileChangeReport"));
-          const answer = agent.request(v2.methods.agent.session.prompt, {
-            sessionId: response.sessionId,
-            prompt: PROMPT,
-            _meta: requestMeta("r-1"),
+      it.each([
+        ["a cancel answered with -32800 before its insertion", false, "cancel", "cancelled"],
+        ["a cancel stopped after its insertion", true, "cancel", "cancelled"],
+        ["ended with an error result", true, "error", "providerError"],
+        ["ended without a result, as the query ended", true, "end", "providerError"],
+        [
+          "failed otherwise before its insertion, as the query ended",
+          false,
+          "end",
+          "providerError",
+        ],
+      ] as const)(
+        "reports a prompt that %s unavailable, without reading a checkpoint",
+        async (_, insert, end, reason) => {
+          const client = v2Client();
+          const { claude, sessionId } = await client.connect(async (agent) => {
+            const { response, claude } = await openSession(agent, air("agentFileChangeReport"));
+            const sessionId = response.sessionId;
+            const answer = agent
+              .request(v2.methods.agent.session.prompt, {
+                sessionId,
+                prompt: PROMPT,
+                _meta: requestMeta("r-1"),
+              })
+              .catch((error: unknown) => error);
+            const prompt = await claude.prompt(0);
+            if (insert) {
+              claude.send(echo(prompt));
+              expect(await answer).toEqual({ messageId: prompt.uuid });
+            }
+            if (end === "cancel") {
+              await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+              if (insert) {
+                await vi.waitFor(() => expect(claude.interrupt).toHaveBeenCalled());
+                claude.send(
+                  result({
+                    subtype: "error_during_execution",
+                    is_error: true,
+                    terminal_reason: "aborted_streaming",
+                  }),
+                );
+                claude.send(sessionState("idle"));
+              }
+            } else if (end === "error") {
+              claude.send(
+                result({
+                  subtype: "error_during_execution",
+                  is_error: true,
+                  errors: ["Overloaded"],
+                }),
+              );
+              claude.send(sessionState("idle"));
+            } else {
+              claude.end(new Error("Claude Code exited"));
+            }
+            if (!insert) {
+              expect(await answer).toMatchObject({ code: end === "cancel" ? -32800 : -32603 });
+            }
+            await vi.waitFor(() =>
+              expect(reports(updatesOf(client.notifications, sessionId))).toHaveLength(1),
+            );
+            return { claude, sessionId };
           });
-          await claude.prompt(0);
-          await agent.notify(v2.methods.agent.session.cancel, { sessionId: response.sessionId });
-          await expect(answer).rejects.toMatchObject({ code: -32800 });
-          return { claude, sessionId: response.sessionId };
-        });
 
-        expect(claude.rewindFiles).not.toHaveBeenCalled();
-        expect(reports(updatesOf(client.notifications, sessionId))).toEqual([
-          { version: 1, requestId: "r-1", status: "unavailable", reason: "cancelled" },
-        ]);
-      });
+          expect(claude.rewindFiles).not.toHaveBeenCalled();
+          expect(reports(updatesOf(client.notifications, sessionId))).toEqual([
+            { version: 1, requestId: "r-1", status: "unavailable", reason },
+          ]);
+        },
+      );
 
       it.each([
         ["an AIR client without the capability", air()],
