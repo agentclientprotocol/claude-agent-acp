@@ -236,6 +236,11 @@ export class SessionTasks {
   private readonly cancelledAgents = new Set<string>();
   /** The subagents that the root's last cancel stopped (see {@link foregroundCancelFailed}). */
   private readonly foregroundCancelled = new Set<string>();
+  /**
+   * Whether the root's cancel is in effect: from {@link cancelForeground}
+   * until {@link foregroundCancelEnded} or {@link foregroundCancelFailed}.
+   */
+  private rootCancelling = false;
   /** Set when the root session closes: no request goes to the client after it. */
   private closed = false;
   /** The session that made each SendMessage call: the sender of a resumed child's prompt. */
@@ -553,17 +558,24 @@ export class SessionTasks {
    * interrupt stops their runs, which then end `cancelled`. Until then, of
    * their consolidated messages only the results of the tool calls that the
    * client holds go out, as on the root and on the bridge (see
-   * `SessionOutput.cancelled`).
+   * `SessionOutput.cancelled`). A foreground subagent that Claude Code
+   * reports after the cancel, until {@link foregroundCancelEnded}, is
+   * stopped work too: Claude Code started it before the interrupt, and the
+   * session reads its `task_started` only after the cancel.
    */
   cancelForeground(): void {
     this.foregroundCancelled.clear();
-    for (const agentId of this.agents.keys()) {
-      if (!this.waitsOn(agentId, undefined)) continue;
-      this.withdraw(agentId);
-      this.foregroundCancelled.add(agentId);
-      const output = this.children.get(agentId)?.output;
-      if (output) output.cancelled = true;
-    }
+    this.rootCancelling = true;
+    for (const agentId of this.agents.keys()) this.cancelIfForeground(agentId);
+  }
+
+  /**
+   * The work that the root's cancel stopped ended: its result, Claude Code's
+   * idle, or the start of a later prompt. A subagent that comes after it is
+   * the later work's.
+   */
+  foregroundCancelEnded(): void {
+    this.rootCancelling = false;
   }
 
   /**
@@ -572,6 +584,7 @@ export class SessionTasks {
    * again, not a stopped run's.
    */
   foregroundCancelFailed(): void {
+    this.rootCancelling = false;
     for (const agentId of this.foregroundCancelled) {
       this.cancelledAgents.delete(agentId);
       const child = this.children.get(agentId);
@@ -874,6 +887,7 @@ export class SessionTasks {
       // no longer tracks, such as one from before a restart, cannot be
       // placed: the child stays unexposed, its traffic the root's.
       if (message.parent_task_id !== undefined && !this.children.has(message.parent_task_id)) {
+        this.cancelIfForeground(message.task_id);
         this.host.foregroundRequestsChanged();
         return;
       }
@@ -898,6 +912,8 @@ export class SessionTasks {
         }
       }
     }
+    // After `startRun`, which clears the stop of the resumed child's last run.
+    this.cancelIfForeground(message.task_id);
     this.host.foregroundRequestsChanged();
     this.publish();
   }
@@ -1245,6 +1261,8 @@ export class SessionTasks {
     output.route = (notification) => this.route(output, notification, child);
     child.output = output;
     child.announced = true;
+    // Before the messages that waited for the announcement go out.
+    this.cancelIfForeground(child.sessionId);
     return identity;
   }
 
@@ -1590,8 +1608,9 @@ export class SessionTasks {
    * Runs `send` as an open request of the agent `agentId` (see
    * {@link RequestTarget.openRequest}). While it is open, `announced`, the
    * child session it goes to, is `requires_action`, and the work that waits
-   * on the agent is too. After the root closed, its signal is aborted before
-   * `send` runs.
+   * on the agent is too. After the root closed, or while a cancel stops the
+   * agent's run, `send` runs with an aborted signal and the request does not
+   * count as open.
    */
   private async agentRequest<T>(
     agentId: string,
@@ -1599,8 +1618,8 @@ export class SessionTasks {
     toolSignal: AbortSignal,
     send: (signal: AbortSignal) => Promise<T>,
   ): Promise<T> {
+    if (this.closed || this.cancelledAgents.has(agentId)) return send(AbortSignal.abort());
     const abort = new AbortController();
-    if (this.closed) abort.abort();
     const signal = AbortSignal.any([toolSignal, abort.signal]);
     const requests = this.agentRequests.get(agentId) ?? new Set();
     this.agentRequests.set(agentId, requests);
@@ -1628,6 +1647,18 @@ export class SessionTasks {
     request: v2.RequestPermissionRequest,
     signal: AbortSignal,
   ) => Promise<v2.RequestPermissionResponse>;
+
+  /**
+   * While the root's cancel is in effect, the agent `agentId`, when the root
+   * waits on it, is stopped with the root's work (see {@link cancelForeground}).
+   */
+  private cancelIfForeground(agentId: string): void {
+    if (!this.rootCancelling || !this.waitsOn(agentId, undefined)) return;
+    this.withdraw(agentId);
+    this.foregroundCancelled.add(agentId);
+    const output = this.children.get(agentId)?.output;
+    if (output) output.cancelled = true;
+  }
 
   /** Withdraws the open requests of the agent `agentId`, whose run a cancel stops. */
   private withdraw(agentId: string): void {

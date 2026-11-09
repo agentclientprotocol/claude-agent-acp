@@ -415,6 +415,20 @@ function subagent(agentId: string, launch: string, fields: Record<string, unknow
       ]),
       parent_tool_use_id: parent,
     }),
+    /**
+     * The streamed start of its Agent call, which comes before the
+     * consolidated `launch`: after a cancel, only the stream goes out.
+     */
+    launchStart: () => ({
+      type: "stream_event",
+      event: {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: launch, name: "Agent", input: {} },
+      },
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+    }),
     started: (more: Record<string, unknown> = {}) =>
       system("task_started", {
         tool_use_id: launch,
@@ -2273,6 +2287,55 @@ describe("native ACP v2 core", () => {
       });
 
       expect(decision).toMatchObject({ behavior: "deny", decisionClassification: "user_reject" });
+    });
+
+    it("stops a foreground subagent that Claude Code reports after the root's cancel, until the cancelled work's result", async () => {
+      const client = nativeClient();
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        claude.send(cycleStart());
+        await vi.waitFor(() => expect(client.states()).toEqual(["running"]));
+        await agent.notify(v2.methods.agent.session.cancel, { sessionId: response.sessionId });
+        await vi.waitFor(() => expect(claude.interrupt).toHaveBeenCalled());
+        // The interrupt stopped a subagent whose launch the session reads only now.
+        const late = subagent("late", "toolu_late");
+        claude.send(late.launchStart());
+        claude.send(late.launch());
+        claude.send(late.started());
+        claude.send(late.says("Half an answer"));
+        // A background subagent goes on after the root's cancel.
+        const background = subagent("bg", "toolu_bg", { is_backgrounded: true });
+        claude.send(background.launchStart());
+        claude.send(background.launch());
+        claude.send(background.started());
+        await vi.waitFor(() => expect(updatesOf(client.notifications, "bg")).not.toEqual([]));
+        await expect(
+          askPermission(claude, "Bash", { command: "make" }, { agentID: "late" }),
+        ).rejects.toThrow("Tool use aborted");
+        await askPermission(claude, "Bash", { command: "make" }, { agentID: "bg" });
+        claude.send(late.ended("stopped"));
+        claude.send(
+          result({
+            subtype: "error_during_execution",
+            is_error: true,
+            terminal_reason: "aborted_streaming",
+          }),
+        );
+        claude.send(sessionState("idle"));
+        await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+        // The cancel ended with its work: a later turn's subagent asks the client.
+        claude.send(cycleStart());
+        const next = subagent("next", "toolu_next");
+        claude.send(next.launch());
+        claude.send(next.started());
+        await askPermission(claude, "Bash", { command: "make" }, { agentID: "next" });
+      });
+
+      expect(client.permissionRequests.map((request) => request.sessionId)).toEqual(["bg", "next"]);
+      // Announced, without the message of its stopped run.
+      expect(updatesOf(client.notifications, "late").map((update) => update.sessionUpdate)).toEqual(
+        ["state_update", "session_message", "state_update"],
+      );
     });
 
     it("sends a subagent's request on its session when it is announced while the request is built", async () => {

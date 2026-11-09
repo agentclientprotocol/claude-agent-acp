@@ -148,7 +148,9 @@ final status. A child that its parent waits on (`is_backgrounded` not `true`) is
 parent's foreground work, also before its announcement: its requests block the parent too
 (`requires_action`), and cancelling the parent stops it. After the parent's `session/cancel`,
 of a foreground child's consolidated messages only the results of the tool calls that the client
-holds go out until its run ends, as for the root. A child's unfinished tool calls get their final
+holds go out until its run ends, as for the root, and its requests are withdrawn, also later ones.
+A foreground child that Claude Code reports after the cancel, before the stopped work's result or
+idle or the next prompt's start, is stopped the same way. A child's unfinished tool calls get their final
 status before its idle (unlike the bridge, see "Intended differences"): `cancelled` when it was
 stopped, `failed` when it failed or a reset ended it, and otherwise a tool call that Claude
 dropped before it ran ends `cancelled`. Claude Code's later results for a stopped or failed run's

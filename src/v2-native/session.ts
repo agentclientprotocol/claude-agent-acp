@@ -1015,6 +1015,9 @@ export class NativeSession implements RequestTarget {
    */
   private promptStarted(uuid: string): void {
     if (this.stopped.promptStarted(uuid, this.foreground)) return;
+    // Claude Code takes its prompts in order: the work that a cancel stopped
+    // has ended, also when the cancel came while it ran nothing.
+    this.tasks.foregroundCancelEnded();
     this.clearContext.promptStarted(uuid);
     this.inserted(uuid);
     this.openTurn(uuid);
@@ -1048,6 +1051,8 @@ export class NativeSession implements RequestTarget {
     if (isPlaceholderResult(message)) return;
     this.idleOwed = true;
     const { dropped, interrupted } = this.stopped.result(message);
+    // Also a dropped result: the cancel's interrupt reached no further.
+    this.tasks.foregroundCancelEnded();
     if (dropped) {
       this.turnReport.reset();
       return;
@@ -1111,6 +1116,7 @@ export class NativeSession implements RequestTarget {
       return;
     }
     this.stopped.idle();
+    this.tasks.foregroundCancelEnded();
     this.closeTurn();
   }
 
