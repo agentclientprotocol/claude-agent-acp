@@ -464,6 +464,8 @@ export {
   MODEL_CONFIG_ID,
   resolveModelPreference,
 } from "./session-model.js";
+// Moved to result-end.ts; kept as an export for consumers that deep-import dist/acp-agent.js.
+export { isLoginRequiredText } from "./result-end.js";
 
 /** Claude CLI emits this synthetic result when an interrupted cycle ends on
  *  queued user input before producing any assistant content. It is a hand-off
