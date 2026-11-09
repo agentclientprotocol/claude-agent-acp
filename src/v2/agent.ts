@@ -138,6 +138,12 @@ class V2Agent implements AgentHandle, SessionConnection {
    * its start, so a second start never replaces a running query.
    */
   private readonly starting = new Map<string, Promise<V2Session>>();
+  /**
+   * The `session/resume` handlers that run, by session id. A close waits for
+   * them, so a resume's replay, snapshot and response go out before the close
+   * response, and nothing of the session after it.
+   */
+  private readonly resuming = new Map<string, Set<Promise<unknown>>>();
   readonly translator = new V2UpdateTranslator();
   readonly auth: V2Auth;
   /** The `--hide-claude-auth` subscription guard (see `subscription-guard.ts`). */
@@ -326,7 +332,22 @@ class V2Agent implements AgentHandle, SessionConnection {
    * { type: "start" }` the stored history replays first. Either way, the
    * state snapshot goes out after any replay and before the response.
    */
-  async resumeSession(params: v2.ResumeSessionRequest): Promise<v2.ResumeSessionResponse> {
+  resumeSession(params: v2.ResumeSessionRequest): Promise<v2.ResumeSessionResponse> {
+    const { sessionId } = params;
+    const run = this.resume(params);
+    let runs = this.resuming.get(sessionId);
+    if (!runs) this.resuming.set(sessionId, (runs = new Set()));
+    runs.add(run);
+    const settled = () => {
+      runs.delete(run);
+      if (runs.size === 0 && this.resuming.get(sessionId) === runs) this.resuming.delete(sessionId);
+    };
+    run.then(settled, settled);
+    return run;
+  }
+
+  /** The handler of {@link resumeSession}. */
+  private async resume(params: v2.ResumeSessionRequest): Promise<v2.ResumeSessionResponse> {
     const { sessionId, replayFrom } = params;
     if (replayFrom != null && replayFrom.type !== "start") {
       throw RequestError.invalidParams(
@@ -434,8 +455,9 @@ class V2Agent implements AgentHandle, SessionConnection {
     if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "close");
     // A restart that runs ends first, so the close ends the session it started.
     await this.restarts.closing(sessionId);
-    // A resume that starts the session: the close ends what it started.
-    await this.startSettled(sessionId);
+    // A resume that runs answers first: the close ends what it started, and
+    // its updates go out before the close response.
+    await this.setupSettled(sessionId);
     this.stopped.delete(sessionId);
     const session = this.sessions.get(sessionId);
     if (session) {
@@ -580,6 +602,17 @@ class V2Agent implements AgentHandle, SessionConnection {
       // The draft leaves out an empty list.
       ...(commands.length > 0 ? { availableCommands: commands } : {}),
     };
+  }
+
+  /**
+   * Resolves once the resumes of `sessionId` that run now, and every start of
+   * it, settled, whether they succeeded or not. A resume that comes later is
+   * not waited for.
+   */
+  private async setupSettled(sessionId: string): Promise<void> {
+    const resumes = [...(this.resuming.get(sessionId) ?? [])];
+    await Promise.all(resumes.map((resume) => resume.catch(() => {})));
+    await this.startSettled(sessionId);
   }
 
   /** Resolves once no start of `sessionId` runs, whether the starts succeeded or not. */

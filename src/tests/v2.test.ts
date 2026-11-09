@@ -1270,6 +1270,37 @@ describe("ACP v2 core", () => {
     expect(error).toMatchObject({ code: -32002 });
   });
 
+  it("answers a session/close that comes during a resume's replay after the resume, and sends nothing after it", async () => {
+    const client = v2Client();
+    const read = Promise.withResolvers<never[]>();
+    await client.connect(async (agent) => {
+      const { response } = await openSession(agent);
+      const sessionId = response.sessionId;
+      vi.mocked(getSessionMessages).mockReturnValueOnce(read.promise);
+      const order: string[] = [];
+      const resume = agent
+        .request(v2.methods.agent.session.resume, { sessionId, cwd, replayFrom: { type: "start" } })
+        .then(() => order.push("resume"));
+      await vi.waitFor(() => expect(getSessionMessages).toHaveBeenCalled());
+      let sentBeforeClose = -1;
+      const close = agent.request(v2.methods.agent.session.close, { sessionId }).then(() => {
+        order.push("close");
+        sentBeforeClose = client.notifications.length;
+      });
+      // The close reaches the agent while the replay reads the transcript.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      read.resolve([]);
+      await Promise.all([resume, close]);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(order).toEqual(["resume", "close"]);
+      expect(client.notifications.slice(sentBeforeClose)).toEqual([]);
+      const restarts = (agents[0] as unknown as { restarts: { setups: Map<string, unknown> } })
+        .restarts;
+      expect(restarts.setups.has(sessionId)).toBe(false);
+    });
+  });
+
   it("ends the work at the turn's result while background subagents keep Claude Code running", async () => {
     const client = v2Client();
     await client.connect(async (agent) => {
