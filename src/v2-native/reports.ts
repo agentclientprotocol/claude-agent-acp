@@ -77,6 +77,13 @@ export interface ReportsSetup {
   env: Record<string, string | undefined>;
   /** The names of the client's MCP servers. */
   mcpServers: readonly string[];
+  /**
+   * Whether the session asks the user to sign in to an MCP server that needs
+   * it (see `SessionElicitations.authenticateMcpServers`): the client renders
+   * URL elicitations and the query can authenticate. Its startup then sends
+   * no "needs authentication" notice, as on the bridge.
+   */
+  mcpOAuth: boolean;
   /** The query, for its context window (`getContextUsage`). */
   query: Pick<Query, "getContextUsage">;
   /**
@@ -93,6 +100,7 @@ export class SessionReports {
   private idleCompaction: IdleCompaction | undefined;
   private settings: ReportsSetup["settings"] | undefined;
   private clientMcpServers = new Set<string>();
+  private mcpOAuth = false;
   private readonly reportedMcpServers = new Set<string>();
   /** The tool uses whose `informational` progress went out as a notice. */
   private readonly noticedToolUses = new Set<string>();
@@ -145,6 +153,7 @@ export class SessionReports {
   /** Called once, before the query's first message. */
   configure(setup: ReportsSetup): void {
     this.clientMcpServers = new Set(setup.mcpServers);
+    this.mcpOAuth = setup.mcpOAuth;
     this.settings = setup.settings;
     this.query = setup.query;
     // From the same env the query got, as on the bridge.
@@ -516,8 +525,7 @@ export class SessionReports {
       if (!this.clientMcpServers.has(server.name) || this.reportedMcpServers.has(server.name)) {
         continue;
       }
-      // This core runs no MCP OAuth flow.
-      const notice = mcpServerStartupNotice(server, false);
+      const notice = mcpServerStartupNotice(server, this.mcpOAuth);
       if (!notice) continue;
       this.reportedMcpServers.add(server.name);
       this.host.emit([{ sessionId: this.host.sessionId, update: noticeUpdate(notice) }]);

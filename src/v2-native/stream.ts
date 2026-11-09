@@ -108,6 +108,8 @@ export class SessionOutput {
   private replayToolUses: ToolUseCache | undefined;
   /** During {@link replay}, what the session's subagents ask of it. */
   private replayHooks: ReplayHooks | undefined;
+  /** During {@link replay}, the replayed tool calls without a final status. */
+  private replayUnfinished: Set<string> | undefined;
   /** Set by the session's tasks: rewrites the live updates (see {@link OutputRoute}). */
   route: OutputRoute | undefined;
   /** Set by the session around one message: rewrites its updates before {@link route}. */
@@ -353,10 +355,20 @@ export class SessionOutput {
    * transcripts are left out, as live. The client may hold the replayed
    * messages already, so each message is cleared before its first chunk.
    * `hooks` replays the subagents' own histories to their sessions.
+   *
+   * A replayed tool call that the history gives no result, such as one that
+   * ran when Claude Code was killed, ends `failed` after the replay, as v2
+   * asks of replayed work that no longer runs. The calls that the live
+   * session holds open, and those in `live` (its background work), go on.
    */
-  replay(messages: SessionMessage[], hooks?: ReplayHooks): void {
+  replay(
+    messages: SessionMessage[],
+    hooks?: ReplayHooks,
+    live: ReadonlySet<string> = new Set(),
+  ): void {
     this.replayCleared = new Set();
     this.replayHooks = hooks;
+    const unfinished = (this.replayUnfinished = new Set());
     try {
       for (const message of messages) {
         if (message.parent_tool_use_id !== null || isReplayHiddenMetaMessage(message)) continue;
@@ -394,6 +406,11 @@ export class SessionOutput {
       this.replayCleared = undefined;
       this.replayToolUses = undefined;
       this.replayHooks = undefined;
+      this.replayUnfinished = undefined;
+    }
+    for (const toolCallId of unfinished) {
+      if (this.unfinished.has(toolCallId) || live.has(toolCallId)) continue;
+      this.send({ sessionUpdate: "tool_call_update", toolCallId, status: "failed" });
     }
   }
 
@@ -553,9 +570,12 @@ export class SessionOutput {
     for (const v2Update of this.translator.updates(this.sessionId, update, replaying)) {
       const clear = this.replayCleared && replayClear(this.replayCleared, v2Update);
       if (clear) this.send(clear);
-      if (v2Update.sessionUpdate === "tool_call_update" && !replaying) {
+      if (v2Update.sessionUpdate === "tool_call_update") {
         const { toolCallId, status } = v2Update as { toolCallId: string; status?: string | null };
-        if (status != null) {
+        if (status != null && replaying) {
+          if (FINAL_STATUSES.has(status)) this.replayUnfinished?.delete(toolCallId);
+          else this.replayUnfinished?.add(toolCallId);
+        } else if (status != null) {
           if (FINAL_STATUSES.has(status)) {
             this.unfinished.delete(toolCallId);
             this.dispatched.delete(toolCallId);

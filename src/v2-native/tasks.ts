@@ -1452,7 +1452,7 @@ export class SessionTasks {
   }
 
   /** The tool calls and terminals of `sessionId` that go on in the background. */
-  private backgroundWork(sessionId: string): Set<string> {
+  backgroundWork(sessionId: string): Set<string> {
     const work = this.backgroundCalls(sessionId);
     for (const terminal of this.terminals.values()) {
       if (terminal.output.sessionId === sessionId) work.add(terminal.toolCallId);

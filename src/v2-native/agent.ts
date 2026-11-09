@@ -38,6 +38,7 @@ import { claudeCliPath } from "../claude-cli.js";
 import { clientSystemPrompt, sessionSystemPrompt } from "../client-system-prompt.js";
 import type { ElicitationSupport } from "../elicitation.js";
 import { forkSession } from "../fork-session.js";
+import { supportsMcpOAuth } from "../mcp-oauth.js";
 import { sdkMcpServers } from "../mcp-servers.js";
 import { ALLOW_BYPASS, autoModeDisabled } from "../permissions/modes.js";
 import { readResumedTail, resumedModelFromTranscript } from "../resumed-session.js";
@@ -126,6 +127,13 @@ export function nativeV2AgentApp(
 
 class NativeV2Agent implements AgentHandle, SessionConnection {
   readonly sessions = new Map<string, NativeSession>();
+  /**
+   * The sessions whose query ended without `session/close`, with what to tell
+   * the client. v2 keeps a session active until it is closed or the
+   * connection ends, so its requests fail with what happened, not -32002,
+   * until a resume starts it again.
+   */
+  private readonly stopped = new Map<string, string>();
   readonly translator = new V2UpdateTranslator();
   readonly auth: NativeAuth;
   /** The `--hide-claude-auth` subscription guard (see `subscription-guard.ts`). */
@@ -154,7 +162,12 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       start: (sessionId, params) => this.restartSession(sessionId, params),
       lost: async (sessionId, previous) => {
         await previous.retire();
-        if (this.sessions.get(sessionId) === previous) this.ended(sessionId);
+        if (this.sessions.get(sessionId) === previous) {
+          this.stop(
+            sessionId,
+            "Claude Code could not start again. Resume the session to continue.",
+          );
+        }
       },
       send: (notification) => this.send(notification),
     });
@@ -197,9 +210,16 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     return this.ctx.notify(v2.methods.client.elicitation.complete, params);
   }
 
-  ended(sessionId: string): void {
-    // A later `session/resume` starts the session again from its transcript.
+  ended(session: NativeSession): void {
+    // The old query of a restart that replaced it already.
+    if (this.sessions.get(session.sessionId) !== session) return;
+    this.stop(session.sessionId, "Claude Code stopped. Resume the session to continue.");
+  }
+
+  /** The session's query ended: a later `session/resume` starts it again from its transcript. */
+  private stop(sessionId: string, message: string): void {
     this.sessions.delete(sessionId);
+    this.stopped.set(sessionId, message);
     this.translator.forget(sessionId);
     this.auth.sessionEnded(sessionId);
     this.guard.sessionEnded(sessionId);
@@ -240,10 +260,10 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
   /**
    * `session/prompt`. Each prompt reads the auth identity again, as on v1. A
    * restart of the session's query that is due runs first (see
-   * `restarts.ts`), then the subscription guard judges the account, except
-   * for the adapter's `/remote-control`, which the bridge runs before its
-   * guard. Each await happens only when there is something to wait for, so
-   * the prompts of a session keep their order.
+   * `restarts.ts`), then the subscription guard judges the account, among
+   * the session's prompts (see `NativeSession.prompt`). The restart's await
+   * happens only when one is due, so the prompts of a session keep their
+   * order.
    */
   async prompt(params: v2.PromptRequest): Promise<v2.PromptResponse> {
     this.session(params.sessionId, "prompt");
@@ -251,12 +271,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     const restart = this.restarts.beforePrompt(params.sessionId);
     if (restart) await restart;
     const session = this.session(params.sessionId, "prompt");
-    const query = session.claudeQuery();
-    if (query && !session.mayRunRemoteControl(params.prompt)) {
-      const refusal = this.guard.beforePrompt(params.sessionId, query);
-      if (refusal) await refusal;
-    }
-    return session.prompt(params);
+    return session.prompt(params, (query) => this.guard.beforePrompt(params.sessionId, query));
   }
 
   async newSession(params: v2.NewSessionRequest): Promise<v2.NewSessionResponse> {
@@ -305,7 +320,8 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     let history: Promise<SessionMessage[]> | undefined;
     if (session) {
       // Resuming the active session synchronizes it again. Its work goes on,
-      // and the request's MCP servers replace the session's.
+      // and the request's MCP servers and additional directories replace the
+      // session's.
       const request = await validatedSetup(params);
       if (request.cwd !== session.cwd) {
         throw RequestError.invalidParams(
@@ -313,18 +329,18 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
           `Session ${sessionId} works in ${session.cwd}: resume it with that \`cwd\``,
         );
       }
-      if (!sameDirectories(request.additionalDirectories ?? [], session.additionalDirectories)) {
-        throw RequestError.invalidParams(
-          { additionalDirectories: request.additionalDirectories },
-          `Session ${sessionId} is active with other additional directories: close it, then resume it with these`,
-        );
-      }
       await session.setMcpServers({
         ...clientOptions(params._meta)?.mcpServers,
         ...sdkMcpServers(request.mcpServers),
       });
-      // A restart of its query starts with these servers.
-      this.restarts.track(sessionId, params);
+      if (!sameDirectories(request.additionalDirectories ?? [], session.additionalDirectories)) {
+        // The SDK cannot change them on a running query: it restarts with
+        // them at its next turn boundary (see `restarts.ts`).
+        this.restarts.rootsChanged(sessionId, params);
+      } else {
+        // A restart of its query starts with these servers.
+        this.restarts.track(sessionId, params);
+      }
     } else {
       // One read of the transcript serves the replay and the resumed model.
       history = replayFrom != null ? getSessionMessages(sessionId, { dir: params.cwd }) : undefined;
@@ -336,7 +352,11 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     if (replayFrom != null) {
       const messages = await (history ?? getSessionMessages(sessionId, { dir: session.cwd }));
       subagents = await session.tasks.loadReplay(messages);
-      session.output.replay(messages, subagents?.hooks(session.output, messages));
+      session.output.replay(
+        messages,
+        subagents?.hooks(session.output, messages),
+        session.tasks.backgroundWork(sessionId),
+      );
       subagents?.finish();
       const end = replayEndUpdate(this.clientCapabilities);
       if (end) this.send({ sessionId, update: end });
@@ -389,13 +409,16 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "close");
     // A restart that runs ends first, so the close ends the session it started.
     await this.restarts.closing(sessionId);
+    this.stopped.delete(sessionId);
     const session = this.sessions.get(sessionId);
-    if (!session) return {};
-    await session.close();
-    if (this.sessions.get(sessionId) === session) this.sessions.delete(sessionId);
-    this.translator.forget(sessionId);
-    this.auth.sessionEnded(sessionId);
-    this.guard.sessionEnded(sessionId);
+    if (session) {
+      await session.close();
+      if (this.sessions.get(sessionId) === session) this.sessions.delete(sessionId);
+      this.translator.forget(sessionId);
+      this.auth.sessionEnded(sessionId);
+      this.guard.sessionEnded(sessionId);
+    }
+    this.restarts.closed(sessionId);
     return {};
   }
 
@@ -403,7 +426,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
   async deleteSession({ sessionId }: v2.DeleteSessionRequest): Promise<v2.DeleteSessionResponse> {
     if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "delete");
     const live = this.sessions.get(sessionId);
-    if (live) await this.closeSession({ sessionId });
+    if (live || this.stopped.has(sessionId)) await this.closeSession({ sessionId });
     try {
       await deleteSession(sessionId, live ? { dir: live.cwd } : undefined);
     } catch (error) {
@@ -432,7 +455,15 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     const session = this.sessions.get(sessionId);
     if (session) return session;
     if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, method);
-    throw RequestError.sessionNotFound(sessionId);
+    throw this.inactive(sessionId);
+  }
+
+  /** The error of a request of `sessionId`, which is not running. */
+  private inactive(sessionId: string): RequestError {
+    const stopped = this.stopped.get(sessionId);
+    return stopped !== undefined
+      ? RequestError.internalError({ sessionId }, stopped)
+      : RequestError.sessionNotFound(sessionId);
   }
 
   async cancel(sessionId: string): Promise<void> {
@@ -448,7 +479,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     target: { terminalId: string } | { toolCallId: string },
   ): Promise<Record<string, never>> {
     const root = this.sessions.get(sessionId) ?? this.ownerOfChild(sessionId);
-    if (!root) throw RequestError.sessionNotFound(sessionId);
+    if (!root) throw this.inactive(sessionId);
     if (!(await root.tasks.cancelItem(sessionId, target))) {
       throw "terminalId" in target
         ? RequestError.invalidParams(
@@ -472,6 +503,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     await this.restarts.dispose();
     const sessions = [...this.sessions.values()];
     this.sessions.clear();
+    this.stopped.clear();
     await Promise.all(sessions.map((session) => session.close()));
   }
 
@@ -742,25 +774,30 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       settings,
       env: options.env ?? {},
       mcpServers: request.mcpServers.map((server) => server.name),
+      mcpOAuth: this.elicitation.url && supportsMcpOAuth(q),
       query: q,
       model: { id: models.models.currentModelId, info: models.allowlistedModelInfo },
     });
     session.start(q, config, mcpServers, resume !== undefined);
     this.sessions.set(sessionId, session);
+    this.stopped.delete(sessionId);
     this.restarts.track(sessionId, params);
     return session;
   }
 }
 
 /**
- * The setup request in v1 form, once it is valid: the MCP transports and the
- * system prompt as the bridge checks them, an absolute `cwd` that is a
- * directory, and absolute additional directories.
+ * The setup request in v1 form, once it is valid: the MCP transports as the
+ * bridge checks them, a `systemPrompt` that the session can apply
+ * (`clientSystemPrompt`), an absolute `cwd` that is a directory, and
+ * absolute additional directories. Every setup path calls it before it acts,
+ * so an invalid request creates, resumes or forks nothing.
  */
 async function validatedSetup(
   params: v2.NewSessionRequest | v2.ResumeSessionRequest | v2.ForkSessionRequest,
 ) {
   const request = v1NewSessionRequest({ ...params, mcpServers: params.mcpServers ?? [] });
+  clientSystemPrompt(request.systemPrompt);
   const { cwd } = request;
   if (!path.isAbsolute(cwd)) {
     throw RequestError.invalidParams({ cwd }, `\`cwd\` must be an absolute path, not ${cwd}`);

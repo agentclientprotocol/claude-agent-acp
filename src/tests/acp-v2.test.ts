@@ -109,6 +109,8 @@ const sdk = vi.hoisted(() => ({
   }),
   /** The account that the query cached at its start, which `accountInfo()` reads. */
   accountInfo: async (): Promise<Record<string, unknown>> => ({}),
+  /** The query switches its model (`setModel`). */
+  setModel: async (_model?: string): Promise<void> => {},
   /** Set to serve Remote Control, as a query of a CLI that supports it does. */
   enableRemoteControl: undefined as
     ((enabled: boolean, name?: string) => Promise<{ session_url?: string }>) | undefined,
@@ -142,6 +144,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         close: () => sdk.close(),
         accountInfo: () => sdk.accountInfo(),
         setMcpServers: (servers: Record<string, unknown>) => sdk.setMcpServers(servers),
+        setModel: (model?: string) => sdk.setModel(model),
         ...(sdk.enableRemoteControl ? { enableRemoteControl: sdk.enableRemoteControl } : {}),
       });
       return Object.assign(messages, controls);
@@ -652,6 +655,63 @@ describe("ACP v2 sessions", () => {
     expect(sdk.queryOptions).toHaveLength(1);
   });
 
+  it.each([
+    ["a mode it does not support", { mode: "_custom", content: text("Be brief.") }],
+    [
+      "content other than text",
+      { mode: "append", content: [{ type: "image", mimeType: "image/png", data: "iVBORw0KGgo=" }] },
+    ],
+  ] as const)(
+    "rejects a systemPrompt with %s on resume of the active session and on fork, and copies nothing",
+    async (_case, systemPrompt) => {
+      const { app, authUpdate } = v2Client();
+      const invalid = { code: -32602, data: { systemPrompt: expect.anything() } };
+      await app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        vi.mocked(forkSession).mockClear();
+        await expect(
+          agent.request(v2.methods.agent.session.resume, {
+            sessionId,
+            cwd,
+            systemPrompt: systemPrompt as v2.SystemPrompt,
+          }),
+        ).rejects.toMatchObject(invalid);
+        await expect(
+          agent.request(v2.methods.agent.session.fork, {
+            sessionId,
+            cwd,
+            systemPrompt: systemPrompt as v2.SystemPrompt,
+          }),
+        ).rejects.toMatchObject(invalid);
+        await authUpdate(1);
+      });
+      expect(forkSession).not.toHaveBeenCalled();
+      expect(sdk.queryOptions).toHaveLength(1);
+    },
+  );
+
+  it("restarts the active session with the additional directories that a resume brings", async () => {
+    const extra = await mkdtemp(path.join(tempDir, "extra-"));
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        additionalDirectories: [extra],
+      });
+      await vi.waitFor(() => expect(sdk.queryOptions).toHaveLength(2));
+      await client.authUpdate(1);
+    });
+
+    expect(sdk.queryOptions[1]).toMatchObject({
+      resume: sdk.queryOptions[0].sessionId,
+      additionalDirectories: [extra],
+    });
+  });
+
   it("lists, resumes, closes, and deletes sessions", async () => {
     const { app, authUpdate } = v2Client();
     await app.connectWith(connectRouter(), async (agent) => {
@@ -950,6 +1010,80 @@ describe("ACP v2 sessions", () => {
       expect(sdk.flagSettings).toEqual([{ effortLevel: "high" }, { effortLevel: null }]);
     });
 
+    it("runs config changes of a session in the order they came", async () => {
+      // The model switch takes a while: the effort change waits for it, and
+      // then finds no effort option on the new model.
+      sdk.setModel = () => new Promise((resolve) => setTimeout(resolve, 20));
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        const model = agent.request(v2.methods.agent.session.setConfigOption, {
+          sessionId,
+          configId: "model",
+          type: "id",
+          value: "claude-haiku-4-5",
+        });
+        const effort = agent.request(v2.methods.agent.session.setConfigOption, {
+          sessionId,
+          configId: "effort",
+          type: "id",
+          value: "high",
+        });
+        await model;
+        await expect(effort).rejects.toMatchObject({ code: -32602 });
+        await client.authUpdate(1);
+      });
+
+      expect(sdk.flagSettings).toEqual([]);
+    });
+
+    it("keeps the client's effort, Fast mode, ultracode and agent across a restart of the query", async () => {
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        // The effort that the session was created with is no longer the client's choice.
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, {
+          cwd,
+          _meta: { claudeCode: { options: { effort: "high" } } },
+        });
+        for (const request of [
+          { configId: "effort", type: "id", value: "low" },
+          { configId: "fast", type: "boolean", value: true },
+          { configId: "ultracode", type: "boolean", value: true },
+          { configId: "agent", type: "id", value: "reviewer" },
+        ] as const) {
+          await agent.request(v2.methods.agent.session.setConfigOption, { sessionId, ...request });
+        }
+        sdk.flagSettings = [];
+        await agent.request(v2.methods.agent.providers.set, {
+          providerId: "main",
+          apiType: "anthropic",
+          baseUrl: "https://gateway.example.com",
+        });
+        await vi.waitFor(() =>
+          // The gateway lists no models, so the model option is gone.
+          expect(values(client.updates("config_option_update").at(-1)?.configOptions)).toEqual({
+            mode: ["select", "auto"],
+            effort: ["select", "low"],
+            fast: ["boolean", true],
+            ultracode: ["boolean", true],
+            agent: ["select", "reviewer"],
+          }),
+        );
+        await client.authUpdate(1);
+      });
+
+      expect(sdk.queryOptions).toHaveLength(2);
+      expect(sdk.queryOptions[1].effort).toBeUndefined();
+      expect(sdk.flagSettings).toEqual([
+        { ultracode: true },
+        { fastMode: true },
+        { effortLevel: "low", ultracode: true },
+        { agent: "reviewer" },
+      ]);
+    });
+
     it("turns Fast mode off with a notice when Claude Code reports it off", async () => {
       sdk.initializationResult = async () => ({ models: [OPUS], fast_mode_state: "on" });
       scriptTurns(async function* (options) {
@@ -1089,6 +1223,40 @@ describe("ACP v2 sessions", () => {
       { elicitationId: (client.elicitations[0] as { elicitationId: string }).elicitationId },
     ]);
   });
+
+  it.each([
+    ["renders URL elicitations, which the sign-in uses", { elicitation: { url: {} } }, []],
+    ["renders no URL elicitations", {}, ['MCP server "linear" needs authentication']],
+  ])(
+    "reports an MCP server that needs a sign-in as a notice only when the client %s",
+    async (_case, capabilities, notices) => {
+      scriptTurns(async function* (options) {
+        yield {
+          type: "system",
+          subtype: "init",
+          mcp_servers: [{ name: "linear", status: "needs-auth" }],
+          session_id: options.sessionId,
+          uuid: randomUUID(),
+        };
+        yield assistantText(options, "Done.");
+        yield result(options);
+        yield idleState(options);
+      });
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent, capabilities);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, {
+          cwd,
+          mcpServers: [{ type: "http", name: "linear", url: "https://mcp.linear.app/mcp" }],
+        });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+        await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+        await client.authUpdate(1);
+      });
+
+      expect(client.updates("notice").map((notice) => notice.title)).toEqual(notices);
+    },
+  );
 
   it("sends the URL elicitation of MCP OAuth only after the session/new response", async () => {
     sdk.mcpServerStatus = async () => [{ name: "linear", status: "needs-auth" }];
@@ -3520,128 +3688,150 @@ describe("ACP v2 prompts", () => {
     });
   });
 
-  it("carries out a plan accepted with clearing the context in a fresh context, in the same turn", async () => {
-    /**
-     * Claude Code, as the bundled CLI answers each prompt: the client's
-     * prompt plans and calls ExitPlanMode, `/clear` mounts a fresh
-     * conversation, and the plan's prompt carries it out. The bridge sends
-     * the plan's prompt to a fresh query instead of `/clear`.
-     */
-    const prompts: string[] = [];
-    sdk.run = async function* (input, options) {
-      for await (const prompt of input) {
-        const content = prompt.message.content;
-        const promptText =
-          typeof content === "string"
-            ? content
-            : content.map((block) => (block.type === "text" ? block.text : "")).join("");
-        prompts.push(promptText);
-        yield {
-          type: "user",
-          message: prompt.message,
-          parent_tool_use_id: null,
-          uuid: prompt.uuid,
-          session_id: options.sessionId,
-          isReplay: true,
-        };
-        if (promptText === "/clear") {
+  it.each([
+    ["a model with Auto", true, "auto"],
+    // Auto runs as its fallback, with no notice: the answer chose the mode.
+    ["a model without Auto", false, "acceptEdits"],
+  ])(
+    "carries out a plan accepted with clearing the context in a fresh context, in the same turn, on %s",
+    async (_case, supportsAutoMode, mode) => {
+      sdk.initializationResult = async () => ({
+        models: [
+          {
+            value: "claude-sonnet-4-6",
+            displayName: "Claude Sonnet",
+            description: "Fast",
+            supportsAutoMode,
+          },
+        ],
+      });
+      /**
+       * Claude Code, as the bundled CLI answers each prompt: the client's
+       * prompt plans and calls ExitPlanMode, `/clear` mounts a fresh
+       * conversation, and the plan's prompt carries it out. The bridge sends
+       * the plan's prompt to a fresh query instead of `/clear`. Each echo
+       * carries the prompt's `origin`, as the bundled CLI's does.
+       */
+      const prompts: string[] = [];
+      sdk.run = async function* (input, options) {
+        for await (const prompt of input) {
+          const content = prompt.message.content;
+          const promptText =
+            typeof content === "string"
+              ? content
+              : content.map((block) => (block.type === "text" ? block.text : "")).join("");
+          prompts.push(promptText);
           yield {
-            type: "conversation_reset",
-            new_conversation_id: randomUUID(),
-            uuid: randomUUID(),
-            trigger: "clear",
-            user_message_uuid: prompt.uuid,
-            timestamp: new Date().toISOString(),
+            type: "user",
+            message: prompt.message,
+            parent_tool_use_id: null,
+            uuid: prompt.uuid,
             session_id: options.sessionId,
+            isReplay: true,
+            origin: prompt.origin,
           };
-          yield result(options, {
-            num_turns: 0,
-            stop_reason: null,
-            usage: {
-              input_tokens: 0,
-              output_tokens: 0,
-              cache_read_input_tokens: 0,
-              cache_creation_input_tokens: 0,
-            },
-          });
-          yield idleState(options);
-        } else if (promptText.startsWith("Implement the following plan")) {
-          yield assistantText(options, "Implemented.", "msg_implemented");
-          yield result(options, { stop_reason: "max_tokens" });
-          yield idleState(options);
-        } else {
-          yield toolUseMessage(options, "toolu_plan", "ExitPlanMode", { plan: "Implement it" });
-          const decision = await options.canUseTool!("ExitPlanMode", { plan: "Implement it" }, {
-            signal: new AbortController().signal,
-            toolUseID: "toolu_plan",
-            suggestions: [],
-          } as unknown as Parameters<NonNullable<Options["canUseTool"]>>[2]);
-          expect(decision).toMatchObject({ behavior: "deny", interrupt: true });
-          yield {
-            ...toolResultMessage(options, "toolu_plan", {
-              content: "User accepted the plan and requested a fresh context",
+          if (promptText === "/clear") {
+            yield {
+              type: "conversation_reset",
+              new_conversation_id: randomUUID(),
+              uuid: randomUUID(),
+              trigger: "clear",
+              user_message_uuid: prompt.uuid,
+              timestamp: new Date().toISOString(),
+              session_id: options.sessionId,
+            };
+            yield result(options, {
+              num_turns: 0,
+              stop_reason: null,
+              usage: {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+              },
+            });
+            yield idleState(options);
+          } else if (promptText.startsWith("Implement the following plan")) {
+            yield assistantText(options, "Implemented.", "msg_implemented");
+            yield result(options, { stop_reason: "max_tokens" });
+            yield idleState(options);
+          } else {
+            yield toolUseMessage(options, "toolu_plan", "ExitPlanMode", { plan: "Implement it" });
+            const decision = await options.canUseTool!("ExitPlanMode", { plan: "Implement it" }, {
+              signal: new AbortController().signal,
+              toolUseID: "toolu_plan",
+              suggestions: [],
+            } as unknown as Parameters<NonNullable<Options["canUseTool"]>>[2]);
+            expect(decision).toMatchObject({ behavior: "deny", interrupt: true });
+            yield {
+              ...toolResultMessage(options, "toolu_plan", {
+                content: "User accepted the plan and requested a fresh context",
+                is_error: true,
+              }),
+              tool_result_meta: [{ id: "toolu_plan", non_execution_kind: "user-rejected" }],
+            };
+            yield result(options, {
+              subtype: "error_during_execution",
               is_error: true,
-            }),
-            tool_result_meta: [{ id: "toolu_plan", non_execution_kind: "user-rejected" }],
-          };
-          yield result(options, {
-            subtype: "error_during_execution",
-            is_error: true,
-            stop_reason: null,
-            errors: [
-              "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
-            ],
-          });
-          yield idleState(options);
+              stop_reason: null,
+              errors: [
+                "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+              ],
+            });
+            yield idleState(options);
+          }
         }
-      }
-    };
-    const client = v2Client({
-      answerPermission: () => ({
-        outcome: { outcome: "selected", optionId: "exit-plan-clear-auto" },
-      }),
-    });
-    await client.app.connectWith(connectRouter(), async (agent) => {
-      await initializeV2(agent);
-      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
-      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("plan") });
-      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle max_tokens"));
-      await client.authUpdate(1);
-    });
+      };
+      const client = v2Client({
+        answerPermission: () => ({
+          outcome: { outcome: "selected", optionId: "exit-plan-clear-auto" },
+        }),
+      });
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("plan") });
+        await vi.waitFor(() =>
+          expect(turnTrace(client.sessionUpdates)).toContain("idle max_tokens"),
+        );
+        await client.authUpdate(1);
+      });
 
-    // The option says how much of the context is in use.
-    expect(client.permissionRequests[0].options).toContainEqual({
-      optionId: "exit-plan-clear-auto",
-      name: "Yes, clear context (0% used) and use auto mode",
-      kind: "allow_always",
-    });
-    expect(prompts.at(-1)).toBe("Implement the following plan:\n\nImplement it");
-    // One turn: the plan's prompt shows no `user_message`, and the turn ends with its result.
-    expect(turnTrace(client.sessionUpdates)).toEqual([
-      "user_message",
-      "running",
-      "requires_action",
-      "running",
-      "agent_message_chunk",
-      "idle max_tokens",
-    ]);
-    // The accepted plan's tool call completes, and the fresh context starts empty.
-    expect(client.updates("tool_call_update").at(-1)).toMatchObject({
-      toolCallId: "toolu_plan",
-      status: "completed",
-    });
-    expect(client.updates("usage_update").map(({ used }) => used)).toContain(0);
-    expect(client.updates("plan_update").at(-1)).toEqual({
-      sessionUpdate: "plan_update",
-      plan: { type: "markdown", planId: "plan-mode", content: "Implement it" },
-    });
-    expect(
-      client
-        .updates("config_option_update")
-        .at(-1)
-        ?.configOptions.find((option) => option.configId === "mode")?.currentValue,
-    ).toBe("auto");
-  });
+      // The option says how much of the context is in use.
+      expect(client.permissionRequests[0].options).toContainEqual({
+        optionId: "exit-plan-clear-auto",
+        name: "Yes, clear context (0% used) and use auto mode",
+        kind: "allow_always",
+      });
+      expect(prompts.at(-1)).toBe("Implement the following plan:\n\nImplement it");
+      // One turn: the adapter's prompts show no user message, and the turn ends with its result.
+      expect(client.updates("user_message_chunk")).toEqual([]);
+      expect(turnTrace(client.sessionUpdates)).toEqual([
+        "user_message",
+        "running",
+        "requires_action",
+        "running",
+        "agent_message_chunk",
+        "idle max_tokens",
+      ]);
+      // The accepted plan's tool call completes, and the fresh context starts empty.
+      expect(client.updates("tool_call_update").at(-1)).toMatchObject({
+        toolCallId: "toolu_plan",
+        status: "completed",
+      });
+      expect(client.updates("usage_update").map(({ used }) => used)).toContain(0);
+      expect(client.updates("plan_update").at(-1)).toEqual({
+        sessionUpdate: "plan_update",
+        plan: { type: "markdown", planId: "plan-mode", content: "Implement it" },
+      });
+      expect(
+        client
+          .updates("config_option_update")
+          .at(-1)
+          ?.configOptions.find((option) => option.configId === "mode")?.currentValue,
+      ).toBe(mode);
+    },
+  );
 });
 
 describe("ACP v2 idle compaction", () => {
@@ -8279,6 +8469,47 @@ describe("ACP v2 subscription guard (--hide-claude-auth)", () => {
     expect(client.updates("user_message")).toEqual([]);
   });
 
+  it.each([
+    [
+      "session/cancel",
+      (agent: v2.ClientContext, sessionId: string) =>
+        agent.notify(v2.methods.agent.session.cancel, { sessionId }),
+    ],
+    [
+      "session/close",
+      (agent: v2.ClientContext, sessionId: string) =>
+        agent.request(v2.methods.agent.session.close, { sessionId }),
+    ],
+  ])("answers a prompt that the guard still judges with -32800 on %s", async (_method, stop) => {
+    accountsAtStart(API_KEY);
+    scriptTurns(async function* (options) {
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const reading = Promise.withResolvers<void>();
+      const account = Promise.withResolvers<Record<string, unknown>>();
+      sdk.accountInfo = () => {
+        reading.resolve();
+        return account.promise;
+      };
+      const prompt = agent
+        .request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") })
+        .catch((error: unknown) => error);
+      await reading.promise;
+      const stopped = stop(agent, sessionId);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      account.resolve(API_KEY);
+      expect(await prompt).toMatchObject({ code: -32800 });
+      await stopped;
+      await client.authUpdate(1);
+    });
+
+    expect(client.updates("user_message")).toEqual([]);
+  });
+
   it("starts the query again after a sign-out, and refuses the next prompt on the account it finds", async () => {
     accountsAtStart(API_KEY, SUBSCRIPTION);
     sdk.accountInfo = async () => API_KEY;
@@ -8300,6 +8531,64 @@ describe("ACP v2 subscription guard (--hide-claude-auth)", () => {
     });
 
     expect(client.updates("user_message")).toHaveLength(1);
+  });
+
+  it("restarts the query for a provider change only after the account restart that runs", async () => {
+    accountsAtStart(API_KEY);
+    sdk.accountInfo = async () => API_KEY;
+    scriptTurns(
+      async function* (options) {
+        yield result(options, { is_error: true, result: "Not logged in · Please run /login" });
+      },
+      async function* (options) {
+        yield result(options);
+      },
+    );
+    // Whether the prompt input of each query is still open: a session ends its query's input.
+    const inputOpen: boolean[] = [];
+    const run = sdk.run;
+    sdk.run = (prompts, options) => {
+      const index = inputOpen.push(true) - 1;
+      return run(
+        (async function* () {
+          yield* prompts;
+          inputOpen[index] = false;
+        })(),
+        options,
+      );
+    };
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle error"));
+      // The account restart's query takes a while to start.
+      const started = Promise.withResolvers<void>();
+      const initialization = sdk.initializationResult;
+      sdk.initializationResult = async () => {
+        await started.promise;
+        return initialization();
+      };
+      const again = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("again"),
+      });
+      await vi.waitFor(() => expect(sdk.queryOptions).toHaveLength(2));
+      const set = agent.request(v2.methods.agent.providers.set, {
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gateway.example.com",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      started.resolve();
+      await set;
+      await again;
+      // One query of the session is left: none of the others was left running.
+      expect(inputOpen).toHaveLength(3);
+      await vi.waitFor(() => expect(inputOpen.filter((open) => open)).toHaveLength(1));
+      await client.authUpdate(1);
+    });
   });
 });
 
@@ -8365,6 +8654,54 @@ describe("ACP v2 Remote Control", () => {
       "idle end_turn",
     ]);
   });
+
+  // The bridge runs /remote-control before its subscription guard, so it
+  // inserts the command before a prompt received earlier that the guard still
+  // judges. v2 asks that held prompts be inserted in the order received.
+  it.skipIf(!NATIVE_CORE)(
+    "inserts a prompt that the subscription guard judges before a /remote-control sent after it",
+    async () => {
+      const argv = process.argv;
+      process.argv = [...argv, "--hide-claude-auth"];
+      const apiKey = { apiKeySource: "ANTHROPIC_API_KEY", apiProvider: "firstParty" };
+      sdk.initializationResult = async () => ({
+        ...(await sdkDefaults.initializationResult()),
+        account: apiKey,
+      });
+      const account = Promise.withResolvers<Record<string, unknown>>();
+      sdk.accountInfo = () => account.promise;
+      scriptTurns(async function* (options) {
+        yield result(options);
+      });
+      const client = v2Client();
+      try {
+        await client.app.connectWith(connectRouter(), async (agent) => {
+          await initializeV2(agent);
+          const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+          const first = agent.request(v2.methods.agent.session.prompt, {
+            sessionId,
+            prompt: text("fix the bug"),
+          });
+          const command = agent.request(v2.methods.agent.session.prompt, {
+            sessionId,
+            prompt: text("/remote-control"),
+          });
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          account.resolve(apiKey);
+          await Promise.all([first, command]);
+          await vi.waitFor(() => expect(sdk.enableRemoteControl).toHaveBeenCalled());
+          await client.authUpdate(1);
+        });
+      } finally {
+        process.argv = argv;
+      }
+
+      expect(client.updates("user_message").map((message) => message.content)).toEqual([
+        text("fix the bug"),
+        text("/remote-control"),
+      ]);
+    },
+  );
 
   it("runs /remote-control sent while Claude works once the turn ends", async () => {
     const release = Promise.withResolvers<void>();

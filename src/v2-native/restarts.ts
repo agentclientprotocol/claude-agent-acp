@@ -9,11 +9,16 @@
  *
  * - The route: `providers/set`, `providers/disable`, and an `auth/logout`
  *   that drops a provider or a gateway login. Each live session restarts at
- *   its next turn boundary: no turn is open, no prompt waits in Claude Code's
- *   queue, and no subagent runs. A running turn is never cut. Prompts that
+ *   its next turn boundary: no turn is open, no prompt of the session waits
+ *   to go to Claude Code or in its queue, and no subagent runs. Prompts that
  *   come meanwhile wait, and go to the new query. The request that changed
  *   the route answers once every live session restarted, as on the bridge.
- *   A session that cannot start again is no longer active.
+ *   A session that cannot start again stops: its requests then fail with
+ *   what happened, until a resume starts it again.
+ * - The additional directories: a resume of the active session with other
+ *   ones restarts it at its next turn boundary, as for a new route. Claude
+ *   Code reads them once, when its process starts, and the SDK has no call
+ *   that changes them on a running query.
  * - The account, under `--hide-claude-auth` (see `subscription-guard.ts`):
  *   the next prompt that finds the session at a turn boundary restarts it
  *   first, so the guard judges the new account. If the restart fails, such
@@ -21,20 +26,23 @@
  *   and the session stays as it was, for a retry after a sign-in.
  *
  * The new query starts before the old one ends, so a failed start leaves the
- * session as it was. The old one is idle then, and ends right after: its
- * background commands end with it (their terminals exit), as when a query
- * ends. The model and mode the client chose are set again on the new query,
- * which then reports its options in a `config_option_update`, as on the
- * bridge.
+ * session as it was. The old one ends at its next turn boundary after that,
+ * so work that started on it during the start, such as a turn that Claude
+ * Code started on its own, is not cut. Its background commands end with it
+ * (their terminals exit), as when a query ends. The new query starts without
+ * the effort of the setup's `_meta`, and the client's choices are set again
+ * on it (`SessionConfig.restoreFrom`), which then reports its options in a
+ * `config_option_update`, as on the bridge. One restart of a session runs at
+ * a time: a route restart waits for an account restart that runs.
  *
  * A `session/cancel` or `session/close` answers the prompts that wait for a
- * restart with -32800.
+ * restart with -32800, and stops the work that runs on the old query while
+ * the restart waits for it.
  */
 import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { Logger } from "../acp-agent.js";
-import { MODEL_CONFIG_ID } from "../session-model.js";
-import { MODE_CONFIG_ID } from "../session-mode.js";
+import { withoutEffort } from "../session-effort.js";
 import type { NativeSession } from "./session.js";
 
 /** The request that set the session up, whose options a restart starts with again. */
@@ -50,7 +58,7 @@ export interface RestartHost {
    * and the current route. The new session is active once it resolves.
    */
   start(sessionId: string, params: SetupParams): Promise<NativeSession>;
-  /** `previous` could not start again: the session is no longer active. */
+  /** `previous` could not start again: the session stops. */
   lost(sessionId: string, previous: NativeSession): Promise<void>;
   send(notification: v2.UpdateSessionNotification): void;
 }
@@ -66,6 +74,10 @@ export class SessionRestarts {
   private readonly reroutes = new Map<string, Reroute>();
   /** The restarts that run: from the new query's start to the old one's end. */
   private readonly swaps = new Map<string, Promise<void>>();
+  /** The session that each running restart replaces. */
+  private readonly retiring = new Map<string, NativeSession>();
+  /** The sessions that `session/close` closes: a restart that runs does not track them again. */
+  private readonly closingSessions = new Set<string>();
   /** The prompts that wait for a restart, each with what rejects it. */
   private readonly held = new Map<string, Set<(error: unknown) => void>>();
 
@@ -73,7 +85,18 @@ export class SessionRestarts {
 
   /** The session started from `params`, or a resume of the active session brought new ones. */
   track(sessionId: string, params: SetupParams): void {
+    if (this.closingSessions.has(sessionId)) return;
     this.setups.set(sessionId, params);
+  }
+
+  /**
+   * A resume of the active session brought other additional directories:
+   * the session restarts with `params` at its next turn boundary (see the
+   * module doc). Does not wait for it.
+   */
+  rootsChanged(sessionId: string, params: SetupParams): void {
+    this.track(sessionId, params);
+    void this.rerouteSession(sessionId);
   }
 
   /**
@@ -119,9 +142,16 @@ export class SessionRestarts {
     return this.swaps.get(sessionId)?.catch(() => {});
   }
 
-  /** `session/cancel`: the prompts that wait for a restart fail with -32800. */
+  /**
+   * `session/cancel`: the prompts that wait for a restart fail with -32800,
+   * and work that runs on the query that a restart replaces stops too (the
+   * restart waits for it).
+   */
   cancelled(sessionId: string): void {
     this.release(sessionId, RequestError.requestCancelled());
+    const retiring = this.retiring.get(sessionId);
+    // Until the new query started, the old one is the active session, which the cancel stops.
+    if (retiring && retiring !== this.host.active(sessionId)) void retiring.cancel();
   }
 
   /**
@@ -131,17 +161,28 @@ export class SessionRestarts {
    * ends the session that it started.
    */
   async closing(sessionId: string): Promise<void> {
+    this.closingSessions.add(sessionId);
     this.forget(sessionId);
     this.release(sessionId, RequestError.requestCancelled());
+    // The close stops the old query's work too, which the restart waits for.
+    await this.retiring.get(sessionId)?.close();
     await this.swaps.get(sessionId)?.catch(() => {});
+  }
+
+  /** `session/close` closed the session. */
+  closed(sessionId: string): void {
+    this.closingSessions.delete(sessionId);
+    this.forget(sessionId);
   }
 
   /** Waits for the restarts that run, so no new query starts after the agent's sessions closed. */
   async dispose(): Promise<void> {
-    for (const sessionId of [...this.setups.keys()]) {
+    for (const sessionId of [...this.setups.keys(), ...this.retiring.keys()]) {
+      this.closingSessions.add(sessionId);
       this.forget(sessionId);
       this.release(sessionId, RequestError.requestCancelled());
     }
+    await Promise.all([...this.retiring.values()].map((session) => session.close()));
     await Promise.all([...this.swaps.values()].map((swap) => swap.catch(() => {})));
   }
 
@@ -153,9 +194,16 @@ export class SessionRestarts {
     const reroute: Reroute = { done: Promise.resolve(), started: false };
     reroute.done = (async () => {
       await waiting?.done;
-      const session = this.host.active(sessionId);
-      // `false` once the session closed.
-      if (!session || !(await session.turnBoundary(true))) return;
+      let session: NativeSession | undefined;
+      for (;;) {
+        // After an account restart that runs, on the session it started.
+        await this.swaps.get(sessionId)?.catch(() => {});
+        session = this.host.active(sessionId);
+        // `false` once the session closed.
+        if (!session || !(await session.turnBoundary(true))) return;
+        // An account restart can start at the boundary too: wait for it.
+        if (!this.swaps.has(sessionId)) break;
+      }
       if (this.host.active(sessionId) !== session || !this.setups.has(sessionId)) return;
       reroute.started = true;
       await this.swap(sessionId, session, { keepOnFailure: false });
@@ -186,7 +234,8 @@ export class SessionRestarts {
       this.host.logger.log(`Restarting the query of session ${sessionId}`);
       let session: NativeSession;
       try {
-        session = await this.host.start(sessionId, params);
+        // The client's effort pin is restored below instead.
+        session = await this.host.start(sessionId, withoutEffort(params));
       } catch (error) {
         if (keepOnFailure) throw error;
         this.host.logger.error(`Session ${sessionId}: could not start again`, error);
@@ -196,15 +245,23 @@ export class SessionRestarts {
       // The new query read the account in force.
       this.accountChanged.delete(sessionId);
       session.reports.restartedFrom(previous.reports);
+      // Work that started on the old query while the new one started, such
+      // as a turn that Claude Code started on its own, ends first. New
+      // prompts wait for this restart meanwhile (`beforePrompt`).
+      await previous.turnBoundary(true);
       await previous.retire();
-      await restoreChoices(session, previous, this.host.logger);
+      // A close during the restart closes the new session next.
+      if (this.closingSessions.has(sessionId)) return;
+      await session.config.restoreFrom(previous.config);
       this.host.send({
         sessionId,
         update: { sessionUpdate: "config_option_update", configOptions: session.config.options() },
       });
     })().finally(() => {
       if (this.swaps.get(sessionId) === run) this.swaps.delete(sessionId);
+      if (this.retiring.get(sessionId) === previous) this.retiring.delete(sessionId);
     });
+    this.retiring.set(sessionId, previous);
     this.swaps.set(sessionId, run);
     return run;
   }
@@ -232,29 +289,4 @@ export class SessionRestarts {
     this.held.delete(sessionId);
     for (const settle of [...(holds ?? [])]) settle(error);
   }
-}
-
-/**
- * Sets the model, then the mode, of `previous` on `session`: the model
- * decides which modes it serves. A value the new query refuses is logged.
- */
-async function restoreChoices(
-  session: NativeSession,
-  previous: NativeSession,
-  logger: Logger,
-): Promise<void> {
-  for (const configId of [MODEL_CONFIG_ID, MODE_CONFIG_ID]) {
-    const value = currentValue(previous, configId);
-    if (value === undefined || value === currentValue(session, configId)) continue;
-    try {
-      await session.config.set({ sessionId: session.sessionId, configId, type: "id", value });
-    } catch (error) {
-      logger.error(`Could not restore ${configId} "${value}" after the query restart:`, error);
-    }
-  }
-}
-
-function currentValue(session: NativeSession, configId: string): string | undefined {
-  const option = session.config.options().find((entry) => entry.configId === configId);
-  return option && typeof option.currentValue === "string" ? option.currentValue : undefined;
 }

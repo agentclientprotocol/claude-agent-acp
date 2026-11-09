@@ -410,6 +410,7 @@ import {
   mergeEffortSettings,
   settleEffortAfterModelSwitch,
   settingsEffortForModel,
+  withoutEffort,
 } from "./session-effort.js";
 import {
   createUltracodeConfigOption,
@@ -1830,17 +1831,6 @@ export type NewSessionMeta = {
   };
   additionalRoots?: string[];
 };
-
-/** `params` without `_meta.claudeCode.options.effort`. */
-function withoutEffort(params: NewSessionRequest): NewSessionRequest {
-  const meta = params._meta as NewSessionMeta | undefined;
-  if (meta?.claudeCode?.options?.effort === undefined) {
-    return params;
-  }
-  const options = { ...meta.claudeCode.options };
-  delete options.effort;
-  return { ...params, _meta: { ...meta, claudeCode: { ...meta.claudeCode, options } } };
-}
 
 /** The JSON-RPC code ACP assigns to `authRequired`. Read from the SDK so it
  *  cannot drift from the errors this agent throws. */

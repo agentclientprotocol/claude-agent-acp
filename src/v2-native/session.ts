@@ -96,8 +96,8 @@ export interface SessionConnection {
     signal: AbortSignal,
   ): Promise<CreateElicitationResponse>;
   completeElicitation(params: CompleteElicitationNotification): Promise<void>;
-  /** The session's query ended on its own: the session is no longer active. */
-  ended(sessionId: string): void;
+  /** The query of `session` ended on its own: the session cannot go on. */
+  ended(session: NativeSession): void;
   /** A turn of the session failed for a missing login (`authRequired`). */
   signedOut(sessionId: string): void;
 }
@@ -180,9 +180,9 @@ export class NativeSession implements RequestTarget {
   private mcpServers = "";
   /** The adapter's `/remote-control`, and messages typed in other clients. */
   private readonly remoteControl: SessionRemoteControl;
-  /** Who waits for {@link turnBoundary}, with whether it counts subagents. */
+  /** Who waits for {@link turnBoundary}, with whether it waits for a restart. */
   private readonly boundaryWaiters: Array<{
-    subagents: boolean;
+    restart: boolean;
     resolve: (reached: boolean) => void;
   }> = [];
 
@@ -352,21 +352,36 @@ export class NativeSession implements RequestTarget {
    * A prompt waits for the interrupt of an earlier `session/cancel` before it
    * goes to Claude Code: the interrupt's `cancelQueued` must not end a prompt
    * that came after the cancel.
+   *
+   * `guard`, the subscription guard's check (see `subscription-guard.ts`),
+   * runs in the prompt's turn among the session's prompts, so they keep their
+   * order, and a cancel or close answers a prompt that waits for it with
+   * -32800 as any prompt not inserted yet. Its refusal answers the prompt.
+   * The adapter's `/remote-control` is not guarded, as on the bridge.
    */
-  prompt(params: v2.PromptRequest): Promise<v2.PromptResponse> {
+  prompt(
+    params: v2.PromptRequest,
+    guard?: (query: Query) => Promise<void> | undefined,
+  ): Promise<v2.PromptResponse> {
     if (this.closed) {
       return Promise.reject(RequestError.sessionNotFound(this.sessionId));
     }
     // Throws invalid params for content that Claude cannot take.
     const request: PromptRequest = v1PromptRequest(params);
-    this.reports.promptSent(request.prompt);
-    // The notice of a mode fallback at the session's start, which sends it at once.
-    void this.config.promptSent();
+    const remoteControl = this.remoteControl.mayRun(request.prompt);
+    const guarded = guard && !remoteControl ? guard : undefined;
+    // As on the bridge, a prompt that the guard refuses titles nothing and
+    // sends no notice.
+    const sent = () => {
+      this.reports.promptSent(request.prompt);
+      // The notice of a mode fallback at the session's start, which sends it at once.
+      void this.config.promptSent();
+    };
+    if (!guarded) sent();
     const uuid = randomUUID();
     const message = { ...promptToClaude(request), uuid };
     const localCommand = this.commands.localCommand(request.prompt);
     if (localCommand) this.localCommands.set(uuid, localCommand);
-    const remoteControl = this.remoteControl.mayRun(request.prompt);
     return new Promise((resolve, reject) => {
       const pending: PendingPrompt = { prompt: params.prompt, pushed: false, resolve, reject };
       this.pending.set(uuid, pending);
@@ -376,6 +391,16 @@ export class NativeSession implements RequestTarget {
         .then(() => this.interrupting)
         .then(async () => {
           if (answered()) return;
+          if (guarded && this.query) {
+            try {
+              await guarded(this.query);
+            } catch (error) {
+              this.failPrompt(uuid, error);
+              return;
+            }
+            if (answered()) return;
+            sent();
+          }
           // The prompts after the adapter's `/remote-control` wait for it.
           if (remoteControl) {
             try {
@@ -395,16 +420,18 @@ export class NativeSession implements RequestTarget {
   }
 
   /**
-   * Whether no work runs that a restart of the query would cut: no turn is
-   * open, no prompt waits in Claude Code's queue, and, with `subagents`, no
-   * subagent runs.
+   * Whether no turn is open and no prompt waits in Claude Code's queue. With
+   * `restart`, for a restart of the query (see `restarts.ts`), also no
+   * prompt of the session waits to go to Claude Code, which the restart would
+   * answer with -32800, and no subagent runs. Without it, for the adapter's
+   * `/remote-control`, whose own prompt waits for the boundary.
    */
-  atTurnBoundary(subagents: boolean): boolean {
+  atTurnBoundary(restart: boolean): boolean {
     return (
       !this.closed &&
       !this.foreground &&
-      ![...this.pending.values()].some((prompt) => prompt.pushed) &&
-      !(subagents && this.tasks.hasLiveSubagents())
+      ![...this.pending.values()].some((prompt) => restart || prompt.pushed) &&
+      !(restart && this.tasks.hasLiveSubagents())
     );
   }
 
@@ -412,28 +439,18 @@ export class NativeSession implements RequestTarget {
    * Resolves `true` at the next turn boundary (see {@link atTurnBoundary}),
    * at once if the session is at one, and `false` once the session closed.
    */
-  turnBoundary(subagents: boolean): Promise<boolean> {
+  turnBoundary(restart: boolean): Promise<boolean> {
     if (this.closed) return Promise.resolve(false);
-    if (this.atTurnBoundary(subagents)) return Promise.resolve(true);
-    return new Promise((resolve) => this.boundaryWaiters.push({ subagents, resolve }));
+    if (this.atTurnBoundary(restart)) return Promise.resolve(true);
+    return new Promise((resolve) => this.boundaryWaiters.push({ restart, resolve }));
   }
 
   private checkBoundary(): void {
     for (const waiter of [...this.boundaryWaiters]) {
-      if (!this.closed && !this.atTurnBoundary(waiter.subagents)) continue;
+      if (!this.closed && !this.atTurnBoundary(waiter.restart)) continue;
       this.boundaryWaiters.splice(this.boundaryWaiters.indexOf(waiter), 1);
       waiter.resolve(!this.closed);
     }
-  }
-
-  /** Whether `prompt` may be the adapter's `/remote-control` (see `remote-control.ts`). */
-  mayRunRemoteControl(prompt: v2.ContentBlock[]): boolean {
-    return this.remoteControl.mayRun(prompt);
-  }
-
-  /** The query, for the subscription guard's read of its cached account. */
-  claudeQuery(): Query | undefined {
-    return this.query;
   }
 
   /**
@@ -470,7 +487,8 @@ export class NativeSession implements RequestTarget {
   /**
    * Sends Claude Code the adapter's own prompt `text`, after the interrupt of
    * an earlier `session/cancel`, as {@link prompt} does. It is no prompt of
-   * the client's: it gets no `user_message`.
+   * the client's: it gets no `user_message`, also when its echo carries the
+   * human `origin` that `promptToClaude` stamps.
    */
   private pushOwnPrompt(text: string, uuid: ReturnType<typeof randomUUID>): void {
     const message = {
@@ -480,7 +498,9 @@ export class NativeSession implements RequestTarget {
     this.pushes = this.pushes
       .then(() => this.interrupting)
       .then(() => {
-        if (!this.closed) this.input.push(message);
+        if (this.closed) return;
+        this.remoteControl.pushed(uuid);
+        this.input.push(message);
       });
   }
 
@@ -693,7 +713,13 @@ export class NativeSession implements RequestTarget {
   }
 
   exitPlanInterrupting(toolUseId: string, reset: ClearContextReset | undefined): void {
-    this.clearContext.interrupting(toolUseId, reset);
+    // The fresh context starts in the mode that the answer's mode runs as on
+    // the model, such as `acceptEdits` for `auto` on a model without Auto,
+    // with no fallback notice, as the bridge starts its fresh query.
+    this.clearContext.interrupting(
+      toolUseId,
+      reset && { ...reset, mode: this.config.effectiveMode(reset.mode) },
+    );
   }
 
   permissionAllowed(result: PermissionResult): Promise<PermissionResult> {
@@ -1107,7 +1133,7 @@ export class NativeSession implements RequestTarget {
     }
     this.closed = true;
     this.checkBoundary();
-    this.connection.ended(this.sessionId);
+    this.connection.ended(this);
   }
 
   /** The session ends: its idle compaction is off, and its own `/compact` settles. */

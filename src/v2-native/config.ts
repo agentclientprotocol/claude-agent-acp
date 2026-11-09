@@ -17,6 +17,11 @@
  * report `supportsAutoMode` runs `auto` as `acceptEdits`, with a notice,
  * whether the client picks `auto`, an answer to ExitPlanMode does, or a model
  * switch leaves the session in it.
+ *
+ * The changes of one session run one at a time, in the order they came, as
+ * the bridge's `serializeConfigurationChange` runs them: a change awaits
+ * Claude Code between its steps, and a model switch rebuilds every option at
+ * its end, so a change that ran meanwhile would be lost.
  */
 import {
   RequestError,
@@ -115,11 +120,15 @@ export class SessionConfig {
   private readonly rules: SessionModeManager<ConfigSession>;
   private readonly agents: AgentInfo[];
   private currentAgent: string;
+  /** Whether the client picked the agent (`session/set_config_option`), which a restart restores. */
+  private agentSelected = false;
   private effort: EffortState;
   private fastModeEnabled: boolean;
   private fastModeDisabledReason: FastModeDisabledReason | undefined;
   private ultracodeEnabled: boolean;
   private readonly ultracodeWorkflowsEnabled: boolean | undefined;
+  /** The end of the last change (see the module doc). */
+  private changes: Promise<void> = Promise.resolve();
 
   private constructor(
     private readonly sessionId: string,
@@ -320,7 +329,76 @@ export class SessionConfig {
    * advertised it (`configOptionValue`): a select takes an `id` of its
    * entries (or a model alias), a boolean takes a boolean.
    */
-  async set(params: v2.SetSessionConfigOptionRequest): Promise<void> {
+  set(params: v2.SetSessionConfigOptionRequest): Promise<void> {
+    return this.serialized(() => this.apply(params));
+  }
+
+  /**
+   * Sets the choices of `previous`, the config of the query that this one
+   * replaced (see `restarts.ts`), as the bridge's `restoreSessionChoices`
+   * does: the model, then the mode, which the model decides, and its
+   * pre-plan mode, then ultracode, Fast mode, the effort pin (after
+   * ultracode, which its flag carries) and the agent the client picked. A
+   * value the new query refuses is logged.
+   */
+  restoreFrom(previous: SessionConfig): Promise<void> {
+    return this.serialized(async () => {
+      const restore = async (choice: string, apply: () => Promise<void>) => {
+        try {
+          await apply();
+        } catch (error) {
+          this.logger.error(`Could not restore ${choice} after the query restart:`, error);
+        }
+      };
+      const select = (configId: string, value: string) =>
+        restore(`${configId} "${value}"`, () =>
+          this.apply({ sessionId: this.sessionId, configId, type: "id", value }),
+        );
+      const model = previous.session.models.currentModelId;
+      if (this.session.models.currentModelId !== model) await select(MODEL_CONFIG_ID, model);
+      // After the model: the start falls back from `auto` on a model without Auto.
+      const mode = previous.session.modes.currentModeId;
+      if (this.session.modes.currentModeId !== mode) {
+        await select(MODE_CONFIG_ID, mode);
+        if (this.session.modes.currentModeId === mode) {
+          this.session.autoModeFallbackWarningPending = false;
+        }
+      }
+      if (this.session.modes.currentModeId === "plan") {
+        this.session.prePlanMode = previous.session.prePlanMode;
+      }
+      // The user's intent, not the option: a model without support hides it.
+      if (this.ultracodeEnabled !== previous.ultracodeEnabled) {
+        await restore("ultracode", () => this.setUltracode(previous.ultracodeEnabled));
+      }
+      if (this.fastModeEnabled !== previous.fastModeEnabled) {
+        await restore("Fast mode", () => this.setFastMode(previous.fastModeEnabled));
+      }
+      if (previous.effort.pinned !== undefined) {
+        await select(EFFORT_CONFIG_ID, previous.effort.pinned);
+      }
+      // Even when unchanged: Default must clear an agent that the setup's
+      // `_meta` picked. Default is valid without an `agent` option too.
+      if (previous.agentSelected) {
+        if (previous.currentAgent === DEFAULT_AGENT_ID) {
+          await restore("Default agent", () => this.selectAgent(DEFAULT_AGENT_ID));
+        } else {
+          await select(AGENT_CONFIG_ID, previous.currentAgent);
+        }
+      }
+    });
+  }
+
+  private serialized<T>(change: () => Promise<T>): Promise<T> {
+    const result = this.changes.then(change);
+    this.changes = result.then(
+      () => {},
+      () => {},
+    );
+    return result;
+  }
+
+  private async apply(params: v2.SetSessionConfigOptionRequest): Promise<void> {
     const request = v1SetSessionConfigOptionRequest(params);
     const option = this.session.configOptions.find((entry) => entry.id === request.configId);
     if (!option) {
@@ -338,7 +416,7 @@ export class SessionConfig {
     const value = selected.value;
     switch (request.configId) {
       case MODE_CONFIG_ID:
-        await this.enterMode(value as PermissionMode);
+        await this.applyMode(value as PermissionMode);
         return;
       case MODEL_CONFIG_ID:
         await this.session.query.setModel(value);
@@ -357,13 +435,7 @@ export class SessionConfig {
             : { pinned: undefined, applied: undefined };
         return;
       case AGENT_CONFIG_ID:
-        // `null` clears the flag layer back to the standard Claude Code
-        // agent. The change takes effect on the next turn.
-        await this.session.query.applyFlagSettings({
-          agent: value === DEFAULT_AGENT_ID ? null : value,
-        });
-        this.currentAgent = value;
-        this.setCurrentValue(AGENT_CONFIG_ID, value);
+        await this.selectAgent(value);
         return;
       default:
         throw RequestError.invalidParams(
@@ -378,7 +450,16 @@ export class SessionConfig {
    * took it: `auto` that the model cannot serve runs as its fallback, with a
    * notice.
    */
-  async enterMode(requested: PermissionMode): Promise<void> {
+  enterMode(requested: PermissionMode): Promise<void> {
+    return this.serialized(() => this.applyMode(requested));
+  }
+
+  /** The mode that `requested` runs as on the current model (see the module doc). */
+  effectiveMode(requested: PermissionMode): PermissionMode {
+    return this.rules.effectiveMode(this.session, requested);
+  }
+
+  private async applyMode(requested: PermissionMode): Promise<void> {
     const mode = this.rules.effectiveMode(this.session, requested);
     await this.session.query.setPermissionMode(mode);
     this.rules.syncConfig(this.session, mode);
@@ -400,11 +481,13 @@ export class SessionConfig {
    * option does not list is recorded by its id, which the option then lists,
    * as on the bridge.
    */
-  async modelSwitched(model: string): Promise<boolean> {
-    const value = resolveModelPreference(this.modelInfos, model)?.value ?? model;
-    if (this.session.models.currentModelId === value) return false;
-    await this.recordModel(value);
-    return true;
+  modelSwitched(model: string): Promise<boolean> {
+    return this.serialized(async () => {
+      const value = resolveModelPreference(this.modelInfos, model)?.value ?? model;
+      if (this.session.models.currentModelId === value) return false;
+      await this.recordModel(value);
+      return true;
+    });
   }
 
   /**
@@ -446,6 +529,20 @@ export class SessionConfig {
     );
     if (fallbackApplied) await this.rules.publishFallbackWarning(this.sessionId, this.session);
     return permissionResult;
+  }
+
+  /**
+   * `null` clears the flag layer back to the standard Claude Code agent. The
+   * change takes effect on the next turn. Applied first, so a rejected
+   * control request leaves the option as it was.
+   */
+  private async selectAgent(value: string): Promise<void> {
+    await this.session.query.applyFlagSettings({
+      agent: value === DEFAULT_AGENT_ID ? null : value,
+    });
+    this.currentAgent = value;
+    this.agentSelected = true;
+    this.setCurrentValue(AGENT_CONFIG_ID, value);
   }
 
   /** Applied first, so a rejected control request leaves the option as it was. */

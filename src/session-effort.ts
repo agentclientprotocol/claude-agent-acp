@@ -25,6 +25,22 @@ export function effortFlagSettings(
   return ultracode ? { effortLevel, ultracode: true } : { effortLevel };
 }
 
+/**
+ * `params` without `_meta.claudeCode.options.effort`, for a restart of the
+ * session's query: the restart restores the current effort pin instead of
+ * the one the session was created with.
+ */
+export function withoutEffort<T extends { _meta?: unknown }>(params: T): T {
+  const meta = params._meta as
+    { claudeCode?: { options?: { effort?: unknown } } } | null | undefined;
+  if (meta?.claudeCode?.options?.effort === undefined) {
+    return params;
+  }
+  const options = { ...meta.claudeCode.options };
+  delete options.effort;
+  return { ...params, _meta: { ...meta, claudeCode: { ...meta.claudeCode, options } } };
+}
+
 function canonicalizeModelSettingsKey(value: string): string {
   return value
     .trim()

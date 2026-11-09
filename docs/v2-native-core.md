@@ -226,13 +226,18 @@ the history cannot place stays unexposed, as the RFD forbids guessing a parent.
   after it, as on the bridge. `providers/set`, `providers/disable`, and an `auth/logout` that
   drops a provider or a gateway login route the live sessions too (see `restarts.ts`).
 - `src/v2-native/restarts.ts`: restarts of a session's query, as the bridge's: a new query
-  resumes the same Claude session, then the old one ends, and the model and mode the client chose
-  are set again and sent in a `config_option_update`. For a new route, each live session restarts
-  at its next turn boundary (no turn open, no prompt in Claude Code's queue, no subagent running),
-  prompts sent meanwhile wait and go to the new query, and the request answers once every session
-  restarted. A session whose query does not start again is no longer active. A `session/cancel`
-  or `session/close` answers the waiting prompts with -32800. The old query's background commands
-  end with it: their terminals exit before the list drops them.
+  resumes the same Claude session without the setup's `_meta` effort, then the old one ends at
+  its next turn boundary, and the client's choices are set again as the bridge's
+  `restoreSessionChoices` sets them (model, mode and pre-plan mode, ultracode, Fast mode, the
+  effort pin, the agent the client picked) and sent in a `config_option_update`. For a new route,
+  each live session restarts at its next turn boundary (no turn open, no prompt of the session
+  waiting to go to Claude Code or in its queue, no subagent running), prompts sent meanwhile wait
+  and go to the new query, and the request answers once every session restarted. A route restart
+  waits for an account restart of the session that runs. A resume of the active session with
+  other additional directories restarts it the same way: Claude Code reads them only when its
+  process starts. A session whose query does not start again stops (see "Intended differences").
+  A `session/cancel` or `session/close` answers the waiting prompts with -32800. The old query's
+  background commands end with it: their terminals exit before the list drops them.
 - `src/v2-native/subscription-guard.ts`: the `--hide-claude-auth` subscription guard, on the
   rules of `hide-claude-auth.ts`, which the bridge applies to v2 sessions. While no provider or
   gateway login routes the traffic, a session does not start, and a prompt is refused before
@@ -240,7 +245,9 @@ the history cannot place stays unexposed, as the RFD forbids guessing a parent.
   `claude_subscription_not_supported` reason) or that holds no accepted credential. A turn that
   fails for a missing login, or a probe that finds another kind of identity, restarts the query at
   the next prompt that finds the session idle, so its start judges the current account. A failed
-  restart fails that prompt and keeps the session, for a retry after a sign-in.
+  restart fails that prompt and keeps the session, for a retry after a sign-in. The guard judges a
+  prompt among the session's prompts, so a cancel or close answers one that waits for it with
+  -32800, and the prompts keep their order.
 - `src/v2-native/remote-control.ts`: the adapter's `/remote-control`, listed and run on the v1
   core's rules (`remote-control.ts`), as a local command of its own turn (see "Intended
   differences"), and the messages typed in another client of the session (a human-origin prompt
@@ -369,6 +376,21 @@ These pieces were extracted so that both cores use the same code:
 - An MCP server's URL elicitation that the user accepts keeps the work `requires_action` until
   Claude Code reports it complete (`elicitation_complete`), the tool use ends, or the turn ends:
   `accept` only consents to open the URL. The bridge reports `running` at the answer.
+- A session whose query ended without `session/close` (Claude Code exited, or a restart's new
+  query did not start) stays active, as v2 keeps a session active until its close or the end of
+  the connection. Its requests fail with -32603 and what happened ("Claude Code stopped. Resume
+  the session to continue."), until a resume starts it again from its transcript. A close ends
+  it, and -32002 follows. The bridge drops the session, so the client gets -32002.
+- A prompt that the `--hide-claude-auth` guard still judges keeps its place: a `/remote-control`
+  sent after it waits for it, as v2 asks that held prompts be inserted in the order received. The
+  bridge runs `/remote-control` before its guard, so it inserts the command first.
+- A replayed tool call that the transcript gives no result, such as one that ran when Claude Code
+  was killed, ends `failed` after the replay, as v2 asks of replayed work that no longer runs. The
+  calls that the active session still runs stay open. The bridge leaves such a call pending.
+- After Claude Code mounts a fresh conversation (`conversation_reset`, such as for `/clear`), the
+  context in use is 0, so ExitPlanMode's option reads "clear context (0% used)". The bridge keeps
+  the old context's figure until the next model request reports usage. This is no spec rule: the
+  bridge's figure is stale.
 
 ## Not served yet
 
@@ -422,10 +444,12 @@ Beyond the scenarios, `v2-native.test.ts` covers these requirements of the draft
 - Stopped work gives its unfinished tool calls a final status before its idle: `cancelled`
   after a cancel, `failed` when the query ends. At any other end, a tool call that Claude dropped
   before it ran ends `cancelled`.
-- A session whose query ended is no longer active (-32002 with `data.sessionId`), and a resume
-  starts it again from its transcript.
+- A session whose query ended stays active until its close: its requests fail with -32603 and
+  `data.sessionId`, not -32002, and a resume starts it again from its transcript.
 - Resuming the active session checks the request as a new one, keeps its work, and replaces its
-  MCP servers. A different `cwd` or other additional directories are rejected.
+  MCP servers and additional directories, which a restart at the next turn boundary applies. A
+  different `cwd` is rejected, and so is a `systemPrompt` that the session cannot apply, on every
+  setup path before it acts (a fork copies nothing then).
 - Config values must have the `id` type, additional directories must be absolute, and terminal
   logins are advertised only with `auth.terminal`.
 

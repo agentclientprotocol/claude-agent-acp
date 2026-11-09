@@ -59,6 +59,8 @@ const sdk = vi.hoisted(() => ({
   previewGate: undefined as Promise<void> | undefined,
   /** When set, Claude Code fails to start with it. */
   startFailure: undefined as Error | undefined,
+  /** When set, Claude Code's start waits for it. */
+  startGate: undefined as Promise<void> | undefined,
 }));
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
@@ -120,6 +122,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
       };
       return Object.assign(messages, {
         initializationResult: async () => {
+          await sdk.startGate;
           if (sdk.startFailure) throw sdk.startFailure;
           return { models: sdk.models };
         },
@@ -192,6 +195,7 @@ beforeEach(async () => {
   sdk.subagents = new Map();
   sdk.previewGate = undefined;
   sdk.startFailure = undefined;
+  sdk.startGate = undefined;
 });
 
 afterEach(async () => {
@@ -550,12 +554,77 @@ describe("native ACP v2 core", () => {
       });
     });
 
-    it("ends a session whose query does not start again under the new route", async () => {
+    it("ends the old query only after a turn that Claude Code started on it while the new one started", async () => {
+      const client = nativeClient();
+      await client.connect(async (agent) => {
+        const { claude } = await openSession(agent);
+        const started = Promise.withResolvers<void>();
+        sdk.startGate = started.promise;
+        const set = setProvider(agent);
+        await vi.waitFor(() => expect(sdk.processes).toHaveLength(2));
+        // A background task ended, say: Claude Code starts a turn on its own.
+        claude.send(cycleStart());
+        await vi.waitFor(() => expect(client.states()).toEqual(["running"]));
+        started.resolve();
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(claude.close).not.toHaveBeenCalled();
+
+        claude.send(result());
+        await set;
+        expect(claude.close).toHaveBeenCalled();
+      });
+
+      expect(client.sessionUpdates).toContainEqual(
+        expect.objectContaining({
+          sessionUpdate: "state_update",
+          state: "idle",
+          stopReason: "end_turn",
+        }),
+      );
+    });
+
+    it("forgets a session that session/close closed while its restart ran", async () => {
+      const client = nativeClient();
+      await client.connect(async (agent) => {
+        const { response } = await openSession(agent);
+        const started = Promise.withResolvers<void>();
+        sdk.startGate = started.promise;
+        const set = setProvider(agent);
+        await vi.waitFor(() => expect(sdk.processes).toHaveLength(2));
+        const close = agent.request(v2.methods.agent.session.close, {
+          sessionId: response.sessionId,
+        });
+        // The close waits for the restart.
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        started.resolve();
+        await close;
+        await set;
+        expect(sdk.processes[1].close).toHaveBeenCalled();
+        // Its setup is gone, so no later route change restarts it.
+        const restarts = (agents[0] as unknown as { restarts: { setups: Map<string, unknown> } })
+          .restarts;
+        expect(restarts.setups.has(response.sessionId)).toBe(false);
+      });
+    });
+
+    it("stops a session whose query does not start again under the new route", async () => {
       const client = nativeClient();
       await client.connect(async (agent) => {
         const { response } = await openSession(agent);
         sdk.startFailure = new Error("Claude Code could not start");
         await setProvider(agent);
+        // The session is still active: v2 ends that only at close.
+        await expect(
+          agent.request(v2.methods.agent.session.prompt, {
+            sessionId: response.sessionId,
+            prompt: PROMPT,
+          }),
+        ).rejects.toMatchObject({
+          code: -32603,
+          message: expect.stringContaining("could not start again. Resume the session"),
+        });
+        // A close ends it: it is no longer active then.
+        await agent.request(v2.methods.agent.session.close, { sessionId: response.sessionId });
         await expect(
           agent.request(v2.methods.agent.session.prompt, {
             sessionId: response.sessionId,
@@ -944,12 +1013,26 @@ describe("native ACP v2 core", () => {
     await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
       claude.end(new Error("Claude Code process exited with code 1"));
-      await expect(
+      // The session is still active, as v2 asks until its close: its
+      // requests say what happened instead of -32002.
+      for (const request of [
         agent.request(v2.methods.agent.session.prompt, {
           sessionId: response.sessionId,
           prompt: PROMPT,
         }),
-      ).rejects.toMatchObject({ code: -32002, data: { sessionId: response.sessionId } });
+        agent.request(v2.methods.agent.session.setConfigOption, {
+          sessionId: response.sessionId,
+          configId: "mode",
+          type: "id",
+          value: "plan",
+        }),
+      ]) {
+        await expect(request).rejects.toMatchObject({
+          code: -32603,
+          message: expect.stringContaining("Claude Code stopped. Resume the session to continue."),
+          data: { sessionId: response.sessionId },
+        });
+      }
       await agent.request(v2.methods.agent.session.resume, { sessionId: response.sessionId, cwd });
     });
 
@@ -1321,6 +1404,44 @@ describe("native ACP v2 core", () => {
         content: { type: "text", text: "Done" },
       },
       // A snapshot, not a completion: no stop reason.
+      { sessionUpdate: "state_update", state: "idle", background: [] },
+    ]);
+  });
+
+  it("gives a replayed tool call that has no result a final status, before the state", async () => {
+    const entry = (type: string, uuid: string, message: unknown) => ({
+      type,
+      uuid,
+      session_id: "s",
+      parent_tool_use_id: null,
+      parent_agent_id: null,
+      message,
+    });
+    // Claude Code was killed while `make` ran: the transcript has no result for it.
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      entry("user", "u1", { role: "user", content: "Build it" }),
+      entry("assistant", "a1", {
+        id: "msg_a",
+        role: "assistant",
+        content: [{ type: "tool_use", id: "toolu_make", name: "Bash", input: { command: "make" } }],
+      }),
+    ] as never);
+    const client = nativeClient();
+    await client.connect(async (agent) => {
+      await agent.request(v2.methods.agent.initialize, {
+        protocolVersion: v2.PROTOCOL_VERSION,
+        info: { name: "native-test-client", version: "1.0.0" },
+        capabilities: {},
+      });
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId: randomUUID(),
+        cwd,
+        replayFrom: { type: "start" },
+      });
+    });
+
+    expect(client.sessionUpdates.slice(-2)).toEqual([
+      { sessionUpdate: "tool_call_update", toolCallId: "toolu_make", status: "failed" },
       { sessionUpdate: "state_update", state: "idle", background: [] },
     ]);
   });
@@ -1743,6 +1864,47 @@ describe("native ACP v2 core", () => {
     expect(subject.toolCall._meta).toMatchObject({
       claudeCode: { mcpServer: { name: "docs", source: "sdk" } },
     });
+  });
+
+  it("offers clearing the context at 0% used after Claude Code mounted a fresh conversation", async () => {
+    const client = nativeClient();
+    await client.connect(async (agent) => {
+      const { response, claude } = await openSession(agent);
+      const prompted = agent.request(v2.methods.agent.session.prompt, {
+        sessionId: response.sessionId,
+        prompt: PROMPT,
+      });
+      claude.send(echo(await claude.prompt(0)));
+      await prompted;
+      const planned = assistant("msg_1", [{ type: "text", text: "Planned." }]);
+      planned.message.usage = { input_tokens: 100_000, output_tokens: 0 };
+      claude.send(planned);
+      await vi.waitFor(() =>
+        expect(client.sessionUpdates.at(-1)?.sessionUpdate).toBe("agent_message_chunk"),
+      );
+      await askPermission(claude, "ExitPlanMode", { plan: "Fix it" });
+      claude.send({
+        type: "conversation_reset",
+        new_conversation_id: randomUUID(),
+        uuid: randomUUID(),
+        trigger: "clear",
+        timestamp: new Date().toISOString(),
+        session_id: "session",
+      });
+      await askPermission(claude, "ExitPlanMode", { plan: "Fix it" });
+    });
+
+    // The bridge keeps the old context's percentage until the next request
+    // reports usage (see "Intended differences" in docs/v2-native-core.md).
+    expect(
+      client.permissionRequests.map(
+        (request) =>
+          request.options.find((option) => option.optionId === "exit-plan-clear-auto")?.name,
+      ),
+    ).toEqual([
+      "Yes, clear context (50% used) and use auto mode",
+      "Yes, clear context (0% used) and use auto mode",
+    ]);
   });
 
   it("lists bypass before auto in ExitPlanMode's options after plan mode left bypass", async () => {
