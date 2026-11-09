@@ -247,7 +247,7 @@ async function restoreChoices(
     const value = currentValue(previous, configId);
     if (value === undefined || value === currentValue(session, configId)) continue;
     try {
-      await session.config.set(configId, "id", value);
+      await session.config.set({ sessionId: session.sessionId, configId, type: "id", value });
     } catch (error) {
       logger.error(`Could not restore ${configId} "${value}" after the query restart:`, error);
     }
