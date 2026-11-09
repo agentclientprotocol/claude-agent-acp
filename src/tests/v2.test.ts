@@ -3900,6 +3900,25 @@ describe("ACP v2 core", () => {
         expect(claude.rewindFiles).not.toHaveBeenCalled();
         expect(reports(client.sessionUpdates)).toEqual([]);
       });
+
+      it("sends no report for the adapter's own /remote-control, as v1", async () => {
+        sdk.enableRemoteControl = vi.fn(async () => ({
+          session_url: "https://claude.ai/code/session_123",
+        }));
+        const client = v2Client();
+        await client.connect(async (agent) => {
+          const { response } = await openSession(agent, air("agentFileChangeReport"));
+          await agent.request(v2.methods.agent.session.prompt, {
+            sessionId: response.sessionId,
+            prompt: [{ type: "text", text: "/remote-control" }],
+            _meta: requestMeta("r-1"),
+          });
+          await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+        });
+
+        expect(sdk.enableRemoteControl).toHaveBeenCalled();
+        expect(reports(client.sessionUpdates)).toEqual([]);
+      });
     });
   });
 

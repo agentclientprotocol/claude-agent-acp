@@ -408,7 +408,10 @@ export class V2Session implements RequestTarget {
     if (!guarded) sent();
     const uuid = randomUUID();
     const message = { ...promptToClaude(request), uuid };
-    this.fileChanges?.requested(uuid, params._meta);
+    // Only a prompt that goes to Claude Code gets a file-change report, as on
+    // v1: the adapter's `/remote-control` registers it once it passes the
+    // prompt on (below).
+    if (!remoteControl) this.fileChanges?.requested(uuid, params._meta);
     const localCommand = this.commands.localCommand(request.prompt);
     if (localCommand) this.localCommands.set(uuid, localCommand);
     return new Promise((resolve, reject) => {
@@ -440,6 +443,7 @@ export class V2Session implements RequestTarget {
               return;
             }
             if (answered()) return;
+            this.fileChanges?.requested(uuid, params._meta);
           }
           pending.pushed = true;
           this.remoteControl.pushed(uuid);
