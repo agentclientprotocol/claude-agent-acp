@@ -4,12 +4,19 @@
  * client picks a value, and follows the changes it learns of (an approved
  * plan's mode).
  */
-import { RequestError, type SessionModeState } from "@agentclientprotocol/sdk/unstable";
+import {
+  RequestError,
+  type SessionConfigOption,
+  type SessionModeState,
+} from "@agentclientprotocol/sdk/unstable";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { ModelInfo, PermissionMode, Query } from "@anthropic-ai/claude-agent-sdk";
+import type { SubagentModels } from "../native-subagents.js";
 import {
   buildModelConfigOption,
   MODEL_CONFIG_ID,
+  modelDisplayName,
+  modelEntryFor,
   type SessionModelState,
 } from "../session-model.js";
 import { MODE_CONFIG_ID, SessionModeManager } from "../session-mode.js";
@@ -26,13 +33,25 @@ export class SessionConfig {
 
   /** The options, built as the v1 core builds its mode and model options. */
   options(): v2.SessionConfigOption[] {
-    return v2ConfigOptions([
+    return v2ConfigOptions(this.v1Options());
+  }
+
+  /** The entries of the `model` option, for the `model` of a subagent's session. */
+  subagentModels(): SubagentModels {
+    return {
+      entry: (model) => modelEntryFor(this.v1Options(), this.modelInfos, model),
+      name: (model) => modelDisplayName(this.modelInfos, model),
+    };
+  }
+
+  private v1Options(): SessionConfigOption[] {
+    return [
       SessionModeManager.configOption(this.modes),
       // A gateway that lists none of the SDK's models leaves no model option.
       ...(this.models.availableModels.length > 0
         ? [buildModelConfigOption(this.models, this.modelInfos, false)]
         : []),
-    ]);
+    ];
   }
 
   availableModeIds(): string[] {

@@ -334,12 +334,30 @@ function subagent(agentId: string, launch: string, fields: Record<string, unknow
     ...more,
   });
   return {
+    /** The Agent call that launches it, made by the root or by the agent of `parent`. */
+    launch: (parent: string | null = null) => ({
+      ...assistant(`msg_${launch}`, [
+        {
+          type: "tool_use",
+          id: launch,
+          name: "Agent",
+          input: {
+            description: "Investigate the test",
+            prompt: "Find why the test fails",
+            subagent_type: "general-purpose",
+            ...(fields.is_backgrounded === true ? { run_in_background: true } : {}),
+          },
+        },
+      ]),
+      parent_tool_use_id: parent,
+    }),
     started: (more: Record<string, unknown> = {}) =>
       system("task_started", {
         tool_use_id: launch,
         task_type: "local_agent",
         subagent_type: "general-purpose",
         description: "Investigate the test",
+        prompt: "Find why the test fails",
         is_backgrounded: false,
         ...fields,
         ...more,
@@ -1154,8 +1172,10 @@ describe("native ACP v2 core", () => {
         const { response, claude } = await openSession(agent);
         const child = subagent(agentId, "toolu_launch");
         claude.send(cycleStart());
-        claude.send(child.started());
+        claude.send(child.launch());
+        // Its first message can come before its `task_started`: it waits for the announcement.
         claude.send(child.prompt("Find why the test fails"));
+        claude.send(child.started());
         claude.send(child.says("It is a race."));
         claude.send(child.ended());
         await vi.waitFor(() =>
@@ -1167,8 +1187,13 @@ describe("native ACP v2 core", () => {
         return response.sessionId;
       });
 
+      // The parent is not shown the Agent call: the announcement, then the
+      // call's prompt as the parent's message to the child.
       const parent = updatesOf(client.notifications, sessionId).filter(
-        (update) => update.sessionUpdate === "subagent_update",
+        (update) =>
+          update.sessionUpdate === "subagent_update" ||
+          update.sessionUpdate === "session_message" ||
+          update.sessionUpdate === "tool_call_update",
       );
       expect(parent).toEqual([
         {
@@ -1177,11 +1202,15 @@ describe("native ACP v2 core", () => {
           title: "Investigate the test",
           description: "general-purpose",
           capabilities: { cancel: {} },
+          state: { state: "running", background: [] },
         },
         {
-          sessionUpdate: "subagent_update",
-          sessionId: agentId,
-          state: { state: "running", background: [] },
+          sessionUpdate: "session_message",
+          messageId: "toolu_launch",
+          senderSessionId: sessionId,
+          recipientSessionId: agentId,
+          recipientMessageId: "toolu_launch",
+          content: [{ type: "text", text: "Find why the test fails" }],
         },
         {
           sessionUpdate: "subagent_update",
@@ -1201,6 +1230,7 @@ describe("native ACP v2 core", () => {
       expect(updatesOf(client.notifications, agentId)[1]).toMatchObject({
         senderSessionId: sessionId,
         recipientSessionId: agentId,
+        senderMessageId: "toolu_launch",
         content: [{ type: "text", text: "Find why the test fails" }],
       });
     });
@@ -1212,6 +1242,7 @@ describe("native ACP v2 core", () => {
         const { response, claude } = await openSession(agent);
         const child = subagent(agentId, "toolu_bg_agent", { is_backgrounded: true });
         claude.send(cycleStart());
+        claude.send(child.launch());
         claude.send({
           type: "system",
           subtype: "background_tasks_changed",
@@ -1256,8 +1287,11 @@ describe("native ACP v2 core", () => {
       await client.connect(async (agent) => {
         const { claude } = await openSession(agent);
         claude.send(cycleStart());
+        const inner = subagent("inner", "toolu_inner", { parent_task_id: "outer" });
+        claude.send(subagent("outer", "toolu_outer").launch());
         claude.send(subagent("outer", "toolu_outer").started());
-        claude.send(subagent("inner", "toolu_inner", { parent_task_id: "outer" }).started());
+        claude.send(inner.launch("toolu_outer"));
+        claude.send(inner.started());
         await vi.waitFor(() =>
           expect(updatesOf(client.notifications, "outer")).toContainEqual(
             expect.objectContaining({ sessionUpdate: "subagent_update", sessionId: "inner" }),
@@ -1274,6 +1308,7 @@ describe("native ACP v2 core", () => {
       await client.connect(async (agent) => {
         const { claude } = await openSession(agent);
         claude.send(cycleStart());
+        claude.send(subagent("child", "toolu_launch").launch());
         claude.send(subagent("child", "toolu_launch").started());
         await vi.waitFor(() => expect(client.states()).toEqual(["running"]));
         const decision = claude.options.canUseTool!(
@@ -1312,6 +1347,7 @@ describe("native ACP v2 core", () => {
       await client.connect(async (agent) => {
         const { claude } = await openSession(agent);
         claude.send(cycleStart());
+        claude.send(subagent("child", "toolu_launch", { is_backgrounded: true }).launch());
         claude.send(subagent("child", "toolu_launch", { is_backgrounded: true }).started());
         await vi.waitFor(() =>
           expect(updatesOf(client.notifications, "child")).toContainEqual(
@@ -1339,6 +1375,7 @@ describe("native ACP v2 core", () => {
       const error = await client.connect(async (agent) => {
         const { claude } = await openSession(agent);
         claude.send(cycleStart());
+        claude.send(subagent("child", "toolu_launch").launch());
         claude.send(subagent("child", "toolu_launch").started());
         await vi.waitFor(() =>
           expect(client.notifications.some((n) => n.sessionId === "child")).toBe(true),

@@ -63,6 +63,7 @@ import {
   sessionModels,
   withClientHooks,
 } from "./setup.js";
+import type { SubagentReplay } from "./subagent-replay.js";
 import { restrictedChild } from "./tasks.js";
 
 /** The sessions per `session/list` page. */
@@ -280,8 +281,12 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       history?.catch(() => {});
       session = await this.startSession(sessionId, params, sessionId, history);
     }
+    let subagents: SubagentReplay | undefined;
     if (replayFrom != null) {
-      session.output.replay(await (history ?? getSessionMessages(sessionId, { dir: session.cwd })));
+      const messages = await (history ?? getSessionMessages(sessionId, { dir: session.cwd }));
+      subagents = await session.tasks.loadReplay(messages);
+      session.output.replay(messages, subagents?.hooks(session.output, messages));
+      subagents?.finish();
       const end = replayEndUpdate(this.clientCapabilities);
       if (end) this.send({ sessionId, update: end });
     }
@@ -290,6 +295,12 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     for (const notification of session.resumeSnapshot()) this.send(notification);
     const response = await this.setupFields(session);
     afterSetupResponse(session, params);
+    // The response ends the replay, and the replayed children's states before
+    // it are history: their current states follow it. Nothing enforces that
+    // the timer runs after the response goes out; it relies on the response
+    // being written when this handler returns, as the bridge's
+    // `afterSetupResponse` does.
+    if (subagents) setTimeout(() => subagents.afterResponse(), 0);
     return response;
   }
 
@@ -492,12 +503,17 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
 
     const clientPrompt = clientSystemPrompt(request.systemPrompt);
     const input = new Pushable<SDKUserMessage>();
+    // A client can turn the affordance off (`_meta.claudeCode.options`). Then
+    // Claude Code's interrupt stops background tasks, so `session/cancel`
+    // could not leave listed work running, and the session lists none.
+    const perTaskStopAffordance = client?.perTaskStopAffordance !== false;
     const session = new NativeSession(
       sessionId,
       request.cwd,
       request.additionalDirectories ?? [],
       this,
       input,
+      perTaskStopAffordance,
     );
     const elicitationOptions = session.elicitations.queryOptions();
     const options: Options = {

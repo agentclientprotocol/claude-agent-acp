@@ -52,7 +52,7 @@ import type { McpCommand } from "../mcp-command.js";
 import type { ElicitationSupport } from "../elicitation.js";
 import { Pushable } from "../utils.js";
 import { v1PromptRequest } from "../v2/prompt.js";
-import { V2Background } from "../v2/background.js";
+import { V2Background, stateUpdate as currentStateUpdate } from "../v2/background.js";
 import type { V2UpdateTranslator } from "../v2/update-translator.js";
 import { MODEL_CONFIG_ID } from "../session-model.js";
 import { SessionCommands } from "./commands.js";
@@ -167,6 +167,8 @@ export class NativeSession implements RequestTarget {
     readonly additionalDirectories: readonly string[],
     private readonly connection: SessionConnection,
     private readonly input: Pushable<SDKUserMessage>,
+    /** Whether Claude Code's interrupt spares background tasks (see {@link SessionTasks}). */
+    reportsBackground = true,
   ) {
     this.output = new SessionOutput(
       sessionId,
@@ -206,10 +208,12 @@ export class NativeSession implements RequestTarget {
         logger: connection.logger,
         translator: connection.translator,
         background: this.background,
+        reportsBackground,
         send: (notification) => this.sendNotification(notification),
         rootState: () => this.foregroundState(),
         // A cancel withdraws the requests of the subagents that the work waits on.
         foregroundRequestsChanged: () => this.reportState(this.cancelledWork),
+        models: () => this.config.subagentModels(),
         stopTask: async (taskId) => {
           await this.query?.stopTask(taskId);
         },
@@ -226,8 +230,6 @@ export class NativeSession implements RequestTarget {
       target: (agentId) => this.target(agentId),
       query: () => this.query,
     });
-    // The session reports its background work: every state carries a list.
-    this.background.changed({ sessionId, items: [], state: undefined });
   }
 
   /**
@@ -250,19 +252,17 @@ export class NativeSession implements RequestTarget {
   }
 
   /**
-   * What `session/resume` sends before its response: the children with their
-   * current states, the current update of each listed item, then the
-   * session's state, with its list. An idle snapshot reports no completion,
-   * so it carries no stop reason, as on the bridge.
+   * What `session/resume` sends before its response: the listed children
+   * with their current states, the current update of each listed item, then
+   * the session's state, with its list. A snapshot is no new completion, so
+   * its idle has no stop reason.
    */
   resumeSnapshot(): v2.UpdateSessionNotification[] {
-    const state = this.foregroundState();
     return [
       ...this.tasks.currentState(),
       this.background.stamp({
         sessionId: this.sessionId,
-        update:
-          state === "idle" ? { sessionUpdate: "state_update", state } : this.stateUpdate(state),
+        update: currentStateUpdate(this.foregroundState()),
       }),
     ];
   }
@@ -845,9 +845,10 @@ export class NativeSession implements RequestTarget {
   /** Ends the open turn: its idle goes out with the turn's outcome. */
   private closeTurn(): void {
     if (!this.foreground) return;
-    // v2 asks for a final status of the turn's tool calls before its idle.
+    // v2 asks for a final status of the turn's tool calls before its idle. A
+    // tool call whose task goes on in the background is not part of the work.
     const cancelled = idleOutcome(this.lastEnd, this.cancelledWork).stopReason === "cancelled";
-    this.output.closeUnfinished(cancelled);
+    this.output.closeUnfinished(cancelled, this.tasks.backgroundCalls(this.sessionId));
     if (cancelled) {
       // v2 asks to stop waiting for the stopped work's requests. Claude Code's
       // interrupt withdraws them, and this withdraws what it left open.
