@@ -1,7 +1,9 @@
 # The native ACP v2 core
 
-Status: the default v2 core. `CLAUDE_AGENT_ACP_V2_CORE=bridge` serves v2 with the bridge
-instead, as a fallback until the bridge is deleted.
+Status: the default v2 core, for every client but JetBrains AIR. A v2 client whose `initialize`
+declares `_meta.jetbrains.air` gets the bridge, which serves it the AIR extensions (see
+"Not served yet"). `CLAUDE_AGENT_ACP_V2_CORE=bridge` serves every v2 client with the bridge, as a
+fallback until the bridge is deleted.
 
 ## Why
 
@@ -365,12 +367,15 @@ These pieces were extracted so that both cores use the same code:
   `-u`. No scenario has an allowance for an intended difference.
 - The scenario double now sends `session_state_changed` when the query asks for it, as the real
   CLI does. The bridge and v1 scenario golden files did not change.
-- A manual run against the bundled Claude Code CLI checked the following:
-  - a prompt answers at insertion
-  - Bash runs as display terminals
+- `src/tests/v2-native-integration.test.ts` (`npm run test:integration`) runs the adapter's
+  process on the default v2 core against the bundled Claude Code CLI, so a CLI that changes the
+  frames the core relies on fails it:
+  - a prompt answers at insertion, then the turn goes `running` → `idle` with `end_turn`
   - a permission request goes `running` → `requires_action` → `running`
   - `session/cancel` fails a queued prompt with -32800 and goes `idle` with `cancelled`
   - the next prompt runs normally
+- A manual run against the bundled Claude Code CLI also checked that Bash runs as display
+  terminals.
 
 ## Intended differences from the bridge
 
@@ -380,11 +385,13 @@ These pieces were extracted so that both cores use the same code:
   the Agent MUST send an idle `state_update`"). Seen with `scripts/compare-v2-cores.mjs`
   (`cancel-at-start`).
 
-- An AIR client gets no AIR extensions: `initialize` advertises no `_meta.jetbrains.air`, and its
-  state updates carry the v2 `background` list. The bridge gives it AIR's subagent form, which
-  reports no list, and the AIR extensions that it reads from the client's `_meta`, such as file
-  change reports (`agentFileChangeReport`). AIR's `loadReplayEnd` event, which the client
-  declares, is sent.
+- The native core serves no AIR extension, so `acpProtocolRouter` (`serve.ts`) gives a v2 AIR
+  client the bridge, also with `v2Core: "native"`. On the native core, an AIR client would lose
+  what the bridge serves it: `sessionFailure` records (with the "Retrying Claude" API retry
+  warnings), prompt suggestions, file change reports (`agentFileChangeReport`), the AIR
+  permission presentation and `recommendedValue`, and AIR's subagent form, which reports no
+  `background` list. The native core's own `loadReplayEnd` event (`setup.ts`) is not reached
+  through the router.
 - `/remote-control` runs as a local command of its own turn, as v2 asks: `running`, the reply,
   then `idle` with `end_turn`. Sent while Claude works, it waits for the work to end, and the
   prompts after it wait for it: v2 asks to hold a prompt, not to reject it, while foreground work
@@ -433,9 +440,11 @@ These pieces were extracted so that both cores use the same code:
 
 ## Not served yet
 
-Nothing that the bridge serves to v2 clients. Neither core serves these:
+The AIR extensions: a v2 AIR client gets the bridge for them (see "Intended differences").
+Nothing else that the bridge serves to v2 clients. Neither core serves these:
 
-- API retries and prompt suggestions: the bridge sends them to AIR only.
+- API retries and prompt suggestions to a client that is not AIR: the bridge sends them to AIR
+  only.
 - A `replayFrom` cursor other than `start`: both cores reject it with -32602, such as "Replaying
   from a \_message cursor is not supported", as the spec asks of a cursor type that the Agent does
   not support. Neither replays from another position or resumes without a replay.
@@ -451,7 +460,8 @@ Nothing that the bridge serves to v2 clients. Neither core serves these:
 2. Port the gaps one feature at a time, each in a module that the native core owns. Some are
    typed for v1 (`native-subagents.ts`, `background-work.ts`).
 3. Done: `native` is the default v2 core, and both cores stay on the v2 tests and scenarios.
-   `CLAUDE_AGENT_ACP_V2_CORE=bridge` selects the bridge.
+   `CLAUDE_AGENT_ACP_V2_CORE=bridge` selects the bridge. A v2 AIR client still gets the bridge,
+   until the native core serves the AIR extensions or AIR serves v2 without them.
 4. Later: delete the bridge. That is `v2/agent.ts`, `v2/prompt.ts`, `v2/background.ts`, the
    v1 request conversions, and the v2 paths of `ClaudeAcpAgent`. Those paths are the `v2` option, the
    `foreground` and `background` hooks, `ForegroundEvents`, `foregroundWork`, and the

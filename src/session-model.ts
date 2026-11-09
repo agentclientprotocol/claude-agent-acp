@@ -104,13 +104,21 @@ function containsWords(haystack: string, needle: string): boolean {
   return false;
 }
 
+/** `id` without the gateway spellings that `normalizeModelId` keeps for
+ *  `deniedModels` and gateway listings: path segments before `claude-`
+ *  (`vertex_ai/`, `openrouter/anthropic/`, `publishers/anthropic/models/`)
+ *  and the Anthropic API's `-latest` suffix (`claude-3-5-haiku-latest`). */
+function withoutGatewaySpelling(id: string): string {
+  return id.replace(/^(?:[^/]+\/)+(?=claude-)/, "").replace(/-latest$/, "");
+}
+
 /** The words of `preference` that name a model: without what
  *  `normalizeModelId` drops (provider prefixes, dates, `-v1:0`, `-fast`,
  *  context hints), version numbers, "claude", and "best"/"default".
  *  "us.anthropic.claude-sonnet-4-5-v1:0" gives ["sonnet"], "opusplan" gives
  *  ["opus"]. */
 function modelPreferenceTokens(preference: string): string[] {
-  return modelWords(normalizeModelId(preference))
+  return modelWords(withoutGatewaySpelling(normalizeModelId(preference)))
     .map((token) => (token === "opusplan" ? "opus" : token))
     .filter((token) => /[a-z]/.test(token) && !["claude", "best", "default"].includes(token));
 }
@@ -123,6 +131,7 @@ function modelCoversTokens(model: ModelInfo, tokens: string[]): boolean {
 
 /**
  * The entry of `models` that `preference` names, or null when it names none.
+ * `best` names the entry `opus` resolves to, unless an entry's value is `best`.
  * In order: an entry whose value, display name or `resolvedModel` equals it
  * (in either context-hint spelling); an entry whose value or display name
  * contains its words ("opus" for "claude-opus-4-5"), or whose value it
@@ -136,6 +145,12 @@ export function resolveModelPreference(models: ModelInfo[], preference: string):
   const trimmed = preference.trim();
   if (!trimmed) return null;
   const lower = trimmed.toLowerCase();
+  // The CLI resolves `best` to its flagship: Opus, unless a server-side flag
+  // names another family that this adapter cannot read. The CLI ignores a
+  // `[1m]` hint on `best`. A listed entry named `best` still matches directly.
+  if (stripContextHints(lower) === "best" && !models.some((model) => model.value === trimmed)) {
+    return resolveModelPreference(models, "opus");
+  }
   const canonicalPreference = canonicalizeModelId(trimmed);
   const directMatch = models.find(
     (model) =>

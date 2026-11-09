@@ -2782,13 +2782,17 @@ describe("native ACP v2 core", () => {
     expect(() => v2CoreFromEnv("v2")).toThrow(/CLAUDE_AGENT_ACP_V2_CORE/);
   });
 
+  const AIR_CAPABILITIES = { _meta: { jetbrains: { air: { version: 1, capabilities: [] } } } };
   it.each([
-    { v2Core: undefined, served: "native" },
-    { v2Core: "native", served: "native" },
-    { v2Core: "bridge", served: "bridge" },
+    { v2Core: undefined, client: "a plain", capabilities: {}, served: "native" },
+    { v2Core: "native", client: "a plain", capabilities: {}, served: "native" },
+    { v2Core: "bridge", client: "a plain", capabilities: {}, served: "bridge" },
+    // The native core serves no AIR extension, so AIR keeps the bridge's.
+    { v2Core: undefined, client: "an AIR", capabilities: AIR_CAPABILITIES, served: "bridge" },
+    { v2Core: "native", client: "an AIR", capabilities: AIR_CAPABILITIES, served: "bridge" },
   ] as const)(
-    "serves v2 with the $served core when v2Core is $v2Core",
-    async ({ v2Core, served }) => {
+    "serves $client v2 client with the $served core when v2Core is $v2Core",
+    async ({ v2Core, capabilities, served }) => {
       const v1Agents: { dispose(): Promise<void> }[] = [];
       const nativeAgents: AgentHandle[] = [];
       const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
@@ -2804,7 +2808,7 @@ describe("native ACP v2 core", () => {
             agent.request(v2.methods.agent.initialize, {
               protocolVersion: v2.PROTOCOL_VERSION,
               info: { name: "test-client", version: "1" },
-              capabilities: {},
+              capabilities,
             }),
           );
         expect({ native: nativeAgents.length, bridge: v1Agents.length }).toEqual(
