@@ -346,49 +346,81 @@ describe("task plan lifecycle", () => {
     );
   });
 
-  it("clears the task plan on a conversation reset", async () => {
-    const taskState = new Map([["task-1", { subject: "Run tests", status: "in_progress" }]]);
-    const { agent, updates } = setup(taskState, async function* (input) {
-      const iter = input[Symbol.asyncIterator]();
-      const first = await iter.next();
-      yield userEcho(first.value);
-      yield {
-        type: "conversation_reset",
-        new_conversation_id: randomUUID(),
-        uuid: randomUUID(),
-        session_id: "test-session",
-      };
-      yield successfulResult();
+  const inProgressPlan = [{ content: "Run tests", status: "in_progress", priority: "medium" }];
+  const planUpdateKinds = new Set(["plan", "plan_update", "plan_removed"]);
 
-      const second = await iter.next();
-      yield userEcho(second.value);
-      yield successfulResult();
-    });
-
-    await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "/clear" }],
-    });
-    await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "Start fresh" }],
-    });
-
-    expect(taskState.size).toBe(0);
-    expect(updates.filter((notification) => notification.update.sessionUpdate === "plan")).toEqual([
-      {
-        sessionId: "test-session",
-        update: {
-          sessionUpdate: "plan",
-          entries: [{ content: "Run tests", status: "in_progress", priority: "medium" }],
+  it.each([
+    {
+      client: "a client without plan operations",
+      clientCapabilities: {},
+      expected: [
+        { sessionUpdate: "plan", entries: inProgressPlan },
+        { sessionUpdate: "plan", entries: [] },
+      ],
+    },
+    {
+      client: "a client with plan operations",
+      clientCapabilities: { plan: {} },
+      expected: [
+        {
+          sessionUpdate: "plan_update",
+          plan: { type: "items", planId: "plan", entries: inProgressPlan },
         },
-      },
-      {
+        { sessionUpdate: "plan_removed", planId: "plan" },
+        { sessionUpdate: "plan_removed", planId: "plan-mode" },
+      ],
+    },
+    {
+      // AIR keeps each approved plan with its approval card.
+      client: "AIR with plan operations",
+      clientCapabilities: { ...AIR_CLIENT_CAPABILITIES, plan: {} },
+      expected: [
+        {
+          sessionUpdate: "plan_update",
+          plan: { type: "items", planId: "plan", entries: inProgressPlan },
+        },
+        { sessionUpdate: "plan_removed", planId: "plan" },
+      ],
+    },
+  ])(
+    "clears the plans on a conversation reset for $client",
+    async ({ clientCapabilities, expected }) => {
+      const taskState = new Map([["task-1", { subject: "Run tests", status: "in_progress" }]]);
+      const { agent, updates } = setup(taskState, async function* (input) {
+        const iter = input[Symbol.asyncIterator]();
+        const first = await iter.next();
+        yield userEcho(first.value);
+        yield {
+          type: "conversation_reset",
+          new_conversation_id: randomUUID(),
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield successfulResult();
+
+        const second = await iter.next();
+        yield userEcho(second.value);
+        yield successfulResult();
+      });
+      await initializeClient(agent, clientCapabilities);
+
+      await agent.prompt({
         sessionId: "test-session",
-        update: { sessionUpdate: "plan", entries: [] },
-      },
-    ]);
-  });
+        prompt: [{ type: "text", text: "/clear" }],
+      });
+      await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "Start fresh" }],
+      });
+
+      expect(taskState.size).toBe(0);
+      expect(
+        updates
+          .map((notification) => notification.update)
+          .filter((update) => planUpdateKinds.has(update.sessionUpdate)),
+      ).toEqual(expected);
+    },
+  );
 });
 
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration", () => {

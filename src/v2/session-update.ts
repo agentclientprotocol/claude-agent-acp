@@ -5,14 +5,8 @@
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import { v2AvailableCommands, v2ConfigOptions } from "./session.js";
+import { checklistPlanOperation } from "../plans.js";
 import { v2ToolCallUpdate } from "./tool-call.js";
-
-/**
- * The id of the plan of a session. v1 has one plan per session, which every
- * plan update replaces whole, from TodoWrite and from the Task tools alike.
- * v2 tracks plans by id, so that plan gets one.
- */
-export const SESSION_PLAN_ID = "plan";
 
 /**
  * The v2 form of a v1 session update, or `undefined` when v2 has no
@@ -48,13 +42,12 @@ export function v2SessionUpdate(
     case "tool_call":
     case "tool_call_update":
       return v2ToolCallUpdate(update);
-    case "plan":
-      // A v2 plan of items is replaced whole as well.
-      return {
-        sessionUpdate: "plan_update",
-        plan: { type: "items", planId: SESSION_PLAN_ID, entries: update.entries },
-        ...(update._meta != null ? { _meta: update._meta } : {}),
-      };
+    case "plan": {
+      // Every v2 client has the `plan` capability, so the agent sends the
+      // checklist as `plan_update`; a legacy plan converts the same way.
+      const converted = checklistPlanOperation(update.entries);
+      return update._meta != null ? { ...converted, _meta: update._meta } : converted;
+    }
     case "plan_update":
     case "plan_removed":
       // v1's draft plan operations have v2's shape.
