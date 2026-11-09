@@ -281,6 +281,66 @@ function resolveSettingsModel(
 
 const MODEL_FAMILY_ALIASES = new Set(["opus", "sonnet", "haiku", "fable"]);
 
+/** The family and version of a `claude-<family>-<major>[-<minor>]` id:
+ *  `claude-fable-5-1` is fable 5.1, `claude-haiku-4-5-20251001` haiku 4.5. */
+function familyVersionOf(id: string): { family: string; major: number; minor: number } | null {
+  const match = id.toLowerCase().match(/^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?![\d.])/);
+  if (!match) return null;
+  return { family: match[1], major: Number(match[2]), minor: Number(match[3] ?? 0) };
+}
+
+/**
+ * Give back the family alias value to the row the CLI lists under a resumed
+ * session's model id.
+ *
+ * The CLI lists Fable 5.1 as `fable`, but when it resumes a session that ran
+ * Fable 5.1 it lists the same row as `claude-fable-5-1` and has no `fable`
+ * row. Clients store the option value as the session's choice, so a value
+ * from a new session would not be offered by a resumed one, and the reverse.
+ *
+ * A row gets its family's alias as its value when its `value` is
+ * `resumedModel`, equals its own `resolvedModel` and has no context hint, no
+ * row has that alias, and no row of the family has a newer version (an alias
+ * runs its family's newest model). Every other row is returned as it is.
+ *
+ * The CLI lists a row the same way when `ANTHROPIC_MODEL` or `settings.model`
+ * pins `claude-fable-5-1`. Those rows keep the pinned id, so a client's choice
+ * stays on that version after a newer Fable becomes `fable`.
+ */
+export function aliasResumedModelRow(
+  models: ModelInfo[],
+  resumedModel: string | undefined,
+): ModelInfo[] {
+  if (resumedModel === undefined) return models;
+  const resumed = canonicalizeModelId(resumedModel);
+  const values = new Set(models.map((model) => model.value));
+  const versions = models.flatMap((model) => {
+    const version = familyVersionOf(model.resolvedModel ?? model.value);
+    return version ? [version] : [];
+  });
+  return models.map((model) => {
+    const version = familyVersionOf(model.value);
+    if (
+      version === null ||
+      !MODEL_FAMILY_ALIASES.has(version.family) ||
+      values.has(version.family) ||
+      model.resolvedModel !== model.value ||
+      contextHintOf(model.value) !== null ||
+      canonicalizeModelId(model.value) !== resumed ||
+      versions.some(
+        (other) =>
+          other.family === version.family &&
+          (other.major > version.major ||
+            (other.major === version.major && other.minor > version.minor)),
+      )
+    ) {
+      return model;
+    }
+    values.add(version.family);
+    return { ...model, value: version.family };
+  });
+}
+
 /** A model id without the spellings that name the same model: provider
  *  prefixes, dates, version suffixes, `:variant` suffixes, dotted versions,
  *  `-fast` and context hints. `deniedModels` and gateway listings both match on

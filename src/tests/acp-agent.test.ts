@@ -13858,7 +13858,7 @@ describe("MCP server startup failures", () => {
     );
     expect(lines).toHaveLength(1);
     expect(lines[0].content.text).toBe(
-      '**MCP server "client-fs" failed to start:** Its tools are unavailable in this session. Run /mcp for the error.',
+      '\n\n> **MCP server "client-fs" failed to start:** Its tools are unavailable in this session. Run /mcp for the error.\n\n',
     );
   });
 });
@@ -18610,8 +18610,8 @@ describe("assembled assistant text fallback", () => {
     ]);
     expect(child.some((update) => update.sessionUpdate === "compaction_update")).toBe(false);
 
-    // Unrecognized framing: the text stays visible rather than vanishing
-    // behind a summary-less entity.
+    // Unrecognized framing: still the compaction isCompactSummary says it is,
+    // without summary text, and never a message from the user.
     const unknownFraming = await replay(true, [
       {
         ...summaryMessage("odd-summary"),
@@ -18622,12 +18622,14 @@ describe("assembled assistant text fallback", () => {
         },
       },
     ]);
-    expect(unknownFraming.some((update) => update.sessionUpdate === "compaction_update")).toBe(
-      false,
-    );
-    expect(unknownFraming.some((update) => update.sessionUpdate === "user_message_chunk")).toBe(
-      true,
-    );
+    expect(unknownFraming).toEqual([
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "odd-summary",
+        status: "completed",
+        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
+      },
+    ]);
   });
 
   it("preserves the model response after multiple compactions in one turn", async () => {
@@ -18848,7 +18850,7 @@ describe("assembled assistant text fallback", () => {
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
 
     const chunks = updates.filter(({ update }) => update.sessionUpdate === "agent_message_chunk");
-    expect(messageChunkTexts(updates)).toEqual(["**Warning:** hook says no"]);
+    expect(messageChunkTexts(updates)).toEqual(["\n\n> **Warning:** hook says no\n\n"]);
     expect(chunks[0]?.update).toMatchObject({
       _meta: { claudeCode: { kind: "informational", level: "warning" } },
     });
@@ -18903,10 +18905,31 @@ describe("assembled assistant text fallback", () => {
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
 
     const chunks = updates.filter(({ update }) => update.sessionUpdate === "agent_message_chunk");
-    expect(messageChunkTexts(updates)).toEqual(["plain hook detail"]);
+    expect(messageChunkTexts(updates)).toEqual(["\n\n> plain hook detail\n\n"]);
     expect(chunks[0]?.update).toMatchObject({
       _meta: { claudeCode: { kind: "informational", level: "info" } },
     });
+  });
+
+  it("renders a multi-line hook notice as one quote with a single speaker prefix", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "informational",
+        content: "Stop says: token: 3 calls\nStop says: hand off now",
+        level: "notice",
+        session_id: "test-session",
+      },
+      result(),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual([
+      "\n\n> **Notice:** Stop says: token: 3 calls\n> hand off now\n\n",
+    ]);
   });
 
   it("delivers an informational frame as a notice and still owns the result text", async () => {
@@ -25951,6 +25974,82 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       ]);
     });
 
+    // Issue #1453: a previous cycle's trailing idle completed the next turn task.
+    it.each(["result", "idle"] as const)(
+      "keeps the next turn task open across an owed idle until its own %s",
+      async (end) => {
+        const { agent, asyncTaskUpdates } = await airAgent();
+        let wake = () => {};
+        const woken = new Promise<void>((resolve) => (wake = resolve));
+        let finish = () => {};
+        const finished = new Promise<void>((resolve) => (finish = resolve));
+        injectGeneratorSession(agent, (input) => {
+          async function* messageGenerator() {
+            const iter = input[Symbol.asyncIterator]();
+            yield userEcho((await iter.next()).value);
+            yield running();
+            yield resultMessage();
+            yield idle();
+            await woken;
+            yield running();
+            yield assistantText("first autonomous cycle");
+            yield resultMessage({ origin: { kind: "task-notification" } });
+            // The CLI stays running: the next output opens a new turn task.
+            yield assistantText("next autonomous cycle");
+            yield idle(); // The previous autonomous result's late trailer.
+            await finished;
+            yield assistantText("still working in the next cycle");
+            if (end === "result") {
+              yield resultMessage({ origin: { kind: "task-notification" } });
+            }
+            yield idle();
+          }
+          return messageGenerator();
+        });
+
+        await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+        wake();
+        try {
+          await waitFor(
+            () =>
+              asyncTaskUpdates().filter((u) => u.sessionUpdate === "async_task_spawned").length ===
+                2 && agent.sessions["test-session"].owedTrailingIdles === 0,
+          );
+          const [first, firstEnd, next] = asyncTaskUpdates();
+          expect(asyncTaskUpdates()).toEqual([
+            first,
+            {
+              sessionUpdate: "async_task_state_update",
+              asyncTaskId: first.asyncTaskId,
+              state: "completed",
+            },
+            next,
+          ]);
+          expect(firstEnd.state).toBe("completed");
+          expect(next.sessionUpdate).toBe("async_task_spawned");
+          expect(next.asyncTaskId).not.toBe(first.asyncTaskId);
+        } finally {
+          finish();
+          await agent.sessions["test-session"]?.consumer;
+        }
+        const [first, , next] = asyncTaskUpdates();
+        expect(asyncTaskUpdates()).toEqual([
+          first,
+          {
+            sessionUpdate: "async_task_state_update",
+            asyncTaskId: first.asyncTaskId,
+            state: "completed",
+          },
+          next,
+          {
+            sessionUpdate: "async_task_state_update",
+            asyncTaskId: next.asyncTaskId,
+            state: "completed",
+          },
+        ]);
+      },
+    );
+
     describe("started by a scheduler fire", () => {
       const lifecycleStarted = (fire: { wakeup_source?: string; scheduled_for?: number }) =>
         ({
@@ -30203,6 +30302,61 @@ describe("agent selection config option", () => {
       const agentOption = session.configOptions.find((o) => o.id === "agent");
       expect(agentOption?.currentValue).toBe("default");
     });
+  });
+});
+
+describe("rate_limit_event", () => {
+  it("rides on the next usage_update when it comes before the turn's first assistant frame", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => {
+          updates.push(notification);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    const rateLimit = { status: "allowed", resetsAt: 1700000000, rateLimitType: "seven_day" };
+    const usage = {
+      input_tokens: 10,
+      output_tokens: 5,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    };
+    injectGeneratorSession(agent, async function* (input) {
+      const { value } = await input[Symbol.asyncIterator]().next();
+      yield userEcho(value);
+      yield {
+        type: "rate_limit_event",
+        rate_limit_info: rateLimit,
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      yield {
+        type: "assistant",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+        message: {
+          id: "msg_rate",
+          role: "assistant",
+          model: "claude-sonnet-4-20250514",
+          content: [{ type: "text", text: "ok" }],
+          usage,
+        },
+      };
+      yield successfulResultMessage({ usage });
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    const usageMetas = updates
+      .map((notification) => notification.update)
+      .filter((update) => update.sessionUpdate === "usage_update")
+      .map((update) => update._meta?.["_claude/rateLimit"]);
+    expect(usageMetas[0]).toEqual(rateLimit);
+    expect(usageMetas.slice(1)).toEqual(usageMetas.slice(1).map(() => undefined));
   });
 });
 

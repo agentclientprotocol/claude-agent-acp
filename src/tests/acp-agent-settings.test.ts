@@ -30,22 +30,22 @@ describe("ClaudeAcpAgent settings", () => {
     } as unknown as AcpClient;
   }
 
-  function mockQuery() {
+  function mockQuery(
+    models: unknown[] = [
+      {
+        value: "claude-sonnet-4-6",
+        displayName: "Claude Sonnet 4.5",
+        description: "Default",
+        supportsAutoMode: true,
+      },
+    ],
+  ) {
     let capturedOptions: any;
     const setModelSpy = vi.fn();
     querySpy.mockImplementation(({ options }: any) => {
       capturedOptions = options;
       return makeMockQuery({
-        initializationResult: async () => ({
-          models: [
-            {
-              value: "claude-sonnet-4-6",
-              displayName: "Claude Sonnet 4.5",
-              description: "Default",
-              supportsAutoMode: true,
-            },
-          ],
-        }),
+        initializationResult: async () => ({ models }),
         setModel: setModelSpy,
       }) as any;
     });
@@ -432,7 +432,7 @@ describe("ClaudeAcpAgent settings", () => {
   describe("on resume", () => {
     const sessionId = "resumed-mode-session";
 
-    async function setup(records: unknown[]) {
+    async function setup(records: unknown[], models?: unknown[]) {
       await fs.promises.writeFile(
         path.join(tempDir, "settings.json"),
         JSON.stringify({ permissions: { defaultMode: "plan" } }),
@@ -446,11 +446,11 @@ describe("ClaudeAcpAgent settings", () => {
         records.map((record) => JSON.stringify(record)).join("\n") + "\n",
       );
 
-      const { getCapturedOptions } = mockQuery();
+      const { getCapturedOptions, setModelSpy } = mockQuery(models);
       const { ClaudeAcpAgent } = await import("../acp-agent.js");
       const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
       (agent as any).logger = { log: () => {}, error: () => {} };
-      return { agent, projectDir, getCapturedOptions };
+      return { agent, projectDir, getCapturedOptions, setModelSpy };
     }
 
     async function resume(records: unknown[], meta: object = {}) {
@@ -475,6 +475,26 @@ describe("ClaudeAcpAgent settings", () => {
         origin: { kind: "human" },
         message: { role: "user", content: "hello" },
         ...(permissionMode ? { permissionMode } : {}),
+      };
+      previousUuid = uuid;
+      return record;
+    };
+    const assistant = (model: string) => {
+      const uuid = crypto.randomUUID();
+      const record = {
+        type: "assistant",
+        uuid,
+        parentUuid: previousUuid,
+        sessionId,
+        timestamp: new Date().toISOString(),
+        isSidechain: false,
+        message: {
+          id: `msg_${uuid}`,
+          type: "message",
+          role: "assistant",
+          model,
+          content: [{ type: "text", text: "ok" }],
+        },
       };
       previousUuid = uuid;
       return record;
@@ -511,6 +531,41 @@ describe("ClaudeAcpAgent settings", () => {
 
       expect(permissionMode).toBe("plan");
       expect(response.modes.currentModeId).toBe("plan");
+    });
+
+    it("offers Fable 5.1 as `fable` when the CLI resumed on it", async () => {
+      // The CLI names the Fable 5.1 row after its startup model, which on
+      // resume is the transcript's model; a fresh session lists it as `fable`.
+      const fable = (value: string, resolvedModel: string, displayName: string) => ({
+        value,
+        resolvedModel,
+        displayName,
+        description: "",
+      });
+      const { agent, projectDir, setModelSpy } = await setup(
+        [user(), assistant("claude-fable-5-1")],
+        [
+          fable("default", "claude-opus-5-5", "Default (recommended)"),
+          fable("claude-fable-5-1", "claude-fable-5-1", "Fable 5.1"),
+          fable("claude-fable-5", "claude-fable-5", "Fable 5"),
+        ],
+      );
+
+      const response = await (agent as any).createSession(
+        { cwd: projectDir, mcpServers: [], _meta: { disableBuiltInTools: true } },
+        { resume: sessionId },
+      );
+
+      const model = response.configOptions.find((option: any) => option.id === "model");
+      expect(model).toMatchObject({
+        currentValue: "fable",
+        options: [
+          { value: "default" },
+          { value: "fable", name: "Fable 5.1" },
+          { value: "claude-fable-5", name: "Fable 5" },
+        ],
+      });
+      expect(setModelSpy).not.toHaveBeenCalled();
     });
 
     it("continues in the last permission mode on session/load", async () => {

@@ -284,6 +284,7 @@ import {
 import { IdleCompaction } from "./idle-compaction.js";
 import {
   clientSupportsNotices,
+  collapseHookSpeaker,
   MAX_NOTICE_TITLE_LENGTH,
   normalizeNoticeText,
   noticeOrTranscriptUpdate,
@@ -361,6 +362,7 @@ import {
   SessionModeManager,
 } from "./session-mode.js";
 import {
+  aliasResumedModelRow,
   applyAvailableModelsAllowlist,
   buildModelConfigOption,
   getAvailableModels,
@@ -4660,6 +4662,8 @@ export class ClaudeAcpAgent {
     let lastAssistantTotalUsage: number | null = null;
     let lastAssistantUsage: UsageSnapshot | null = null;
     let lastAssistantModel: string | null = null;
+    // A rate_limit_event that came before the turn had any usage to report.
+    let pendingRateLimit: unknown = null;
     // When the Claude SDK classifies a turn as failed (e.g. rate limit, auth
     // problem, billing), it sets a categorical `error` field on the
     // `SDKAssistantMessage` that precedes the final `result` message. We capture
@@ -4967,7 +4971,8 @@ export class ClaudeAcpAgent {
     };
 
     // ACP's usage_update has no model field, so the model the usage belongs
-    // to rides in `_meta` alongside the other `_claude/*` keys.
+    // to rides in `_meta` alongside the other `_claude/*` keys, as does a
+    // pending rate limit.
     const attachUsageModel = <
       T extends {
         sessionUpdate: "usage_update";
@@ -4978,6 +4983,13 @@ export class ClaudeAcpAgent {
     >(
       update: T,
     ): T => {
+      if (pendingRateLimit !== null) {
+        update = {
+          ...update,
+          _meta: { "_claude/rateLimit": pendingRateLimit, ...(update._meta ?? {}) },
+        };
+        pendingRateLimit = null;
+      }
       if (!lastAssistantModel) return update;
       return {
         ...update,
@@ -6404,8 +6416,6 @@ export class ClaudeAcpAgent {
                   !firstUnsettledQueuedTurn()
                 ) {
                   await asyncTasks.autonomousTurnStarted();
-                } else if (message.state === "idle" && asyncTasks.autonomousTurnOpen) {
-                  await asyncTasks.autonomousTurnEnded("completed");
                 }
                 if (
                   message.state === "running" &&
@@ -6437,6 +6447,9 @@ export class ClaudeAcpAgent {
                   // here. An owed idle belongs to an earlier result: it can lag
                   // past the cycle's first output.
                   if (session.owedTrailingIdles === 0) {
+                    if (asyncTasks.autonomousTurnOpen) {
+                      await asyncTasks.autonomousTurnEnded("completed");
+                    }
                     await closeCycleToolCalls();
                     this.endAutonomousCycle(params.sessionId, {
                       outcome: { stopReason: session.cancelled ? "cancelled" : "end_turn" },
@@ -6709,10 +6722,11 @@ export class ClaudeAcpAgent {
                   }
                 }
                 const severity = message.level === "warning" ? "warning" : "info";
+                const transcriptContent = collapseHookSpeaker(message.content);
                 const transcriptText =
                   message.level === "info"
-                    ? message.content
-                    : `**${sentenceCase(message.level)}:** ${message.content}`;
+                    ? transcriptContent
+                    : `**${sentenceCase(message.level)}:** ${transcriptContent}`;
                 await sendUpdate({
                   sessionId: params.sessionId,
                   update: noticeOrTranscriptUpdate(
@@ -8502,6 +8516,18 @@ export class ClaudeAcpAgent {
                 content,
                 toolUseResult,
                 session.toolUseCache,
+                (toolUseId) => {
+                  for (const [taskId, task] of session.liveBackgroundTasks) {
+                    if (
+                      task.parentToolUseId === toolUseId &&
+                      task.taskType === "local_bash" &&
+                      task.backgrounded
+                    ) {
+                      return taskId;
+                    }
+                  }
+                  return undefined;
+                },
               );
               if (backgroundBashTask) await asyncTasks.taskBackgrounded(backgroundBashTask);
               // The command's terminal runs until its task ends, unless the
@@ -8676,7 +8702,11 @@ export class ClaudeAcpAgent {
           }
           case "rate_limit_event": {
             session.idleCompaction?.noteRateLimit(message.rate_limit_info);
-            if (lastAssistantTotalUsage !== null) {
+            // With partial messages on, the SDK sends this before the turn's
+            // first assistant frame, while there is no usage yet to send it with.
+            if (lastAssistantTotalUsage === null) {
+              pendingRateLimit = message.rate_limit_info;
+            } else {
               await sendUpdate({
                 sessionId: params.sessionId,
                 update: attachUsageModel({
@@ -10025,9 +10055,10 @@ export class ClaudeAcpAgent {
       // The entity is keyed by the summary message's uuid, which differs from
       // the live id (the `compacting` status uuid) — replay is terminal-first
       // by the RFD, and no client merges a replay into a live entity store.
-      // A subagent's own compaction summary is not the root session's, and a
-      // summary whose framing is unrecognized stays visible as transcript
-      // text rather than vanishing behind a summary-less entity.
+      // A subagent's own compaction summary is not the root session's. A summary
+      // whose framing is unrecognized is still this compaction, without summary
+      // text: isCompactSummary says what it is, and the framing is Claude Code's
+      // to change.
       if (
         replayCompactionUpdates &&
         isCompactSummaryMessage(message) &&
@@ -10043,10 +10074,9 @@ export class ClaudeAcpAgent {
             airClient: this.toolCallCapabilities.air.client,
           },
         );
-        if (replayCompaction.recordSummary(assistantMessageText(message.message))) {
-          await replayCompaction.finish(message.uuid, "completed");
-          return;
-        }
+        replayCompaction.recordSummary(assistantMessageText(message.message));
+        await replayCompaction.finish(message.uuid, "completed");
+        return;
       }
 
       for (const notification of toAcpNotifications(
@@ -12490,14 +12520,21 @@ export class ClaudeAcpAgent {
       // configured. Managed `deniedModels` drops entries the CLI would refuse.
       const settingsAvailableModels = settingsManager.getSettings().availableModels;
       const settingsModelOverrides = settingsManager.getSettings().modelOverrides;
+      const resumedModel = await resumedModelHint;
+      // A resumed Fable 5.1 session lists Fable 5.1 as `fable`, as a new
+      // session does (see `aliasResumedModelRow`).
+      const sdkModels = aliasResumedModelRow(
+        initializationResult.models,
+        creationOpts.resume !== undefined ? resumedModel : undefined,
+      );
       const settingsAllowedModels = Array.isArray(settingsAvailableModels)
         ? applyAvailableModelsAllowlist(
-            initializationResult.models,
+            sdkModels,
             settingsAvailableModels,
             settingsModelOverrides,
             settingsManager.getManagedDeniedModels(),
           )
-        : initializationResult.models;
+        : sdkModels;
       // Then keep only the models the `providers/set` gateway listed.
       const allowedModels = resolvedProvider?.listedModels
         ? narrowToGatewayModels(
@@ -12515,7 +12552,7 @@ export class ClaudeAcpAgent {
         this.logger,
         creationOpts.resume !== undefined,
         sessionId,
-        await resumedModelHint,
+        resumedModel,
         resolvedProvider?.listedModels !== undefined,
       );
       timing.phase("models");
@@ -12531,7 +12568,7 @@ export class ClaudeAcpAgent {
       const allowlistedModelInfo = allowedModels.find((m) => m.value === models.currentModelId);
       const fallbackModelInfo = allowlistedModelInfo
         ? undefined
-        : (resolveModelPreference(initializationResult.models, models.currentModelId) ?? undefined);
+        : (resolveModelPreference(sdkModels, models.currentModelId) ?? undefined);
       const currentModelInfo = allowlistedModelInfo ?? fallbackModelInfo;
       // Register the fallback-resolved capabilities under the verbatim live id
       // so every modelInfos consumer (buildConfigOptions' effort lookup, later

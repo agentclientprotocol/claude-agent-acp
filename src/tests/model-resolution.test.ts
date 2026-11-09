@@ -4,6 +4,7 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk/unstable";
 import {
+  aliasResumedModelRow,
   resolveModelPreference,
   applyAvailableModelsAllowlist,
   isDeniedModel,
@@ -193,6 +194,52 @@ describe("matchResumedModel", () => {
     const result = matchResumedModel(LIVE_SHAPED_MODELS, "claude-gpt-99");
     expect(result.value).toBe("claude-gpt-99");
     expect(result.displayName).toBe("claude-gpt-99");
+  });
+});
+
+describe("aliasResumedModelRow", () => {
+  const row = (value: string, resolvedModel = value): ModelInfo => ({
+    value,
+    resolvedModel,
+    displayName: value,
+    description: "",
+  });
+  // What the CLI lists after resuming a session on `claude-fable-5-1`.
+  const STARTED_ON_FABLE = [
+    row("default", "claude-opus-5-5"),
+    row("claude-fable-5-1"),
+    row("claude-fable-5"),
+  ];
+
+  it("lists the resumed model's row under its family alias", () => {
+    expect(aliasResumedModelRow(STARTED_ON_FABLE, "claude-fable-5-1").map((m) => m.value)).toEqual([
+      "default",
+      "fable",
+      "claude-fable-5",
+    ]);
+  });
+
+  it.each([
+    [
+      "the alias already has a row",
+      [row("fable", "claude-fable-5-1"), row("claude-fable-5")],
+      "claude-fable-5",
+    ],
+    ["the row is not the resumed model", STARTED_ON_FABLE, "claude-opus-5-5"],
+    ["the session is not resumed", STARTED_ON_FABLE, undefined],
+    [
+      "the family has a newer row",
+      [row("claude-fable-5-1"), row("claude-fable-5")],
+      "claude-fable-5",
+    ],
+    [
+      "the row carries a context hint",
+      [row("claude-fable-5-1[1m]", "claude-fable-5-1")],
+      "claude-fable-5-1[1m]",
+    ],
+    ["the row is not a family model", [row("claude-gpt-9")], "claude-gpt-9"],
+  ])("keeps every value when %s", (_case, models, resumedModel) => {
+    expect(aliasResumedModelRow(models, resumedModel)).toEqual(models);
   });
 });
 
