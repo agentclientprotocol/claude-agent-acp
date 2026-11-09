@@ -84,7 +84,6 @@ import {
   SDKUserMessageReplay,
   Settings,
   SlashCommand,
-  ThinkingConfig,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
   GOAL_ACTIONS,
@@ -199,7 +198,7 @@ import {
 import { forkSession } from "./fork-session.js";
 import {
   clientSystemPrompt,
-  sdkSystemPrompt,
+  sessionSystemPrompt,
   SYSTEM_PROMPT_CAPABILITY,
 } from "./client-system-prompt.js";
 import {
@@ -362,6 +361,7 @@ import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "./u
 
 export { DEFAULT_AGENT_ID } from "./session-config-ids.js";
 import { MCP_AVAILABLE_COMMAND, parseMcpCommand, runMcpCommand } from "./mcp-command.js";
+import { parseModelConfig, resolveThinkingConfig } from "./session-env.js";
 import {
   MODE_CONFIG_ID,
   resolveInitialPermissionMode,
@@ -11480,31 +11480,11 @@ export class ClaudeAcpAgent {
     const mcpServers = sdkMcpServers(params.mcpServers);
 
     const customInstructions = airCustomInstructions(params._meta);
-    let systemPrompt: Options["systemPrompt"] =
-      customInstructions === undefined
-        ? { type: "preset", preset: "claude_code" }
-        : { type: "preset", preset: "claude_code", append: customInstructions };
-    if (params._meta?.systemPrompt) {
-      const customPrompt = params._meta.systemPrompt;
-      if (typeof customPrompt === "string") {
-        systemPrompt = customPrompt;
-      } else if (
-        typeof customPrompt === "object" &&
-        customPrompt !== null &&
-        !Array.isArray(customPrompt)
-      ) {
-        // Forward all preset options (append, excludeDynamicSections, and
-        // anything the SDK adds later) while locking type/preset.
-        systemPrompt = {
-          ...(customPrompt as object),
-          type: "preset",
-          preset: "claude_code",
-        } as Options["systemPrompt"];
-      }
-    }
-    // The spec's `systemPrompt` takes precedence over the `_meta.systemPrompt`
-    // extension above.
-    if (clientPrompt) systemPrompt = sdkSystemPrompt(clientPrompt, customInstructions);
+    const systemPrompt = sessionSystemPrompt(
+      clientPrompt,
+      params._meta?.systemPrompt,
+      customInstructions,
+    );
 
     // Extract options from _meta if provided
     const sessionMeta = params._meta as NewSessionMeta | undefined;
@@ -12914,7 +12894,7 @@ export function buildConfigOptions(
   return options;
 }
 
-function getAvailableSlashCommands(
+export function getAvailableSlashCommands(
   commands: SlashCommand[],
   // Names the CLI tagged terminal-bound on `system`/init (their UX lives in
   // the CLI's own terminal, which ACP clients aren't) — filtered alongside
@@ -14148,61 +14128,6 @@ function immediateContextWindow(
       ) ?? DEFAULT_CONTEXT_WINDOW,
     authoritative: false,
   };
-}
-
-/** Translate the legacy `MAX_THINKING_TOKENS` env var, plus the optional
- *  `CLAUDE_CODE_THINKING_DISPLAY` env var, into the SDK's `thinking` option.
- *  The `maxThinkingTokens` option it used to feed is deprecated and reduced
- *  to on/off on current models, so map the value to explicit thinking config
- *  instead: unset → `undefined` (SDK default, adaptive on models that support
- *  it) unless a display mode is requested, in which case it becomes explicit
- *  `adaptive`; `0` → disabled; a positive integer → a fixed token budget.
- *  Anything else is ignored with a warning. `CLAUDE_CODE_THINKING_DISPLAY`
- *  must be `summarized` or `omitted`; it has no effect when thinking is
- *  disabled. */
-function resolveThinkingConfig(
-  rawTokens: string | undefined,
-  rawDisplay: string | undefined,
-  logger: Logger,
-): ThinkingConfig | undefined {
-  let display: "summarized" | "omitted" | undefined;
-  if (rawDisplay !== undefined) {
-    if (rawDisplay === "summarized" || rawDisplay === "omitted") {
-      display = rawDisplay;
-    } else {
-      logger.error(
-        `Ignoring CLAUDE_CODE_THINKING_DISPLAY: expected 'summarized' or 'omitted', got '${rawDisplay}'.`,
-      );
-    }
-  }
-
-  if (rawTokens === undefined) {
-    return display ? { type: "adaptive", display } : undefined;
-  }
-  const parsed = Number.parseInt(rawTokens, 10);
-  if (Number.isNaN(parsed) || parsed < 0) {
-    logger.error(
-      `Ignoring MAX_THINKING_TOKENS: expected a non-negative integer, got '${rawTokens}'.`,
-    );
-    return display ? { type: "adaptive", display } : undefined;
-  }
-  return parsed === 0
-    ? { type: "disabled" }
-    : { type: "enabled", budgetTokens: parsed, ...(display && { display }) };
-}
-
-function parseModelConfig(
-  raw: string | undefined,
-): { modelOverrides?: Record<string, string>; availableModels?: string[] } | undefined {
-  if (!raw) return undefined;
-  const parsed = JSON.parse(raw);
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new Error("CLAUDE_MODEL_CONFIG must be a JSON object");
-  }
-  const result: { modelOverrides?: Record<string, string>; availableModels?: string[] } = {};
-  if (parsed.modelOverrides !== undefined) result.modelOverrides = parsed.modelOverrides;
-  if (parsed.availableModels !== undefined) result.availableModels = parsed.availableModels;
-  return Object.keys(result).length > 0 ? result : undefined;
 }
 
 /**

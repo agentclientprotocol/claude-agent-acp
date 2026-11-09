@@ -68,8 +68,8 @@ const NATIVE_STOPS: Record<string, string> = {
 
 /**
  * The scenarios whose session updates equal the bridge's v2 golden file.
- * The others differ in what the native core does not serve yet (an Edit's
- * patch before it runs, subagent details, ...; see `docs/v2-native-core.md`).
+ * The others differ in what the native core does not serve yet (subagent
+ * details, ...; see `docs/v2-native-core.md`).
  */
 const SAME_AS_BRIDGE: string[] = [
   "session-setup",
@@ -81,12 +81,17 @@ const SAME_AS_BRIDGE: string[] = [
   "async-task-ends-before-tool-id",
   "async-task-released-at-turn-end",
   "read",
+  "write-new",
+  "write-existing",
+  "edit-with-permission",
+  "edit-rejected",
   "notebook-edit",
   "grep-and-glob",
   "web-fetch-and-search",
   "todo-write",
   "task-create-update",
   "goal",
+  "exit-plan-approve",
   "exit-plan-reject",
   "skill",
   "mcp-tool",

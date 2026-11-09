@@ -32,11 +32,7 @@
  * {@link SessionOutput}).
  */
 import { randomUUID } from "node:crypto";
-import {
-  RequestError,
-  type AvailableCommand,
-  type PromptRequest,
-} from "@agentclientprotocol/sdk/unstable";
+import { RequestError, type PromptRequest } from "@agentclientprotocol/sdk/unstable";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type {
   PermissionMode,
@@ -46,11 +42,13 @@ import type {
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { promptToClaude, type Logger } from "../acp-agent.js";
+import type { McpCommand } from "../mcp-command.js";
 import { Pushable } from "../utils.js";
 import { v1PromptRequest } from "../v2/prompt.js";
 import { V2Background } from "../v2/background.js";
 import type { V2UpdateTranslator } from "../v2/update-translator.js";
 import { MODEL_CONFIG_ID } from "../session-model.js";
+import { SessionCommands } from "./commands.js";
 import type { SessionConfig } from "./config.js";
 import { idleOutcome, isPlaceholderResult, ResultUsage, type TurnEnd } from "./outcome.js";
 import { StoppedWork } from "./stopped-work.js";
@@ -89,6 +87,8 @@ type OpenRequest = {
   /** Whether a cancel came while it was open: its work is being stopped. */
   coveredByCancel: boolean;
 };
+
+type McpServers = Parameters<Query["setMcpServers"]>[0];
 
 /** The `command_lifecycle` frame of a uuid-stamped prompt. It is not part of the SDK's types. */
 type CommandLifecycleFrame = { type: "command_lifecycle"; command_uuid: string; state: string };
@@ -137,6 +137,12 @@ export class NativeSession implements RequestTarget {
   private readonly background: V2Background;
   readonly tasks: SessionTasks;
   config!: SessionConfig;
+  commands!: SessionCommands;
+  /** The `/mcp` prompts not inserted yet, by uuid, and the open turn's (see `SessionCommands`). */
+  private readonly localCommands = new Map<string, McpCommand>();
+  private turnLocalCommand: { command: McpCommand; abort: AbortController } | undefined;
+  /** The JSON of the query's MCP servers. */
+  private mcpServers = "";
 
   constructor(
     readonly sessionId: string,
@@ -199,44 +205,53 @@ export class NativeSession implements RequestTarget {
     this.background.changed({ sessionId, items: [], state: undefined });
   }
 
-  /** Starts reading the query. Called once, after its initialization. */
-  start(query: Query, config: SessionConfig, resumed = false): void {
+  /**
+   * Starts reading the query. Called once, after its initialization.
+   * `mcpServers` are the servers the query started with.
+   */
+  start(query: Query, config: SessionConfig, mcpServers: McpServers, resumed = false): void {
     this.query = query;
     this.config = config;
     this.usage = new ResultUsage(resumed);
+    this.mcpServers = JSON.stringify(mcpServers);
+    this.commands = new SessionCommands(query);
     void this.consume(query);
   }
 
-  /** The session's commands, from Claude Code, in v1 form. */
-  async commands(): Promise<AvailableCommand[]> {
-    if (!this.query) return [];
-    const commands = await this.query.supportedCommands();
-    return commands.map((command) => ({
-      name: command.name,
-      description: command.description,
-      ...(command.argumentHint ? { input: { hint: command.argumentHint } } : {}),
-    }));
+  /** Sends the session's commands in an update, read again from Claude Code. */
+  async sendCommands(): Promise<void> {
+    const availableCommands = await this.commands.list();
+    this.send({ sessionUpdate: "available_commands_update", availableCommands });
   }
 
   /**
    * What `session/resume` sends before its response: the children with their
    * current states, the current update of each listed item, then the
-   * session's state, with its list.
+   * session's state, with its list. An idle snapshot reports no completion,
+   * so it carries no stop reason, as on the bridge.
    */
   resumeSnapshot(): v2.UpdateSessionNotification[] {
+    const state = this.foregroundState();
     return [
       ...this.tasks.currentState(),
       this.background.stamp({
         sessionId: this.sessionId,
-        update: this.stateUpdate(this.foregroundState()),
+        update:
+          state === "idle" ? { sessionUpdate: "state_update", state } : this.stateUpdate(state),
       }),
     ];
   }
 
-  /** Replaces the session's MCP servers, as a resume of the active session asks. */
-  async setMcpServers(servers: Parameters<Query["setMcpServers"]>[0]): Promise<void> {
+  /**
+   * Replaces the session's MCP servers, as a resume of the active session
+   * asks. The same servers stay as they are, connected, as on the bridge.
+   */
+  async setMcpServers(servers: McpServers): Promise<void> {
+    const key = JSON.stringify(servers);
+    if (key === this.mcpServers) return;
     await this.query?.setMcpServers(servers);
     this.reports.mcpServersChanged(Object.keys(servers));
+    this.mcpServers = key;
   }
 
   // --- Requests ---------------------------------------------------------
@@ -258,6 +273,8 @@ export class NativeSession implements RequestTarget {
     this.reports.promptSent(request.prompt);
     const uuid = randomUUID();
     const message = { ...promptToClaude(request), uuid };
+    const localCommand = this.commands.localCommand(request.prompt);
+    if (localCommand) this.localCommands.set(uuid, localCommand);
     return new Promise((resolve, reject) => {
       const pending: PendingPrompt = { prompt: params.prompt, pushed: false, resolve, reject };
       this.pending.set(uuid, pending);
@@ -352,6 +369,7 @@ export class NativeSession implements RequestTarget {
       this.output.cancelled = true;
     }
     for (const request of this.requests) request.coveredByCancel = true;
+    this.turnLocalCommand?.abort.abort();
     // The subagents that the work waits on stop with it. Background ones go on.
     this.tasks.cancelForeground();
   }
@@ -457,7 +475,7 @@ export class NativeSession implements RequestTarget {
       for await (const message of query) {
         if (this.closed) break;
         try {
-          this.handle(message);
+          await this.handle(message);
         } catch (error) {
           this.connection.logger.error(
             `Session ${this.sessionId}: failed to handle a ${message.type} message`,
@@ -471,7 +489,8 @@ export class NativeSession implements RequestTarget {
     }
   }
 
-  private handle(message: SDKMessage): void {
+  /** Handles one message. Only a `/mcp` turn's result is awaited (see {@link result}). */
+  private handle(message: SDKMessage): void | Promise<void> {
     if ((message as { type: string }).type === "command_lifecycle") {
       this.lifecycle(message as unknown as CommandLifecycleFrame);
       return;
@@ -515,13 +534,14 @@ export class NativeSession implements RequestTarget {
         this.tasks.toolResults(this.output, message);
         return;
       case "result":
-        this.result(message);
-        return;
+        return this.result(message);
       case "system":
         switch (message.subtype) {
           case "init":
             if (message.capabilities?.includes("msg_lifecycle_v1")) this.lifecycleFrames = true;
             this.reports.handle(message);
+            // Its terminal-bound commands leave the list.
+            if (this.commands.init(message)) this.resendCommands();
             return;
           case "status":
             // Each model request starts with one, which lists the prompts it serves.
@@ -535,6 +555,9 @@ export class NativeSession implements RequestTarget {
             // The output of a local command, such as `/cost`.
             if (this.stopped.drops(message)) return;
             this.output.agentMessage(message.content, message.uuid);
+            return;
+          case "commands_changed":
+            this.send(this.commands.changed(message.commands));
             return;
           case "session_state_changed":
             if (message.state === "idle") {
@@ -645,7 +668,7 @@ export class NativeSession implements RequestTarget {
     this.openTurn(undefined);
   }
 
-  private result(message: SDKResultMessage): void {
+  private result(message: SDKResultMessage): void | Promise<void> {
     // Every result moves the usage reading on, also one that ends nothing.
     const end = this.usage.record(message);
     if (isPlaceholderResult(message)) return;
@@ -658,6 +681,7 @@ export class NativeSession implements RequestTarget {
     this.openTurn(undefined);
     this.lastEnd = end;
     this.reports.result(message);
+    const local = this.turnLocalCommand;
     if (message.stop_reason === "refusal") {
       // The refused message shows nothing: its explanation answers.
       if (this.refusalExplanation) {
@@ -673,6 +697,18 @@ export class NativeSession implements RequestTarget {
       // A local command (such as `/context`) answers with its result alone:
       // no model text streamed for it. A result that only repeats a notice or
       // a compaction of the turn is not shown again.
+      if (local && this.query) {
+        // The adapter's `/mcp` text replaces Claude Code's. `consume` waits
+        // for it, so it goes out before the turn's idle.
+        return this.commands
+          .replace(this.query, local.command, message.result, local.abort.signal, (error) =>
+            this.connection.logger.error(`Session ${this.sessionId}: ${error}`),
+          )
+          .then((text) => {
+            this.output.agentMessage(text, message.uuid);
+            this.closeTurn();
+          });
+      }
       this.output.agentMessage(message.result, message.uuid);
     }
     this.closeTurn();
@@ -690,6 +726,13 @@ export class NativeSession implements RequestTarget {
     }
     this.stopped.idle();
     this.closeTurn();
+  }
+
+  /** Sends the commands again, without failing the message that changed them. */
+  private resendCommands(): void {
+    this.sendCommands().catch((error) => {
+      this.connection.logger.error(`Session ${this.sessionId}: failed to send its commands`, error);
+    });
   }
 
   /** The query ended, with `error` when it failed. The session cannot go on. */
@@ -743,7 +786,12 @@ export class NativeSession implements RequestTarget {
    * if one did.
    */
   private openTurn(command: string | undefined): void {
-    if (command !== undefined) this.turnCommand = command;
+    if (command !== undefined) {
+      this.turnCommand = command;
+      const local = this.localCommands.get(command);
+      this.localCommands.delete(command);
+      if (local) this.turnLocalCommand = { command: local, abort: new AbortController() };
+    }
     if (this.foreground) return;
     this.foreground = true;
     this.lastEnd = undefined;
@@ -776,6 +824,7 @@ export class NativeSession implements RequestTarget {
     const ownCommandDone = this.ownCommandDone;
     this.ownCommandDone = undefined;
     ownCommandDone?.();
+    this.turnLocalCommand = undefined;
   }
 
   private foregroundState(): ForegroundState {
@@ -827,6 +876,7 @@ export class NativeSession implements RequestTarget {
     const prompt = this.pending.get(uuid);
     if (!prompt) return false;
     this.pending.delete(uuid);
+    this.localCommands.delete(uuid);
     prompt.reject(error);
     return true;
   }

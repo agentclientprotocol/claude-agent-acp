@@ -7,7 +7,11 @@
 import { RequestError, type SessionModeState } from "@agentclientprotocol/sdk/unstable";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { ModelInfo, PermissionMode, Query } from "@anthropic-ai/claude-agent-sdk";
-import { MODEL_CONFIG_ID } from "../session-model.js";
+import {
+  buildModelConfigOption,
+  MODEL_CONFIG_ID,
+  type SessionModelState,
+} from "../session-model.js";
 import { MODE_CONFIG_ID, SessionModeManager } from "../session-mode.js";
 import { v2ConfigOptions } from "../v2/session.js";
 
@@ -15,28 +19,18 @@ export class SessionConfig {
   constructor(
     private readonly query: Pick<Query, "setPermissionMode" | "setModel">,
     private modes: SessionModeState,
-    private readonly models: ModelInfo[],
-    private currentModel: string,
+    private models: SessionModelState,
+    /** What Claude Code reports of each model, for the option's descriptions. */
+    private readonly modelInfos: ModelInfo[],
   ) {}
 
+  /** The options, built as the v1 core builds its mode and model options. */
   options(): v2.SessionConfigOption[] {
     return v2ConfigOptions([
       SessionModeManager.configOption(this.modes),
-      ...(this.models.length > 0
-        ? [
-            {
-              id: MODEL_CONFIG_ID,
-              name: "Model",
-              category: "model" as const,
-              type: "select" as const,
-              currentValue: this.currentModel,
-              options: this.models.map((model) => ({
-                value: model.value,
-                name: model.displayName,
-                ...(model.description ? { description: model.description } : {}),
-              })),
-            },
-          ]
+      // A gateway that lists none of the SDK's models leaves no model option.
+      ...(this.models.availableModels.length > 0
+        ? [buildModelConfigOption(this.models, this.modelInfos, false)]
         : []),
     ]);
   }
@@ -66,11 +60,11 @@ export class SessionConfig {
         return;
       }
       case MODEL_CONFIG_ID: {
-        if (!this.models.some((model) => model.value === value)) {
+        if (!this.models.availableModels.some((model) => model.modelId === value)) {
           throw RequestError.invalidParams({ value }, `Unknown model: ${value}`);
         }
         await this.query.setModel(value);
-        this.currentModel = value;
+        this.models = { ...this.models, currentModelId: value };
         return;
       }
       default:

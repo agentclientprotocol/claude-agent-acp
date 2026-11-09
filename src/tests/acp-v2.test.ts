@@ -50,11 +50,19 @@ vi.mock("node:child_process", async () => {
 /** What the mocked Claude Agent SDK saw and answers. Reset before each test. */
 const sdk = vi.hoisted(() => ({
   queryOptions: [] as Options[],
-  /** What Claude Code sends, given the prompts it receives (see `scriptTurns`). */
+  /**
+   * What Claude Code sends, given the prompts it receives (see `scriptTurns`).
+   * By default it sends nothing and, like the real CLI, runs until its input
+   * ends.
+   */
   run: async function* (
-    _prompts: AsyncIterable<SDKUserMessage>,
+    prompts: AsyncIterable<SDKUserMessage>,
     _options: Options,
-  ): AsyncGenerator<Record<string, unknown>> {},
+  ): AsyncGenerator<Record<string, unknown>> {
+    const input = prompts[Symbol.asyncIterator]();
+    while (!(await input.next()).done);
+    yield* [];
+  },
   /** Claude Code receives an interrupt, as `cancel()` sends one. */
   interrupt: async (): Promise<void> => {},
   /** Claude Code stops one task, as `cancel()` does for a child session. */
@@ -380,6 +388,12 @@ describe("ACP protocol routing", () => {
     });
 
     // The v2 app registers neither `_session/async_task/stop` nor `_session/goal`.
+    // The native core serves none of the AIR extensions (they are v1-core
+    // features, see docs/v2-native-core.md), so it advertises no AIR entry.
+    if (process.env.V2_CORE_UNDER_TEST === "native") {
+      expect(response._meta?.jetbrains).toBeUndefined();
+      return;
+    }
     const air = (response._meta as any)?.jetbrains?.air;
     expect(air.capabilities).toContain("sessionFailure");
     expect(air.capabilities).not.toContain("asyncTasks");
@@ -1559,7 +1573,14 @@ describe("ACP v2 prompts", () => {
         _meta: { jetbrains: { air: { version: 1, loadReplayEnd: true } } },
       },
     });
-    expect(atResponse.at(-1)?.update).toEqual({ sessionUpdate: "state_update", state: "idle" });
+    // The bridge gives an AIR client AIR's subagent form, which reports no
+    // `background` list. The native core serves every client the v2 form,
+    // with the list.
+    expect(atResponse.at(-1)?.update).toEqual({
+      sessionUpdate: "state_update",
+      state: "idle",
+      ...(process.env.V2_CORE_UNDER_TEST === "native" ? { background: [] } : {}),
+    });
     expect(client.sessionUpdates.filter(isEnd)).toHaveLength(1);
   });
 

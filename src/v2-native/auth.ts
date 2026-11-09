@@ -53,6 +53,8 @@ export interface SessionRouting {
   settings?: Settings;
   /** The models the session offers: those the provider's gateway listed. */
   models(models: ModelInfo[]): ModelInfo[];
+  /** Whether {@link models} narrows the models to a gateway's list. */
+  narrowsModels: boolean;
 }
 
 export class NativeAuth {
@@ -176,6 +178,7 @@ export class NativeAuth {
         config?.listedModels
           ? narrowToGatewayModels(models, config.listedModels, config.bedrockRegionPrefix)
           : models,
+      narrowsModels: config?.listedModels !== undefined,
     };
   }
 
