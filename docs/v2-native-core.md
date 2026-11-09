@@ -354,6 +354,12 @@ These pieces were extracted so that both cores use the same code:
 
 ## Intended differences from the bridge
 
+- A cancel right after `running`, before any output: the bridge sends `idle(cancelled)` at once,
+  without usage. The native core sends it once Claude Code's aborted result arrives, with that
+  result's usage, as v2 asks ("After all ongoing operations have been successfully aborted ...
+  the Agent MUST send an idle `state_update`"). Seen with `scripts/compare-v2-cores.mjs`
+  (`cancel-at-start`).
+
 - An AIR client gets no AIR extensions: `initialize` advertises no `_meta.jetbrains.air`, and its
   state updates carry the v2 `background` list. The bridge gives it AIR's subagent form, which
   reports no list, and the AIR extensions that it reads from the client's `_meta`, such as file
