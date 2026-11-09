@@ -27,11 +27,13 @@
  * (`Session.reportsBackground`): `session/cancel` must leave listed work
  * running.
  */
-import { RequestError } from "@agentclientprotocol/sdk/unstable";
+import { RequestError, type ToolCallUpdate } from "@agentclientprotocol/sdk/unstable";
 import type { AcpSessionNotification } from "./acp-subagents.js";
 import type { NativeSubagent } from "./native-subagents.js";
 import { type AcpToolCallRenderer, V2_CANCELLED, V2_PAUSED } from "./tool-calls/renderer.js";
 import { type BackgroundOutput, BackgroundOutputTail } from "./background-output.js";
+import type { TaskProgressFields } from "./async-tasks.js";
+import { textContent } from "./tool-calls/content.js";
 
 /** An item of a `background` list. */
 export type BackgroundItem =
@@ -68,7 +70,13 @@ export type BackgroundTaskEnd = "completed" | "failed" | "stopped" | undefined;
 /** The live background task set of `background_tasks_changed`, by task id. */
 export type BackgroundLevel = Map<
   string,
-  { ambient: boolean; taskType: string; description: string; parentTaskId?: string }
+  {
+    ambient: boolean;
+    taskType: string;
+    description: string;
+    parentTaskId?: string;
+    progress?: TaskProgressFields;
+  }
 >;
 
 /** The work state of a session, as its `state_update` names it. */
@@ -264,11 +272,9 @@ export class SessionBackgroundWork {
     if (toolCall) {
       this.toolCalls.delete(taskId);
       await send(
-        toolCallStatusUpdate(
-          this.sessionId,
-          toolCall,
-          end === "stopped" ? V2_CANCELLED : end === "failed" ? "failed" : "completed",
-        ),
+        toolCallUpdate(this.sessionId, toolCall, {
+          status: end === "stopped" ? V2_CANCELLED : end === "failed" ? "failed" : "completed",
+        }),
       );
     }
   }
@@ -282,7 +288,33 @@ export class SessionBackgroundWork {
     const toolCall = this.toolCalls.get(taskId);
     if (!toolCall || (toolCall.paused ?? false) === paused) return undefined;
     toolCall.paused = paused;
-    return toolCallStatusUpdate(this.sessionId, toolCall, paused ? V2_PAUSED : "in_progress");
+    return toolCallUpdate(this.sessionId, toolCall, { status: paused ? V2_PAUSED : "in_progress" });
+  }
+
+  /** Updates an existing workflow card without changing its work state. */
+  taskProgress(taskId: string, progress: TaskProgressFields): AcpSessionNotification | undefined {
+    const task = this.level.get(taskId);
+    if (!task || task.taskType !== "local_workflow") return undefined;
+    const previous = workflowProgress(task.progress);
+    task.progress = { ...task.progress, ...progress };
+    const current = workflowProgress(task.progress);
+    if (!current || JSON.stringify(previous) === JSON.stringify(current)) return undefined;
+    const toolCall = this.toolCalls.get(taskId);
+    return toolCall ? toolCallUpdate(this.sessionId, toolCall, current) : undefined;
+  }
+
+  /**
+   * The latest progress of the workflow calls in `toolCallIds`.
+   *
+   * A task can report progress before its launch tool returns. Those fields
+   * wait in the live task level and are sent after the launch result.
+   */
+  toolCallProgress(toolCallIds: ReadonlySet<string>): AcpSessionNotification[] {
+    return [...this.toolCalls].flatMap(([taskId, toolCall]) => {
+      if (!toolCallIds.has(toolCall.toolCallId)) return [];
+      const progress = workflowProgress(this.level.get(taskId)?.progress);
+      return progress ? [toolCallUpdate(this.sessionId, toolCall, progress)] : [];
+    });
   }
 
   /**
@@ -303,6 +335,7 @@ export class SessionBackgroundWork {
           taskType: task.task_type,
           description: task.description,
           ...(task.parent_task_id !== undefined ? { parentTaskId: task.parent_task_id } : {}),
+          progress: this.level.get(task.task_id)?.progress,
         },
       ]),
     );
@@ -331,7 +364,7 @@ export class SessionBackgroundWork {
     for (const [taskId, toolCall] of this.toolCalls) {
       if (toolCall.parentToolUseId) continue;
       this.toolCalls.delete(taskId);
-      updates.push(toolCallStatusUpdate(this.sessionId, toolCall, V2_CANCELLED));
+      updates.push(toolCallUpdate(this.sessionId, toolCall, { status: V2_CANCELLED }));
     }
     this.level = new Map();
     this.returned.clear();
@@ -434,14 +467,18 @@ export class SessionBackgroundWork {
     renderer: AcpToolCallRenderer,
     cwd: string,
   ): AcpSessionNotification[] {
-    return [...this.toolCalls.values()]
-      .filter((toolCall) => toolCallIds.includes(toolCall.toolCallId))
-      .map((toolCall) => {
+    return [...this.toolCalls]
+      .filter(([, toolCall]) => toolCallIds.includes(toolCall.toolCallId))
+      .map(([taskId, toolCall]) => {
         const update = renderer.toolCall({ id: toolCall.toolCallId, ...toolCall.toolUse }, { cwd });
         const status = toolCall.paused ? V2_PAUSED : "in_progress";
         return {
           sessionId: this.sessionId,
-          update: { ...update, status } as AcpSessionNotification["update"],
+          update: {
+            ...update,
+            ...workflowProgress(this.level.get(taskId)?.progress),
+            status,
+          } as AcpSessionNotification["update"],
         };
       });
   }
@@ -553,23 +590,41 @@ function terminalExit(sessionId: string, terminal: BackgroundTerminal): AcpSessi
   };
 }
 
-function toolCallStatusUpdate(
+function toolCallUpdate(
   sessionId: string,
   toolCall: BackgroundToolCall,
-  status: NonNullable<
-    Extract<AcpSessionNotification["update"], { sessionUpdate: "tool_call_update" }>["status"]
-  >,
+  fields: Omit<ToolCallUpdate, "toolCallId">,
 ): AcpSessionNotification {
   return {
     sessionId,
     update: {
       sessionUpdate: "tool_call_update",
       toolCallId: toolCall.toolCallId,
-      status,
+      ...fields,
       ...(toolCall.parentToolUseId
         ? { _meta: { claudeCode: { parentToolUseId: toolCall.parentToolUseId } } }
         : {}),
     },
+  };
+}
+
+/** The latest workflow activity, rendered as one replaceable tool-card body. */
+function workflowProgress(progress: TaskProgressFields | undefined) {
+  if (!progress || Object.keys(progress).length === 0) return undefined;
+  const activity = progress.description ?? progress.summary;
+  const usage = progress.usage;
+  const text = [
+    progress.summary ?? progress.description,
+    progress.lastToolName ? `Last activity: ${progress.lastToolName}` : undefined,
+    usage
+      ? `${usage.totalTokens.toLocaleString("en-US")} tokens · ${usage.toolUses.toLocaleString("en-US")} tool calls · ${Math.floor(usage.durationMs / 1000)}s`
+      : undefined,
+  ]
+    .filter((part) => part !== undefined)
+    .join("\n\n");
+  return {
+    title: activity ? `Workflow: ${activity}` : "Workflow",
+    content: [textContent(text)],
   };
 }
 

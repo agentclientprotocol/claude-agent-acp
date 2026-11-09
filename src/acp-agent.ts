@@ -163,6 +163,7 @@ import {
   backgroundBashTaskFromToolResult,
   backgroundedBashToolCallIds,
   clientSupportsAsyncTasks,
+  taskProgressFields,
 } from "./async-tasks.js";
 import {
   type BackgroundSink,
@@ -6755,13 +6756,18 @@ export class ClaudeAcpAgent {
               case "hook_response":
               case "files_persisted":
                 break;
-              case "task_progress":
+              case "task_progress": {
                 if (isLateTaskRun(session, message.task_id, message.run_id)) {
                   this.logger.log(
                     `Ignoring task_progress for task ${message.task_id} from earlier run ${message.run_id}`,
                   );
                   break;
                 }
+                const progress = session.background.taskProgress(
+                  message.task_id,
+                  taskProgressFields(message),
+                );
+                if (progress) await sendUpdate(progress);
                 await asyncTasks.taskProgress({
                   task_id: message.task_id,
                   description: message.description,
@@ -6771,6 +6777,7 @@ export class ClaudeAcpAgent {
                   tool_use_id: message.tool_use_id,
                 });
                 break;
+              }
               case "task_started":
                 if (isLateTaskRun(session, message.task_id, message.run_id)) {
                   this.logger.log(
@@ -8633,6 +8640,9 @@ export class ClaudeAcpAgent {
                   runningToolCalls,
                 ),
               );
+            }
+            for (const progress of session.background.toolCallProgress(runningToolCalls)) {
+              await sendUpdate(progress);
             }
             // After the result's own updates: the command's output replaces
             // the placeholder that they gave its terminal.
@@ -10780,15 +10790,13 @@ export class ClaudeAcpAgent {
   }
 
   /**
-   * The PreToolUse hook of a v2 connection, for Edit and Write: the tool call
-   * shows the exact patch of the change before the tool runs.
+   * Captures pre-execution patches for v2 Edit and Write tool calls.
    *
-   * A v2 diff cannot hold the input's snippet, so without it an auto-approved
-   * Edit or Write would show its change only once it is done. Claude Code runs
-   * the tool only after the hook returns, so the file is as it was before the
-   * change, as for the approval patch of a permission request (which runs
-   * after this hook, and shows the same patch). The hook makes no permission
-   * decision, and a failure only leaves the preview out.
+   * A v2 diff cannot hold the input's snippet, so the patch needs the file as
+   * it was before the tool runs. Claude Code waits for the hook before running
+   * the tool. If its streamed tool use has not arrived, the patch waits for
+   * the tool call's first publication. The hook makes no permission decision,
+   * and a failure only leaves the preview out.
    */
   private fileChangePreviewHook(sessionId: string): HookCallback {
     return async (input, toolUseID, { signal }) => {
@@ -10815,34 +10823,25 @@ export class ClaudeAcpAgent {
     const toolInput = (input.tool_input ?? {}) as Record<string, unknown>;
     const content = await previewPatchContent(input.tool_name, toolInput, session.cwd, "v2");
     if (!content) return;
+    const fields = toolCallFieldsOf(session);
+    // Workflow tools can run hooks without streaming their use or result.
+    // Keep the patch until the stream or a permission request publishes the
+    // tool call, instead of creating a pending call with no completion path.
+    if (!session.emittedToolCalls.has(toolUseID)) {
+      fields.stagePreview(toolUseID, content);
+      return;
+    }
     const { parentToolUseId, toolCallSessionId } = this.toolUseOwner(
       session,
       sessionId,
       input.agent_id,
     );
-    // Hook callbacks bypass the stream, so the hook can come before the
-    // streamed tool_use, as `canUseTool` can: then the tool call goes out
-    // with the patch.
-    if (!session.emittedToolCalls.has(toolUseID)) {
-      await this.ensureToolCallEmitted(
-        sessionId,
-        input.tool_name,
-        toolUseID,
-        toolInput,
-        parentToolUseId,
-        undefined,
-        toolCallSessionId,
-        content,
-      );
-      return;
-    }
     const update: SessionNotification["update"] = {
       sessionUpdate: "tool_call_update",
       toolCallId: toolUseID,
       content,
     };
     if (parentToolUseId) stampParentToolUseId(update, parentToolUseId);
-    const fields = toolCallFieldsOf(session);
     if (!fields.apply(update)) return;
     // The streamed input must not replace the patch, as for an approval patch.
     fields.pinContent(toolUseID, content);
@@ -12319,9 +12318,9 @@ export class ClaudeAcpAgent {
               ],
             }
           : {}),
-        // On v2, an Edit or Write shows its exact patch before it runs, also
-        // when no permission request shows it (`fileChangePreviewHook`): a v2
-        // diff cannot hold the input's snippet.
+        // v2 needs the patch captured before an Edit or Write runs, also
+        // without a permission request (`fileChangePreviewHook`): a v2 diff
+        // cannot hold the input's snippet.
         ...(this.v2 || subagentConfigHook
           ? {
               PreToolUse: [
