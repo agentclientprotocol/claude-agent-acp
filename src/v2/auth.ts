@@ -82,6 +82,12 @@ export class V2Auth {
   /** The settings of each live session, for the probe at the start of its prompts. */
   private readonly sessionSettings = new Map<string, AuthStatusSettings>();
   private readonly status: AuthStatusReporter;
+  /**
+   * Counts the route changes that restarted the live sessions. A session
+   * whose start read {@link routing} before one is not live yet then, so it
+   * restarts once its setup answered (see `SessionRestarts.track`).
+   */
+  private routeChanges = 0;
 
   constructor(
     ctx: v2.AgentContext,
@@ -164,7 +170,7 @@ export class V2Auth {
       // The live sessions leave the dropped route, also when the CLI logout
       // failed. A plain CLI login needs no restart: the running CLI picks up
       // the logout by itself.
-      if (routed) await this.events.routeChanged();
+      if (routed) await this.rerouted();
     }
     // The read starts after the credentials were cleared, so it does not join
     // a probe in flight. If it cannot read them, the logout still happened.
@@ -183,7 +189,7 @@ export class V2Auth {
     await this.updateProvider(async () => {
       this.provider = await withListedModels(config, this.provider, this.logger);
     });
-    await this.events.routeChanged();
+    await this.rerouted();
     return {};
   }
 
@@ -193,7 +199,7 @@ export class V2Auth {
       await this.updateProvider(async () => {
         this.provider = undefined;
       });
-      await this.events.routeChanged();
+      await this.rerouted();
     }
     return {};
   }
@@ -201,6 +207,19 @@ export class V2Auth {
   /** Whether a provider or a gateway login routes the traffic, rather than the CLI's own login. */
   overridesRoute(): boolean {
     return (this.provider ?? gatewayRequestToProviderConfig(this.gatewayLogin)) != null;
+  }
+
+  /** The number of route changes so far: read it right before {@link routing}. */
+  get routeGeneration(): number {
+    return this.routeChanges;
+  }
+
+  /** The route changed: restarts the live sessions (see `SessionRestarts.reroute`). */
+  private rerouted(): Promise<void> {
+    // In the same call as the reroute's look at the live sessions: a session
+    // either is among them or sees the new count when it is tracked.
+    this.routeChanges++;
+    return this.events.routeChanged();
   }
 
   /** Settles once the provider changes that came so far have applied. */

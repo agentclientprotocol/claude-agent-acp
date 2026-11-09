@@ -17,7 +17,9 @@
  *   wait for: until then the session keeps its query, and its prompts go to
  *   that query under the old route (the provider RFD lets an Agent leave
  *   running sessions on it). That restart starts under the route in force
- *   when it runs.
+ *   when it runs. A session whose query start read the route before the
+ *   change, and that became live after it, restarts the same way once its
+ *   setup response went out.
  *   A session that cannot start again stops: its requests then fail with
  *   what happened, until a resume starts it again.
  * - The additional directories: a resume of the active session with other
@@ -89,15 +91,42 @@ export class SessionRestarts {
   private readonly retiring = new Map<string, V2Session>();
   /** The sessions that `session/close` closes: a restart that runs does not track them again. */
   private readonly closingSessions = new Set<string>();
+  /**
+   * The sessions whose start read the route before a change that
+   * {@link reroute} did not find them live for: they restart once their
+   * setup answered ({@link setupAnswered}).
+   */
+  private readonly staleRoutes = new Set<string>();
   /** The prompts that wait for a restart, each with what rejects it. */
   private readonly held = new Map<string, Set<(error: unknown) => void>>();
 
   constructor(private readonly host: RestartHost) {}
 
-  /** The session started from `params`, or a resume of the active session brought new ones. */
-  track(sessionId: string, params: SetupParams): void {
+  /**
+   * The session started from `params`, or a resume of the active session
+   * brought new ones. `staleRoute`: the start read the route before a route
+   * change came.
+   */
+  track(sessionId: string, params: SetupParams, { staleRoute = false } = {}): void {
     if (this.closingSessions.has(sessionId)) return;
     this.setups.set(sessionId, params);
+    // A restart's start: the change found the session it replaces live, and
+    // its reroute runs again after this restart.
+    if (staleRoute && !this.swaps.has(sessionId)) this.staleRoutes.add(sessionId);
+  }
+
+  /**
+   * The setup response of `sessionId` goes out: a route restart that its
+   * start missed runs from then, as for a live session (see {@link reroute}).
+   * Not before: the restart's updates must not precede the response.
+   */
+  setupAnswered(sessionId: string): void {
+    if (!this.staleRoutes.delete(sessionId)) return;
+    // The handler returns the response right after this call, and the SDK
+    // writes it before a timer runs. Nothing else orders the two.
+    setTimeout(() => {
+      if (this.setups.has(sessionId)) void this.rerouteSession(sessionId);
+    }, 0);
   }
 
   /**
@@ -117,6 +146,7 @@ export class SessionRestarts {
   forget(sessionId: string): void {
     this.setups.delete(sessionId);
     this.accountChanged.delete(sessionId);
+    this.staleRoutes.delete(sessionId);
   }
 
   /**

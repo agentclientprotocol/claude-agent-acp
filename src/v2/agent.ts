@@ -305,7 +305,7 @@ class V2Agent implements AgentHandle, SessionConnection {
     const sessionId = randomUUID();
     const session = await this.startSession(sessionId, params, undefined);
     const response = { sessionId, ...(await this.setupFields(session)) };
-    afterSetupResponse(session, params);
+    this.afterSetup(session, params);
     return response;
   }
 
@@ -323,7 +323,7 @@ class V2Agent implements AgentHandle, SessionConnection {
     });
     const session = await this.startSession(sessionId, params, sessionId);
     const response = { sessionId, ...(await this.setupFields(session)) };
-    afterSetupResponse(session, params);
+    this.afterSetup(session, params);
     return response;
   }
 
@@ -410,8 +410,7 @@ class V2Agent implements AgentHandle, SessionConnection {
     await session.reports.publishTitle();
     for (const notification of session.resumeSnapshot()) this.send(notification);
     const response = await this.setupFields(session);
-    // A restart for other additional directories retires `session`.
-    if (!this.restarts.restarting(sessionId)) afterSetupResponse(session, params);
+    this.afterSetup(session, params);
     // The response ends the replay, and the replayed children's states before
     // it are history: their current states follow it. Nothing enforces that
     // the timer runs after the response goes out; it relies on the response
@@ -617,6 +616,17 @@ class V2Agent implements AgentHandle, SessionConnection {
     await this.startSettled(sessionId);
   }
 
+  /**
+   * What follows a setup response: OAuth for its MCP servers, and a route
+   * restart that the session's start missed (`SessionRestarts.setupAnswered`).
+   * A restart that runs, such as for other additional directories, retires
+   * `session` and starts OAuth on the new query instead.
+   */
+  private afterSetup(session: V2Session, params: SetupParams): void {
+    if (!this.restarts.restarting(session.sessionId)) afterSetupResponse(session, params);
+    this.restarts.setupAnswered(session.sessionId);
+  }
+
   /** Resolves once no start of `sessionId` runs, whether the starts succeeded or not. */
   private async startSettled(sessionId: string): Promise<void> {
     // Each wait can end with another start running, which began after it.
@@ -696,6 +706,7 @@ class V2Agent implements AgentHandle, SessionConnection {
     // The settings stay live for the idle compaction (see `reports.ts`) until the session
     // ends. They keep the values they read: their cwd and key helper.
     const authStarted = this.auth.sessionStarting(settings);
+    const routeGeneration = this.auth.routeGeneration;
     const routing = this.auth.routing();
     const thinking = resolveThinkingConfig(
       process.env.MAX_THINKING_TOKENS,
@@ -892,7 +903,10 @@ class V2Agent implements AgentHandle, SessionConnection {
     session.start(q, config, mcpServers, resume !== undefined);
     this.sessions.set(sessionId, session);
     this.stopped.delete(sessionId);
-    this.restarts.track(sessionId, params);
+    // A route change during the start did not find this session live.
+    this.restarts.track(sessionId, params, {
+      staleRoute: this.auth.routeGeneration !== routeGeneration,
+    });
     return session;
   }
 }

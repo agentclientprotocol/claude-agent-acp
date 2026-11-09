@@ -651,6 +651,32 @@ describe("ACP v2 core", () => {
       );
     });
 
+    it("restarts a session whose start read the route before the change, once its setup answered", async () => {
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        await agent.request(v2.methods.agent.initialize, {
+          protocolVersion: v2.PROTOCOL_VERSION,
+          info: { name: "v2-test-client", version: "1.0.0" },
+          capabilities: {},
+        });
+        const started = Promise.withResolvers<void>();
+        sdk.startGate = started.promise;
+        const created = agent.request(v2.methods.agent.session.new, { cwd });
+        await vi.waitFor(() => expect(sdk.processes).toHaveLength(1));
+        await setProvider(agent);
+        started.resolve();
+        const { sessionId } = await created;
+        expect(sdk.processes).toHaveLength(1);
+
+        await vi.waitFor(() => expect(sdk.processes[0].close).toHaveBeenCalled());
+        expect(sdk.processes).toHaveLength(2);
+        expect(sdk.processes[1].options).toMatchObject({
+          resume: sessionId,
+          env: { ANTHROPIC_BASE_URL: "https://gateway.example.com" },
+        });
+      });
+    });
+
     it("forgets a session that session/close closed while its restart ran", async () => {
       const client = v2Client();
       await client.connect(async (agent) => {
