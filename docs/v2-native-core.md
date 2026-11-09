@@ -45,10 +45,13 @@ The reports that are not Claude's output come from `src/v2-native/reports.ts`, b
 | ACP v2                                  | Claude Code                                                                     |
 | --------------------------------------- | ------------------------------------------------------------------------------- |
 | `usage_update` (`used`, `size`)         | the root `message_start`/`message_delta` usage, the assistant message's usage   |
+| `size` before the first result          | an earlier result's window (`contextWindowCache`), else `getContextUsage`       |
 | `usage_update` with `cost`              | the turn's `result` (`total_cost_usd`, `modelUsage` for the window, `origin`)   |
 | `usage_update` `_meta`                  | the model (`_claude/model`), a `rate_limit_event` (`_claude/rateLimit`)         |
 | `_meta.quota` of the turn's `idle`      | the `result`'s `usage` and its increment of `modelUsage`                        |
 | `notice`                                | `informational` (not level `info`), a client MCP server `failed` at `init`      |
+| `notice` and the `model` option         | `model_refusal_fallback` (the swap of a `retry` that is not `local`)            |
+| an empty Task\* plan, the title again   | `conversation_reset` (also the idle compaction starts over)                     |
 | `compaction_update`, summary chunks     | `status` `compacting` and `compact_result`, `compact_boundary`, `PostCompact`   |
 | `compaction_update` on replay           | a transcript message with `isCompactSummary`                                    |
 | `session_info_update` (title)           | `SessionTitles`: the title Claude Code stores or generates, read at `idle`      |
@@ -154,10 +157,25 @@ resume, delete and config changes on it fail with -32602. A session started with
   Without form elicitation, AskUserQuestion is disallowed and the refusal fallback is not
   declared. An MCP server's request in a mode the client did not advertise, or that the client
   answers with an error, is answered `cancel`.
-- `src/v2-native/config.ts`: the mode and model config options, on the v1 core's mode rules
-  (`SessionModeManager`): `auto` runs as `acceptEdits`, with a notice, for a model that does not
-  support it. A model switch that the adapter did not make (`PostModelSwitch`, such as a typed
-  `/model`) updates the `model` option.
+- `src/v2-native/config.ts`: the config options, built and set as the bridge builds and sets them
+  (`buildConfigOptions` and `configOptionValue`): mode, model (also by an alias such as `opus`),
+  effort, Fast mode and ultracode (boolean options), and the custom main-thread agents
+  (`supportedAgents`). Effort, Fast mode, ultracode and agent are set with `applyFlagSettings`.
+  A model switch rebuilds the options for the new model: effort follows `effortForModelSwitch`,
+  and Fast mode and ultracode show only on a model that supports them. The mode follows the v1
+  core's rules (`SessionModeManager`): `auto` runs as `acceptEdits`, with a notice, for a model
+  that does not support it. A model switch that the adapter did not make (`PostModelSwitch`, such
+  as a typed `/model`, or a refusal fallback) updates the options. Claude Code's
+  `fast_mode_state` (on `init` and on results of prompts) updates the Fast mode option, with a
+  notice when it turns off a Fast mode the user had on.
+- `src/v2-native/clear-context.ts`: ExitPlanMode's "Yes, clear context" option, offered to the
+  root's plan as on the bridge. The answer interrupts the cycle, and the turn stays open: the
+  session sends Claude Code `/clear`, then sets the chosen mode and sends "Implement the following
+  plan" in the fresh conversation. The client sees what the bridge sends: the plan's tool call
+  `completed`, the options, a `usage_update` of an empty context, the markdown plan, then the
+  plan's run in the same turn, whose idle has the whole turn's usage. The bridge starts a fresh
+  query instead; `/clear` is Claude Code's own fresh conversation, and keeps the query's tasks and
+  MCP servers.
 - `src/v2-native/setup.ts`: what session setup adds on the bridge's rules: the client's
   `_meta.claudeCode.options`, `CLAUDE_MODEL_CONFIG`, the models (the `availableModels`
   allowlist, `ANTHROPIC_MODEL` and the settings' `model`, the resumed transcript's model), the
@@ -172,7 +190,9 @@ resume, delete and config changes on it fail with -32602. A session started with
   at the start of each prompt, as on the bridge.
 - `src/v2-native/reports.ts`: usage, notices, compactions, titles, and the idle
   compaction (see the table above), and the hooks that feed them (PostCompact, TaskCreated,
-  TaskCompleted).
+  TaskCompleted). The context window is seeded as on the bridge (`context-window.ts`): a window
+  that a result of any session on the same backend reported, else a guess from the model's names
+  refined by a background `getContextUsage`, until the session's own result reports it.
 
 About 5,500 lines in total. The native core shares these with v1 and the bridge:
 
@@ -217,6 +237,19 @@ These pieces were extracted so that both cores use the same code:
   `replayCompactSummary` (`context-compaction.ts`), taken from `ClaudeAcpAgent`
 - `SessionTitles` (`session-titles.ts`) now reads its session and agent through the
   `TitledSession` and `TitleOwner` interfaces, which `ClaudeAcpAgent` matches as it is
+- the config options (`session-config-options.ts`): `buildConfigOptions`, the custom agents
+  (`discoverCustomAgents`), the capability checks, and `configOptionValue`, the value check of
+  `session/set_config_option`, taken from `ClaudeAcpAgent.selectSessionConfigOption`
+- Fast mode (`session-fast-mode.ts`): its option and values, and `fastModeStateChange`, taken
+  from `syncFastModeState`
+- the effort of a model switch (`effortForModelSwitch`, `settleEffortAfterModelSwitch` in
+  `session-effort.ts`), taken from `applyConfigOptionValue`
+- `withCurrentModelInfo` (`session-model.ts`): the current model's capabilities, also for a
+  resumed model outside the allowlist, taken from `ClaudeAcpAgent.createSession`
+- the context window (`context-window.ts`): the cross-session cache, its provider key, the
+  seed, and `readContextWindow`, taken from `acp-agent.ts`
+- `modelRefusalFallback` (`session-notices.ts`): the notice of a refusal fallback, taken from
+  the bridge's `model_refusal_fallback` handler
 
 ## How it is checked
 
@@ -253,6 +286,9 @@ These pieces were extracted so that both cores use the same code:
 - While the root's turn waits on foreground subagents, it reports `requires_action` only when each
   of them waits on the user. One that still makes progress keeps the turn `running`, as v2 asks.
   The bridge reports `requires_action` as soon as one of them asks.
+- ExitPlanMode of a subagent offers no "clear context" option: a fresh context continues the
+  root's turn, and cannot clear a subagent's context. The bridge offers it to a subagent's plan
+  too.
 - An MCP server's URL elicitation that the user accepts keeps the work `requires_action` until
   Claude Code reports it complete (`elicitation_complete`), the tool use ends, or the turn ends:
   `accept` only consents to open the URL. The bridge reports `running` at the answer.
@@ -272,20 +308,14 @@ These pieces were extracted so that both cores use the same code:
   - a subagent whose parent Claude Code no longer tracks, such as after a restart, stays
     unexposed: its traffic is the root's
 - Reports:
-  - the model fallback notice (`model_refusal_fallback`), and its swap of the model option
-  - the context window before the first result: no `getContextUsage` read, and no
-    cross-session cache of windows (the bridge's `contextWindowCache`)
-  - `conversation_reset`: the plan, title and idle compaction state are not reset
   - the bridge sends API retries and prompt suggestions to AIR only, so v2 clients get neither
+  - `conversation_reset` does not end the session's subagents; the bridge ends them `failed`
 - Session options:
-  - effort, fast mode, ultracode and agent options (the bridge's `buildConfigOptions` and their
-    set paths)
   - a resume of the active session with other MCP servers calls `setMcpServers`; the bridge
     recreates the query
 - Resume:
   - `replayFrom` other than `start`
   - the notice for subagent history that a replay cannot restore
-- ExitPlanMode's "clear context" option.
 - The v1-only features: AIR extensions, steering, Remote Control, the Claude subscription guard,
   and file change reports.
 

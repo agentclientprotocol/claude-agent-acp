@@ -42,6 +42,8 @@ import {
 } from "@agentclientprotocol/sdk/unstable";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type {
+  FastModeDisabledReason,
+  FastModeState,
   PermissionMode,
   PermissionResult,
   Query,
@@ -49,7 +51,7 @@ import type {
   SDKResultMessage,
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { promptToClaude, type Logger } from "../acp-agent.js";
+import { AUTONOMOUS_RESULT_ORIGINS, promptToClaude, type Logger } from "../acp-agent.js";
 import type { McpCommand } from "../mcp-command.js";
 import type { ElicitationSupport } from "../elicitation.js";
 import { Pushable } from "../utils.js";
@@ -57,6 +59,10 @@ import { v1PromptRequest } from "../v2/prompt.js";
 import { V2Background, stateUpdate as currentStateUpdate } from "../v2/background.js";
 import type { V2UpdateTranslator } from "../v2/update-translator.js";
 import { MODEL_CONFIG_ID } from "../session-model.js";
+import { modelRefusalFallback, noticeUpdate } from "../session-notices.js";
+import { planModeUpdate } from "../exit-plan.js";
+import type { ClearContextReset } from "../clear-context-coordinator.js";
+import { ClearContext } from "./clear-context.js";
 import { SessionCommands } from "./commands.js";
 import type { SessionConfig } from "./config.js";
 import {
@@ -162,6 +168,8 @@ export class NativeSession implements RequestTarget {
   readonly elicitations: SessionElicitations;
   config!: SessionConfig;
   commands!: SessionCommands;
+  /** ExitPlanMode's "clear context" option (see {@link ClearContext}). */
+  readonly clearContext: ClearContext;
   /** The `/mcp` prompts not inserted yet, by uuid, and the open turn's (see `SessionCommands`). */
   private readonly localCommands = new Map<string, McpCommand>();
   private turnLocalCommand: { command: McpCommand; abort: AbortController } | undefined;
@@ -208,6 +216,27 @@ export class NativeSession implements RequestTarget {
       titledSession: () => (this.query && !this.closed ? titled : undefined),
     });
     this.output.onAgentText = (content) => this.reports.agentText(content);
+    this.clearContext = new ClearContext(
+      {
+        push: (text, uuid) => this.pushOwnPrompt(text, uuid),
+        enterMode: (mode) => this.config.enterMode(mode),
+        publish: (plan) => {
+          this.send({
+            sessionUpdate: "config_option_update",
+            configOptions: this.config.options(),
+          });
+          // Otherwise the client shows the old context's usage until the fresh one reports its own.
+          this.reports.emptyContext();
+          // The approved plan becomes the session's plan. Its ExitPlanMode
+          // ended as a rejection, so the stream did not show it.
+          this.output.emitV1([{ sessionId, update: planModeUpdate(plan) }]);
+        },
+        logError: (message, error) =>
+          connection.logger.error(`Session ${sessionId}: ${message}`, error),
+      },
+      () => this.output.toolUses(),
+      randomUUID,
+    );
     this.background = new V2Background(connection.translator.terminals);
     this.tasks = new SessionTasks(
       {
@@ -355,6 +384,23 @@ export class NativeSession implements RequestTarget {
   }
 
   /**
+   * Sends Claude Code the adapter's own prompt `text`, after the interrupt of
+   * an earlier `session/cancel`, as {@link prompt} does. It is no prompt of
+   * the client's: it gets no `user_message`.
+   */
+  private pushOwnPrompt(text: string, uuid: ReturnType<typeof randomUUID>): void {
+    const message = {
+      ...promptToClaude({ sessionId: this.sessionId, prompt: [{ type: "text", text }] }),
+      uuid,
+    };
+    this.pushes = this.pushes
+      .then(() => this.interrupting)
+      .then(() => {
+        if (!this.closed) this.input.push(message);
+      });
+  }
+
+  /**
    * Stops the foreground work, and answers the prompts not inserted yet with
    * -32800. The work's idle reports `cancelled`. Background work goes on.
    *
@@ -403,6 +449,11 @@ export class NativeSession implements RequestTarget {
       if (prompt.pushed) pushed.push(uuid);
       this.failPrompt(uuid, RequestError.requestCancelled());
     }
+    // A turn that waits for its plan's prompt in a fresh context: the
+    // adapter's prompts are stopped work too, and no frame of the turn's own
+    // prompt is left to end it.
+    const heldTurn = this.clearContext.holdsTurn();
+    pushed.push(...this.clearContext.stop());
     this.stopped.cancelled(pushed, this.foreground);
     if (this.foreground) {
       this.cancelledWork = true;
@@ -412,15 +463,14 @@ export class NativeSession implements RequestTarget {
     this.turnLocalCommand?.abort.abort();
     // The subagents that the work waits on stop with it. Background ones go on.
     this.tasks.cancelForeground();
+    if (heldTurn) this.closeTurn();
   }
 
   async setConfigOption(
-    configId: string,
-    type: string | undefined,
-    value: unknown,
+    params: v2.SetSessionConfigOptionRequest,
   ): Promise<v2.SessionConfigOption[]> {
-    await this.config.set(configId, type, value);
-    if (configId === MODEL_CONFIG_ID) this.reports.disarmIdleCompaction("model change");
+    await this.config.set(params);
+    if (params.configId === MODEL_CONFIG_ID) this.modelChangedReports();
     const options = this.config.options();
     // v2 sends every config change as an update too, for the session's other clients.
     this.send({ sessionUpdate: "config_option_update", configOptions: options });
@@ -530,6 +580,21 @@ export class NativeSession implements RequestTarget {
     return this.config.prePlanMode();
   }
 
+  /** A fresh context continues the open turn: only the root's plan in a turn offers it. */
+  contextReset(agentId: string | undefined): {
+    offered: boolean;
+    usedPercent: number | undefined;
+  } {
+    return {
+      offered: agentId === undefined && this.foreground,
+      usedPercent: this.reports.contextUsedPercent(),
+    };
+  }
+
+  exitPlanInterrupting(toolUseId: string, reset: ClearContextReset | undefined): void {
+    this.clearContext.interrupting(toolUseId, reset);
+  }
+
   permissionAllowed(result: PermissionResult): Promise<PermissionResult> {
     return this.config.permissionAllowed(result);
   }
@@ -538,12 +603,15 @@ export class NativeSession implements RequestTarget {
     return this.connection.translator.toolCallMeta.subject(sessionId, toolCall);
   }
 
-  /** Claude Code switched the model without the adapter (see `modelSwitchHook`). */
+  /**
+   * Claude Code switched the model without the adapter: a typed `/model`
+   * (see `modelSwitchHook`), or a refusal fallback.
+   */
   modelSwitched(model: string): void {
     this.config.modelSwitched(model).then(
       (changed) => {
         if (!changed) return;
-        this.reports.disarmIdleCompaction("model change");
+        this.modelChangedReports();
         this.send({ sessionUpdate: "config_option_update", configOptions: this.config.options() });
       },
       (error: unknown) => {
@@ -553,6 +621,38 @@ export class NativeSession implements RequestTarget {
         );
       },
     );
+  }
+
+  /** The reports follow the model: its context window, and the idle compaction. */
+  private modelChangedReports(): void {
+    const { id, info } = this.config.currentModel();
+    this.reports.modelChanged(id, info);
+  }
+
+  /** Claude Code reported a Fast mode state, on `system`/init or a result. */
+  private fastModeReported(message: {
+    fast_mode_state?: FastModeState;
+    fast_mode_disabled_reason?: FastModeDisabledReason;
+  }): void {
+    if (this.config.fastModeReported(message.fast_mode_state, message.fast_mode_disabled_reason)) {
+      this.send({ sessionUpdate: "config_option_update", configOptions: this.config.options() });
+    }
+  }
+
+  /**
+   * Claude Code mounted a fresh conversation (such as for `/clear`), whose
+   * Task* ids and task store are independent of the previous transcript. As
+   * on the bridge, the client's plan of Task* entries is cleared before a
+   * follow-up prompt can republish stale tasks, and the title and the idle
+   * compaction start over. The fresh context of an approved plan sends no
+   * empty Task* plan, as the bridge's fresh query sends none.
+   */
+  private conversationReset(): void {
+    this.output.taskState.clear();
+    if (!this.clearContext.holdsTurn()) this.output.taskPlanChanged();
+    this.reports.conversationReset();
+    // A fresh context for an approved plan: the plan goes out in it.
+    this.clearContext.conversationReset();
   }
 
   // --- The query's messages ----------------------------------------------
@@ -585,6 +685,9 @@ export class NativeSession implements RequestTarget {
     // Task events, and a subagent's messages, which go to its session.
     if (this.tasks.handle(message)) return;
     switch (message.type) {
+      case "conversation_reset":
+        this.conversationReset();
+        return;
       case "stream_event":
         if (this.stopped.drops(message)) return;
         if (message.parent_tool_use_id === null) {
@@ -614,7 +717,17 @@ export class NativeSession implements RequestTarget {
           return;
         }
         if (this.stopped.drops(message)) return;
-        this.tasks.toolResults(this.output, message);
+        if (message.parent_tool_use_id !== null) {
+          this.tasks.toolResults(this.output, message);
+          return;
+        }
+        // The rewrite applies to the updates of this message only.
+        this.output.rewrite = this.clearContext.toolResults(message);
+        try {
+          this.tasks.toolResults(this.output, message);
+        } finally {
+          this.output.rewrite = undefined;
+        }
         return;
       case "result":
         return this.result(message);
@@ -623,6 +736,8 @@ export class NativeSession implements RequestTarget {
           case "init":
             if (message.capabilities?.includes("msg_lifecycle_v1")) this.lifecycleFrames = true;
             this.elicitations.init(message.capabilities);
+            // A fresh init (such as after a reinitialize) can carry another Fast mode state.
+            this.fastModeReported(message);
             this.reports.handle(message);
             // Its terminal-bound commands leave the list.
             if (this.commands.init(message)) this.resendCommands();
@@ -646,6 +761,15 @@ export class NativeSession implements RequestTarget {
           case "elicitation_complete":
             this.elicitations.completed(message.elicitation_id);
             return;
+          case "model_refusal_fallback": {
+            // Claude Code retried a refused turn on the fallback model.
+            const fallback = modelRefusalFallback(message);
+            this.output.emitV1([
+              { sessionId: this.sessionId, update: noticeUpdate(fallback.notice) },
+            ]);
+            if (fallback.persistent) this.modelSwitched(message.fallback_model);
+            return;
+          }
           case "model_refusal_no_fallback":
             this.turnReport.refusalWithoutFallback(message);
             return;
@@ -736,6 +860,7 @@ export class NativeSession implements RequestTarget {
    */
   private promptStarted(uuid: string): void {
     if (this.stopped.promptStarted(uuid, this.foreground)) return;
+    this.clearContext.promptStarted(uuid);
     this.inserted(uuid);
     this.openTurn(uuid);
   }
@@ -776,8 +901,18 @@ export class NativeSession implements RequestTarget {
     if (interrupted) this.cancelledWork = true;
     // A result with no open turn: a turn that sent nothing before it.
     this.openTurn(undefined);
-    this.lastEnd = end;
+    // A cycle that Claude Code started on its own leaves its Fast mode state
+    // to the next result of a prompt, as on the bridge.
+    if (!(message.origin && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind))) {
+      this.fastModeReported(message);
+    }
     this.reports.result(message);
+    // The turn goes on in a fresh context (see `ClearContext`).
+    if (this.clearContext.holdsResult(message, end)) {
+      this.turnReport.reset();
+      return;
+    }
+    this.lastEnd = this.clearContext.turnEnd(end);
     const local = this.turnLocalCommand;
     if (message.stop_reason === "refusal") {
       // The refused message shows nothing: its explanation answers.
@@ -896,9 +1031,13 @@ export class NativeSession implements RequestTarget {
     this.reportState();
   }
 
-  /** Ends the open turn: its idle goes out with the turn's outcome. */
+  /**
+   * Ends the open turn: its idle goes out with the turn's outcome. A turn
+   * that waits for its plan's prompt in a fresh context goes on: its end is
+   * that prompt's.
+   */
   private closeTurn(): void {
-    if (!this.foreground) return;
+    if (!this.foreground || this.clearContext.holdsTurn()) return;
     // v2 asks for a final status of the turn's tool calls before its idle. A
     // tool call whose task goes on in the background is not part of the work.
     const cancelled = idleOutcome(this.lastEnd, this.cancelledWork).stopReason === "cancelled";

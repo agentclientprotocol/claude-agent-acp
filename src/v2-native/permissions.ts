@@ -18,6 +18,7 @@ import {
 import { decodeClaudePermissionResponse } from "../permissions/response.js";
 import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { v1PermissionResponse, v2PermissionRequest } from "../v2/permission.js";
+import type { ClearContextReset } from "../clear-context-coordinator.js";
 import type { RequestTarget } from "./tasks.js";
 
 const V2_CAPABILITIES = ClientCapabilities.from(undefined, { v2: true });
@@ -38,6 +39,16 @@ export interface PermissionHost {
   prePlanMode(): string | undefined;
   /** An allowed answer, with a mode the model cannot serve set as its fallback (see `config.ts`). */
   permissionAllowed(result: PermissionResult): Promise<PermissionResult>;
+  /**
+   * Whether ExitPlanMode of the agent `agentId` offers to clear the context
+   * (see `ClearContext`), and how much of the context is in use.
+   */
+  contextReset(agentId: string | undefined): { offered: boolean; usedPercent: number | undefined };
+  /**
+   * An ExitPlanMode answer that interrupts the cycle: "No, keep planning", or
+   * a plan accepted with clearing the context (`reset`).
+   */
+  exitPlanInterrupting(toolUseId: string, reset: ClearContextReset | undefined): void;
   /** The subject's tool call, with the `_meta` that the client holds of it, as on the bridge. */
   toolCallSubject<T extends ToolCallUpdate>(sessionId: string, toolCall: T): T;
   /**
@@ -122,6 +133,7 @@ export function canUseTool(host: PermissionHost): CanUseTool {
       airClient: false,
     });
     if (toolCallMeta) presentation.toolCall._meta = toolCallMeta;
+    const contextReset = host.contextReset(agentID);
     const options = buildClaudePermissionOptions({
       toolName,
       displayName,
@@ -132,9 +144,8 @@ export function canUseTool(host: PermissionHost): CanUseTool {
       defaultToNo,
       availableModes: host.availableModes(),
       prePlanMode: host.prePlanMode(),
-      // Clearing the context after a plan needs a turn to continue in, which
-      // this core does not start on its own.
-      allowContextReset: false,
+      allowContextReset: contextReset.offered,
+      contextUsedPercent: contextReset.usedPercent,
     });
     // The stream never shows SandboxNetworkAccess's tool call: the client
     // gets it before the request, and its status after the answer.
@@ -159,14 +170,24 @@ export function canUseTool(host: PermissionHost): CanUseTool {
         decisionClassification: "user_reject",
       };
     }
-    const decoded = decodeClaudePermissionResponse(
+    const decision = decodeClaudePermissionResponse(
       response,
       toolName,
       toolInput,
       toolUseID,
       options,
       durableChangeSet,
-    ).permissionResult;
+    );
+    const decoded = decision.permissionResult;
+    if (toolName === "ExitPlanMode" && decoded.behavior === "deny" && decoded.interrupt === true) {
+      const plan = typeof toolInput.plan === "string" ? toolInput.plan.trim() : "";
+      host.exitPlanInterrupting(
+        toolUseID,
+        decision.contextResetMode && plan
+          ? { toolUseId: toolUseID, plan, mode: decision.contextResetMode }
+          : undefined,
+      );
+    }
     const permissionResult = await host.permissionAllowed(decoded);
     if (networkAccess) {
       target.output.toolCallStatus(

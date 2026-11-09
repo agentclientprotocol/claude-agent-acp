@@ -12,8 +12,10 @@
  */
 import type { ContentBlock, PromptRequest } from "@agentclientprotocol/sdk/unstable";
 import type {
+  ModelInfo,
   ModelUsage,
   Options,
+  Query,
   SDKAssistantMessage,
   SDKMessage,
   SDKPartialAssistantMessage,
@@ -25,6 +27,12 @@ import {
   ContextCompactionLifecycle,
   contextCompactionMetadataFromBoundary,
 } from "../context-compaction.js";
+import {
+  cacheResultContextWindow,
+  immediateContextWindow,
+  providerCacheKeyFor,
+  readContextWindow,
+} from "../context-window.js";
 import { IdleCompaction } from "../idle-compaction.js";
 import {
   informationalNotice,
@@ -69,6 +77,14 @@ export interface ReportsSetup {
   env: Record<string, string | undefined>;
   /** The names of the client's MCP servers. */
   mcpServers: readonly string[];
+  /** The query, for its context window (`getContextUsage`). */
+  query: Pick<Query, "getContextUsage">;
+  /**
+   * The session's model, and its allowlisted entry: the only one whose
+   * identity strings are a trustworthy window signal (see
+   * `withCurrentModelInfo`).
+   */
+  model: { id: string; info: ModelInfo | undefined };
 }
 
 export class SessionReports {
@@ -90,10 +106,16 @@ export class SessionReports {
   /** The normalized texts of the turn's notices (see {@link repeats}). */
   private noticeTexts: string[] = [];
 
-  /** The context window of the session's model. */
+  /** The context window of the session's model (see `context-window.ts`). */
   private contextWindow = DEFAULT_CONTEXT_WINDOW;
-  /** Whether {@link contextWindow} came from a result's `modelUsage`. */
+  /** Whether {@link contextWindow} came from Claude Code, not from a guess. */
   private contextWindowAuthoritative = false;
+  /** The model that {@link contextWindow} is of. */
+  private modelId: string | undefined;
+  /** Scopes the cross-session window cache to the query's backend. */
+  private providerCacheKey = "";
+  private query: ReportsSetup["query"] | undefined;
+  private disposed = false;
   /** The context used after the last main-thread request. */
   private contextUsed: number | undefined;
 
@@ -124,6 +146,10 @@ export class SessionReports {
   configure(setup: ReportsSetup): void {
     this.clientMcpServers = new Set(setup.mcpServers);
     this.settings = setup.settings;
+    this.query = setup.query;
+    // From the same env the query got, as on the bridge.
+    this.providerCacheKey = providerCacheKeyFor(setup.env);
+    this.seedContextWindow(setup.model.id, setup.model.info);
     this.idleCompaction = new IdleCompaction(
       {
         isBusy: () => this.host.isBusy(),
@@ -221,12 +247,56 @@ export class SessionReports {
     }
   }
 
-  /** Drops the armed idle compaction: a prompt, a cancel or a model change came. */
+  /** Drops the armed idle compaction: a prompt or a cancel came. */
   disarmIdleCompaction(reason: string): void {
     this.idleCompaction?.disarm(reason);
   }
 
+  /**
+   * The session's model is `id` now: the idle compaction's request describes
+   * the old one, and the context window is seeded for the new one, as on the
+   * bridge (`applyConfigOptionValue`). Nothing changes for the same model.
+   */
+  modelChanged(id: string, info: ModelInfo | undefined): void {
+    if (id === this.modelId) return;
+    this.idleCompaction?.disarm("model change");
+    this.seedContextWindow(id, info);
+  }
+
+  /**
+   * A `conversation_reset`: Claude Code mounted a fresh transcript. A
+   * compaction still open ends `cancelled`, the title is evaluated again at
+   * the next idle, and the idle compaction's request and TTL describe the
+   * dropped conversation.
+   */
+  conversationReset(): void {
+    void this.compaction.reset();
+    // The fresh conversation's context is empty.
+    this.lastUsage = null;
+    this.lastTotal = null;
+    this.contextUsed = 0;
+    this.titles.reset();
+    this.idleCompaction?.reset();
+  }
+
+  /** Sends the usage of an empty context, as a fresh context for an approved plan starts. */
+  emptyContext(): void {
+    this.host.emit([
+      {
+        sessionId: this.host.sessionId,
+        update: { sessionUpdate: "usage_update", used: 0, size: this.contextWindow },
+      },
+    ]);
+  }
+
+  /** The share of the context window in use, in percent, once a request reported it. */
+  contextUsedPercent(): number | undefined {
+    if (this.contextUsed === undefined || this.contextWindow <= 0) return undefined;
+    return Math.max(0, Math.min(100, Math.round((this.contextUsed / this.contextWindow) * 100)));
+  }
+
   dispose(): void {
+    this.disposed = true;
     this.idleCompaction?.dispose();
     this.settings?.dispose();
   }
@@ -302,9 +372,10 @@ export class SessionReports {
       ? getMatchingModelUsage(message.modelUsage, this.lastModel)
       : undefined;
     const window = (matching?.usage as ModelUsage | undefined)?.contextWindow;
-    if (typeof window === "number" && window > 0) {
+    if (matching && typeof window === "number" && window > 0) {
       this.contextWindow = window;
       this.contextWindowAuthoritative = true;
+      cacheResultContextWindow(this.providerCacheKey, matching.key, this.lastModel, window);
     }
     if (this.lastTotal === null) return;
     this.sendUsage({
@@ -395,6 +466,40 @@ export class SessionReports {
       default:
         return false;
     }
+  }
+
+  /**
+   * The window of model `id` without IPC: one learned from a result of this
+   * or another session on the same backend, else a guess from the model's
+   * names. A guess is then read from Claude Code in the background
+   * (`readContextWindow`), until a result reports the window.
+   */
+  private seedContextWindow(id: string, info: ModelInfo | undefined): void {
+    this.modelId = id;
+    const seeded = immediateContextWindow(this.providerCacheKey, id, info);
+    this.contextWindow = seeded.size;
+    this.contextWindowAuthoritative = seeded.authoritative;
+    const query = this.query;
+    if (seeded.authoritative || !query) return;
+    const current = () => !this.disposed && this.modelId === id;
+    // A synchronous throw must not fail the caller either.
+    Promise.resolve()
+      .then(() => readContextWindow(query))
+      .then(
+        (window) => {
+          if (!current() || this.contextWindowAuthoritative || window === undefined) return;
+          this.contextWindow = window;
+          this.contextWindowAuthoritative = true;
+        },
+        (error: unknown) => {
+          if (current()) {
+            this.host.logger.error(
+              `Session ${this.host.sessionId}: failed to read the context window`,
+              error,
+            );
+          }
+        },
+      );
   }
 
   /** A notice for each client MCP server that did not start, once per server. */

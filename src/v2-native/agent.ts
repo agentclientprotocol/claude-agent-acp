@@ -40,6 +40,7 @@ import { forkSession } from "../fork-session.js";
 import { sdkMcpServers } from "../mcp-servers.js";
 import { ALLOW_BYPASS, autoModeDisabled } from "../permissions/modes.js";
 import { readResumedTail, resumedModelFromTranscript } from "../resumed-session.js";
+import { mergeEffortSettings } from "../session-effort.js";
 import { resolveThinkingConfig } from "../session-env.js";
 import { resolveInitialPermissionMode } from "../session-mode.js";
 import { sanitizeTitle } from "../session-titles.js";
@@ -365,11 +366,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
   async setConfigOption(
     params: v2.SetSessionConfigOptionRequest,
   ): Promise<v2.SetSessionConfigOptionResponse> {
-    const configOptions = await this.session(params.sessionId, "configure").setConfigOption(
-      params.configId,
-      (params as { type?: string }).type,
-      params.value,
-    );
+    const configOptions = await this.session(params.sessionId, "configure").setConfigOption(params);
     return { configOptions };
   }
 
@@ -639,13 +636,24 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       settings.dispose();
       throw error;
     }
-    // Does not throw: a failed sync of the mode is logged (`SessionModeManager.initialize`).
+    // Does not throw: a failed sync of the mode is logged
+    // (`SessionModeManager.initialize`), and a failed read of the agents or
+    // of ultracode leaves them out.
     const config = await SessionConfig.start(
       sessionId,
       q,
       { mode, builtInDefault, allowBypass, allowAuto },
       models.models,
       models.modelInfos,
+      models.currentModelInfo,
+      {
+        fastMode: {
+          state: initialization.fast_mode_state,
+          disabledReason: initialization.fast_mode_disabled_reason,
+        },
+        client,
+        effortSettings: () => mergeEffortSettings(settings.getSettings(), configured),
+      },
       (notification) => session.output.emitV1([notification]),
       this.logger,
     );
@@ -653,6 +661,8 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       settings,
       env: options.env ?? {},
       mcpServers: request.mcpServers.map((server) => server.name),
+      query: q,
+      model: { id: models.models.currentModelId, info: models.allowlistedModelInfo },
     });
     session.start(q, config, mcpServers, resume !== undefined);
     this.sessions.set(sessionId, session);
