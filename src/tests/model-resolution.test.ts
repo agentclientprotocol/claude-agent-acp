@@ -204,17 +204,19 @@ describe("aliasResumedModelRow", () => {
     displayName: value,
     description: "",
   });
-  // What the CLI lists after resuming a session on `claude-fable-5-1`.
+  // What CLI 2.1.321 lists after resuming a session on `fable` (Fable 5.2).
   const STARTED_ON_FABLE = [
     row("default", "claude-opus-5-5"),
+    row("claude-fable-5-2"),
     row("claude-fable-5-1"),
     row("claude-fable-5"),
   ];
 
   it("lists the resumed model's row under its family alias", () => {
-    expect(aliasResumedModelRow(STARTED_ON_FABLE, "claude-fable-5-1").map((m) => m.value)).toEqual([
+    expect(aliasResumedModelRow(STARTED_ON_FABLE, "claude-fable-5-2").map((m) => m.value)).toEqual([
       "default",
       "fable",
+      "claude-fable-5-1",
       "claude-fable-5",
     ]);
   });
@@ -227,11 +229,7 @@ describe("aliasResumedModelRow", () => {
     ],
     ["the row is not the resumed model", STARTED_ON_FABLE, "claude-opus-5-5"],
     ["the session is not resumed", STARTED_ON_FABLE, undefined],
-    [
-      "the family has a newer row",
-      [row("claude-fable-5-1"), row("claude-fable-5")],
-      "claude-fable-5",
-    ],
+    ["the family has a newer row", STARTED_ON_FABLE, "claude-fable-5-1"],
     [
       "the row carries a context hint",
       [row("claude-fable-5-1[1m]", "claude-fable-5-1")],

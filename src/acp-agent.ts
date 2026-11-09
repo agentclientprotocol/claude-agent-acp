@@ -12534,7 +12534,7 @@ export class ClaudeAcpAgent {
       const settingsAvailableModels = settingsManager.getSettings().availableModels;
       const settingsModelOverrides = settingsManager.getSettings().modelOverrides;
       const resumedModel = await resumedModelHint;
-      // A resumed Fable 5.1 session lists Fable 5.1 as `fable`, as a new
+      // A resumed Fable 5.2 session lists Fable 5.2 as `fable`, as a new
       // session does (see `aliasResumedModelRow`).
       const sdkModels = aliasResumedModelRow(
         initializationResult.models,

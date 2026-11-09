@@ -293,8 +293,8 @@ function familyVersionOf(id: string): { family: string; major: number; minor: nu
  * Give back the family alias value to the row the CLI lists under a resumed
  * session's model id.
  *
- * The CLI lists Fable 5.1 as `fable`, but when it resumes a session that ran
- * Fable 5.1 it lists the same row as `claude-fable-5-1` and has no `fable`
+ * The CLI lists Fable 5.2 as `fable`, but when it resumes a session that ran
+ * Fable 5.2 it lists the same row as `claude-fable-5-2` and has no `fable`
  * row. Clients store the option value as the session's choice, so a value
  * from a new session would not be offered by a resumed one, and the reverse.
  *
@@ -304,8 +304,9 @@ function familyVersionOf(id: string): { family: string; major: number; minor: nu
  * runs its family's newest model). Every other row is returned as it is.
  *
  * The CLI lists a row the same way when `ANTHROPIC_MODEL` or `settings.model`
- * pins `claude-fable-5-1`. Those rows keep the pinned id, so a client's choice
- * stays on that version after a newer Fable becomes `fable`.
+ * pins `claude-fable-5-2`. Those rows keep the pinned id, so a client's choice
+ * stays on that version after a newer Fable becomes `fable`. A resumed Fable
+ * 5.1 session keeps `claude-fable-5-1` too, because Fable 5.2 is newer.
  */
 export function aliasResumedModelRow(
   models: ModelInfo[],
