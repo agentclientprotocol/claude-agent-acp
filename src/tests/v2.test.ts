@@ -3347,6 +3347,100 @@ describe("ACP v2 core", () => {
         expect(reportAt).toBeLessThan(idleAt);
       });
 
+      it("reads the report of a turn whose plan ran in a fresh context from the plan's prompt", async () => {
+        const client = v2Client({
+          answerPermission: () => ({
+            outcome: { outcome: "selected", optionId: "exit-plan-clear-auto" },
+          }),
+        });
+        const changed = path.join(await realpath(cwd), "src", "App.ts");
+        const { claude, sessionId, plan } = await client.connect(async (agent) => {
+          const { response, claude } = await openSession(agent, air("agentFileChangeReport"));
+          claude.rewindFiles.mockResolvedValue({ canRewind: true, filesChanged: [changed] });
+          const answer = agent.request(v2.methods.agent.session.prompt, {
+            sessionId: response.sessionId,
+            prompt: PROMPT,
+            _meta: requestMeta("r-1"),
+          });
+          claude.send(echo(await claude.prompt(0)));
+          await answer;
+          claude.send(
+            assistant("msg_plan", [
+              {
+                type: "tool_use",
+                id: "toolu_plan",
+                name: "ExitPlanMode",
+                input: { plan: "Do it" },
+              },
+            ]),
+          );
+          await askPermission(
+            claude,
+            "ExitPlanMode",
+            { plan: "Do it" },
+            { toolUseID: "toolu_plan" },
+          );
+          claude.send({
+            type: "user",
+            message: {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "toolu_plan",
+                  content: "User accepted the plan and requested a fresh context",
+                  is_error: true,
+                },
+              ],
+            },
+            tool_result_meta: [{ id: "toolu_plan", non_execution_kind: "user-rejected" }],
+            parent_tool_use_id: null,
+            uuid: randomUUID(),
+          });
+          claude.send(
+            result({
+              subtype: "error_during_execution",
+              is_error: true,
+              stop_reason: null,
+              errors: [
+                "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+              ],
+            }),
+          );
+          claude.send(sessionState("idle"));
+          const clear = await claude.prompt(1);
+          claude.send(echo(clear));
+          claude.send({
+            type: "conversation_reset",
+            new_conversation_id: randomUUID(),
+            uuid: randomUUID(),
+            trigger: "clear",
+            timestamp: new Date().toISOString(),
+            session_id: "session",
+          });
+          claude.send(result({ num_turns: 0, stop_reason: null }));
+          // `/clear` reset Claude Code's file history: only the plan's prompt has a checkpoint.
+          const plan = await claude.prompt(2);
+          claude.send(echo(plan));
+          claude.send(result());
+          claude.send(sessionState("idle"));
+          await vi.waitFor(() => expect(client.states().at(-1)).toBe("idle"));
+          return { claude, sessionId: response.sessionId, plan };
+        });
+
+        expect(claude.rewindFiles).toHaveBeenCalledExactlyOnceWith(plan.uuid, { dryRun: true });
+        expect(reports(updatesOf(client.notifications, sessionId))).toEqual([
+          {
+            version: 1,
+            requestId: "r-1",
+            status: "reported",
+            paths: [changed],
+            declaredComplete: false,
+            truncated: false,
+          },
+        ]);
+      });
+
       it("reports a prompt that a cancel ended unavailable, without reading a checkpoint", async () => {
         const client = v2Client();
         const { claude, sessionId } = await client.connect(async (agent) => {

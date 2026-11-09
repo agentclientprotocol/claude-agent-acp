@@ -216,7 +216,9 @@ lists: `_meta.jetbrains.air.capabilities` is `["agentFileChangeReport", "recomme
   `_meta.jetbrains.air.agentFileChangeReportRequest` is valid gets one report. v1 sends it before
   the prompt's response, at the turn's end. A v2 prompt is answered at its insertion, so the
   report goes out at the end of the turn that serves the prompt, before that turn's idle: the
-  session reads the prompt's checkpoint (up to 2 seconds), and the idle waits for it. A turn that
+  session reads the prompt's checkpoint (up to 2 seconds), and the idle waits for it. A turn whose
+  plan runs in a fresh context (ExitPlanMode's "Yes, clear context") reads the checkpoint of the
+  plan's prompt instead: `/clear` reset Claude Code's file history. A turn that
   ends `cancelled` reports `unavailable` with `cancelled`. Any other turn that ends with an error
   or without a result reports `unavailable` with `providerError`. A prompt that a cancel answers with -32800 before its
   insertion reports `cancelled`, and one that fails otherwise `providerError`.

@@ -68,6 +68,17 @@ export class TurnFileChanges {
     this.turn.push(report);
   }
 
+  /**
+   * The open turn goes on in a fresh context (`clear-context.ts`), with the
+   * plan's prompt `planUuid`. `/clear` reset Claude Code's file history, so
+   * the checkpoints of the turn's own prompts are gone: its reports read the
+   * plan prompt's checkpoint. v1 sends the plan with the turn's prompt uuid
+   * instead (`clear-context-coordinator.ts`).
+   */
+  contextCleared(planUuid: string): void {
+    for (const report of this.turn) report.promptUuid = planUuid;
+  }
+
   /** A message of the query: a subagent's file-tool edits go into the open turn's reports. */
   message(message: SDKMessage): void {
     if (this.turn.length === 0) return;

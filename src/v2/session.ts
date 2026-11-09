@@ -1059,7 +1059,7 @@ export class V2Session implements RequestTarget {
     // Claude Code takes its prompts in order: the work that a cancel stopped
     // has ended, also when the cancel came while it ran nothing.
     this.tasks.foregroundCancelEnded();
-    this.clearContext.promptStarted(uuid);
+    if (this.clearContext.promptStarted(uuid)) this.fileChanges?.contextCleared(uuid);
     this.inserted(uuid);
     this.openTurn(uuid);
   }
