@@ -10,21 +10,23 @@
  *   uuid, or the prompt's echo, whichever comes first. `cancelled`,
  *   `discarded` or `refused` fails the prompt.
  * - The foreground work is Claude Code's turn: it starts with a prompt's
- *   `started` frame or the turn's `system/init` (a turn that Claude Code
- *   starts on its own, such as after a background task ends), and ends with
- *   the turn's `result`, whose stop reason and usage the idle carries.
- *   Claude Code's own `session_state_changed` stays `running` while
- *   background subagents work, which v2 lists as background work instead
- *   (`background`), so it only ends a turn that ended without a result.
+ *   `started` frame or echo, or with the main conversation's output (a
+ *   cycle that Claude Code starts on its own, such as after a background
+ *   task ends), and ends with the turn's `result`, whose stop reason, usage
+ *   and quota the idle carries (see `outcome.ts`). Claude Code's own
+ *   `session_state_changed` stays `running` while background subagents work,
+ *   which v2 lists as background work instead (`background`), so its `idle`
+ *   only ends a turn that ended without a result.
  * - `requires_action` is this session's own: a turn is open, and a
  *   permission request of this session is open, or of a subagent that the
  *   turn waits on.
  * - Subagents are child sessions, and background work is listed on every
  *   state (see {@link SessionTasks}).
- * - `session/cancel` is Claude Code's interrupt with `cancelQueued`, which
- *   also ends the prompts that are not inserted yet, as v2 asks: each gets a
- *   `cancelled` lifecycle frame. With `perTaskStopAffordance`, the interrupt
- *   spares background tasks.
+ * - `session/cancel` answers the prompts that are not inserted yet with
+ *   -32800, and sends Claude Code's interrupt with `cancelQueued`, which ends
+ *   them in Claude Code too. A run of one that Claude Code had taken in
+ *   already is dropped (see {@link StoppedWork}). With
+ *   `perTaskStopAffordance`, the interrupt spares background tasks.
  *
  * Output goes out as it comes, whatever prompt it belongs to (see
  * {@link SessionOutput}).
@@ -43,12 +45,14 @@ import type {
   SDKResultMessage,
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { isLoginRequiredText, promptToClaude, type Logger } from "../acp-agent.js";
+import { promptToClaude, type Logger } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
 import { v1PromptRequest } from "../v2/prompt.js";
 import { V2Background } from "../v2/background.js";
 import type { V2UpdateTranslator } from "../v2/update-translator.js";
 import type { SessionConfig } from "./config.js";
+import { idleOutcome, isPlaceholderResult, ResultUsage, type TurnEnd } from "./outcome.js";
+import { StoppedWork } from "./stopped-work.js";
 import { SessionOutput } from "./stream.js";
 import { SessionTasks, type RequestTarget } from "./tasks.js";
 
@@ -76,11 +80,16 @@ type PendingPrompt = {
 
 type ForegroundState = "idle" | "running" | "requires_action";
 
+/** An open permission request of the session. */
+type OpenRequest = {
+  /** Withdraws the request, with `$/cancel_request`. */
+  abort: AbortController;
+  /** Whether a cancel came while it was open: its work is being stopped. */
+  coveredByCancel: boolean;
+};
+
 /** The `command_lifecycle` frame of a uuid-stamped prompt. It is not part of the SDK's types. */
 type CommandLifecycleFrame = { type: "command_lifecycle"; command_uuid: string; state: string };
-
-/** How long `session/close` waits for the cancelled work to end before it ends the query. */
-const CLOSE_TIMEOUT_MS = 5000;
 
 export class NativeSession implements RequestTarget {
   /** The prompts not inserted yet, by uuid. */
@@ -91,27 +100,31 @@ export class NativeSession implements RequestTarget {
   private turnCommand: string | undefined;
   /** The state the client was told last. */
   private reportedState: ForegroundState = "idle";
-  private openRequests = 0;
-  /** The open permission requests, aborted by `session/cancel`. */
-  private readonly requestAborts = new Set<AbortController>();
+  /** The open permission requests of the session. */
+  private readonly requests = new Set<OpenRequest>();
   /** Whether `session/cancel` stops the open turn: its idle reports `cancelled`. */
   private cancelledWork = false;
-  /**
-   * The pushed prompts that a `session/cancel` covered, which Claude Code had
-   * not reported on yet. Its interrupt ends them, or the turn they start.
-   */
-  private readonly cancelCovered = new Set<string>();
+  /** What a cancel stopped before the client saw it, and the reach of its interrupt. */
+  readonly stopped = new StoppedWork();
   /** The interrupt of the last `session/cancel`, while it runs. */
   private interrupting: Promise<void> | undefined;
   /** Pushes prompts in the order they came (see {@link prompt}). */
   private pushes: Promise<void> = Promise.resolve();
-  /** The result of the open turn. */
-  private lastResult: SDKResultMessage | undefined;
+  /** The result that ended the open turn, with what the turn spent. */
+  private lastEnd: TurnEnd | undefined;
+  private usage = new ResultUsage(false);
+  /**
+   * Whether Claude Code's `idle` for the last result is still to come. It can
+   * come after the next cycle's first output, and does not end that cycle.
+   */
+  private idleOwed = false;
+  /** Whether Claude Code sends `command_lifecycle` frames (`msg_lifecycle_v1`). */
+  private lifecycleFrames = false;
+  /** The explanation of the open turn's refusal, from its refused assistant message. */
+  private refusalExplanation: string | undefined;
   /** Set by `session/close`, or when the query ends: nothing more goes out. */
   private closed = false;
   private closing: Promise<void> | undefined;
-  /** Called when the cancelled work and the covered prompts have ended. */
-  private settledWaiters: Array<() => void> = [];
   private query: Query | undefined;
   readonly output: SessionOutput;
   /** The `background` lists of the session and its children, stamped on each state. */
@@ -144,7 +157,8 @@ export class NativeSession implements RequestTarget {
         background: this.background,
         send: (notification) => this.sendNotification(notification),
         rootState: () => this.foregroundState(),
-        foregroundRequestsChanged: () => this.reportState(),
+        // A cancel withdraws the requests of the subagents that the work waits on.
+        foregroundRequestsChanged: () => this.reportState(this.cancelledWork),
         stopTask: async (taskId) => {
           await this.query?.stopTask(taskId);
         },
@@ -157,9 +171,10 @@ export class NativeSession implements RequestTarget {
   }
 
   /** Starts reading the query. Called once, after its initialization. */
-  start(query: Query, config: SessionConfig): void {
+  start(query: Query, config: SessionConfig, resumed = false): void {
     this.query = query;
     this.config = config;
+    this.usage = new ResultUsage(resumed);
     void this.consume(query);
   }
 
@@ -227,26 +242,18 @@ export class NativeSession implements RequestTarget {
   }
 
   /**
-   * Stops the foreground work, and the prompts not inserted yet. The work's
-   * idle reports `cancelled`. Open permission requests are withdrawn with
-   * `$/cancel_request`. Background work goes on.
+   * Stops the foreground work, and answers the prompts not inserted yet with
+   * -32800. The work's idle reports `cancelled`. Background work goes on.
+   *
+   * The interrupt goes out also while the session is idle, as on the bridge:
+   * Claude Code may run a cycle that this session has not read yet.
    */
   async cancel(): Promise<void> {
     if (this.closed || !this.query) return;
-    // Not pushed yet: no one but this session knows of them.
-    for (const [uuid, prompt] of [...this.pending]) {
-      if (!prompt.pushed) this.failPrompt(uuid, RequestError.requestCancelled());
-    }
-    const covered = [...this.pending.keys()];
-    if (!this.foreground && covered.length === 0) return;
-    if (this.foreground) this.cancelledWork = true;
-    for (const uuid of covered) this.cancelCovered.add(uuid);
-    for (const abort of this.requestAborts) abort.abort();
-    // The subagents that the work waits on stop with it. Background ones go on.
-    this.tasks.cancelForeground();
+    this.stopForeground();
     // `cancelQueued` is untyped in the SDK (`Query.interrupt` takes it since
-    // the CLI's `interrupt_cancel_queued_v1`): Claude Code then ends each
-    // queued prompt with a `cancelled` lifecycle frame, which fails it here.
+    // the CLI's `interrupt_cancel_queued_v1`): Claude Code then drops the
+    // queued prompts, which this session answered already.
     const interrupt = this.query.interrupt as (options: {
       cancelQueued: boolean;
     }) => Promise<unknown>;
@@ -257,12 +264,36 @@ export class NativeSession implements RequestTarget {
         // stopped, so the work's idle reports how it really ends.
         this.connection.logger.error(`Session ${this.sessionId}: the interrupt failed`, error);
         this.cancelledWork = false;
-        this.cancelCovered.clear();
+        this.output.cancelled = false;
+        this.stopped.interruptFailed();
       },
     );
     this.interrupting = done;
     await done;
     if (this.interrupting === done) this.interrupting = undefined;
+  }
+
+  /**
+   * What a cancel or close stops at once: the prompts not inserted yet, the
+   * open turn, and the work of the subagents that it waits on. The open
+   * permission requests stay open: Claude Code's interrupt withdraws them,
+   * and the end of the stopped work withdraws what is left (see
+   * {@link closeTurn}).
+   */
+  private stopForeground(): void {
+    const pushed: string[] = [];
+    for (const [uuid, prompt] of [...this.pending]) {
+      if (prompt.pushed) pushed.push(uuid);
+      this.failPrompt(uuid, RequestError.requestCancelled());
+    }
+    this.stopped.cancelled(pushed, this.foreground);
+    if (this.foreground) {
+      this.cancelledWork = true;
+      this.output.cancelled = true;
+    }
+    for (const request of this.requests) request.coveredByCancel = true;
+    // The subagents that the work waits on stop with it. Background ones go on.
+    this.tasks.cancelForeground();
   }
 
   async setConfigOption(
@@ -278,22 +309,23 @@ export class NativeSession implements RequestTarget {
   }
 
   /**
-   * Cancels as `session/cancel` does, waits for the cancelled work's idle and
-   * for the covered prompts' answers, then ends the query, which stops the
-   * background work too. Nothing of the session goes out after it resolves.
+   * Cancels as `session/cancel` does, ends the open turn with its cancelled
+   * idle, then ends the query, which stops the background work too. Nothing
+   * of the session goes out after it resolves. As on the bridge, it does not
+   * wait for Claude Code to end the work: the query's end stops it, and the
+   * tool calls that the work leaves open end `cancelled` before its idle.
    */
   close(): Promise<void> {
     this.closing ??= (async () => {
-      await this.cancel();
+      if (!this.closed) this.stopForeground();
       // v2 asks to withdraw every request of the session before the close
       // response, also its background subagents'.
       this.tasks.withdrawAll();
-      await this.settled(CLOSE_TIMEOUT_MS);
-      // Claude Code did not end the work in time: it ends with the query.
-      if (this.foreground) {
-        this.cancelledWork = true;
-        this.closeTurn();
+      for (const request of this.requests) {
+        request.coveredByCancel = true;
+        request.abort.abort();
       }
+      this.closeTurn();
       this.failPending(RequestError.requestCancelled());
       this.closed = true;
       this.input.end();
@@ -312,6 +344,14 @@ export class NativeSession implements RequestTarget {
     return this.cancelledWork;
   }
 
+  dropsToolUse(
+    toolUseId: string,
+    agentId: string | undefined,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    return this.stopped.dropsToolUse(toolUseId, agentId, signal);
+  }
+
   /** The session of a permission request: this one, or a subagent's (see `canUseTool`). */
   target(agentId: string | undefined): Promise<RequestTarget> {
     return this.tasks.target(agentId, this);
@@ -321,10 +361,9 @@ export class NativeSession implements RequestTarget {
     request: v2.RequestPermissionRequest,
     toolSignal: AbortSignal,
   ): Promise<v2.RequestPermissionResponse> {
-    const abort = new AbortController();
-    const signal = AbortSignal.any([toolSignal, abort.signal]);
-    this.requestAborts.add(abort);
-    this.openRequests++;
+    const open: OpenRequest = { abort: new AbortController(), coveredByCancel: false };
+    const signal = AbortSignal.any([toolSignal, open.abort.signal]);
+    this.requests.add(open);
     this.reportState();
     try {
       // The subject is an upsert of the tool call: the client may see the
@@ -334,9 +373,12 @@ export class NativeSession implements RequestTarget {
       if (signal.aborted) return { outcome: { outcome: "cancelled" } };
       throw error;
     } finally {
-      this.requestAborts.delete(abort);
-      this.openRequests--;
-      this.reportState();
+      this.requests.delete(open);
+      // A request withdrawn after a cancel (Claude Code's interrupt aborts
+      // `toolSignal`) ends work that is stopping: its idle follows, so no
+      // `running` comes first. One that the user answers, or that Claude Code
+      // withdraws without a cancel (a hook answered it), lets the work go on.
+      this.reportState(open.coveredByCancel && signal.aborted);
     }
   }
 
@@ -360,7 +402,6 @@ export class NativeSession implements RequestTarget {
             error,
           );
         }
-        this.checkSettled();
       }
       this.ended(undefined);
     } catch (error) {
@@ -377,11 +418,20 @@ export class NativeSession implements RequestTarget {
     if (this.tasks.handle(message)) return;
     switch (message.type) {
       case "stream_event":
-        if (message.parent_tool_use_id === null) this.openTurn(undefined);
+        if (this.stopped.drops(message)) return;
+        if (message.parent_tool_use_id === null) this.outputStarts();
         this.output.streamEvent(message);
         return;
       case "assistant":
-        if (message.parent_tool_use_id === null) this.openTurn(undefined);
+        if (message.parent_tool_use_id === null) {
+          this.usage.assistant(message.message.model);
+          if (message.message.stop_reason === "refusal") {
+            this.refusalExplanation =
+              message.message.stop_details?.explanation ?? this.refusalExplanation;
+          }
+        }
+        if (this.stopped.drops(message)) return;
+        if (message.parent_tool_use_id === null) this.outputStarts();
         this.output.assistant(message);
         return;
       case "user":
@@ -389,11 +439,11 @@ export class NativeSession implements RequestTarget {
         // in. A prompt Claude Code reported `started` for is inserted already.
         if ("isReplay" in message && message.isReplay) {
           if (message.uuid && message.parent_tool_use_id === null) {
-            this.inserted(message.uuid);
-            this.openTurn(message.uuid);
+            this.promptStarted(message.uuid);
           }
           return;
         }
+        if (this.stopped.drops(message)) return;
         this.tasks.toolResults(this.output, message);
         return;
       case "result":
@@ -402,13 +452,22 @@ export class NativeSession implements RequestTarget {
       case "system":
         switch (message.subtype) {
           case "init":
-            // Each turn starts with one, also a turn that no prompt started.
-            this.openTurn(undefined);
+            if (message.capabilities?.includes("msg_lifecycle_v1")) this.lifecycleFrames = true;
+            return;
+          case "status":
+            // Each model request starts with one, which lists the prompts it serves.
+            if (message.status === "requesting") {
+              const prompts = (message as { user_message_uuids?: unknown }).user_message_uuids;
+              this.stopped.requesting(Array.isArray(prompts) ? prompts : []);
+            }
+            return;
+          case "local_command_output":
+            // The output of a local command, such as `/cost`.
+            if (this.stopped.drops(message)) return;
+            this.output.agentMessage(message.content, message.uuid);
             return;
           case "session_state_changed":
-            // The turn's `result` ends it. An idle without one ends it too,
-            // such as a turn that an interrupt stopped before it ran.
-            if (message.state === "idle") this.closeTurn();
+            if (message.state === "idle") this.claudeCodeIdle();
             return;
           default:
             return;
@@ -421,23 +480,20 @@ export class NativeSession implements RequestTarget {
   }
 
   private lifecycle(frame: CommandLifecycleFrame): void {
+    this.lifecycleFrames = true;
     const uuid = frame.command_uuid;
     switch (frame.state) {
       case "started":
-        // The prompt's `user_message` comes before the turn's `running`, as
-        // on the bridge. v2 allows either order.
-        this.inserted(uuid);
-        this.openTurn(uuid);
+        this.promptStarted(uuid);
         return;
       case "cancelled":
-        this.cancelCovered.delete(uuid);
         if (this.failPrompt(uuid, RequestError.requestCancelled())) return;
+        this.stopped.promptEnded(uuid);
         // The prompt had started: the interrupt stopped its turn.
         if (uuid === this.turnCommand) this.closeTurn();
         return;
       case "discarded":
       case "refused":
-        this.cancelCovered.delete(uuid);
         this.failPrompt(
           uuid,
           RequestError.internalError(
@@ -448,12 +504,25 @@ export class NativeSession implements RequestTarget {
         return;
       case "completed":
         // Comes after the turn's result. A turn that ended without one ends here.
+        this.stopped.promptEnded(uuid);
         if (uuid === this.turnCommand) this.closeTurn();
         return;
       default:
         // `queued`: the prompt waits in Claude Code's queue.
         return;
     }
+  }
+
+  /**
+   * Claude Code took in the prompt `uuid`: its `started` frame or its echo.
+   * The prompt's `user_message` comes before the turn's `running`, as on the
+   * bridge. v2 allows either order. A prompt that a cancel abandoned starts
+   * nothing (see {@link StoppedWork}).
+   */
+  private promptStarted(uuid: string): void {
+    if (this.stopped.promptStarted(uuid, this.foreground)) return;
+    this.inserted(uuid);
+    this.openTurn(uuid);
   }
 
   private inserted(uuid: string): void {
@@ -464,20 +533,61 @@ export class NativeSession implements RequestTarget {
     prompt.resolve({ messageId: uuid });
   }
 
+  /**
+   * Output of the main conversation while no turn is open starts a cycle
+   * that Claude Code started on its own. Without lifecycle frames, a pushed
+   * prompt's output can come before its echo, so output while one waits is
+   * that prompt's, and its echo opens the turn, as on the bridge.
+   */
+  private outputStarts(): void {
+    if (this.foreground) return;
+    if (!this.lifecycleFrames && [...this.pending.values()].some((prompt) => prompt.pushed)) {
+      return;
+    }
+    this.openTurn(undefined);
+  }
+
   private result(message: SDKResultMessage): void {
+    // Every result moves the usage reading on, also one that ends nothing.
+    const end = this.usage.record(message);
+    if (isPlaceholderResult(message)) return;
+    this.idleOwed = true;
+    const { dropped, interrupted } = this.stopped.result(message);
+    if (dropped) return;
+    // The interrupt stopped work that Claude Code had started before the cancel arrived.
+    if (interrupted) this.cancelledWork = true;
     // A result with no open turn: a turn that sent nothing before it.
     this.openTurn(undefined);
-    this.lastResult = message;
-    // A local command (such as `/context`) answers with its result alone: no
-    // model text streamed for it.
-    if (
+    this.lastEnd = end;
+    if (message.stop_reason === "refusal") {
+      // The refused message shows nothing: its explanation answers.
+      if (this.refusalExplanation) {
+        this.output.agentMessage(this.refusalExplanation, message.uuid);
+      }
+    } else if (
       message.subtype === "success" &&
       !message.is_error &&
       message.result &&
       !this.output.hasAgentText()
     ) {
+      // A local command (such as `/context`) answers with its result alone:
+      // no model text streamed for it.
       this.output.agentMessage(message.result, message.uuid);
     }
+    this.closeTurn();
+  }
+
+  /**
+   * Claude Code's `idle`. The one that follows a result is that result's, and
+   * can come after the next cycle's first output. Any other ends the open
+   * turn, such as one that an interrupt stopped before it ran.
+   */
+  private claudeCodeIdle(): void {
+    if (this.idleOwed) {
+      this.idleOwed = false;
+      return;
+    }
+    this.stopped.idle();
     this.closeTurn();
   }
 
@@ -498,7 +608,8 @@ export class NativeSession implements RequestTarget {
     this.tasks.queryEnded({ code: failure.code, message: failure.message });
     if (this.foreground) {
       // Cancelled work that ended with the query was still cancelled.
-      this.output.finishUnfinished(this.cancelledWork ? "cancelled" : "failed");
+      if (this.cancelledWork) this.output.closeUnfinished(true);
+      else this.output.finishUnfinished("failed");
       this.foreground = false;
       this.reportedState = "idle";
       this.send({
@@ -520,17 +631,13 @@ export class NativeSession implements RequestTarget {
 
   /**
    * Opens a turn, if none is open. `command` is the prompt that started it,
-   * if one did. A prompt that a cancel covered starts work that the cancel's
-   * interrupt stops.
+   * if one did.
    */
   private openTurn(command: string | undefined): void {
-    if (command !== undefined) {
-      this.turnCommand = command;
-      if (this.cancelCovered.delete(command)) this.cancelledWork = true;
-    }
+    if (command !== undefined) this.turnCommand = command;
     if (this.foreground) return;
     this.foreground = true;
-    this.lastResult = undefined;
+    this.lastEnd = undefined;
     this.output.resetAgentText();
     this.reportState();
   }
@@ -538,34 +645,42 @@ export class NativeSession implements RequestTarget {
   /** Ends the open turn: its idle goes out with the turn's outcome. */
   private closeTurn(): void {
     if (!this.foreground) return;
-    // v2 asks for a final status of the tool calls of stopped work before its idle.
-    const outcome = idleOutcome(this.lastResult, this.cancelledWork).stopReason;
-    if (outcome === "cancelled" || outcome === "error") {
-      this.output.finishUnfinished(outcome === "cancelled" ? "cancelled" : "failed");
+    // v2 asks for a final status of the turn's tool calls before its idle.
+    const cancelled = idleOutcome(this.lastEnd, this.cancelledWork).stopReason === "cancelled";
+    this.output.closeUnfinished(cancelled);
+    if (cancelled) {
+      // v2 asks to stop waiting for the stopped work's requests. Claude Code's
+      // interrupt withdraws them, and this withdraws what it left open.
+      for (const request of this.requests) {
+        if (request.coveredByCancel) request.abort.abort();
+      }
     }
     this.foreground = false;
     this.reportState();
     this.cancelledWork = false;
-    this.lastResult = undefined;
+    this.output.cancelled = false;
+    this.lastEnd = undefined;
     this.turnCommand = undefined;
+    this.refusalExplanation = undefined;
   }
 
   private foregroundState(): ForegroundState {
     if (!this.foreground) return "idle";
-    return this.openRequests > 0 || this.tasks.foregroundBlocked() ? "requires_action" : "running";
+    return this.requests.size > 0 || this.tasks.foregroundBlocked() ? "requires_action" : "running";
   }
 
-  /** Reports the foreground state when it changed. */
-  private reportState(): void {
+  /**
+   * Reports the foreground state when it changed. `withdrawnByCancel`: the
+   * change is the end of a request that a cancel withdrew, so the work is
+   * stopping and its idle follows: no `running` goes out for it.
+   */
+  private reportState(withdrawnByCancel = false): void {
     if (this.closed) return;
     const state = this.foregroundState();
     if (state === this.reportedState) return;
-    // A cancel withdrew the open requests: the work is stopping, and its idle follows.
-    if (this.reportedState === "requires_action" && state === "running" && this.cancelledWork) {
-      return;
-    }
+    const silent = withdrawnByCancel && state === "running";
     this.reportedState = state;
-    this.send(this.stateUpdate(state));
+    if (!silent) this.send(this.stateUpdate(state));
   }
 
   private stateUpdate(state: ForegroundState): v2.SessionUpdate {
@@ -578,7 +693,7 @@ export class NativeSession implements RequestTarget {
         return {
           sessionUpdate: "state_update",
           state,
-          ...idleOutcome(this.lastResult, this.cancelledWork),
+          ...idleOutcome(this.lastEnd, this.cancelledWork),
         };
     }
   }
@@ -593,26 +708,6 @@ export class NativeSession implements RequestTarget {
     this.connection.send(this.background.stamp(notification));
   }
 
-  /** Resolves once no turn is open and every prompt is answered, or after `timeoutMs`. */
-  private settled(timeoutMs: number): Promise<void> {
-    if (!this.foreground && this.pending.size === 0) return Promise.resolve();
-    return new Promise((resolve) => {
-      const timer = setTimeout(done, timeoutMs);
-      function done() {
-        clearTimeout(timer);
-        resolve();
-      }
-      this.settledWaiters.push(done);
-    });
-  }
-
-  private checkSettled(): void {
-    if (this.foreground || this.pending.size > 0) return;
-    const waiters = this.settledWaiters;
-    this.settledWaiters = [];
-    for (const waiter of waiters) waiter();
-  }
-
   /** Fails the prompt `uuid` if it is not answered yet. Returns whether it was pending. */
   private failPrompt(uuid: string, error: unknown): boolean {
     const prompt = this.pending.get(uuid);
@@ -625,54 +720,4 @@ export class NativeSession implements RequestTarget {
   private failPending(error: unknown): void {
     for (const uuid of [...this.pending.keys()]) this.failPrompt(uuid, error);
   }
-}
-
-/**
- * The idle members this core reports. Typed as those members, so the checker
- * matches each stop reason to its own, which it cannot against the whole
- * union with its custom and unknown members.
- */
-type IdleOutcome = Extract<
-  v2.IdleStateUpdate,
-  {
-    stopReason: "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled" | "error";
-  }
->;
-
-/** The stop reason, usage and error of an idle, from the turn's result. */
-function idleOutcome(result: SDKResultMessage | undefined, cancelled: boolean): IdleOutcome {
-  const usage = usageOf(result);
-  if (cancelled) return { stopReason: "cancelled", ...usage };
-  if (!result) return { stopReason: "end_turn" };
-  if (result.subtype === "error_max_turns") return { stopReason: "max_turn_requests", ...usage };
-  if (result.stop_reason === "max_tokens") return { stopReason: "max_tokens", ...usage };
-  if (result.stop_reason === "refusal") return { stopReason: "refusal", ...usage };
-  if (result.subtype !== "success" || result.is_error) {
-    const text = result.subtype === "success" ? result.result : result.errors.join("\n");
-    const error =
-      result.subtype === "success" && isLoginRequiredText(text)
-        ? RequestError.authRequired()
-        : RequestError.internalError(undefined, text || `Claude Code ended with ${result.subtype}`);
-    return { stopReason: "error", error: { code: error.code, message: error.message }, ...usage };
-  }
-  return { stopReason: "end_turn", ...usage };
-}
-
-function usageOf(result: SDKResultMessage | undefined): { usage?: v2.Usage } {
-  if (!result) return {};
-  const { input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens } =
-    result.usage;
-  const inputTokens = input_tokens ?? 0;
-  const outputTokens = output_tokens ?? 0;
-  const cachedReadTokens = cache_read_input_tokens ?? 0;
-  const cachedWriteTokens = cache_creation_input_tokens ?? 0;
-  return {
-    usage: {
-      inputTokens,
-      outputTokens,
-      cachedReadTokens,
-      cachedWriteTokens,
-      totalTokens: inputTokens + outputTokens + cachedReadTokens + cachedWriteTokens,
-    },
-  };
 }

@@ -28,11 +28,11 @@ both, so a v2 core can follow Claude Code's own events instead of rebuilding a t
 | ACP v2                             | Claude Code                                                                       |
 | ---------------------------------- | --------------------------------------------------------------------------------- |
 | `session/prompt` answers           | `command_lifecycle` `started` for the prompt's uuid, or the prompt's echo         |
-| `session/prompt` fails             | `command_lifecycle` `cancelled` (-32800), `discarded` or `refused` (-32603)       |
-| `state_update` `running`           | a turn starts: a prompt's `started`, or the turn's `system/init`                  |
-| `state_update` `idle`              | the turn's `result`, with its stop reason, usage and error                        |
+| `session/prompt` fails             | `session/cancel` or `cancelled` (-32800), `discarded` or `refused` (-32603)       |
+| `state_update` `running`           | a turn starts: a prompt's `started` or echo, or the main conversation's output    |
+| `state_update` `idle`              | the turn's `result`, with its stop reason, usage, `_meta.quota` and error         |
 | `state_update` `requires_action`   | a turn is open and a permission request of the session is open                    |
-| `session/cancel`                   | `interrupt({ cancelQueued: true })`, which also ends the queued prompts           |
+| `session/cancel`                   | `interrupt({ cancelQueued: true })`, also while idle, as on the bridge            |
 | `session/resume` with `replayFrom` | `getSessionMessages`, mapped like live output                                     |
 | output updates                     | the shared SDK mapping (`toAcpNotifications`), translated by `V2UpdateTranslator` |
 
@@ -57,7 +57,19 @@ subagent that sleeps 20 seconds):
 So each turn is foreground work from its start to its `result`, as v2 asks ("When foreground
 work ends, the Agent MUST report `idle`, even if background activity continues"). An `idle`
 without a result, or the `completed` or `cancelled` frame of the turn's prompt, also ends a turn,
-such as one that an interrupt stopped before it ran.
+such as one that an interrupt stopped before it ran. The `idle` that follows a result is that
+result's, also when it comes after the next cycle's first output. A placeholder result
+(`num_turns: 0` of a task notification) ends nothing: Claude Code answers queued notifications
+with one model call. The idle's usage and `_meta.quota` are the result's (`outcome.ts`, with the
+quota helpers of `usage-quota.ts` that v1 uses). A failed turn's idle carries its error instead.
+
+`session/cancel` answers every prompt not inserted yet with -32800, as the bridge does. Claude
+Code can still run one that it had taken in before the interrupt arrived, or a cycle that it
+started while the client saw no work. The client never saw that work, so it is dropped: its
+output, its states, and its permission requests, which are denied (`stopped-work.ts`). An aborted
+result after a cancel ends the work that the interrupt stopped as `cancelled`. Claude Code's
+interrupt withdraws the open permission requests. Their end reports no `running` before the
+idle, and one that the user answers after the cancel reports `running`, as on the bridge.
 
 ## Subagents and background work
 
@@ -132,8 +144,8 @@ These pieces were extracted so that both cores use the same code:
 - `src/tests/acp-scenarios-v2-native.test.ts` runs every scenario of the shared suite on the
   native core. All 40 send only schema-valid v2. 39 pass. `ask-user-question` stops, because
   the native core sends no form elicitations. `SAME_AS_BRIDGE` lists the scenarios whose session
-  updates equal the bridge's golden file, which today is only `session-setup`. The differences
-  are listed below.
+  updates equal the bridge's golden file: `session-setup`, the three `async-task-*` scenarios
+  and `goal`. The differences are listed below.
 - The scenario double now sends `session_state_changed` when the query asks for it, as the real
   CLI does. The bridge and v1 scenario golden files did not change.
 - A manual run against the bundled Claude Code CLI checked the following:
@@ -145,7 +157,6 @@ These pieces were extracted so that both cores use the same code:
 
 ## Intended differences from the bridge
 
-- The turn's `running` comes before the prompt's `user_message`. v2 allows this.
 - Output that comes after `session/cancel`, until the turn's `result`, is still sent: the work is
   still stopping. The bridge drops the output of stopped work.
 - A text block that an interrupt cut short does not get its tail from the consolidated message.
@@ -170,7 +181,6 @@ These pieces were extracted so that both cores use the same code:
     unexposed: its traffic is the root's
 - Reports:
   - `usage_update` (context window, cost)
-  - quota `_meta`
   - `session_info_update` (titles)
   - notices (API retries, rate limits, model fallback)
   - compaction updates
@@ -215,13 +225,16 @@ These pieces were extracted so that both cores use the same code:
 Beyond the scenarios, `v2-native.test.ts` covers these requirements of the draft spec:
 
 - A cancel covers only the prompts received before it. A later prompt waits for the interrupt,
-  whose `cancelQueued` would end it otherwise. A prompt not pushed yet fails at once.
+  whose `cancelQueued` would end it otherwise. Every covered prompt fails at once, and the run
+  of one that Claude Code had taken in already is dropped, its tool uses denied.
 - A cancel that ended only queued prompts leaves the next turn's stop reason alone.
 - `session/close` sends the cancelled work's final updates and `idle(cancelled)` before its
-  response, and nothing after. It waits up to 5 seconds for Claude Code to end the work.
+  response, and nothing after. As on the bridge, it ends the work at once, without waiting for
+  Claude Code.
 - Closing or deleting a session that does not exist succeeds.
 - Stopped work gives its unfinished tool calls a final status before its idle: `cancelled`
-  after a cancel, `failed` after an error.
+  after a cancel, `failed` when the query ends. At any other end, a tool call that Claude dropped
+  before it ran ends `cancelled`.
 - A session whose query ended is no longer active (-32002 with `data.sessionId`), and a resume
   starts it again from its transcript.
 - Resuming the active session checks the request as a new one, keeps its work, and replaces its
