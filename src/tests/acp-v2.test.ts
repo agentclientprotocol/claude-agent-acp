@@ -6168,6 +6168,96 @@ describe("ACP v2 terminal of a command in the background", () => {
         ).toEqual([]);
       });
 
+      it("lists a workflow's phases and agents on its card, and keeps them when a report has none", async () => {
+        // As CLI 2.1.319 sends it, trimmed of the fields the card ignores.
+        const snapshot = [
+          { type: "workflow_phase", index: 1, title: "Count" },
+          { type: "workflow_phase", index: 2, title: "Sum" },
+          {
+            type: "workflow_agent",
+            index: 1,
+            label: "two",
+            phaseIndex: 1,
+            phaseTitle: "Count",
+            agentId: "af3724ea06eadb5dd",
+            model: "claude-haiku-5-5",
+            state: "done",
+            attempt: 1,
+            promptPreview: "Reply with only the number 2.",
+            tokens: 14629,
+            toolCalls: 0,
+            durationMs: 1329,
+            resultPreview: "2",
+          },
+          {
+            type: "workflow_agent",
+            index: 2,
+            label: "three",
+            phaseIndex: 1,
+            phaseTitle: "Count",
+            model: "claude-haiku-5-5",
+            state: "start",
+            lastToolName: "Bash",
+            lastToolSummary: "echo 3",
+          },
+        ];
+        const progress = (options: Options, fields: Record<string, unknown>) =>
+          taskEvent(options, "task_progress", {
+            task_id: "wf1",
+            tool_use_id: "toolu_wf",
+            description: "Count: three",
+            ...fields,
+          });
+        scriptTurns(async function* (options) {
+          yield toolUseMessage(options, "toolu_wf", "Workflow", { script: "probe" });
+          yield level(options, [workflow]);
+          yield taskEvent(options, "task_started", { ...workflow, tool_use_id: "toolu_wf" });
+          yield {
+            ...toolResultMessage(options, "toolu_wf", { content: "Workflow launched." }),
+            tool_use_result: {
+              status: "async_launched",
+              taskId: "wf1",
+              taskType: "local_workflow",
+            },
+          };
+          yield progress(options, {
+            usage: { total_tokens: 14629, tool_uses: 0, duration_ms: 1343 },
+            workflow_progress: snapshot,
+          });
+          // The CLI leaves the snapshot out of some reports.
+          yield progress(options, {
+            usage: { total_tokens: 29282, tool_uses: 1, duration_ms: 2806 },
+          });
+          yield result(options);
+          yield idleState(options);
+        });
+        const list = [
+          "**Count**",
+          "- two: done · 14,629 tokens · 0 tool calls · 1s",
+          "- three: running · Bash: echo 3",
+          "",
+          "**Sum**",
+          "- not started",
+        ].join("\n");
+        const client = await promptUntil("idle end_turn [toolu_wf]");
+
+        expect(
+          client
+            .updates("tool_call_update")
+            .flatMap((update) => (update.content ? [update.content] : []))
+            .slice(-2),
+        ).toEqual(
+          ["14,629 tokens · 0 tool calls · 1s", "29,282 tokens · 1 tool calls · 2s"].map(
+            (usage) => [
+              {
+                type: "content",
+                content: { type: "text", text: `Count: three\n\n${usage}\n\n${list}` },
+              },
+            ],
+          ),
+        );
+      });
+
       it("sends each listed call's current state before the state snapshot of session/resume", async () => {
         scriptTurns(async function* (options) {
           yield* monitorStarts(options);

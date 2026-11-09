@@ -165,6 +165,7 @@ import {
   clientSupportsAsyncTasks,
   taskProgressFields,
 } from "./async-tasks.js";
+import { workflowSnapshot } from "./workflow-progress.js";
 import {
   type BackgroundSink,
   type BackgroundTaskEnd,
@@ -6763,10 +6764,14 @@ export class ClaudeAcpAgent {
                   );
                   break;
                 }
-                const progress = session.background.taskProgress(
-                  message.task_id,
-                  taskProgressFields(message),
+                // The SDK does not type `workflow_progress`; see workflow-progress.ts.
+                const workflow = workflowSnapshot(
+                  (message as { workflow_progress?: unknown }).workflow_progress,
                 );
+                const progress = session.background.taskProgress(message.task_id, {
+                  ...taskProgressFields(message),
+                  ...(workflow ? { workflow } : {}),
+                });
                 if (progress) await sendUpdate(progress);
                 await asyncTasks.taskProgress({
                   task_id: message.task_id,
