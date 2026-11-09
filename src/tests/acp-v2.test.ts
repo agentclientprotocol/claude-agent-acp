@@ -412,7 +412,7 @@ describe("ACP protocol routing", () => {
 
     // The v2 app registers neither `_session/async_task/stop` nor `_session/goal`.
     // The core lists only the AIR extensions that v2 does not cover (see
-    // "AIR clients" in docs/acp-v2.md).
+    // "ACP v2" in docs/air-extensions.md).
     const air = (response._meta as any)?.jetbrains?.air;
     expect(air.capabilities).toEqual(["agentFileChangeReport", "recommendedValue"]);
     expect(air.capabilities).not.toContain("asyncTasks");
@@ -9404,8 +9404,13 @@ describe("ACP v2 subscription guard (--hide-claude-auth)", () => {
   beforeEach(() => {
     const argv = process.argv;
     process.argv = [...argv, "--hide-claude-auth"];
+    // The guard judges the account that `claude auth status` reports. A
+    // real-CLI run (`npm run test:integration`) would otherwise probe the
+    // machine's own login, so these tests read only the scripted accounts.
+    vi.stubEnv("CLAUDE_CODE_EXECUTABLE", "/usr/bin/false");
     return () => {
       process.argv = argv;
+      vi.unstubAllEnvs();
     };
   });
 
