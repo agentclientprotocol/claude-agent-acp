@@ -1574,6 +1574,59 @@ describe("ACP v2 prompts", () => {
     ]);
   });
 
+  it("removes the checklist and the approved plan on a conversation reset", async () => {
+    scriptTurns(
+      async function* (options) {
+        const todoWrite = assistantText(options, "", "msg_todo");
+        todoWrite.message.content = [
+          {
+            type: "tool_use",
+            id: "toolu_todo",
+            name: "TodoWrite",
+            input: { todos: [{ content: "Do X", status: "pending", activeForm: "Doing X" }] },
+          },
+        ] as never;
+        yield todoWrite;
+        yield result(options);
+      },
+      async function* (options) {
+        yield {
+          type: "conversation_reset",
+          new_conversation_id: randomUUID(),
+          uuid: randomUUID(),
+          session_id: options.sessionId,
+        };
+        yield result(options);
+      },
+    );
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("plan") });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("/clear") });
+      await vi.waitFor(() => expect(client.updates("plan_removed")).toHaveLength(2));
+      await client.authUpdate(1);
+    });
+
+    expect(
+      client.sessionUpdates
+        .map(({ update }) => update)
+        .filter(({ sessionUpdate }) => sessionUpdate.startsWith("plan_")),
+    ).toEqual([
+      {
+        sessionUpdate: "plan_update",
+        plan: {
+          type: "items",
+          planId: "plan",
+          entries: [{ content: "Do X", status: "pending", priority: "medium" }],
+        },
+      },
+      { sessionUpdate: "plan_removed", planId: "plan" },
+      { sessionUpdate: "plan_removed", planId: "plan-mode" },
+    ]);
+  });
+
   it("reports Claude Code's warnings as live notices", async () => {
     scriptTurns(async function* (options) {
       yield {
@@ -6559,6 +6612,13 @@ describe("ACP v2 session translation", () => {
       sessionUpdate: "plan_update",
       plan: { type: "items", planId: "plan", entries },
       _meta: meta,
+    });
+  });
+
+  it("reports an empty legacy plan as the removal of the session's v2 plan", () => {
+    expect(v2SessionUpdate({ sessionUpdate: "plan", entries: [] })).toEqual({
+      sessionUpdate: "plan_removed",
+      planId: "plan",
     });
   });
 

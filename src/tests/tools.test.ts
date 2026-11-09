@@ -2684,6 +2684,36 @@ describe("toAcpNotifications - TodoWrite with undefined input regression", () =>
     const planUpdates = notifications.filter((n) => (n.update as any).sessionUpdate === "plan");
     expect(planUpdates).toHaveLength(1);
   });
+
+  it.each([
+    {
+      todos: [{ content: "Do X", status: "pending", activeForm: "Doing X" }],
+      expected: {
+        sessionUpdate: "plan_update",
+        plan: {
+          type: "items",
+          planId: "plan",
+          entries: [{ content: "Do X", status: "pending", priority: "medium" }],
+        },
+      },
+    },
+    { todos: [], expected: { sessionUpdate: "plan_removed", planId: "plan" } },
+  ])(
+    "sends $todos.length todos as a plan operation to a client with plan operations",
+    ({ todos, expected }) => {
+      const notifications = toAcpNotifications(
+        [{ type: "tool_use" as const, id: "toolu_todo", name: "TodoWrite", input: { todos } }],
+        "assistant",
+        "test-session",
+        {},
+        mockClient,
+        mockLogger,
+        { clientCapabilities: { plan: {} } },
+      );
+
+      expect(notifications.map(({ update }) => update)).toEqual([expected]);
+    },
+  );
 });
 
 describe("parseTaskCreateOutput", () => {
@@ -2921,6 +2951,39 @@ describe("toAcpNotifications - Task* tools", () => {
 
     expect(notifications).toHaveLength(0);
     expect(taskState.size).toBe(0);
+  });
+
+  it("sends the task snapshot as a plan operation to a client with plan operations", () => {
+    const toolUseCache: ToolUseCache = {
+      "1": { type: "tool_use", id: "1", name: "TaskCreate", input: { subject: "First" } },
+    };
+    const created = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "1",
+          content: JSON.stringify({ task: { id: "1", subject: "First" } }),
+          is_error: false,
+        },
+      ] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { taskState: new Map(), clientCapabilities: { plan: {} } },
+    );
+
+    expect(created.map(({ update }) => update)).toEqual([
+      {
+        sessionUpdate: "plan_update",
+        plan: {
+          type: "items",
+          planId: "plan",
+          entries: [{ content: "First", status: "pending", priority: "medium" }],
+        },
+      },
+    ]);
   });
 
   it("emits a plan snapshot after a TaskCreate tool_result and accumulates state", () => {
