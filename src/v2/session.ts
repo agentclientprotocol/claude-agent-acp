@@ -150,6 +150,8 @@ export class V2Session implements RequestTarget {
   private interrupting: Promise<void> | undefined;
   /** Pushes prompts in the order they came (see {@link prompt}). */
   private pushes: Promise<void> = Promise.resolve();
+  /** Pushes the adapter's own prompts of the open turn in order (see {@link pushOwnPrompt}). */
+  private ownPushes: Promise<void> = Promise.resolve();
   /** The result that ended the open turn, with what the turn spent. */
   private lastEnd: TurnEnd | undefined;
   private usage = new ResultUsage(false);
@@ -517,13 +519,18 @@ export class V2Session implements RequestTarget {
    * an earlier `session/cancel`, as {@link prompt} does. It is no prompt of
    * the client's: it gets no `user_message`, also when its echo carries the
    * human `origin` that `promptToClaude` stamps.
+   *
+   * These prompts continue the open turn (`clear-context.ts`), so they do not
+   * wait on {@link pushes}: a `/remote-control` there waits for the turn to
+   * end, which needs them. The client's prompts keep their order among
+   * themselves on `pushes`.
    */
   private pushOwnPrompt(text: string, uuid: ReturnType<typeof randomUUID>): void {
     const message = {
       ...promptToClaude({ sessionId: this.sessionId, prompt: [{ type: "text", text }] }),
       uuid,
     };
-    this.pushes = this.pushes
+    this.ownPushes = this.ownPushes
       .then(() => this.interrupting)
       .then(() => {
         if (this.closed) return;

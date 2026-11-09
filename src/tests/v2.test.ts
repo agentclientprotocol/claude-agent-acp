@@ -64,6 +64,8 @@ const sdk = vi.hoisted(() => ({
   startFailure: undefined as Error | undefined,
   /** When set, Claude Code's start waits for it. */
   startGate: undefined as Promise<void> | undefined,
+  /** When set, the query serves Remote Control with it (`enableRemoteControl`). */
+  enableRemoteControl: undefined as ((...args: unknown[]) => Promise<unknown>) | undefined,
 }));
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
@@ -142,6 +144,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         applyFlagSettings: fake.applyFlagSettings,
         rewindFiles: fake.rewindFiles,
         mcpServerStatus: async () => sdk.mcpServers,
+        ...(sdk.enableRemoteControl ? { enableRemoteControl: sdk.enableRemoteControl } : {}),
         // A server that needs OAuth: Claude Code returns its authorization URL.
         mcpAuthenticate: async () => ({
           authUrl: "https://mcp.example.com/authorize",
@@ -203,6 +206,7 @@ beforeEach(async () => {
   sdk.previewGate = undefined;
   sdk.startFailure = undefined;
   sdk.startGate = undefined;
+  sdk.enableRemoteControl = undefined;
 });
 
 afterEach(async () => {
@@ -1379,6 +1383,91 @@ describe("ACP v2 core", () => {
     expect(client.states()).toEqual(["running", "requires_action", "running", "idle"]);
     // No plan's prompt went out after the cancel.
     expect(sdk.processes[0].prompts).toHaveLength(2);
+  });
+
+  it("continues an approved plan in its fresh context while a /remote-control waits for the turn", async () => {
+    sdk.enableRemoteControl = vi.fn(async () => ({
+      session_url: "https://claude.ai/code/session_123",
+    }));
+    const client = v2Client({
+      answerPermission: () => ({
+        outcome: { outcome: "selected", optionId: "exit-plan-clear-auto" },
+      }),
+    });
+    await client.connect(async (agent) => {
+      const { response, claude } = await openSession(agent);
+      const sessionId = response.sessionId;
+      const prompted = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: PROMPT,
+      });
+      claude.send(echo(await claude.prompt(0)));
+      await prompted;
+      claude.send(
+        assistant("msg_plan", [
+          { type: "tool_use", id: "toolu_plan", name: "ExitPlanMode", input: { plan: "Do it" } },
+        ]),
+      );
+      await askPermission(claude, "ExitPlanMode", { plan: "Do it" }, { toolUseID: "toolu_plan" });
+      // Held until the turn ends.
+      const command = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: [{ type: "text", text: "/remote-control" }],
+      });
+      claude.send({
+        type: "user",
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_plan",
+              content: "User accepted the plan and requested a fresh context",
+              is_error: true,
+            },
+          ],
+        },
+        tool_result_meta: [{ id: "toolu_plan", non_execution_kind: "user-rejected" }],
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+      });
+      claude.send(
+        result({
+          subtype: "error_during_execution",
+          is_error: true,
+          stop_reason: null,
+          errors: ["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],
+        }),
+      );
+      claude.send(sessionState("idle"));
+      const clear = await claude.prompt(1);
+      claude.send(lifecycle(clear, "started"));
+      claude.send(echo(clear));
+      claude.send({
+        type: "conversation_reset",
+        new_conversation_id: randomUUID(),
+        uuid: randomUUID(),
+        trigger: "clear",
+        timestamp: new Date().toISOString(),
+        session_id: sessionId,
+      });
+      claude.send(result({ num_turns: 0, stop_reason: null }));
+      claude.send(lifecycle(clear, "completed"));
+      const plan = await claude.prompt(2);
+      claude.send(lifecycle(plan, "started"));
+      claude.send(echo(plan));
+      claude.send(result());
+      claude.send(lifecycle(plan, "completed"));
+      claude.send(sessionState("idle"));
+      await command;
+      await vi.waitFor(() => expect(sdk.enableRemoteControl).toHaveBeenCalled());
+    });
+
+    expect(sdk.processes[0].prompts.map((prompt) => prompt.message.content)).toEqual([
+      PROMPT,
+      [{ type: "text", text: "/clear" }],
+      [{ type: "text", text: "Implement the following plan:\n\nDo it" }],
+    ]);
   });
 
   it("ends a cycle at its own result, not at a placeholder or at the idle of the turn before", async () => {
