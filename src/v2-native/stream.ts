@@ -248,6 +248,11 @@ export class SessionOutput {
     this.emit([{ sessionId: this.sessionId, update }]);
   }
 
+  /** Whether the stream mapped the tool call `toolCallId`, shown or routed away. */
+  holds(toolCallId: string): boolean {
+    return this.emittedToolCalls.has(toolCallId);
+  }
+
   /** The tool uses of the session's tool calls, by id. */
   toolUses(): Readonly<ToolUseCache> {
     return this.toolUseCache;

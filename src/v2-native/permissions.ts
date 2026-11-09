@@ -49,6 +49,11 @@ export interface PermissionHost {
    * a plan accepted with clearing the context (`reset`).
    */
   exitPlanInterrupting(toolUseId: string, reset: ClearContextReset | undefined): void;
+  /**
+   * A permission request of `target` is about to show the tool call
+   * `toolCallId` of `toolName` (see `SessionTasks.requestShows`).
+   */
+  requestShows(target: RequestTarget, toolName: string, toolCallId: string): void;
   /** The subject's tool call, with the `_meta` that the client holds of it, as on the bridge. */
   toolCallSubject<T extends ToolCallUpdate>(sessionId: string, toolCall: T): T;
   /**
@@ -151,6 +156,7 @@ export function canUseTool(host: PermissionHost): CanUseTool {
     // gets it before the request, and its status after the answer.
     const networkAccess = toolName === "SandboxNetworkAccess";
     if (networkAccess) target.output.permissionToolCall(toolName, toolUseID, toolInput);
+    host.requestShows(target, toolName, toolUseID);
     const toolCall = host.toolCallSubject(target.sessionId, presentation.toolCall);
     const response = v1PermissionResponse(
       await target.requestPermission(

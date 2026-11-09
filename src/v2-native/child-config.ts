@@ -83,6 +83,12 @@ export class ChildConfigurations {
     return options;
   }
 
+  /** The configuration that the client last got for the child `agentId`, if any. */
+  published(agentId: string): SessionConfigOption[] | undefined {
+    const published = this.children.get(agentId)?.published;
+    return published === undefined ? undefined : (JSON.parse(published) as SessionConfigOption[]);
+  }
+
   /** A child that stays unexposed: its options go nowhere. */
   forget(agentId: string): void {
     this.children.delete(agentId);

@@ -282,6 +282,12 @@ export class SessionTasks {
     { initial: AcpSessionNotification; sender: string; delivered: boolean }
   >();
   /**
+   * The SendMessage calls that a permission request showed before their tool
+   * use streamed: the client holds them, so they stay shown until their final
+   * update, as on the bridge (its `eagerToolCallSessions`).
+   */
+  private readonly shownSendMessages = new Set<string>();
+  /**
    * The SubagentHandback calls of announced children, which the client is not
    * shown until their final update, with their first report, the report from
    * their input, and the call that delegated the run.
@@ -353,6 +359,30 @@ export class SessionTasks {
     const restoring = this.restoring;
     this.restoring = undefined;
     return restoring;
+  }
+
+  /**
+   * Restores the agent that a SendMessage result of `output` resumed
+   * (`resumedAgentId`), when this process does not know it, as the bridge
+   * does (`sendMessageResumed`): Claude Code can resume an agent without a
+   * `task_started`. The caller sends the result's updates after it, so the
+   * restored child takes the call's message. Undefined when nothing is
+   * restored: the agent is known, or no SendMessage call of the session
+   * carried the result.
+   */
+  restoreResumed(output: SessionOutput, message: SDKUserMessage): Promise<void> | undefined {
+    const agentId = resumedNativeSubagentId(message.tool_use_result);
+    const content = message.message.content;
+    if (agentId === undefined || this.children.has(agentId) || !Array.isArray(content)) {
+      return undefined;
+    }
+    const resume = sendMessageResume(
+      output.toolUses(),
+      agentId,
+      content.flatMap((block) => (block.type === "tool_result" ? [block.tool_use_id] : [])),
+    );
+    if (!resume || !this.senderByToolUse.has(resume.toolUseId)) return undefined;
+    return this.restore(agentId, resume.text, resume.toolUseId);
   }
 
   /**
@@ -445,7 +475,11 @@ export class SessionTasks {
 
   /** Reads the subagents that the history `messages` launched, for its replay. */
   loadReplay(messages: SessionMessage[]): Promise<SubagentReplay | undefined> {
-    return SubagentReplay.load(this.host, messages, (sessionId) => this.children.has(sessionId));
+    return SubagentReplay.load(this.host, messages, {
+      tracks: (sessionId) => this.children.has(sessionId),
+      configuration: (sessionId) =>
+        this.hasChild(sessionId) ? this.configs.published(sessionId) : undefined,
+    });
   }
 
   /** Whether a subagent task runs, announced or not, in the foreground or the background. */
@@ -581,6 +615,19 @@ export class SessionTasks {
     const child = message.agent_id !== undefined ? this.children.get(message.agent_id) : undefined;
     if (child?.announced) child.output!.permissionDenied(message, child.launchToolUseId);
     else this.rootOutput.permissionDenied(message);
+  }
+
+  /**
+   * A permission request on the session of `output` shows the tool call
+   * `toolCallId` to the client. A SendMessage call whose tool use has not
+   * streamed yet then stays shown: its updates go out, and its message goes
+   * to the child only, as on the bridge. One that already streamed stays
+   * hidden, as the bridge's does.
+   */
+  requestShows(output: SessionOutput, toolName: string, toolCallId: string): void {
+    if (toolName === "SendMessage" && !output.holds(toolCallId)) {
+      this.shownSendMessages.add(toolCallId);
+    }
   }
 
   /**
@@ -1091,7 +1138,10 @@ export class SessionTasks {
         // user]", which the child's session does not show.
         const content = message.message.content;
         if (Array.isArray(content) && content.some((block) => block.type === "tool_result")) {
-          this.toolResults(output, message);
+          // The session handles its next message after the restore (see `restored`).
+          const restoring = this.restoreResumed(output, message);
+          if (restoring) this.restoring = restoring.then(() => this.toolResults(output, message));
+          else this.toolResults(output, message);
         }
         return;
       }
@@ -1293,6 +1343,11 @@ export class SessionTasks {
     toolName: unknown,
   ): AcpSessionNotification[] | undefined {
     const update = notification.update as ToolCallUpdate;
+    // A call that its permission request showed (see `requestShows`).
+    if (this.shownSendMessages.has(update.toolCallId)) {
+      if (FINAL_STATUSES.has(update.status)) this.shownSendMessages.delete(update.toolCallId);
+      return [notification];
+    }
     let call = this.hiddenSendMessages.get(update.toolCallId);
     if (!call) {
       if (update.sessionUpdate !== "tool_call" || toolName !== "SendMessage") return undefined;
