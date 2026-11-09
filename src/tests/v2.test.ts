@@ -2420,6 +2420,35 @@ describe("ACP v2 core", () => {
       });
     });
 
+    it("lets the subagent that a child waits on ask again when Claude Code refuses to stop the child", async () => {
+      const client = v2Client({ answerPermission: () => new Promise(() => {}) });
+      await client.connect(async (agent) => {
+        const { claude } = await openSession(agent);
+        const child = subagent("child", "toolu_launch", { is_backgrounded: true });
+        const inner = subagent("inner", "toolu_inner", { parent_task_id: "child" });
+        claude.send(cycleStart());
+        claude.send(child.launch());
+        claude.send(child.started());
+        claude.send(inner.launch("toolu_launch"));
+        claude.send(inner.started());
+        await vi.waitFor(() =>
+          expect(updatesOf(client.notifications, "inner")).toContainEqual(
+            expect.objectContaining({ state: "running" }),
+          ),
+        );
+        claude.stopTask.mockRejectedValueOnce(new Error("refused"));
+        await agent.notify(v2.methods.agent.session.cancel, { sessionId: "child" });
+        await vi.waitFor(() => expect(claude.stopTask).toHaveBeenCalledWith("child"));
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        // The inner subagent's run goes on: its next request is its own.
+        void askPermission(claude, "Bash", { command: "make" }, { agentID: "inner" }).catch(
+          () => {},
+        );
+        await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(1));
+        expect(client.permissionRequests[0].sessionId).toBe("inner");
+      });
+    });
+
     it("reports the root running again when the interrupt fails, and lets its subagent ask again", async () => {
       let answer = (_: v2.RequestPermissionResponse) => {};
       const client = v2Client({
