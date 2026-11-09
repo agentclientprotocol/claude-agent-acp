@@ -337,9 +337,12 @@ These pieces were extracted so that both cores use the same code:
 - `src/tests/v2-native.test.ts` drives the core with a Claude Code double, message by message:
   insertion, folding, lifecycle failures, cancel, permission states, config, local commands,
   a crashed query, and replay.
-- `src/tests/acp-scenarios-v2-native.test.ts` runs every scenario of the shared suite on the
-  native core. All 40 send only schema-valid v2, and all pass. `SAME_AS_BRIDGE` lists the
-  scenarios whose session updates equal the bridge's golden file: all 40 now.
+- `src/tests/acp-scenarios-v2.test.ts`, the bridge's v2 scenarios, also runs in the
+  `v2-native-core` project. On the native core, all 40 scenarios pass, send only schema-valid v2,
+  report each tool call with a title first, and equal the bridge's golden files
+  (`acp-scenarios/__snapshots__/v2/`) in full: requests, responses, notifications, permission
+  requests, elicitations and errors. The native run only reads the golden files, also under
+  `-u`. No scenario has an allowance for an intended difference.
 - The scenario double now sends `session_state_changed` when the query asks for it, as the real
   CLI does. The bridge and v1 scenario golden files did not change.
 - A manual run against the bundled Claude Code CLI checked the following:
@@ -421,7 +424,7 @@ These pieces were extracted so that both cores use the same code:
    the v1 core's module.
 2. Port the gaps one feature at a time, each in a module that the native core owns. Some are
    typed for v1 (`native-subagents.ts`, `background-work.ts`).
-3. Ratchet `NATIVE_STOPS` and `SAME_AS_BRIDGE`, and make `native` the default once it serves
+3. Keep both cores on the v2 tests and scenarios, and make `native` the default once it serves
    what v2 clients need.
 4. Delete the bridge: `v2/agent.ts`, `v2/prompt.ts`, `v2/background.ts`, the v1 request
    conversions, and the v2 paths of `ClaudeAcpAgent`. Those paths are the `v2` option, the

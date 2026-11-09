@@ -11,15 +11,20 @@
  *   `tool_call`, so a report of a tool call that the client has not seen
  *   creates it, where v1 drops it.
  * - Golden files: `acp-scenarios/__snapshots__/v2/<scenario>.jsonl` for each
- *   passing scenario. Run `npx vitest run src/tests/acp-scenarios-v2.test.ts -u`
- *   to update them.
+ *   passing scenario, every message of the run. Run
+ *   `npx vitest run src/tests/acp-scenarios-v2.test.ts -u` to update them.
+ *
+ * With `V2_CORE_UNDER_TEST=native` (the `v2-native-core` project of
+ * `vitest.config.ts`), the same checks run on the native v2 core
+ * (`src/v2-native/`): its run must equal the bridge's golden files in full,
+ * and never writes them, also under `-u`.
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ClaudeAcpAgent } from "../acp-agent.js";
+import type { AgentHandle } from "../v2-native/agent.js";
 import {
   resetIds,
   runScenarioV2,
@@ -60,6 +65,9 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 
 const PASSES = "passes";
 
+/** Whether the scenarios run on the native v2 core (`src/v2-native/`) instead of the bridge. */
+const NATIVE_CORE = process.env.V2_CORE_UNDER_TEST === "native";
+
 /**
  * The scenarios that stop on the v2 surface, each with the reason, which names
  * the step of `docs/acp-v2.md` that removes it. Every other scenario passes.
@@ -86,12 +94,16 @@ beforeAll(async () => {
   const { acpProtocolRouter } = await import("../serve.js");
   for (const scenario of SCENARIOS) {
     resetIds();
-    const agents: ClaudeAcpAgent[] = [];
+    const agents: { dispose(): Promise<void> }[] = [];
     const quiet = { log: () => {}, error: () => {} };
     runs.set(
       scenario.name,
       await runScenarioV2(
-        (stream) => acpProtocolRouter(quiet, (agent) => agents.push(agent)).connect(stream),
+        (stream) =>
+          acpProtocolRouter(quiet, (agent) => agents.push(agent), "auto", {
+            v2Core: NATIVE_CORE ? "native" : "bridge",
+            onNativeAgent: (agent: AgentHandle) => agents.push(agent),
+          }).connect(stream),
         scenario,
       ),
     );
@@ -163,10 +175,16 @@ describe("ACP v2 scenarios", () => {
     const passing = SCENARIOS.map((scenario) => scenario.name).filter(
       (scenario) => statusOf(scenario) === PASSES,
     );
+    const golden = (scenario: string) =>
+      path.join(here, "acp-scenarios", "__snapshots__", "v2", `${scenario}.jsonl`);
     it.each(passing)("%s", async (scenario) => {
-      await expect(toJsonLines(run(scenario).normalized)).toMatchFileSnapshot(
-        path.join(here, "acp-scenarios", "__snapshots__", "v2", `${scenario}.jsonl`),
-      );
+      const lines = toJsonLines(run(scenario).normalized);
+      if (NATIVE_CORE) {
+        // The golden files are the bridge's: the native run only reads them.
+        expect(lines).toEqual(fs.readFileSync(golden(scenario), "utf8"));
+        return;
+      }
+      await expect(lines).toMatchFileSnapshot(golden(scenario));
     });
   });
 });

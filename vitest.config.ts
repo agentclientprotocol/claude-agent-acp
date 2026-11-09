@@ -44,14 +44,14 @@ export default defineConfig({
         },
       },
       {
-        // The bridge's ACP v2 tests again, against the native v2 core
-        // (`src/v2-native/`), so both cores are held to them.
+        // The bridge's ACP v2 tests and v2 scenarios again, against the
+        // native v2 core (`src/v2-native/`), so both cores are held to them.
         resolve,
         test: {
           ...shared,
           name: "v2-native-core",
           env: { ...env, V2_CORE_UNDER_TEST: "native" },
-          include: ["src/tests/acp-v2.test.ts"],
+          include: ["src/tests/acp-v2.test.ts", "src/tests/acp-scenarios-v2.test.ts"],
         },
       },
     ],
