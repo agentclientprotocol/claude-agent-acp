@@ -34,6 +34,7 @@ export function makeMockQuery(overrides: Record<string, unknown> = {}) {
     setPermissionMode: async () => {},
     supportedCommands: async () => [],
     mcpServerStatus: async () => [],
+    setMcpServers: async () => ({ added: [], removed: [], errors: {} }),
     getContextUsage: async () => DEFAULT_CONTEXT_USAGE,
     // No ultracode fields: session creation falls back to settings and the
     // model's effort levels, as with a CLI that does not report them.

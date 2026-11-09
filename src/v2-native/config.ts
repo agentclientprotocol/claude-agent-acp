@@ -4,10 +4,15 @@
  * client picks a value, and follows the changes it learns of (an approved
  * plan's mode).
  */
-import { RequestError, type SessionModeState } from "@agentclientprotocol/sdk/unstable";
+import {
+  RequestError,
+  type SessionConfigOption,
+  type SessionModeState,
+} from "@agentclientprotocol/sdk/unstable";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { ModelInfo, PermissionMode, Query } from "@anthropic-ai/claude-agent-sdk";
-import { MODEL_CONFIG_ID } from "../session-model.js";
+import type { SubagentModels } from "../native-subagents.js";
+import { MODEL_CONFIG_ID, modelDisplayName, modelEntryFor } from "../session-model.js";
 import { MODE_CONFIG_ID, SessionModeManager } from "../session-mode.js";
 import { v2ConfigOptions } from "../v2/session.js";
 
@@ -20,7 +25,19 @@ export class SessionConfig {
   ) {}
 
   options(): v2.SessionConfigOption[] {
-    return v2ConfigOptions([
+    return v2ConfigOptions(this.v1Options());
+  }
+
+  /** The entries of the `model` option, for the `model` of a subagent's session. */
+  subagentModels(): SubagentModels {
+    return {
+      entry: (model) => modelEntryFor(this.v1Options(), this.models, model),
+      name: (model) => modelDisplayName(this.models, model),
+    };
+  }
+
+  private v1Options(): SessionConfigOption[] {
+    return [
       SessionModeManager.configOption(this.modes),
       ...(this.models.length > 0
         ? [
@@ -38,7 +55,7 @@ export class SessionConfig {
             },
           ]
         : []),
-    ]);
+    ];
   }
 
   availableModeIds(): string[] {

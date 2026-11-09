@@ -130,7 +130,7 @@ type TaskStarted = {
   prompt?: unknown;
 };
 
-type SubagentIdentity = {
+export type SubagentIdentity = {
   name?: string;
   description?: string;
   prompt?: string;
@@ -2133,7 +2133,7 @@ function isFailedToolCallUpdate(update: AcpSessionNotification["update"]): boole
  * one), a SendMessage call whose message reached no announced child, or a
  * failed SubagentHandback call.
  */
-function unexposedControlFallback(
+export function unexposedControlFallback(
   initial: AcpSessionNotification | undefined,
   terminal: AcpSessionNotification,
   sessionId: string,
@@ -2227,7 +2227,8 @@ function subagentDescription(prompt: unknown, description: unknown): string {
   return "Delegated task";
 }
 
-function subagentIdentity(input: unknown): SubagentIdentity | undefined {
+/** The labels and prompt of a child, from the input of the Agent or Task call that launched it. */
+export function subagentIdentity(input: unknown): SubagentIdentity | undefined {
   if (typeof input !== "object" || input === null || Array.isArray(input)) return undefined;
   const value = input as Record<string, unknown>;
   const identity: SubagentIdentity = {
@@ -2239,7 +2240,7 @@ function subagentIdentity(input: unknown): SubagentIdentity | undefined {
   return Object.values(identity).some(Boolean) ? identity : undefined;
 }
 
-function mergeSubagentIdentity(
+export function mergeSubagentIdentity(
   previous: SubagentIdentity | undefined,
   next: SubagentIdentity,
 ): SubagentIdentity {

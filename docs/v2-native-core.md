@@ -65,24 +65,32 @@ such as one that an interrupt stopped before it ran.
 AIR's draft and restores subagents from history. It follows the subagents RFD, from Claude
 Code's task events (with `forwardSubagentText` and `perTaskStopAffordance`):
 
-| ACP v2                                                 | Claude Code                                                                        |
-| ------------------------------------------------------ | ---------------------------------------------------------------------------------- |
-| child session id                                       | the agent id (`task_id`), the same for every delegation to it                      |
-| `subagent_update` announcement, on the parent's stream | `task_started` of a `local_agent`; the parent is `parent_task_id`, or the root     |
-| the child's traffic                                    | messages whose `parent_tool_use_id` is the Agent call that launched it             |
-| incoming `session_message` in the child                | the first user text of each run: the delegation                                    |
-| `cwd` of the child                                     | the `SubagentStart` hook's `cwd`, when it is not the parent's (such as a worktree) |
-| child `running` / `idle`, mirrored on the parent       | `task_started` (or a `running` patch) to `task_notification`                       |
-| child `requires_action`                                | a permission request whose `agentID` is the child                                  |
-| `session/cancel` of a child                            | `stopTask(agentId)`                                                                |
-| `background` of a session                              | its background subagents, commands (terminals), task tool calls and other tasks    |
-| `terminal/cancel`, `tool_call/cancel`                  | `stopTask` of the listed item's task                                               |
+| ACP v2                                                           | Claude Code                                                                               |
+| ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| child session id                                                 | the agent id (`task_id`), the same for every delegation to it                             |
+| `subagent_update` announcement, running, on the parent           | `task_started` of a `local_agent` and its Agent or Task call, on the session that made it |
+| the parent's outgoing and the child's incoming `session_message` | the prompt of the Agent call (`task_started.prompt`), which the parent is not shown       |
+| the child's reply, on the parent                                 | the completed result of a foreground child's Agent call                                   |
+| the child's traffic, streamed                                    | messages whose `parent_tool_use_id` is the Agent call that launched it                    |
+| `config_option_update` (`model`) of the child                    | the model of the child's response, as the root's `model` entry                            |
+| `cwd` of the child                                               | the `SubagentStart` hook's `cwd`, when it is not the parent's (such as a worktree)        |
+| child `running` / `idle`, mirrored on the parent                 | `task_started` (or a `running` patch) to `task_notification`                              |
+| child `requires_action`                                          | a permission request whose `agentID` is the announced child                               |
+| `session/cancel` of a child                                      | `stopTask(agentId)`                                                                       |
+| `background` of a session                                        | its background subagents, commands (terminals), task tool calls and other tasks           |
+| `terminal/cancel`, `tool_call/cancel`                            | `stopTask` of the listed item's task                                                      |
+| a replayed child (`session/resume` with `replayFrom`)            | the subagent transcripts and metadata (`getSubagentMessages`, `subagent-replay.ts`)       |
 
-A child that its parent waits on (`is_backgrounded: false`) is part of the parent's foreground
-work: its requests block the parent too (`requires_action`), and cancelling the parent stops
-it. A background child is listed in its parent's `background` while it works, and cancelling
-the parent leaves it running. The client can only watch a child and cancel its run: prompt,
-close, resume, delete and config changes on it fail with -32602.
+These are the bridge's rules. A child's messages before its announcement wait for it, and a
+child that ends before it is announced stays unexposed: its Agent call is then shown with its
+final status. A child that its parent waits on (`is_backgrounded` not `true`) is part of the
+parent's foreground work, also before its announcement: its requests block the parent too
+(`requires_action`), and cancelling the parent stops it. A stopped child's unfinished tool
+calls end `cancelled` after its idle, and Claude Code's later results for them are dropped. A
+background child is listed in its parent's `background` while it works, and cancelling the
+parent leaves it running. The client can only watch a child and cancel its run: prompt, close,
+resume, delete and config changes on it fail with -32602. A session started with
+`perTaskStopAffordance: false` in `_meta.claudeCode.options` lists no background work.
 
 ## Layout
 
@@ -91,7 +99,8 @@ close, resume, delete and config changes on it fail with -32602.
   query's messages.
 - `src/v2-native/stream.ts`: the SDK output, and replayed history, as v2 updates.
 - `src/v2-native/tasks.ts`: Claude Code's tasks: subagents as child sessions, and the
-  `background` list of each session (see below).
+  `background` list of each session (see above).
+- `src/v2-native/subagent-replay.ts`: the subagents' histories in a replay.
 - `src/v2-native/permissions.ts`: `canUseTool` as v2 permission requests, on the session of the
   agent that asks.
 - `src/v2-native/config.ts`: the mode and model config options.
@@ -111,6 +120,10 @@ About 2,600 lines in total. The native core shares these with v1 and the bridge:
 - the `background` stamping and the `cancel` advertisement of listed items (`V2Background`)
 - the background command helpers: `backgroundBashTaskFromToolResult`, `withRunningTerminal`,
   `withRunningToolCall`, `BackgroundOutputTail`
+- the bridge's pure subagent helpers (`native-subagents.ts`: `rfdLabels`, `subagentIdentity`,
+  `linkedSessionMessages`, `launchReply`, `unexposedControlFallback`, `childModelOption`,
+  `responseModelEntry`, `rfdEndState`), and the subagent history readers (`subagentHistory`,
+  `readSubagentMessages`, `firstResponseModel`, `replaySubagentTerminalState`)
 
 These pieces were extracted so that both cores use the same code:
 
@@ -149,6 +162,8 @@ These pieces were extracted so that both cores use the same code:
 - Output that comes after `session/cancel`, until the turn's `result`, is still sent: the work is
   still stopping. The bridge drops the output of stopped work.
 - A text block that an interrupt cut short does not get its tail from the consolidated message.
+- `session/cancel` while the session is idle sends Claude Code no interrupt: no foreground work
+  is there to stop. The bridge interrupts.
 
 ## Not served yet
 
@@ -163,9 +178,12 @@ These pieces were extracted so that both cores use the same code:
   - the refusal-fallback dialog
   - MCP OAuth
 - Subagents:
-  - the child's configuration (`config_option_update` from the `SubagentStart` hook)
-  - the incoming view of a SendMessage, which the child's transcript does not show
-  - replaying children's history on resume (`getSubagentMessages`)
+  - the child's configuration from its hooks (mode, effort, agent, `PostModelSwitch`): only its
+    `model` is reported, from its responses
+  - SendMessage and SubagentHandback as session messages: they stay tool calls
+  - a child's tool progress
+  - in a replay, SendMessage deliveries, hand-backs and a child's model changes after its first
+    response
   - a subagent whose parent Claude Code no longer tracks, such as after a restart, stays
     unexposed: its traffic is the root's
 - Reports:

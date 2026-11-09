@@ -46,7 +46,7 @@ import type {
 import { isLoginRequiredText, promptToClaude, type Logger } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
 import { v1PromptRequest } from "../v2/prompt.js";
-import { V2Background } from "../v2/background.js";
+import { V2Background, stateUpdate as currentStateUpdate } from "../v2/background.js";
 import type { V2UpdateTranslator } from "../v2/update-translator.js";
 import type { SessionConfig } from "./config.js";
 import { SessionOutput } from "./stream.js";
@@ -126,6 +126,8 @@ export class NativeSession implements RequestTarget {
     readonly additionalDirectories: readonly string[],
     private readonly connection: SessionConnection,
     private readonly input: Pushable<SDKUserMessage>,
+    /** Whether Claude Code's interrupt spares background tasks (see {@link SessionTasks}). */
+    reportsBackground = true,
   ) {
     this.output = new SessionOutput(
       sessionId,
@@ -142,9 +144,11 @@ export class NativeSession implements RequestTarget {
         logger: connection.logger,
         translator: connection.translator,
         background: this.background,
+        reportsBackground,
         send: (notification) => this.sendNotification(notification),
         rootState: () => this.foregroundState(),
         foregroundRequestsChanged: () => this.reportState(),
+        models: () => this.config.subagentModels(),
         stopTask: async (taskId) => {
           await this.query?.stopTask(taskId);
         },
@@ -152,8 +156,6 @@ export class NativeSession implements RequestTarget {
       this.output,
     );
     this.tasks.hostRequest = (request, signal) => connection.requestPermission(request, signal);
-    // The session reports its background work: every state carries a list.
-    this.background.changed({ sessionId, items: [], state: undefined });
   }
 
   /** Starts reading the query. Called once, after its initialization. */
@@ -175,16 +177,17 @@ export class NativeSession implements RequestTarget {
   }
 
   /**
-   * What `session/resume` sends before its response: the children with their
-   * current states, the current update of each listed item, then the
-   * session's state, with its list.
+   * What `session/resume` sends before its response: the listed children
+   * with their current states, the current update of each listed item, then
+   * the session's state, with its list. A snapshot is no new completion, so
+   * its idle has no stop reason.
    */
   resumeSnapshot(): v2.UpdateSessionNotification[] {
     return [
       ...this.tasks.currentState(),
       this.background.stamp({
         sessionId: this.sessionId,
-        update: this.stateUpdate(this.foregroundState()),
+        update: currentStateUpdate(this.foregroundState()),
       }),
     ];
   }
@@ -541,7 +544,11 @@ export class NativeSession implements RequestTarget {
     // v2 asks for a final status of the tool calls of stopped work before its idle.
     const outcome = idleOutcome(this.lastResult, this.cancelledWork).stopReason;
     if (outcome === "cancelled" || outcome === "error") {
-      this.output.finishUnfinished(outcome === "cancelled" ? "cancelled" : "failed");
+      // A tool call whose task goes on in the background is not part of the work.
+      this.output.finishUnfinished(
+        outcome === "cancelled" ? "cancelled" : "failed",
+        this.tasks.backgroundCalls(this.sessionId),
+      );
     }
     this.foreground = false;
     this.reportState();
