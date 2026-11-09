@@ -2263,6 +2263,59 @@ describe("ACP v2 prompts", () => {
     ]);
   });
 
+  it("removes the checklist and the approved plan on a conversation reset", async () => {
+    scriptTurns(
+      async function* (options) {
+        const todoWrite = assistantText(options, "", "msg_todo");
+        todoWrite.message.content = [
+          {
+            type: "tool_use",
+            id: "toolu_todo",
+            name: "TodoWrite",
+            input: { todos: [{ content: "Do X", status: "pending", activeForm: "Doing X" }] },
+          },
+        ] as never;
+        yield todoWrite;
+        yield result(options);
+      },
+      async function* (options) {
+        yield {
+          type: "conversation_reset",
+          new_conversation_id: randomUUID(),
+          uuid: randomUUID(),
+          session_id: options.sessionId,
+        };
+        yield result(options);
+      },
+    );
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("plan") });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("/clear") });
+      await vi.waitFor(() => expect(client.updates("plan_removed")).toHaveLength(2));
+      await client.authUpdate(1);
+    });
+
+    expect(
+      client.sessionUpdates
+        .map(({ update }) => update)
+        .filter(({ sessionUpdate }) => sessionUpdate.startsWith("plan_")),
+    ).toEqual([
+      {
+        sessionUpdate: "plan_update",
+        plan: {
+          type: "items",
+          planId: "plan",
+          entries: [{ content: "Do X", status: "pending", priority: "medium" }],
+        },
+      },
+      { sessionUpdate: "plan_removed", planId: "plan" },
+      { sessionUpdate: "plan_removed", planId: "plan-mode" },
+    ]);
+  });
+
   it("reports Claude Code's warnings as live notices", async () => {
     scriptTurns(async function* (options) {
       yield {
@@ -2854,6 +2907,34 @@ describe("ACP v2 prompts", () => {
     expect(atClose).toEqual(["user_message", "running", "agent_message_chunk", "idle cancelled"]);
   });
 
+  it.each([
+    ["Edit", "workflow-agent"],
+    ["Write", undefined],
+  ] as const)("does not publish a preview for a hook-only %s", async (name, agentId) => {
+    const file = path.join(cwd, "app.ts");
+    await writeFile(file, "const value = 1;\n");
+    const input =
+      name === "Edit"
+        ? { file_path: file, old_string: "const value = 1;", new_string: "const value = 2;" }
+        : { file_path: file, content: "const value = 2;\n" };
+    scriptTurns(async function* (options) {
+      // Workflow agents run these hooks without streaming their tool uses
+      // or results to the root query.
+      await previewToolUse(options, { id: "workflow-edit", name, input, agentId });
+      await writeFile(file, "const value = 2;\n");
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+    });
+
+    expect(client.updates("tool_call_update")).toEqual([]);
+  });
+
   // Hook callbacks bypass the SDK's message queue, so the hook can also come
   // before the agent has seen the streamed tool_use.
   it.each([
@@ -2888,27 +2969,19 @@ describe("ACP v2 prompts", () => {
         };
         // Claude Code runs the PreToolUse hooks and waits for them; no
         // permission request comes for an auto-approved Edit.
-        const preToolUse = async () => {
-          for (const matcher of options.hooks?.PreToolUse ?? []) {
-            for (const hook of matcher.hooks) {
-              await hook(
-                {
-                  hook_event_name: "PreToolUse",
-                  session_id: options.sessionId!,
-                  cwd,
-                  tool_name: "Edit",
-                  tool_input: input,
-                  tool_use_id: "toolu_edit",
-                } as never,
-                "toolu_edit",
-                { signal: new AbortController().signal },
-              );
-            }
-          }
-        };
+        const preToolUse = () => previewToolUse(options, { id: "toolu_edit", name: "Edit", input });
         if (hookFirst) await preToolUse();
-        yield toolUse;
+        yield stream(options, {
+          type: "message_start",
+          message: { id: "msg_edit", role: "assistant", content: [], usage: {} },
+        });
+        yield stream(options, {
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "tool_use", id: "toolu_edit", name: "Edit", input: {} },
+        });
         if (!hookFirst) await preToolUse();
+        yield toolUse;
         // The Edit runs.
         await writeFile(file, "line 1\nconst value = 2;\nline 3\n");
         yield {
@@ -5124,22 +5197,7 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
         session_id: options.sessionId,
       };
       // Claude Code runs the PreToolUse hooks, then asks for the permission.
-      for (const matcher of options.hooks?.PreToolUse ?? []) {
-        for (const hook of matcher.hooks) {
-          await hook(
-            {
-              hook_event_name: "PreToolUse",
-              session_id: options.sessionId!,
-              cwd,
-              tool_name: "Write",
-              tool_input: input,
-              tool_use_id: "toolu_late",
-            } as never,
-            "toolu_late",
-            { signal: new AbortController().signal },
-          );
-        }
-      }
+      await previewToolUse(options, { id: "toolu_late", name: "Write", input });
       decision = await options.canUseTool!("Write", input, {
         signal: new AbortController().signal,
         suggestions: [],
@@ -6308,6 +6366,56 @@ describe("ACP v2 requests that subagents make", () => {
         "agent-1 idle []",
         "root idle []",
       ]);
+    });
+
+    it("starts a subagent's task without a tool call on the subagent's stream, and lists it there", async () => {
+      const workflow = {
+        task_id: "wf1",
+        task_type: "local_workflow",
+        description: "Review",
+        parent_task_id: "agent-1",
+      };
+      scriptTurns(async function* (options) {
+        yield agentUse(options);
+        yield level(options, [agent1]);
+        yield taskStarted(options, "agent-1", { prompt: "Look around", is_backgrounded: true });
+        yield result(options);
+        yield idleState(options);
+        yield level(options, [agent1, workflow]);
+        yield {
+          type: "system",
+          subtype: "task_started",
+          ...workflow,
+          uuid: randomUUID(),
+          session_id: options.sessionId,
+        };
+      });
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+        await vi.waitFor(() =>
+          expect(
+            client.sessionUpdates
+              .filter(
+                ({ sessionId, update }) =>
+                  sessionId === "agent-1" && update.sessionUpdate === "state_update",
+              )
+              .at(-1)?.update,
+          ).toMatchObject({ background: [{ type: "tool_call", toolCallId: "task_wf1" }] }),
+        );
+      });
+
+      expect(
+        client.sessionUpdates.filter(
+          ({ update }) =>
+            update.sessionUpdate === "tool_call_update" && update.toolCallId === "task_wf1",
+        )[0],
+      ).toMatchObject({
+        sessionId: "agent-1",
+        update: { title: "Review", kind: "other", status: "in_progress" },
+      });
     });
 
     it("keeps an idle subagent listed while its own command runs in the background", async () => {
@@ -7893,6 +8001,210 @@ describe("ACP v2 terminal of a command in the background", () => {
         ).toEqual(["pending", "in_progress"]);
       });
 
+      it("updates a workflow card from SDK progress before launch and while idle, and keeps it on resume", async () => {
+        const finish = Promise.withResolvers<void>();
+        const progress = (options: Options, fields: Record<string, unknown> = {}) =>
+          taskEvent(options, "task_progress", {
+            task_id: "wf1",
+            tool_use_id: "toolu_wf",
+            description: "Probe: probe",
+            summary: "Run a probe",
+            last_tool_name: "probe",
+            usage: { total_tokens: 0, tool_uses: 0, duration_ms: 29 },
+            ...fields,
+          });
+        scriptTurns(async function* (options) {
+          yield progress(options, { task_id: "unknown" });
+          yield toolUseMessage(options, "toolu_wf", "Workflow", { script: "probe" });
+          yield level(options, [workflow]);
+          yield taskEvent(options, "task_started", { ...workflow, tool_use_id: "toolu_wf" });
+          // Observed on CLI 2.1.319: workflow progress can precede the launch
+          // result. last_tool_name is the active agent's label, not a tool.
+          yield progress(options);
+          yield {
+            ...toolResultMessage(options, "toolu_wf", { content: "Workflow launched." }),
+            tool_use_result: {
+              status: "async_launched",
+              taskId: "wf1",
+              taskType: "local_workflow",
+            },
+          };
+          yield result(options);
+          yield idleState(options);
+          yield taskEvent(options, "task_updated", { task_id: "wf1", patch: { status: "paused" } });
+          yield progress(options, {
+            summary: undefined,
+            last_tool_name: undefined,
+            usage: { total_tokens: 4003, tool_uses: 2, duration_ms: 1494 },
+          });
+          yield level(options, [workflow]);
+          yield progress(options, {
+            usage: { total_tokens: 4003, tool_uses: 2, duration_ms: 1494 },
+          });
+          await finish.promise;
+          yield taskEvent(options, "task_updated", {
+            task_id: "wf1",
+            patch: { status: "completed" },
+          });
+          yield progress(options, { description: "Late progress" });
+          yield level(options, []);
+        });
+        const body = (tokens: string, tools: number, seconds: number) => [
+          {
+            type: "content",
+            content: {
+              type: "text",
+              text: `Run a probe\n\nLast activity: probe\n\n${tokens} tokens · ${tools} tool calls · ${seconds}s`,
+            },
+          },
+        ];
+        let resumed: v2.SessionUpdate[] = [];
+        let live: v2.SessionUpdate[] = [];
+        const client = await promptUntil(
+          "idle end_turn [toolu_wf]",
+          async (agent, sessionId, client) => {
+            await vi.waitFor(() =>
+              expect(client.updates("tool_call_update")).toContainEqual(
+                expect.objectContaining({ content: body("4,003", 2, 1) }),
+              ),
+            );
+            live = client.updates("tool_call_update");
+            const before = client.sessionUpdates.length;
+            await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+            resumed = client.sessionUpdates.slice(before).map(({ update }) => update);
+            finish.resolve();
+            await vi.waitFor(() => expect(backgroundTrace(client)).toContain("idle []"));
+          },
+        );
+
+        expect(
+          live.filter(
+            (update) =>
+              update.sessionUpdate === "tool_call_update" &&
+              update.title === "Workflow: Probe: probe",
+          ),
+        ).toEqual([
+          {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "toolu_wf",
+            title: "Workflow: Probe: probe",
+            content: body("0", 0, 0),
+          },
+          {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "toolu_wf",
+            title: "Workflow: Probe: probe",
+            content: body("4,003", 2, 1),
+          },
+        ]);
+        expect(resumed[0]).toMatchObject({
+          toolCallId: "toolu_wf",
+          title: "Workflow: Probe: probe",
+          content: body("4,003", 2, 1),
+          status: "paused",
+        });
+        expect(
+          client
+            .updates("tool_call_update")
+            .flatMap((update) => (update.status ? [update.status] : [])),
+        ).toEqual(["pending", "in_progress", "paused", "paused", "completed"]);
+        const calls = client.updates("tool_call_update");
+        const completed = calls.findIndex((update) => update.status === "completed");
+        expect(
+          calls.slice(completed + 1).filter((update) => update.title || update.content),
+        ).toEqual([]);
+      });
+
+      it("lists a workflow's phases and agents on its card, and keeps them when a report has none", async () => {
+        // As CLI 2.1.319 sends it, trimmed of the fields the card ignores.
+        const snapshot = [
+          { type: "workflow_phase", index: 1, title: "Count" },
+          { type: "workflow_phase", index: 2, title: "Sum" },
+          {
+            type: "workflow_agent",
+            index: 1,
+            label: "two",
+            phaseIndex: 1,
+            phaseTitle: "Count",
+            agentId: "af3724ea06eadb5dd",
+            model: "claude-haiku-5-5",
+            state: "done",
+            attempt: 1,
+            promptPreview: "Reply with only the number 2.",
+            tokens: 14629,
+            toolCalls: 0,
+            durationMs: 1329,
+            resultPreview: "2",
+          },
+          {
+            type: "workflow_agent",
+            index: 2,
+            label: "three",
+            phaseIndex: 1,
+            phaseTitle: "Count",
+            model: "claude-haiku-5-5",
+            state: "start",
+            lastToolName: "Bash",
+            lastToolSummary: "echo 3",
+          },
+        ];
+        const progress = (options: Options, fields: Record<string, unknown>) =>
+          taskEvent(options, "task_progress", {
+            task_id: "wf1",
+            tool_use_id: "toolu_wf",
+            description: "Count: three",
+            ...fields,
+          });
+        scriptTurns(async function* (options) {
+          yield toolUseMessage(options, "toolu_wf", "Workflow", { script: "probe" });
+          yield level(options, [workflow]);
+          yield taskEvent(options, "task_started", { ...workflow, tool_use_id: "toolu_wf" });
+          yield {
+            ...toolResultMessage(options, "toolu_wf", { content: "Workflow launched." }),
+            tool_use_result: {
+              status: "async_launched",
+              taskId: "wf1",
+              taskType: "local_workflow",
+            },
+          };
+          yield progress(options, {
+            usage: { total_tokens: 14629, tool_uses: 0, duration_ms: 1343 },
+            workflow_progress: snapshot,
+          });
+          // The CLI leaves the snapshot out of some reports.
+          yield progress(options, {
+            usage: { total_tokens: 29282, tool_uses: 1, duration_ms: 2806 },
+          });
+          yield result(options);
+          yield idleState(options);
+        });
+        const list = [
+          "**Count**",
+          "- two: done · 14,629 tokens · 0 tool calls · 1s",
+          "- three: running · Bash: echo 3",
+          "",
+          "**Sum**",
+          "- not started",
+        ].join("\n");
+        const client = await promptUntil("idle end_turn [toolu_wf]");
+
+        expect(
+          client
+            .updates("tool_call_update")
+            .flatMap((update) => (update.content ? [update.content] : []))
+            .slice(-2),
+        ).toEqual(
+          ["14,629 tokens · 0 tool calls · 1s", "29,282 tokens · 1 tool calls · 2s"].map(
+            (usage) => [
+              {
+                type: "content",
+                content: { type: "text", text: `Count: three\n\n${usage}\n\n${list}` },
+              },
+            ],
+          ),
+        );
+      });
+
       it("sends each listed call's current state before the state snapshot of session/resume", async () => {
         scriptTurns(async function* (options) {
           yield* monitorStarts(options);
@@ -7931,31 +8243,126 @@ describe("ACP v2 terminal of a command in the background", () => {
         ]);
       });
 
-      it("lists a task whose call returned before the task started as a _claude/task item", async () => {
-        scriptTurns(async function* (options) {
-          yield toolUseMessage(options, "toolu_mcp", "mcp__ci__watch", { job: "build" });
-          yield toolResultMessage(options, "toolu_mcp", { content: "Watching the build." });
-          // The call's task joins the level and starts after the call returned,
-          // so the call ended and cannot be listed.
-          const task = { task_id: "mcp1", task_type: "mcp_task", description: "Watch the build" };
-          yield level(options, [task]);
-          yield taskEvent(options, "task_started", { ...task, tool_use_id: "toolu_mcp" });
-          yield result(options);
-          yield idleState(options);
-        });
-        const client = await promptUntil("idle end_turn [_claude/task]");
+      /** The adapter's own call for the task `mcp1`, which an MCP call started
+       *  but which started only after that call returned with its final status. */
+      async function* lateTaskStarts(options: Options) {
+        yield toolUseMessage(options, "toolu_mcp", "mcp__ci__watch", { job: "build" });
+        yield toolResultMessage(options, "toolu_mcp", { content: "Watching the build." });
+        const task = { task_id: "mcp1", task_type: "mcp_task", description: "Watch the build" };
+        yield level(options, [task]);
+        yield taskEvent(options, "task_started", { ...task, tool_use_id: "toolu_mcp" });
+        yield result(options);
+        yield idleState(options);
+      }
 
-        expect(client.updates("state_update").at(-1)).toMatchObject({
-          background: [{ type: "_claude/task", taskId: "mcp1", description: "Watch the build" }],
+      it("starts a tool call for a task whose call returned before the task started, and lists it", async () => {
+        scriptTurns(lateTaskStarts);
+        const client = await promptUntil("idle end_turn [task_mcp1]");
+
+        const updates = client.sessionUpdates.map(({ update }) => update);
+        const started = updates.findIndex(
+          (update) =>
+            update.sessionUpdate === "tool_call_update" && update.toolCallId === "task_mcp1",
+        );
+        const listed = updates.findIndex(
+          (update) =>
+            update.sessionUpdate === "state_update" &&
+            JSON.stringify(update).includes('"task_mcp1"'),
+        );
+        expect(updates[started]).toMatchObject({
+          title: "Watch the build",
+          kind: "other",
+          status: "in_progress",
         });
+        expect(started).toBeLessThan(listed);
+        // The call that started the task keeps its final status.
+        expect(
+          updates
+            .filter(
+              (update) =>
+                update.sessionUpdate === "tool_call_update" &&
+                update.toolCallId === "toolu_mcp" &&
+                update.status !== undefined,
+            )
+            .map((update) => (update as { status?: unknown }).status)
+            .at(-1),
+        ).toBe("completed");
+      });
+
+      it("stops such a task on tool_call/cancel, and reports its call cancelled", async () => {
+        const stopped = Promise.withResolvers<string>();
+        sdk.stopTask = async (taskId) => stopped.resolve(taskId);
+        scriptTurns(async function* (options) {
+          yield* lateTaskStarts(options);
+          await stopped.promise;
+          yield taskEvent(options, "task_notification", {
+            task_id: "mcp1",
+            tool_use_id: "toolu_mcp",
+            status: "stopped",
+            summary: "Stopped",
+          });
+          yield level(options, []);
+        });
+        const client = await promptUntil(
+          "idle end_turn [task_mcp1]",
+          async (agent, sessionId, client) => {
+            await expect(
+              agent.request(v2.methods.agent.toolCall.cancel, {
+                sessionId,
+                toolCallId: "task_mcp1",
+              }),
+            ).resolves.toEqual({});
+            expect(await stopped.promise).toBe("mcp1");
+            await vi.waitFor(() => expect(backgroundTrace(client)).toContain("idle []"));
+          },
+        );
+
+        const statuses = client.sessionUpdates.flatMap(({ update }) =>
+          update.sessionUpdate === "tool_call_update" &&
+          update.toolCallId === "task_mcp1" &&
+          update.status
+            ? [String(update.status)]
+            : [],
+        );
+        expect(statuses).toEqual(["in_progress", "cancelled"]);
+      });
+
+      it("sends such a task's call before the state snapshot of session/resume", async () => {
+        scriptTurns(lateTaskStarts);
+        let resumed: v2.SessionUpdate[] = [];
+        await promptUntil("idle end_turn [task_mcp1]", async (agent, sessionId, client) => {
+          const before = client.sessionUpdates.length;
+          await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+          resumed = client.sessionUpdates.slice(before).map(({ update }) => update);
+        });
+
+        expect(resumed).toEqual([
+          expect.objectContaining({
+            sessionUpdate: "tool_call_update",
+            toolCallId: "task_mcp1",
+            title: "Watch the build",
+            kind: "other",
+            status: "in_progress",
+          }),
+          {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "task_mcp1",
+            capabilities: { cancel: {} },
+          },
+          {
+            sessionUpdate: "state_update",
+            state: "idle",
+            background: [{ type: "tool_call", toolCallId: "task_mcp1" }],
+          },
+        ]);
       });
 
       // No tool call started these, such as tasks that a hook started.
       it.each([
         {
           task: workflow,
-          trace: ["running []", "running [_claude/task]", "idle end_turn [_claude/task]"],
-          background: [{ type: "_claude/task", taskId: "wf1", description: "Review" }],
+          trace: ["running []", "running [task_wf1]", "idle end_turn [task_wf1]"],
+          background: [{ type: "tool_call", toolCallId: "task_wf1" }],
         },
         // A watcher Claude Code started by itself is housekeeping.
         {
@@ -7964,7 +8371,7 @@ describe("ACP v2 terminal of a command in the background", () => {
           background: [],
         },
       ])(
-        "lists a $task.task_type task without such a call unless it is ambient",
+        "starts and lists a tool call for a $task.task_type task without such a call unless it is ambient",
         async ({ task, trace, background }) => {
           scriptTurns(async function* (options) {
             yield level(options, [task]);
@@ -8172,6 +8579,13 @@ describe("ACP v2 session translation", () => {
       sessionUpdate: "plan_update",
       plan: { type: "items", planId: "plan", entries },
       _meta: meta,
+    });
+  });
+
+  it("reports an empty legacy plan as the removal of the session's v2 plan", () => {
+    expect(v2SessionUpdate({ sessionUpdate: "plan", entries: [] })).toEqual({
+      sessionUpdate: "plan_removed",
+      planId: "plan",
     });
   });
 
@@ -9199,3 +9613,27 @@ describe("ACP v2 Remote Control", () => {
     ]);
   });
 });
+
+async function previewToolUse(
+  options: Options,
+  tool: { id: string; name: string; input: unknown; agentId?: string },
+): Promise<void> {
+  for (const matcher of options.hooks?.PreToolUse ?? []) {
+    for (const hook of matcher.hooks) {
+      await hook(
+        {
+          hook_event_name: "PreToolUse",
+          session_id: options.sessionId!,
+          transcript_path: path.join(cwd, "session.jsonl"),
+          cwd,
+          tool_name: tool.name,
+          tool_input: tool.input,
+          tool_use_id: tool.id,
+          ...(tool.agentId ? { agent_id: tool.agentId } : {}),
+        },
+        tool.id,
+        { signal: new AbortController().signal },
+      );
+    }
+  }
+}

@@ -95,6 +95,7 @@ import {
   toGoalSnapshot,
 } from "./goal-extension.js";
 import { blobResourceToClaude } from "./blob-resources.js";
+import { checklistPlanUpdate, resetPlanUpdates } from "./plans.js";
 import { PromptSuggestions } from "./prompt-suggestions.js";
 import { sanitizeTitle, SessionTitles } from "./session-titles.js";
 import {
@@ -368,6 +369,7 @@ import {
   SessionModeManager,
 } from "./session-mode.js";
 import {
+  aliasResumedModelRow,
   applyAvailableModelsAllowlist,
   getAvailableModels,
   MODEL_CONFIG_ID,
@@ -3581,7 +3583,7 @@ export class ClaudeAcpAgent {
     if (!entries) return;
     await this.client.sessionUpdate({
       sessionId,
-      update: { sessionUpdate: "plan", entries },
+      update: checklistPlanUpdate(entries, this.clientCapabilities?.plan != null),
     });
   }
 
@@ -7670,7 +7672,13 @@ export class ClaudeAcpAgent {
             session.toolCallFields?.clear();
             clearHookCallbacks(params.sessionId);
             session.taskState.clear();
-            await this.publishTaskPlan(params.sessionId, session.taskState);
+            forgetPublishedTaskPlan(session.taskState);
+            for (const update of resetPlanUpdates(
+              this.clientCapabilities?.plan != null,
+              this.toolCallCapabilities.air.client,
+            )) {
+              await this.client.sessionUpdate({ sessionId: params.sessionId, update });
+            }
             // A reset mounts a fresh transcript (`new_conversation_id`), so our
             // cached title no longer describes the session: drop it and
             // re-evaluate at the next turn-end.
@@ -10860,14 +10868,21 @@ export class ClaudeAcpAgent {
       // configured. Managed `deniedModels` drops entries the CLI would refuse.
       const settingsAvailableModels = settingsManager.getSettings().availableModels;
       const settingsModelOverrides = settingsManager.getSettings().modelOverrides;
+      const resumedModel = await resumedModelHint;
+      // A resumed Fable 5.2 session lists Fable 5.2 as `fable`, as a new
+      // session does (see `aliasResumedModelRow`).
+      const sdkModels = aliasResumedModelRow(
+        initializationResult.models,
+        creationOpts.resume !== undefined ? resumedModel : undefined,
+      );
       const settingsAllowedModels = Array.isArray(settingsAvailableModels)
         ? applyAvailableModelsAllowlist(
-            initializationResult.models,
+            sdkModels,
             settingsAvailableModels,
             settingsModelOverrides,
             settingsManager.getManagedDeniedModels(),
           )
-        : initializationResult.models;
+        : sdkModels;
       // Then keep only the models the `providers/set` gateway listed.
       const allowedModels = resolvedProvider?.listedModels
         ? narrowToGatewayModels(
@@ -10885,7 +10900,7 @@ export class ClaudeAcpAgent {
         this.logger,
         creationOpts.resume !== undefined,
         sessionId,
-        await resumedModelHint,
+        resumedModel,
         resolvedProvider?.listedModels !== undefined,
       );
       timing.phase("models");
@@ -10895,7 +10910,7 @@ export class ClaudeAcpAgent {
       // `withCurrentModelInfo`).
       const { allowlistedModelInfo, currentModelInfo, modelInfos } = withCurrentModelInfo(
         allowedModels,
-        initializationResult.models,
+        sdkModels,
         models.currentModelId,
       );
       const { modes, autoModeFallbackWarningPending } = await this.sessionModes.initialize({
@@ -12077,10 +12092,10 @@ export function toAcpNotifications(
         if (chunk.name === "TodoWrite") {
           // @ts-expect-error - sometimes input is empty object or undefined
           if (Array.isArray(chunk.input?.todos)) {
-            update = {
-              sessionUpdate: "plan",
-              entries: planEntries(chunk.input as { todos: ClaudePlanEntry[] }),
-            };
+            update = checklistPlanUpdate(
+              planEntries(chunk.input as { todos: ClaudePlanEntry[] }),
+              options?.clientCapabilities?.plan != null,
+            );
           }
         } else if (isTaskTool(chunk.name)) {
           // Task* tool_use is suppressed; the plan update is emitted at
@@ -12315,7 +12330,9 @@ export function toAcpNotifications(
           const entries = shouldEmitTaskPlan
             ? changedTaskPlanEntries(taskState, renderer.capabilities.air.client)
             : undefined;
-          if (entries) update = { sessionUpdate: "plan", entries };
+          if (entries) {
+            update = checklistPlanUpdate(entries, options?.clientCapabilities?.plan != null);
+          }
         } else if (toolUse.name !== "TodoWrite") {
           // A command sends its output first, then the exit and the status.
           const [finalUpdate, ...rest] = renderer
