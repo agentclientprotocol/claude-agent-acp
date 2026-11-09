@@ -106,7 +106,12 @@ import {
   toGoalSnapshot,
 } from "./goal-extension.js";
 import { blobResourceToClaude } from "./blob-resources.js";
-import { checklistPlanUpdate, resetPlanUpdates } from "./plans.js";
+import {
+  checklistPlanUpdate,
+  resetPlanUpdates,
+  todoWritePlanUpdate,
+  type SubagentChecklists,
+} from "./plans.js";
 import { promptSuggestionsMeta, promptSuggestionText } from "./prompt-suggestions.js";
 import { sanitizeTitle, SessionTitles } from "./session-titles.js";
 import {
@@ -1026,7 +1031,12 @@ type Turn = {
  *  while the CLI starts. The session record then takes the same objects. */
 type ReplayState = Pick<
   Session,
-  "cwd" | "taskState" | "forwardSubagentText" | "messageIdToUuid" | "sessionFailureState"
+  | "cwd"
+  | "taskState"
+  | "subagentChecklists"
+  | "forwardSubagentText"
+  | "messageIdToUuid"
+  | "sessionFailureState"
 >;
 
 /** A replay that runs before its session record exists. */
@@ -1341,6 +1351,9 @@ export type Session = {
   /** Accumulated task list for the session, keyed by task ID. Task IDs are
    *  per-session, so this state must not be shared across sessions. */
   taskState: TaskState;
+  /** The subagent TodoWrite checklists that the client holds in this session,
+   *  which a conversation reset removes. */
+  subagentChecklists: SubagentChecklists;
   /** Caches `tool_use` blocks by id so the matching `tool_result` can recover
    *  the tool name/input when mapping it to a `tool_call_update`. Per-session
    *  (tool_use ids are only unique within a session) and pruned at
@@ -3165,6 +3178,7 @@ export class ClaudeAcpAgent {
       state: {
         cwd: params.cwd,
         taskState: new Map(),
+        subagentChecklists: new Set(),
         forwardSubagentText: this.forwardsSubagentText(params._meta),
         messageIdToUuid: new Map(),
         sessionFailureState: createSessionFailureState(),
@@ -5613,6 +5627,7 @@ export class ClaudeAcpAgent {
           parentToolUseId: message.parent_tool_use_id,
           cwd: session.cwd,
           taskState: session.taskState,
+          subagentChecklists: session.subagentChecklists,
           emittedToolCalls: session.emittedToolCalls,
           toolCallFields: toolCallFieldsOf(session),
           messageId: messageIdForGrouping(message),
@@ -8104,6 +8119,7 @@ export class ClaudeAcpAgent {
                 toolCallCapabilities: this.toolCallCapabilities,
                 cwd: session.cwd,
                 taskState: session.taskState,
+                subagentChecklists: session.subagentChecklists,
                 emittedToolCalls: session.emittedToolCalls,
                 toolCallFields: toolCallFieldsOf(session),
                 messageId: currentStreamMessageId,
@@ -8419,6 +8435,7 @@ export class ClaudeAcpAgent {
                     parentToolUseId: message.parent_tool_use_id,
                     cwd: session.cwd,
                     taskState: session.taskState,
+                    subagentChecklists: session.subagentChecklists,
                     messageId: messageIdForGrouping(message),
                   },
                 )) {
@@ -8619,6 +8636,7 @@ export class ClaudeAcpAgent {
                 parentToolUseId: message.parent_tool_use_id,
                 cwd: session.cwd,
                 taskState: session.taskState,
+                subagentChecklists: session.subagentChecklists,
                 emittedToolCalls: session.emittedToolCalls,
                 toolCallFields: toolCallFieldsOf(session),
                 messageId: messageIdForGrouping(message),
@@ -8754,6 +8772,7 @@ export class ClaudeAcpAgent {
             for (const update of resetPlanUpdates(
               this.clientCapabilities?.plan != null,
               this.toolCallCapabilities.air.client,
+              session.subagentChecklists,
             )) {
               await this.client.sessionUpdate({ sessionId: params.sessionId, update });
             }
@@ -10119,6 +10138,7 @@ export class ClaudeAcpAgent {
           toolCallCapabilities: this.toolCallCapabilities,
           cwd: replayState()?.cwd,
           taskState: replayState()?.taskState,
+          subagentChecklists: replayState()?.subagentChecklists,
           messageId: replayMessageId,
           parentToolUseId,
         },
@@ -12770,6 +12790,7 @@ export class ClaudeAcpAgent {
         contextWindowAuthoritative: seededWindow.authoritative,
         providerCacheKey,
         taskState,
+        subagentChecklists: creationOpts.replayState?.subagentChecklists ?? new Set(),
         toolUseCache: {},
         emittedToolCalls: new Set(),
         eagerToolCallSessions: new Map(),
@@ -14245,6 +14266,9 @@ export function toAcpNotifications(
     parentToolUseId?: string | null;
     cwd?: string;
     taskState?: TaskState;
+    // The subagent TodoWrite checklists that the client holds in the session.
+    // Mutated in place.
+    subagentChecklists?: SubagentChecklists;
     // Tracks tool_use ids already emitted as a `tool_call` so a permission
     // request (which emits the tool_call eagerly) and the streamed tool_use
     // chunk don't both emit one — whichever arrives second emits a
@@ -14374,10 +14398,14 @@ export function toAcpNotifications(
         if (chunk.name === "TodoWrite") {
           // @ts-expect-error - sometimes input is empty object or undefined
           if (Array.isArray(chunk.input?.todos)) {
-            update = checklistPlanUpdate(
-              planEntries(chunk.input as { todos: ClaudePlanEntry[] }),
-              options?.clientCapabilities?.plan != null,
-            );
+            update = todoWritePlanUpdate(planEntries(chunk.input as { todos: ClaudePlanEntry[] }), {
+              planOperations: options?.clientCapabilities?.plan != null,
+              parentToolUseId: options?.parentToolUseId,
+              // With native subagent sessions, an update of a subagent goes
+              // to the subagent's session (see NativeSubagentRuntime).
+              childSessions: clientSupportsSubagents(options?.clientCapabilities),
+              shown: options?.subagentChecklists,
+            });
           }
         } else if (isTaskTool(chunk.name)) {
           // Task* tool_use is suppressed; the plan update is emitted at
@@ -14716,6 +14744,7 @@ export function streamEventToAcpNotifications(
     toolCallCapabilities?: ToolCallClientCapabilities;
     cwd?: string;
     taskState?: TaskState;
+    subagentChecklists?: SubagentChecklists;
     emittedToolCalls?: Set<string>;
     toolCallFields?: ToolCallFieldTracker;
     messageId?: string;
@@ -14731,6 +14760,7 @@ export function streamEventToAcpNotifications(
     parentToolUseId: message.parent_tool_use_id,
     cwd: options?.cwd,
     taskState: options?.taskState,
+    subagentChecklists: options?.subagentChecklists,
     emittedToolCalls: options?.emittedToolCalls,
     toolCallFields: options?.toolCallFields,
     messageId: options?.messageId,
