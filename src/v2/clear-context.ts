@@ -149,9 +149,11 @@ export class ClearContext {
     return this.continuation !== undefined && !this.continuation.planStarted;
   }
 
-  /** Claude Code took in the prompt `uuid`. */
-  promptStarted(uuid: string): void {
-    if (this.continuation?.planUuid === uuid) this.continuation.planStarted = true;
+  /** Claude Code took in the prompt `uuid`. Returns whether it is the plan's prompt. */
+  promptStarted(uuid: string): boolean {
+    if (this.continuation?.planUuid !== uuid) return false;
+    this.continuation.planStarted = true;
+    return true;
   }
 
   /** Whether `uuid` is one of the adapter's prompts for the fresh context: the client gets no `user_message`. */

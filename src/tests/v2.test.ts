@@ -145,6 +145,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         rewindFiles: fake.rewindFiles,
         mcpServerStatus: async () => sdk.mcpServers,
         ...(sdk.enableRemoteControl ? { enableRemoteControl: sdk.enableRemoteControl } : {}),
+        setMcpServers: async () => ({ added: [], removed: [], errors: {} }),
         // A server that needs OAuth: Claude Code returns its authorization URL.
         mcpAuthenticate: async () => ({
           authUrl: "https://mcp.example.com/authorize",
@@ -671,6 +672,66 @@ describe("ACP v2 core", () => {
         const restarts = (agents[0] as unknown as { restarts: { setups: Map<string, unknown> } })
           .restarts;
         expect(restarts.setups.has(response.sessionId)).toBe(false);
+      });
+    });
+
+    describe("MCP OAuth", () => {
+      const linear = { type: "http" as const, name: "linear", url: "https://mcp.example.com/mcp" };
+      /** A client that leaves each OAuth elicitation open until the agent withdraws it. */
+      const oauthClient = () => {
+        const withdrawn: number[] = [];
+        const client = v2Client({
+          answerElicitation: (_, signal) =>
+            new Promise((resolve) =>
+              signal.addEventListener("abort", () => {
+                withdrawn.push(client.elicitations.length);
+                resolve({ action: "cancel" });
+              }),
+            ),
+        });
+        return { client, withdrawn };
+      };
+      const initialize = (agent: v2.ClientContext) =>
+        agent.request(v2.methods.agent.initialize, {
+          protocolVersion: v2.PROTOCOL_VERSION,
+          info: { name: "v2-test-client", version: "1.0.0" },
+          capabilities: { elicitation: { url: {} } },
+        });
+
+      it("starts OAuth again on the new query of a restart that withdrew it", async () => {
+        // The server stays `needs-auth`: the user has not signed in yet.
+        sdk.mcpServers = [{ name: "linear", status: "needs-auth" }];
+        const { client, withdrawn } = oauthClient();
+        await client.connect(async (agent) => {
+          await initialize(agent);
+          await agent.request(v2.methods.agent.session.new, { cwd, mcpServers: [linear] });
+          await vi.waitFor(() => expect(client.elicitations).toHaveLength(1));
+          await setProvider(agent);
+          await vi.waitFor(() => expect(client.elicitations).toHaveLength(2));
+          // The old query's elicitation was withdrawn before the new one went out.
+          expect(withdrawn).toEqual([1]);
+        });
+      });
+
+      it("starts OAuth only on the new query of a resume with other additional directories", async () => {
+        sdk.mcpServers = [{ name: "linear", status: "needs-auth" }];
+        const extra = await mkdtemp(path.join(tempDir, "extra-"));
+        const { client, withdrawn } = oauthClient();
+        await client.connect(async (agent) => {
+          await initialize(agent);
+          const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+          await agent.request(v2.methods.agent.session.resume, {
+            sessionId,
+            cwd,
+            mcpServers: [linear],
+            additionalDirectories: [extra],
+          });
+          await vi.waitFor(() => expect(sdk.processes[0].close).toHaveBeenCalled());
+          await vi.waitFor(() => expect(client.elicitations).toHaveLength(1));
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          expect(client.elicitations).toHaveLength(1);
+          expect(withdrawn).toEqual([]);
+        });
       });
     });
 
@@ -1858,6 +1919,54 @@ describe("ACP v2 core", () => {
     expect(client.sessionUpdates.at(-1)).toMatchObject({ state: "idle", stopReason: "end_turn" });
   });
 
+  it.each([
+    ["a cycle of Claude Code's own ended", "cycle"],
+    ["a prompt started", "prompt"],
+  ])(
+    "does not read a later aborted result as cancelled by a cancel of an idle session once %s",
+    async (_, after) => {
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const sessionId = response.sessionId;
+        // Claude Code runs nothing: the interrupt stops nothing and sends nothing.
+        await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+        await vi.waitFor(() => expect(claude.interrupt).toHaveBeenCalled());
+        if (after === "cycle") {
+          // Say, a background task ended: Claude Code starts a cycle after the interrupt.
+          claude.send(cycleStart());
+          claude.send(result());
+          claude.send(sessionState("idle"));
+          await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+          claude.send(cycleStart());
+        } else {
+          const answer = agent.request(v2.methods.agent.session.prompt, {
+            sessionId,
+            prompt: PROMPT,
+          });
+          claude.send(lifecycle(await claude.prompt(0), "started"));
+          await answer;
+        }
+        // Then an interrupt of Claude Code's remote control stops the work.
+        claude.send(
+          result({
+            subtype: "error_during_execution",
+            is_error: true,
+            terminal_reason: "aborted_streaming",
+          }),
+        );
+        claude.send(sessionState("idle"));
+        await vi.waitFor(() =>
+          expect(client.states()).toEqual(
+            after === "cycle" ? ["running", "idle", "running", "idle"] : ["running", "idle"],
+          ),
+        );
+      });
+
+      expect(client.sessionUpdates.at(-1)).toMatchObject({ state: "idle", stopReason: "error" });
+    },
+  );
+
   it("sends no permission request of a session after session/close answered", async () => {
     const client = v2Client();
     const decision = await client.connect(async (agent) => {
@@ -2499,6 +2608,35 @@ describe("ACP v2 core", () => {
           }),
         );
         answer({ outcome: { outcome: "cancelled" } });
+      });
+    });
+
+    it("lets the subagent that a child waits on ask again when Claude Code refuses to stop the child", async () => {
+      const client = v2Client({ answerPermission: () => new Promise(() => {}) });
+      await client.connect(async (agent) => {
+        const { claude } = await openSession(agent);
+        const child = subagent("child", "toolu_launch", { is_backgrounded: true });
+        const inner = subagent("inner", "toolu_inner", { parent_task_id: "child" });
+        claude.send(cycleStart());
+        claude.send(child.launch());
+        claude.send(child.started());
+        claude.send(inner.launch("toolu_launch"));
+        claude.send(inner.started());
+        await vi.waitFor(() =>
+          expect(updatesOf(client.notifications, "inner")).toContainEqual(
+            expect.objectContaining({ state: "running" }),
+          ),
+        );
+        claude.stopTask.mockRejectedValueOnce(new Error("refused"));
+        await agent.notify(v2.methods.agent.session.cancel, { sessionId: "child" });
+        await vi.waitFor(() => expect(claude.stopTask).toHaveBeenCalledWith("child"));
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        // The inner subagent's run goes on: its next request is its own.
+        void askPermission(claude, "Bash", { command: "make" }, { agentID: "inner" }).catch(
+          () => {},
+        );
+        await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(1));
+        expect(client.permissionRequests[0].sessionId).toBe("inner");
       });
     });
 
@@ -3498,26 +3636,170 @@ describe("ACP v2 core", () => {
         expect(reportAt).toBeLessThan(idleAt);
       });
 
-      it("reports a prompt that a cancel ended unavailable, without reading a checkpoint", async () => {
-        const client = v2Client();
-        const { claude, sessionId } = await client.connect(async (agent) => {
+      it("reads the report of a turn whose plan ran in a fresh context from the plan's prompt", async () => {
+        const client = v2Client({
+          answerPermission: () => ({
+            outcome: { outcome: "selected", optionId: "exit-plan-clear-auto" },
+          }),
+        });
+        const changed = path.join(await realpath(cwd), "src", "App.ts");
+        const { claude, sessionId, plan } = await client.connect(async (agent) => {
           const { response, claude } = await openSession(agent, air("agentFileChangeReport"));
+          claude.rewindFiles.mockResolvedValue({ canRewind: true, filesChanged: [changed] });
           const answer = agent.request(v2.methods.agent.session.prompt, {
             sessionId: response.sessionId,
             prompt: PROMPT,
             _meta: requestMeta("r-1"),
           });
-          await claude.prompt(0);
-          await agent.notify(v2.methods.agent.session.cancel, { sessionId: response.sessionId });
-          await expect(answer).rejects.toMatchObject({ code: -32800 });
-          return { claude, sessionId: response.sessionId };
+          claude.send(echo(await claude.prompt(0)));
+          await answer;
+          claude.send(
+            assistant("msg_plan", [
+              {
+                type: "tool_use",
+                id: "toolu_plan",
+                name: "ExitPlanMode",
+                input: { plan: "Do it" },
+              },
+            ]),
+          );
+          await askPermission(
+            claude,
+            "ExitPlanMode",
+            { plan: "Do it" },
+            { toolUseID: "toolu_plan" },
+          );
+          claude.send({
+            type: "user",
+            message: {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "toolu_plan",
+                  content: "User accepted the plan and requested a fresh context",
+                  is_error: true,
+                },
+              ],
+            },
+            tool_result_meta: [{ id: "toolu_plan", non_execution_kind: "user-rejected" }],
+            parent_tool_use_id: null,
+            uuid: randomUUID(),
+          });
+          claude.send(
+            result({
+              subtype: "error_during_execution",
+              is_error: true,
+              stop_reason: null,
+              errors: [
+                "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+              ],
+            }),
+          );
+          claude.send(sessionState("idle"));
+          const clear = await claude.prompt(1);
+          claude.send(echo(clear));
+          claude.send({
+            type: "conversation_reset",
+            new_conversation_id: randomUUID(),
+            uuid: randomUUID(),
+            trigger: "clear",
+            timestamp: new Date().toISOString(),
+            session_id: "session",
+          });
+          claude.send(result({ num_turns: 0, stop_reason: null }));
+          // `/clear` reset Claude Code's file history: only the plan's prompt has a checkpoint.
+          const plan = await claude.prompt(2);
+          claude.send(echo(plan));
+          claude.send(result());
+          claude.send(sessionState("idle"));
+          await vi.waitFor(() => expect(client.states().at(-1)).toBe("idle"));
+          return { claude, sessionId: response.sessionId, plan };
         });
 
-        expect(claude.rewindFiles).not.toHaveBeenCalled();
+        expect(claude.rewindFiles).toHaveBeenCalledExactlyOnceWith(plan.uuid, { dryRun: true });
         expect(reports(updatesOf(client.notifications, sessionId))).toEqual([
-          { version: 1, requestId: "r-1", status: "unavailable", reason: "cancelled" },
+          {
+            version: 1,
+            requestId: "r-1",
+            status: "reported",
+            paths: [changed],
+            declaredComplete: false,
+            truncated: false,
+          },
         ]);
       });
+
+      it.each([
+        ["a cancel answered with -32800 before its insertion", false, "cancel", "cancelled"],
+        ["a cancel stopped after its insertion", true, "cancel", "cancelled"],
+        ["ended with an error result", true, "error", "providerError"],
+        ["ended without a result, as the query ended", true, "end", "providerError"],
+        [
+          "failed otherwise before its insertion, as the query ended",
+          false,
+          "end",
+          "providerError",
+        ],
+      ] as const)(
+        "reports a prompt that %s unavailable, without reading a checkpoint",
+        async (_, insert, end, reason) => {
+          const client = v2Client();
+          const { claude, sessionId } = await client.connect(async (agent) => {
+            const { response, claude } = await openSession(agent, air("agentFileChangeReport"));
+            const sessionId = response.sessionId;
+            const answer = agent
+              .request(v2.methods.agent.session.prompt, {
+                sessionId,
+                prompt: PROMPT,
+                _meta: requestMeta("r-1"),
+              })
+              .catch((error: unknown) => error);
+            const prompt = await claude.prompt(0);
+            if (insert) {
+              claude.send(echo(prompt));
+              expect(await answer).toEqual({ messageId: prompt.uuid });
+            }
+            if (end === "cancel") {
+              await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+              if (insert) {
+                await vi.waitFor(() => expect(claude.interrupt).toHaveBeenCalled());
+                claude.send(
+                  result({
+                    subtype: "error_during_execution",
+                    is_error: true,
+                    terminal_reason: "aborted_streaming",
+                  }),
+                );
+                claude.send(sessionState("idle"));
+              }
+            } else if (end === "error") {
+              claude.send(
+                result({
+                  subtype: "error_during_execution",
+                  is_error: true,
+                  errors: ["Overloaded"],
+                }),
+              );
+              claude.send(sessionState("idle"));
+            } else {
+              claude.end(new Error("Claude Code exited"));
+            }
+            if (!insert) {
+              expect(await answer).toMatchObject({ code: end === "cancel" ? -32800 : -32603 });
+            }
+            await vi.waitFor(() =>
+              expect(reports(updatesOf(client.notifications, sessionId))).toHaveLength(1),
+            );
+            return { claude, sessionId };
+          });
+
+          expect(claude.rewindFiles).not.toHaveBeenCalled();
+          expect(reports(updatesOf(client.notifications, sessionId))).toEqual([
+            { version: 1, requestId: "r-1", status: "unavailable", reason },
+          ]);
+        },
+      );
 
       it.each([
         ["an AIR client without the capability", air()],

@@ -60,7 +60,13 @@ import { canUseTool, denyingStoppedWork } from "./permissions.js";
 import { reportHooks } from "./reports.js";
 import { SessionRestarts, type SetupParams } from "./restarts.js";
 import { V2Session, type SessionConnection } from "./session.js";
-import { clientOptions, replayEndUpdate, sessionModels, withClientHooks } from "./setup.js";
+import {
+  afterSetupResponse,
+  clientOptions,
+  replayEndUpdate,
+  sessionModels,
+  withClientHooks,
+} from "./setup.js";
 import type { SubagentReplay } from "./subagent-replay.js";
 import { SubscriptionGuard } from "./subscription-guard.js";
 import { restrictedChild } from "./tasks.js";
@@ -384,7 +390,8 @@ class V2Agent implements AgentHandle, SessionConnection {
     await session.reports.publishTitle();
     for (const notification of session.resumeSnapshot()) this.send(notification);
     const response = await this.setupFields(session);
-    afterSetupResponse(session, params);
+    // A restart for other additional directories retires `session`.
+    if (!this.restarts.restarting(sessionId)) afterSetupResponse(session, params);
     // The response ends the replay, and the replayed children's states before
     // it are history: their current states follow it. Nothing enforces that
     // the timer runs after the response goes out; it relies on the response
@@ -885,24 +892,6 @@ async function validatedSetup(
     }
   }
   return request;
-}
-
-/**
- * Starts OAuth for the setup request's MCP servers that need it, once the
- * setup response is sent: v2 asks for no elicitation before it. The handler
- * returns the response right after this call, and the SDK writes it before a
- * timer runs. Nothing else orders the two.
- */
-function afterSetupResponse(
-  session: V2Session,
-  params: v2.NewSessionRequest | v2.ResumeSessionRequest | v2.ForkSessionRequest,
-): void {
-  // The setup already rejected servers of an unknown transport.
-  const names = (params.mcpServers ?? []).flatMap((server) =>
-    typeof server.name === "string" ? [server.name] : [],
-  );
-  if (names.length === 0) return;
-  setTimeout(() => session.elicitations.authenticateMcpServers(names), 0);
 }
 
 function sameDirectories(left: readonly string[], right: readonly string[]): boolean {

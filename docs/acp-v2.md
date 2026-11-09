@@ -216,7 +216,9 @@ lists: `_meta.jetbrains.air.capabilities` is `["agentFileChangeReport", "recomme
   `_meta.jetbrains.air.agentFileChangeReportRequest` is valid gets one report. v1 sends it before
   the prompt's response, at the turn's end. A v2 prompt is answered at its insertion, so the
   report goes out at the end of the turn that serves the prompt, before that turn's idle: the
-  session reads the prompt's checkpoint (up to 2 seconds), and the idle waits for it. A turn that
+  session reads the prompt's checkpoint (up to 2 seconds), and the idle waits for it. A turn whose
+  plan runs in a fresh context (ExitPlanMode's "Yes, clear context") reads the checkpoint of the
+  plan's prompt instead: `/clear` reset Claude Code's file history. A turn that
   ends `cancelled` reports `unavailable` with `cancelled`. Any other turn that ends with an error
   or without a result reports `unavailable` with `providerError`. A prompt that a cancel answers with -32800 before its
   insertion reports `cancelled`, and one that fails otherwise `providerError`.
@@ -256,7 +258,9 @@ exit codes), which the shared renderer gives only with `air.client`, and the `ki
   for AskUserQuestion (on the session of the agent that asks), for an MCP server's form, and for
   the refusal fallback's consent prompt. A URL for an MCP server's URL request and for MCP OAuth.
   All but MCP OAuth are open requests of their session, like permission requests: a cancel or a
-  close withdraws them. MCP OAuth starts after the setup response, and a close withdraws it.
+  close withdraws them. MCP OAuth starts after the setup response, and a close withdraws it. A
+  restart of the query (`restarts.ts`) withdraws it on the old query and starts it again on the
+  new one.
   Without form elicitation, AskUserQuestion is disallowed and the refusal fallback is not
   declared. An MCP server's request in a mode the client did not advertise, or that the client
   answers with an error, is answered `cancel`.
@@ -341,8 +345,7 @@ exit codes), which the shared renderer gives only with `air.client`, and the `ki
   that a result of any session on the same backend reported, else a guess from the model's names
   refined by a background `getContextUsage`, until the session's own result reports it.
 
-About 5,500 lines in total, plus the v2 wire conversions (see "History"). The v2 agent shares
-these with the v1 core:
+The v2 agent shares these with the v1 core:
 
 - the SDK message mapping and tool call rendering (`toAcpNotifications`,
   `streamEventToAcpNotifications`, `tool-calls/*`)

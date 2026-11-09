@@ -1649,7 +1649,8 @@ The hold protects a client that stops listening at the prompt response.
 ### Behavior with the capability
 
 AIR declares `backgroundSubagents` in `initialize.clientCapabilities._meta.jetbrains.air.capabilities`.
-The capability applies to ACP v1 only. ACP v2 keeps the hold, and the agent does not advertise the capability to ACP v2.
+The capability applies to ACP v1 only, and the agent does not advertise it to ACP v2.
+ACP v2 has no hold: the v2 agent answers `session/prompt` when Claude Code takes the prompt in, lists a background subagent in its parent session's `background` while it works, and reports each subagent's work in the state of its child session (see [ACP v2](#acp-v2)).
 
 - The turn ends at its result with the stop reason of the result, usually `end_turn`.
 - The subagent updates, permission requests and elicitations go out after the prompt response.

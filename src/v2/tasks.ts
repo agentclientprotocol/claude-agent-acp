@@ -609,13 +609,22 @@ export class SessionTasks {
    */
   foregroundCancelFailed(): void {
     this.rootCancelling = false;
-    for (const agentId of this.foregroundCancelled) {
+    this.cancelFailed(this.foregroundCancelled);
+    this.foregroundCancelled.clear();
+  }
+
+  /**
+   * A cancel failed to stop the agents `agentIds` that it withdrew: their
+   * runs go on, and their later requests are theirs again. Each reports
+   * `running` again, which the withdrawn requests did not.
+   */
+  private cancelFailed(agentIds: Iterable<string>): void {
+    for (const agentId of agentIds) {
       this.cancelledAgents.delete(agentId);
       const child = this.children.get(agentId);
       if (child?.output) child.output.cancelled = false;
       if (child) this.reportChild(child);
     }
-    this.foregroundCancelled.clear();
   }
 
   /**
@@ -635,17 +644,19 @@ export class SessionTasks {
   async cancelChild(sessionId: string): Promise<void> {
     const child = this.children.get(sessionId);
     if (!child?.announced || !child.working) return;
+    // The agents that this cancel stops, and not an earlier one still.
+    const withdrawn: string[] = [];
     for (const agentId of this.agents.keys()) {
-      if (this.waitsOn(agentId, sessionId)) this.withdraw(agentId);
+      if (!this.waitsOn(agentId, sessionId)) continue;
+      if (!this.cancelledAgents.has(agentId)) withdrawn.push(agentId);
+      this.withdraw(agentId);
     }
     try {
       await this.host.stopTask(child.sessionId);
     } catch (error) {
       // The run ended meanwhile, or Claude Code refused: it reports how it
-      // ends. A run that goes on reports `running` again, which the
-      // withdrawn requests did not.
-      this.cancelledAgents.delete(sessionId);
-      this.reportChild(child);
+      // ends, and so do the subagents that it waits on.
+      this.cancelFailed(withdrawn);
       this.host.logger.error(`Subagent ${sessionId}: stopping it failed`, error);
     }
   }
