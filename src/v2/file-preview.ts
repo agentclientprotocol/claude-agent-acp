@@ -5,8 +5,9 @@
  * A v2 diff cannot hold the input's snippet, so without it an auto-approved
  * Edit would show its change only once it is done. Claude Code runs the tool
  * only after the hook returns, so the file is still as it was, and the patch
- * is the one a permission request for the tool would show. The hook makes no
- * permission decision, and a failure only leaves the preview out.
+ * is the one a permission request for the tool would show. A patch whose tool
+ * call is not published yet waits for it (`SessionOutput.preview`). The hook
+ * makes no permission decision, and a failure only leaves the preview out.
  */
 import type { HookCallbackMatcher } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "../acp-agent.js";
@@ -30,7 +31,7 @@ export function fileChangePreviewHook(host: PreviewHost, logger: Logger): HookCa
           if (target.cancelling()) return { continue: true };
           const toolInput = (input.tool_input ?? {}) as Record<string, unknown>;
           const content = await previewPatchContent(input.tool_name, toolInput, target.cwd, "v2");
-          if (content) target.output.preview(input.tool_name, toolUseID, toolInput, content);
+          if (content) target.output.preview(toolUseID, content);
         } catch (error) {
           logger.error(`Failed to preview ${toolUseID}:`, error);
         }

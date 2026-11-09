@@ -231,21 +231,16 @@ export class SessionOutput {
 
   /**
    * Shows `content`, the exact patch of an Edit or Write, on its tool call
-   * before the tool runs (see `file-preview.ts`). A hook can come before the
-   * streamed tool_use: the tool call then goes out with the patch, and the
-   * streamed tool_use refines it. Either way the streamed input's diff does
-   * not replace the patch.
+   * before the tool runs (see `file-preview.ts`). The streamed input's diff
+   * does not replace the patch. A hook can come before the streamed tool_use,
+   * and a workflow's tools run hooks without ever streaming their use or
+   * result: the patch then waits for the tool call's first publication (by the
+   * stream or a permission request), instead of showing a tool call that would
+   * never end.
    */
-  preview(toolName: string, toolCallId: string, input: unknown, content: ToolCallContent[]): void {
+  preview(toolCallId: string, content: ToolCallContent[]): void {
     if (!this.emittedToolCalls.has(toolCallId)) {
-      this.emittedToolCalls.add(toolCallId);
-      const update = new AcpToolCallRenderer(V2_TOOL_CALL_CAPABILITIES).toolCall(
-        { id: toolCallId, name: toolName, input },
-        { cwd: this.cwd, previewContent: content },
-      );
-      this.toolCallFields.apply(update);
-      this.toolCallFields.pinContent(toolCallId, content);
-      this.emit([{ sessionId: this.sessionId, update }]);
+      this.toolCallFields.stagePreview(toolCallId, content);
       return;
     }
     const update = { sessionUpdate: "tool_call_update" as const, toolCallId, content };
@@ -329,6 +324,31 @@ export class SessionOutput {
     );
     this.toolCallFields.apply(update);
     this.emit([{ sessionId: this.sessionId, update }]);
+  }
+
+  /**
+   * The tool call that the adapter starts for a background task that no tool
+   * call stands for (see `SessionTasks.adoptTasks`). It ends with the task.
+   */
+  taskToolCall(
+    update: Extract<AcpSessionNotification["update"], { sessionUpdate: "tool_call" }>,
+  ): void {
+    this.emittedToolCalls.add(update.toolCallId);
+    this.toolCallFields.apply(update);
+    this.emit([{ sessionId: this.sessionId, update }]);
+  }
+
+  /** A workflow's latest progress on its tool call, as its title and body (`workflowCard`). */
+  taskToolCallProgress(
+    toolCallId: string,
+    card: { title: string; content: ToolCallContent[] },
+  ): void {
+    this.emit([
+      {
+        sessionId: this.sessionId,
+        update: { sessionUpdate: "tool_call_update", toolCallId, ...card },
+      },
+    ]);
   }
 
   /**

@@ -15,8 +15,7 @@ import type { V2Terminals } from "./terminal.js";
 export type BackgroundItem =
   | { type: "terminal"; terminalId: string }
   | { type: "tool_call"; toolCallId: string }
-  | { type: "subagent"; sessionId: string }
-  | { type: "_claude/task"; taskId: string; description: string };
+  | { type: "subagent"; sessionId: string };
 
 /** The work state of a session, as its `state_update` names it. */
 export type WorkStateName = "idle" | "running" | "requires_action" | "unknown";

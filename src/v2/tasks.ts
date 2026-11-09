@@ -33,7 +33,11 @@
  *   from the file Claude Code writes it to.
  * - A task that a tool call started, such as a `Monitor` or `Workflow` call,
  *   is that tool call, kept `in_progress` (or `paused`) until the task ends.
- * - Any other background task is a `_claude/task` item.
+ *   A workflow's `task_progress` shows on its call (`workflowCard`).
+ * - Any other background task, such as one that a hook started or one that
+ *   started after its tool call returned, gets a tool call that the adapter
+ *   starts for it (`task_<taskId>`), as v2 lists background work only by an
+ *   entity the client knows.
  *
  * Claude Code's interrupt spares background tasks (`perTaskStopAffordance`),
  * so `session/cancel` leaves listed work running, as v2 asks. A session
@@ -51,7 +55,7 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "../acp-agent.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
-import { backgroundBashTaskFromToolResult } from "../async-tasks.js";
+import { backgroundBashTaskFromToolResult, taskProgressFields } from "../async-tasks.js";
 import { BackgroundOutputTail, type BackgroundOutput } from "../background-output.js";
 import {
   childModelOption,
@@ -77,6 +81,7 @@ import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { AcpToolCallRenderer } from "../tool-calls/renderer.js";
 import type { BackgroundItem, V2Background, WorkStateName } from "./background.js";
 import type { V2UpdateTranslator } from "./update-translator.js";
+import { type WorkflowCardProgress, workflowCard, workflowSnapshot } from "../workflow-progress.js";
 import { ChildConfigurations } from "./child-config.js";
 import { SessionOutput } from "./stream.js";
 import { SubagentReplay } from "./subagent-replay.js";
@@ -199,8 +204,14 @@ type ToolCallUpdate = Extract<
   { sessionUpdate: "tool_call" | "tool_call_update" }
 >;
 
-/** A task of `background_tasks_changed`. */
-type LevelTask = { ambient: boolean; taskType: string; description: string; parentTaskId?: string };
+/** A task of `background_tasks_changed`, with the latest progress of a workflow. */
+type LevelTask = {
+  ambient: boolean;
+  taskType: string;
+  description: string;
+  parentTaskId?: string;
+  progress?: WorkflowCardProgress;
+};
 
 /** What `task_started` said of a task that is not a subagent. */
 type StartedTask = { toolUseId?: string; parentTaskId?: string; taskType?: string };
@@ -260,13 +271,18 @@ export class SessionTasks {
       leveled?: boolean;
     }
   >();
-  /** The tool calls whose tasks go on in the background, by task id. */
+  /**
+   * The tool calls whose tasks go on in the background, by task id. A call
+   * that the adapter started for its task (see {@link adoptTasks}) has the
+   * task's description as its `title` instead of a tool use.
+   */
   private readonly toolCalls = new Map<
     string,
     {
       toolCallId: string;
       output: SessionOutput;
-      toolUse: { name: string; input: unknown };
+      toolUse?: { name: string; input: unknown };
+      title?: string;
       paused: boolean;
     }
   >();
@@ -338,6 +354,9 @@ export class SessionTasks {
             return true;
           case "task_notification":
             this.taskNotification(message);
+            return true;
+          case "task_progress":
+            this.taskProgress(message);
             return true;
           case "background_tasks_changed":
             this.levelChanged(message.tasks);
@@ -465,6 +484,13 @@ export class SessionTasks {
           runningToolCalls,
         ) as AcpSessionNotification,
     );
+    // A workflow can report progress before its launch call returns: it
+    // goes on the call after the result's own updates.
+    for (const [taskId, toolCall] of this.toolCalls) {
+      if (!runningToolCalls.has(toolCall.toolCallId)) continue;
+      const card = workflowCard(this.level.get(taskId)?.progress);
+      if (card) toolCall.output.taskToolCallProgress(toolCall.toolCallId, card);
+    }
     // After the result's own updates: the output replaces their placeholder.
     if (command && runningTerminal) {
       this.followOutput(
@@ -741,15 +767,19 @@ export class SessionTasks {
       }
       for (const item of listed) {
         if (item.type !== "tool_call") continue;
-        const toolCall = [...this.toolCalls.values()].find((t) => t.toolCallId === item.toolCallId);
-        if (!toolCall) continue;
-        const update = V2_RENDERER.toolCall(
-          { id: toolCall.toolCallId, ...toolCall.toolUse },
-          { cwd: this.cwdOf(sessionId) },
-        );
+        const listed = [...this.toolCalls].find(([, t]) => t.toolCallId === item.toolCallId);
+        if (!listed) continue;
+        const [taskId, toolCall] = listed;
+        const update = toolCall.toolUse
+          ? V2_RENDERER.toolCall(
+              { id: toolCall.toolCallId, ...toolCall.toolUse },
+              { cwd: this.cwdOf(sessionId) },
+            )
+          : taskToolCall(toolCall.toolCallId, toolCall.title);
         const status = toolCall.paused ? "paused" : "in_progress";
         for (const v2Update of this.host.translator.updates(sessionId, {
           ...update,
+          ...workflowCard(this.level.get(taskId)?.progress),
           status,
         } as AcpSessionNotification["update"])) {
           updates.push({ sessionId, update: v2Update });
@@ -825,6 +855,8 @@ export class SessionTasks {
    */
   publish(): void {
     if (!this.host.reportsBackground) return;
+    // A task that needs a tool call of its own gets it first, so the list can name it.
+    this.adoptTasks();
     const lists = this.lists();
     for (const child of [...this.parentsFirst()].reverse()) {
       this.sendAll(
@@ -970,6 +1002,33 @@ export class SessionTasks {
   }
 
   /**
+   * A task's progress report. A workflow's goes on its tool call, as its
+   * title and body (`workflowCard`), without changing its status. A report
+   * that comes before the call returns waits for the result (see
+   * {@link toolResults}), and a report without `workflow_progress` keeps the
+   * last phase and agent list. A report that changes nothing on the card
+   * sends nothing.
+   */
+  private taskProgress(message: Extract<SDKMessage, { subtype: "task_progress" }>): void {
+    const task = this.level.get(message.task_id);
+    if (!task || task.taskType !== "local_workflow") return;
+    // The SDK does not type `workflow_progress`; see workflow-progress.ts.
+    const workflow = workflowSnapshot(
+      (message as { workflow_progress?: unknown }).workflow_progress,
+    );
+    const previous = workflowCard(task.progress);
+    task.progress = {
+      ...task.progress,
+      ...taskProgressFields(message),
+      ...(workflow ? { workflow } : {}),
+    };
+    const card = workflowCard(task.progress);
+    if (!card || JSON.stringify(previous) === JSON.stringify(card)) return;
+    const toolCall = this.toolCalls.get(message.task_id);
+    toolCall?.output.taskToolCallProgress(toolCall.toolCallId, card);
+  }
+
+  /**
    * The task `taskId` ended. Claude Code can report one end twice (a
    * terminal `task_updated` and a `task_notification`), so a second is a
    * no-op, unless it gives the error text of a failure that the first lacked.
@@ -1034,6 +1093,7 @@ export class SessionTasks {
           taskType: task.task_type,
           description: task.description,
           ...(task.parent_task_id !== undefined ? { parentTaskId: task.parent_task_id } : {}),
+          progress: this.level.get(task.task_id)?.progress,
         },
       ]),
     );
@@ -1783,10 +1843,6 @@ export class SessionTasks {
     const lists = new Map<string, BackgroundItem[]>([[this.host.sessionId, []]]);
     const children = this.parentsFirst();
     for (const child of children) lists.set(child.sessionId, []);
-    const sessionOfTask = (taskId: string | undefined) => {
-      const child = taskId !== undefined ? this.children.get(taskId) : undefined;
-      return child?.announced ? child.sessionId : this.host.sessionId;
-    };
     for (const [taskId, task] of this.level) {
       const toolCall = this.toolCalls.get(taskId);
       if (toolCall) {
@@ -1803,12 +1859,9 @@ export class SessionTasks {
           ?.push({ type: "terminal", terminalId: terminal.toolCallId });
         continue;
       }
-      if (task.taskType === "local_bash" || task.taskType === "local_agent") continue;
-      const started = this.started.get(taskId);
-      if (!started || (started.toolUseId && !this.returned.has(started.toolUseId))) continue;
-      lists
-        .get(sessionOfTask(task.parentTaskId))
-        ?.push({ type: "_claude/task", taskId, description: task.description });
+      // Any other task is listed by the tool call that `adoptTasks` starts
+      // for it, or is not background work. A subagent is listed below, as
+      // its session.
     }
     // A terminal whose task left the level is listed until its exit, which
     // waits for the rest of its output.
@@ -1828,6 +1881,37 @@ export class SessionTasks {
       }
     }
     return lists;
+  }
+
+  /**
+   * Starts a tool call for each live task that no terminal or tool call
+   * stands for yet: v2 lists background work only by an entity the client
+   * knows. Such a task is one that no tool call started, such as one a hook
+   * started, or one whose tool call returned, with its final status, before
+   * the task started. The call (`task_<taskId>`) has the task's description
+   * as its title, is `in_progress`, and ends with the task. A task of an
+   * announced subagent gets its call on the subagent's session. Ambient
+   * tasks are housekeeping and get no call. {@link publish} calls it before
+   * each list it publishes, so the call comes before the first list that
+   * names it, as v2 requires.
+   */
+  private adoptTasks(): void {
+    for (const [taskId, task] of this.level) {
+      if (task.ambient || this.toolCalls.has(taskId) || this.terminals.has(taskId)) continue;
+      // A command without a terminal yet is one that foreground work waits on.
+      // A subagent is listed as its session.
+      if (task.taskType === "local_bash" || task.taskType === "local_agent") continue;
+      // A task joins the level before its `task_started`, and before the tool
+      // call that starts it returns. Until both, the task is unknown or part
+      // of that tool call.
+      const started = this.started.get(taskId);
+      if (!started || (started.toolUseId && !this.returned.has(started.toolUseId))) continue;
+      const parent = task.parentTaskId ? this.children.get(task.parentTaskId) : undefined;
+      const output = (parent?.announced ? parent.output : undefined) ?? this.rootOutput;
+      const toolCallId = `task_${taskId}`;
+      this.toolCalls.set(taskId, { toolCallId, output, title: task.description, paused: false });
+      output.taskToolCall(taskToolCall(toolCallId, task.description));
+    }
   }
 
   /** The task of the terminal or tool call `target` that `sessionId` lists. */
@@ -1887,6 +1971,24 @@ export class SessionTasks {
   private sendAll(notifications: v2.UpdateSessionNotification[]): void {
     for (const notification of notifications) this.host.send(notification);
   }
+}
+
+/**
+ * The `tool_call` that the adapter starts for a task (see
+ * `SessionTasks.adoptTasks`). Claude Code's tool use ids start with `toolu_`,
+ * so `task_<taskId>` names no other call.
+ */
+function taskToolCall(
+  toolCallId: string,
+  title: string | undefined,
+): Extract<ToolCallUpdate, { sessionUpdate: "tool_call" }> {
+  return {
+    sessionUpdate: "tool_call",
+    toolCallId,
+    title: title || "Background task",
+    kind: "other",
+    status: "in_progress",
+  };
 }
 
 /**
