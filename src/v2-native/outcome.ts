@@ -7,12 +7,9 @@
 import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
+import { AUTONOMOUS_RESULT_ORIGINS, isLoginRequiredText } from "../acp-agent.js";
 import {
-  AUTONOMOUS_RESULT_ORIGINS,
   getMatchingModelUsage,
-  isLoginRequiredText,
-} from "../acp-agent.js";
-import {
   modelUsageIncrement,
   normalizeModelUsage,
   quotaMeta,
@@ -20,7 +17,7 @@ import {
   tallyTotal,
   type AccumulatedUsage,
   type ModelTokenTally,
-} from "../usage-quota.js";
+} from "../session-usage.js";
 
 /** A result that ended a turn, with what the turn spent. */
 export type TurnEnd = {

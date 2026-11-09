@@ -43,6 +43,7 @@ import { V2UpdateTranslator } from "../v2/update-translator.js";
 import { NativeAuth } from "./auth.js";
 import { SessionConfig } from "./config.js";
 import { canUseTool } from "./permissions.js";
+import { reportHooks } from "./reports.js";
 import { NativeSession, type SessionConnection } from "./session.js";
 import { restrictedChild } from "./tasks.js";
 
@@ -205,6 +206,8 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     if (replayFrom != null) {
       session.output.replay(await getSessionMessages(sessionId, { dir: session.cwd }));
     }
+    // The current title, after the replay and before the state, as on the bridge.
+    await session.reports.publishTitle();
     for (const notification of session.resumeSnapshot()) this.send(notification);
     return this.setupFields(session);
   }
@@ -362,8 +365,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       this.logger,
       { allowBypass, allowAuto },
     );
-    settings.dispose();
-    // The settings keep the values they read: their cwd and key helper.
+    // The settings stay live for the idle compaction (see `reports.ts`) until the session ends.
     const authStarted = this.auth.sessionStarting(settings);
     const routing = this.auth.routing();
 
@@ -422,6 +424,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
             ],
           },
         ],
+        ...reportHooks(session),
       },
       env: {
         ...process.env,
@@ -439,6 +442,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       initialization = await q.initializationResult();
     } catch (error) {
       q.close();
+      settings.dispose();
       if (
         resume !== undefined &&
         error instanceof Error &&
@@ -453,6 +457,11 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     const currentModel =
       models.find((model) => model.value === "default")?.value ?? models[0]?.value ?? "default";
     const availableModes = buildAvailableModes({ allowBypass, allowAuto });
+    session.reports.configure({
+      settings,
+      env: options.env ?? {},
+      mcpServers: request.mcpServers.map((server) => server.name),
+    });
     session.start(
       q,
       new SessionConfig(q, { currentModeId: mode, availableModes }, models, currentModel),

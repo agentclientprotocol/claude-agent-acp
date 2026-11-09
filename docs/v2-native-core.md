@@ -36,6 +36,22 @@ both, so a v2 core can follow Claude Code's own events instead of rebuilding a t
 | `session/resume` with `replayFrom` | `getSessionMessages`, mapped like live output                                     |
 | output updates                     | the shared SDK mapping (`toAcpNotifications`), translated by `V2UpdateTranslator` |
 
+The reports that are not Claude's output come from `src/v2-native/reports.ts`, built as on v1:
+
+| ACP v2                                  | Claude Code                                                                     |
+| --------------------------------------- | ------------------------------------------------------------------------------- |
+| `usage_update` (`used`, `size`)         | the root `message_start`/`message_delta` usage, the assistant message's usage   |
+| `usage_update` with `cost`              | the turn's `result` (`total_cost_usd`, `modelUsage` for the window, `origin`)   |
+| `usage_update` `_meta`                  | the model (`_claude/model`), a `rate_limit_event` (`_claude/rateLimit`)         |
+| `_meta.quota` of the turn's `idle`      | the `result`'s `usage` and its increment of `modelUsage`                        |
+| `notice`                                | `informational` (not level `info`), a client MCP server `failed` at `init`      |
+| `compaction_update`, summary chunks     | `status` `compacting` and `compact_result`, `compact_boundary`, `PostCompact`   |
+| `compaction_update` on replay           | a transcript message with `isCompactSummary`                                    |
+| `session_info_update` (title)           | `SessionTitles`: the title Claude Code stores or generates, read at `idle`      |
+| `plan_update` of the Task\* list        | TaskCreate/TaskUpdate/TaskList results, the TaskCreated and TaskCompleted hooks |
+| `tool_call_update` progress             | `tool_progress`                                                                 |
+| `running`, then `idle`, no user_message | the adapter's idle `/compact` (`IdleCompaction`)                                |
+
 The session keeps little of its own: a map of prompts that are not inserted yet, whether a turn
 is open, and its count of open permission requests (`src/v2-native/session.ts`).
 
@@ -61,7 +77,7 @@ such as one that an interrupt stopped before it ran. The `idle` that follows a r
 result's, also when it comes after the next cycle's first output. A placeholder result
 (`num_turns: 0` of a task notification) ends nothing: Claude Code answers queued notifications
 with one model call. The idle's usage and `_meta.quota` are the result's (`outcome.ts`, with the
-quota helpers of `usage-quota.ts` that v1 uses). A failed turn's idle carries its error instead.
+quota helpers of `session-usage.ts` that v1 uses). A failed turn's idle carries its error instead.
 
 `session/cancel` answers every prompt not inserted yet with -32800, as the bridge does. Claude
 Code can still run one that it had taken in before the interrupt arrived, or a cycle that it
@@ -111,6 +127,9 @@ close, resume, delete and config changes on it fail with -32602.
   `providers/*`, on the v1 core's state rules (`AuthStatusReporter`, `providers.ts`). The
   identity is read after `initialize`, from each session's account, after a login or logout, and
   at the start of each prompt, as on the bridge.
+- `src/v2-native/reports.ts`: usage, notices, compactions, titles, and the idle
+  compaction (see the table above), and the hooks that feed them (PostCompact, TaskCreated,
+  TaskCompleted).
 
 About 2,600 lines in total. The native core shares these with v1 and the bridge:
 
@@ -135,6 +154,12 @@ These pieces were extracted so that both cores use the same code:
 - the provider routing (`providers.ts`): `ProviderConfig`, the gateway login methods and their
   validation, the `providers/list` response, `providers/set` validation and model listing, and
   `createEnvForProvider`, taken from `ClaudeAcpAgent`
+- the token usage helpers (`session-usage.ts`): usage snapshots, the `_meta.quota` shape, the
+  `modelUsage` increments and the context window guess, taken from `acp-agent.ts`
+- `informationalNotice` and `mcpServerStartupNotice` (`session-notices.ts`), and
+  `replayCompactSummary` (`context-compaction.ts`), taken from `ClaudeAcpAgent`
+- `SessionTitles` (`session-titles.ts`) now reads its session and agent through the
+  `TitledSession` and `TitleOwner` interfaces, which `ClaudeAcpAgent` matches as it is
 
 ## How it is checked
 
@@ -144,8 +169,8 @@ These pieces were extracted so that both cores use the same code:
 - `src/tests/acp-scenarios-v2-native.test.ts` runs every scenario of the shared suite on the
   native core. All 40 send only schema-valid v2. 39 pass. `ask-user-question` stops, because
   the native core sends no form elicitations. `SAME_AS_BRIDGE` lists the scenarios whose session
-  updates equal the bridge's golden file: `session-setup`, the three `async-task-*` scenarios
-  and `goal`. The differences are listed below.
+  updates equal the bridge's golden file: 25 of them. The others differ in what is listed under
+  "Not served yet" (an Edit's patch, subagent details, the resume snapshot).
 - The scenario double now sends `session_state_changed` when the query asks for it, as the real
   CLI does. The bridge and v1 scenario golden files did not change.
 - A manual run against the bundled Claude Code CLI checked the following:
@@ -160,6 +185,9 @@ These pieces were extracted so that both cores use the same code:
 - Output that comes after `session/cancel`, until the turn's `result`, is still sent: the work is
   still stopping. The bridge drops the output of stopped work.
 - A text block that an interrupt cut short does not get its tail from the consolidated message.
+- The idle of a turn that ended without a `result`, such as one that an interrupt stopped
+  before it ran, has no `usage` and no `_meta.quota`. The bridge sends the turn's tally, which
+  is zero then.
 
 ## Not served yet
 
@@ -180,12 +208,11 @@ These pieces were extracted so that both cores use the same code:
   - a subagent whose parent Claude Code no longer tracks, such as after a restart, stays
     unexposed: its traffic is the root's
 - Reports:
-  - `usage_update` (context window, cost)
-  - `session_info_update` (titles)
-  - notices (API retries, rate limits, model fallback)
-  - compaction updates
-  - prompt suggestions
-  - task-hook plans (TaskCreate)
+  - the model fallback notice (`model_refusal_fallback`), and its swap of the model option
+  - the context window before the first result: no `getContextUsage` read, and no
+    cross-session cache of windows (the bridge's `contextWindowCache`)
+  - `conversation_reset`: the plan, title and idle compaction state are not reset
+  - the bridge sends API retries and prompt suggestions to AIR only, so v2 clients get neither
 - An Edit's patch before it runs (the bridge's PreToolUse preview). The permission request does
   show it.
 - Session options:
@@ -196,11 +223,10 @@ These pieces were extracted so that both cores use the same code:
   - model preference from settings (the model starts at `default`)
 - Resume:
   - the mode and model of the transcript's last turn
-  - replaying compactions
   - `replayFrom` other than `start`
 - ExitPlanMode's "clear context" option.
-- The v1-only features: AIR extensions, steering, Remote Control, idle compaction, the Claude
-  subscription guard, MCP startup failure notices, and file change reports.
+- The v1-only features: AIR extensions, steering, Remote Control, the Claude subscription guard,
+  and file change reports.
 
 ## Replacing the bridge
 
@@ -208,10 +234,8 @@ These pieces were extracted so that both cores use the same code:
    `streamEventToAcpNotifications`, `promptToClaude`, `messageIdForGrouping`, and the helpers
    they use. The native core imports them from `acp-agent.ts` today, which is its only tie to
    the v1 core's module.
-2. Port the gaps one feature at a time, each in a module that the native core owns. Start with
-   what clients use most: `usage_update` and titles. Several of
-   these are protocol-neutral modules already (`context-compaction.ts`, `session-titles.ts`).
-   Others are typed for v1 (`native-subagents.ts`, `background-work.ts`).
+2. Port the gaps one feature at a time, each in a module that the native core owns. Some are
+   typed for v1 (`native-subagents.ts`, `background-work.ts`).
 3. Ratchet `NATIVE_STOPS` and `SAME_AS_BRIDGE`, and make `native` the default once it serves
    what v2 clients need.
 4. Delete the bridge: `v2/agent.ts`, `v2/prompt.ts`, `v2/background.ts`, the v1 request

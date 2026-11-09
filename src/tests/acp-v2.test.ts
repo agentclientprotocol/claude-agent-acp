@@ -724,15 +724,21 @@ describe("ACP v2 sessions", () => {
     expect(client.updates("config_option_update")).toEqual([]);
   });
 
-  it("tells the agent that a v2 client takes notices and compaction updates", async () => {
-    const { app, authUpdate } = v2Client();
-    await app.connectWith(connectRouter(), async (agent) => {
-      await initializeV2(agent);
-      await authUpdate(1);
-    });
-    expect(clientSupportsNotices(agents[0].clientCapabilities)).toBe(true);
-    expect(clientSupportsCompactionUpdates(agents[0].clientCapabilities)).toBe(true);
-  });
+  // Bridge internals: the v1 capabilities that the bridge gives ClaudeAcpAgent.
+  // The native core has none, and sends notices and compaction updates to
+  // every v2 client (see "reports Claude Code's warnings as live notices").
+  it.skipIf(process.env.V2_CORE_UNDER_TEST === "native")(
+    "tells the agent that a v2 client takes notices and compaction updates",
+    async () => {
+      const { app, authUpdate } = v2Client();
+      await app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        await authUpdate(1);
+      });
+      expect(clientSupportsNotices(agents[0].clientCapabilities)).toBe(true);
+      expect(clientSupportsCompactionUpdates(agents[0].clientCapabilities)).toBe(true);
+    },
+  );
 
   it("forwards the URL elicitation of MCP OAuth to a v2 client", async () => {
     let statusCall = 0;

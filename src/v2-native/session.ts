@@ -50,9 +50,11 @@ import { Pushable } from "../utils.js";
 import { v1PromptRequest } from "../v2/prompt.js";
 import { V2Background } from "../v2/background.js";
 import type { V2UpdateTranslator } from "../v2/update-translator.js";
+import { MODEL_CONFIG_ID } from "../session-model.js";
 import type { SessionConfig } from "./config.js";
 import { idleOutcome, isPlaceholderResult, ResultUsage, type TurnEnd } from "./outcome.js";
 import { StoppedWork } from "./stopped-work.js";
+import { SessionReports } from "./reports.js";
 import { SessionOutput } from "./stream.js";
 import { SessionTasks, type RequestTarget } from "./tasks.js";
 
@@ -127,6 +129,10 @@ export class NativeSession implements RequestTarget {
   private closing: Promise<void> | undefined;
   private query: Query | undefined;
   readonly output: SessionOutput;
+  /** Usage, quota, notices, compactions and the title (see {@link SessionReports}). */
+  readonly reports: SessionReports;
+  /** Resolves the adapter's own `/compact` once a turn ends (see {@link compact}). */
+  private ownCommandDone: (() => void) | undefined;
   /** The `background` lists of the session and its children, stamped on each state. */
   private readonly background: V2Background;
   readonly tasks: SessionTasks;
@@ -147,6 +153,29 @@ export class NativeSession implements RequestTarget {
       (update) => this.send(update),
       connection.logger,
     );
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    const session = this;
+    const titled = {
+      get query() {
+        return session.query!;
+      },
+      get queryClosed() {
+        return session.closed;
+      },
+      get cancelled() {
+        return session.cancelledWork;
+      },
+      cwd,
+    };
+    this.reports = new SessionReports({
+      sessionId,
+      logger: connection.logger,
+      emit: (notifications) => this.output.emitV1(notifications),
+      isBusy: () => this.foreground || this.pending.size > 0 || this.requests.size > 0,
+      compact: () => this.compact(),
+      titledSession: () => (this.query && !this.closed ? titled : undefined),
+    });
+    this.output.onAgentText = (content) => this.reports.agentText(content);
     this.background = new V2Background(connection.translator.terminals);
     this.tasks = new SessionTasks(
       {
@@ -207,6 +236,7 @@ export class NativeSession implements RequestTarget {
   /** Replaces the session's MCP servers, as a resume of the active session asks. */
   async setMcpServers(servers: Parameters<Query["setMcpServers"]>[0]): Promise<void> {
     await this.query?.setMcpServers(servers);
+    this.reports.mcpServersChanged(Object.keys(servers));
   }
 
   // --- Requests ---------------------------------------------------------
@@ -225,6 +255,7 @@ export class NativeSession implements RequestTarget {
     }
     // Throws invalid params for content that Claude cannot take.
     const request: PromptRequest = v1PromptRequest(params);
+    this.reports.promptSent(request.prompt);
     const uuid = randomUUID();
     const message = { ...promptToClaude(request), uuid };
     return new Promise((resolve, reject) => {
@@ -237,6 +268,34 @@ export class NativeSession implements RequestTarget {
           if (this.pending.get(uuid) !== pending || this.closed) return;
           pending.pushed = true;
           this.input.push(message);
+          this.reports.promptQueued(request.prompt);
+        });
+    });
+  }
+
+  /**
+   * The adapter's idle compaction: `/compact`, as Claude Code's own turn. It
+   * is no prompt of the client's, so it gets no `user_message`, and the client
+   * sees its turn as `running`, then `idle`. Resolves when a turn ends after
+   * it: the idle compaction runs it only while the session is idle, so the
+   * next turn to end is its own.
+   */
+  private compact(): Promise<void> {
+    return new Promise((resolve) => {
+      this.ownCommandDone?.();
+      this.ownCommandDone = resolve;
+      const message = {
+        ...promptToClaude({
+          sessionId: this.sessionId,
+          prompt: [{ type: "text", text: "/compact" }],
+        }),
+        uuid: randomUUID(),
+      };
+      this.pushes = this.pushes
+        .then(() => this.interrupting)
+        .then(() => {
+          if (this.closed) resolve();
+          else this.input.push(message);
         });
     });
   }
@@ -250,6 +309,7 @@ export class NativeSession implements RequestTarget {
    */
   async cancel(): Promise<void> {
     if (this.closed || !this.query) return;
+    this.reports.disarmIdleCompaction("cancel");
     this.stopForeground();
     // `cancelQueued` is untyped in the SDK (`Query.interrupt` takes it since
     // the CLI's `interrupt_cancel_queued_v1`): Claude Code then drops the
@@ -302,6 +362,7 @@ export class NativeSession implements RequestTarget {
     value: unknown,
   ): Promise<v2.SessionConfigOption[]> {
     await this.config.set(configId, type, value);
+    if (configId === MODEL_CONFIG_ID) this.reports.disarmIdleCompaction("model change");
     const options = this.config.options();
     // v2 sends every config change as an update too, for the session's other clients.
     this.send({ sessionUpdate: "config_option_update", configOptions: options });
@@ -328,6 +389,7 @@ export class NativeSession implements RequestTarget {
       this.closeTurn();
       this.failPending(RequestError.requestCancelled());
       this.closed = true;
+      this.endReports();
       this.input.end();
       this.query?.close();
     })();
@@ -419,7 +481,10 @@ export class NativeSession implements RequestTarget {
     switch (message.type) {
       case "stream_event":
         if (this.stopped.drops(message)) return;
-        if (message.parent_tool_use_id === null) this.outputStarts();
+        if (message.parent_tool_use_id === null) {
+          this.outputStarts();
+          this.reports.streamEvent(message);
+        }
         this.output.streamEvent(message);
         return;
       case "assistant":
@@ -431,7 +496,10 @@ export class NativeSession implements RequestTarget {
           }
         }
         if (this.stopped.drops(message)) return;
-        if (message.parent_tool_use_id === null) this.outputStarts();
+        if (message.parent_tool_use_id === null) {
+          this.outputStarts();
+          this.reports.assistant(message);
+        }
         this.output.assistant(message);
         return;
       case "user":
@@ -453,6 +521,7 @@ export class NativeSession implements RequestTarget {
         switch (message.subtype) {
           case "init":
             if (message.capabilities?.includes("msg_lifecycle_v1")) this.lifecycleFrames = true;
+            this.reports.handle(message);
             return;
           case "status":
             // Each model request starts with one, which lists the prompts it serves.
@@ -460,6 +529,7 @@ export class NativeSession implements RequestTarget {
               const prompts = (message as { user_message_uuids?: unknown }).user_message_uuids;
               this.stopped.requesting(Array.isArray(prompts) ? prompts : []);
             }
+            this.report(message);
             return;
           case "local_command_output":
             // The output of a local command, such as `/cost`.
@@ -467,16 +537,44 @@ export class NativeSession implements RequestTarget {
             this.output.agentMessage(message.content, message.uuid);
             return;
           case "session_state_changed":
-            if (message.state === "idle") this.claudeCodeIdle();
+            if (message.state === "idle") {
+              this.claudeCodeIdle();
+              this.reports.idle();
+            }
             return;
           default:
+            this.report(message);
             return;
         }
       default:
-        // Not reported yet: tool progress, background tasks, compaction,
-        // rate limits, notices and the rest (see docs/v2-native-core.md).
+        this.report(message);
         return;
     }
+  }
+
+  /**
+   * The messages that report on the session rather than carry Claude's
+   * output (see {@link SessionReports}). Not reported yet: the rest (see
+   * docs/v2-native-core.md).
+   */
+  private report(message: SDKMessage): void {
+    if (message.type === "tool_progress") {
+      this.output.toolProgress(message);
+      return;
+    }
+    if (message.type === "system" && message.subtype === "memory_recall") {
+      this.output.memoryRecall(message);
+      return;
+    }
+    // A compaction runs in a turn: it opens the turn if nothing reported it yet.
+    if (
+      message.type === "system" &&
+      message.subtype === "status" &&
+      message.status === "compacting"
+    ) {
+      this.openTurn(undefined);
+    }
+    this.reports.handle(message);
   }
 
   private lifecycle(frame: CommandLifecycleFrame): void {
@@ -559,6 +657,7 @@ export class NativeSession implements RequestTarget {
     // A result with no open turn: a turn that sent nothing before it.
     this.openTurn(undefined);
     this.lastEnd = end;
+    this.reports.result(message);
     if (message.stop_reason === "refusal") {
       // The refused message shows nothing: its explanation answers.
       if (this.refusalExplanation) {
@@ -568,10 +667,12 @@ export class NativeSession implements RequestTarget {
       message.subtype === "success" &&
       !message.is_error &&
       message.result &&
-      !this.output.hasAgentText()
+      !this.output.hasAgentText() &&
+      !this.reports.repeats(message.result)
     ) {
       // A local command (such as `/context`) answers with its result alone:
-      // no model text streamed for it.
+      // no model text streamed for it. A result that only repeats a notice or
+      // a compaction of the turn is not shown again.
       this.output.agentMessage(message.result, message.uuid);
     }
     this.closeTurn();
@@ -593,6 +694,7 @@ export class NativeSession implements RequestTarget {
 
   /** The query ended, with `error` when it failed. The session cannot go on. */
   private ended(error: unknown): void {
+    this.endReports();
     if (this.closing || this.closed) {
       this.tasks.queryEnded(undefined);
       this.failPending(RequestError.requestCancelled());
@@ -627,6 +729,13 @@ export class NativeSession implements RequestTarget {
     this.connection.ended(this.sessionId);
   }
 
+  /** The session ends: its idle compaction is off, and its own `/compact` settles. */
+  private endReports(): void {
+    this.reports.dispose();
+    this.ownCommandDone?.();
+    this.ownCommandDone = undefined;
+  }
+
   // --- State ---------------------------------------------------------------
 
   /**
@@ -639,6 +748,7 @@ export class NativeSession implements RequestTarget {
     this.foreground = true;
     this.lastEnd = undefined;
     this.output.resetAgentText();
+    this.reports.turnStarted();
     this.reportState();
   }
 
@@ -655,6 +765,7 @@ export class NativeSession implements RequestTarget {
         if (request.coveredByCancel) request.abort.abort();
       }
     }
+    this.reports.turnEnded();
     this.foreground = false;
     this.reportState();
     this.cancelledWork = false;
@@ -662,6 +773,9 @@ export class NativeSession implements RequestTarget {
     this.lastEnd = undefined;
     this.turnCommand = undefined;
     this.refusalExplanation = undefined;
+    const ownCommandDone = this.ownCommandDone;
+    this.ownCommandDone = undefined;
+    ownCommandDone?.();
   }
 
   private foregroundState(): ForegroundState {

@@ -11,18 +11,41 @@
  * `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` or
  * `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` set), the same request generates it.
  *
- * {@link SessionTitles} holds the per-session state and is owned by `Session`.
- * `acp-agent.ts` drives it from five places: {@link SessionTitles.onPrompt} and
- * {@link SessionTitles.onAssistantText} to collect text,
- * {@link SessionTitles.onPromptQueued} once a prompt is sent to the CLI,
- * {@link SessionTitles.onTurnEnd} at `session_state_changed: idle`, and
- * {@link SessionTitles.reset} on `conversation_reset`.
+ * {@link SessionTitles} holds the per-session state and is owned by the
+ * session, in the v1 core (`acp-agent.ts`) and the native v2 core
+ * (`v2-native/session.ts`). Each drives it from the same places:
+ * {@link SessionTitles.onPrompt} and {@link SessionTitles.onAssistantText} to
+ * collect text, {@link SessionTitles.onPromptQueued} once a prompt is sent to
+ * the CLI, {@link SessionTitles.onTurnEnd} at `session_state_changed: idle`,
+ * and, in v1, {@link SessionTitles.reset} on `conversation_reset`.
  */
 
-import type { ContentBlock, PromptRequest } from "@agentclientprotocol/sdk/unstable";
+import type {
+  ContentBlock,
+  PromptRequest,
+  SessionNotification,
+} from "@agentclientprotocol/sdk/unstable";
 import { getSessionInfo, type Query, type SDKSessionInfo } from "@anthropic-ai/claude-agent-sdk";
-import type { ClaudeAcpAgent, Session } from "./acp-agent.js";
 import { ExplicitTitle } from "./session-index/explicit-title.js";
+
+/** What titles read of their session. */
+export interface TitledSession {
+  readonly query: Query;
+  readonly queryClosed?: boolean;
+  /** Whether a cancel stopped the session's work: no title is generated then. */
+  readonly cancelled?: boolean;
+  readonly cwd: string;
+}
+
+/** What titles need of the core that serves the session (`ClaudeAcpAgent` in v1). */
+export interface TitleOwner {
+  readonly client: { sessionUpdate(notification: SessionNotification): Promise<void> };
+  readonly logger: { error: (...args: any[]) => void };
+  /** The live sessions by id: a session replaced or closed meanwhile adopts no title. */
+  readonly sessions: Readonly<Record<string, TitledSession | undefined>>;
+  /** The title as the client shows it, such as with an archive prefix removed. */
+  clientTitle?(title: string): string;
+}
 
 const MAX_TITLE_LENGTH = 256;
 
@@ -137,7 +160,7 @@ export class SessionTitles {
   }
 
   constructor(
-    private readonly agent: ClaudeAcpAgent,
+    private readonly agent: TitleOwner,
     private readonly sessionId: string,
   ) {}
 
@@ -158,7 +181,7 @@ export class SessionTitles {
    *  prompt alone is the description, because the CLI titles from the prompt
    *  alone. When this yields no title, the stored summary is published and
    *  the next prompt tries again. */
-  onPromptQueued(session: Session, prompt: PromptRequest["prompt"]): void {
+  onPromptQueued(session: TitledSession, prompt: PromptRequest["prompt"]): void {
     this.askedAtPrompt = false;
     // `session.cancelled` is not checked: after a cancelled turn it stays set
     // until the next turn starts, which is after this prompt is queued.
@@ -209,7 +232,7 @@ export class SessionTitles {
    *  turn-end must not wait on it. That covers a prompt too short to title
    *  from, such as "hi". Only when that is not possible do we fall back to
    *  `summary`, which for an SDK-driven session is just the raw first prompt. */
-  async onTurnEnd(session: Session): Promise<void> {
+  async onTurnEnd(session: TitledSession): Promise<void> {
     if (this.explicit.settledByClient) {
       // No title is generated over the one the client set, but a custom title
       // stored since by someone else (a `/rename`) is adopted, as before.
@@ -301,7 +324,7 @@ export class SessionTitles {
    *  have it. Both come from the session file, as `session/list` reports
    *  them; a session with no file yet sends the last title published, if any,
    *  without `updatedAt`. */
-  async publishCurrent(session: Session): Promise<void> {
+  async publishCurrent(session: TitledSession): Promise<void> {
     const info = await this.readSessionInfo(session);
     // A title published but not yet stored (a generated title still being
     // written) wins over `summary`, which is then only the raw first prompt.
@@ -329,7 +352,7 @@ export class SessionTitles {
 
   /** Read the SDK's stored info for this session. A missing session file or read
    *  error is non-fatal: the title is best-effort and another turn will retry. */
-  private async readSessionInfo(session: Session): Promise<SDKSessionInfo | undefined> {
+  private async readSessionInfo(session: TitledSession): Promise<SDKSessionInfo | undefined> {
     try {
       return await getSessionInfo(this.sessionId, { dir: session.cwd });
     } catch (error) {
@@ -357,7 +380,7 @@ export class SessionTitles {
 
   /** Whether to ask the SDK for a generated title now: once per session, on a
    *  live query, with enough collected text for the generator to work with. */
-  private canRequest(session: Session): boolean {
+  private canRequest(session: TitledSession): boolean {
     if (this.settled || session.queryClosed || session.cancelled) {
       return false;
     }
@@ -383,7 +406,7 @@ export class SessionTitles {
    *  session's title, or a `/rename`), else one generated from `description`.
    *  The file is read first because the CLI checks only the titles it holds in
    *  memory before generating one. */
-  private async titleFromPrompt(session: Session, description: string): Promise<void> {
+  private async titleFromPrompt(session: TitledSession, description: string): Promise<void> {
     const info = await this.readSessionInfo(session);
     if (this.agent.sessions[this.sessionId] !== session || this.explicit.active) {
       return;
@@ -405,7 +428,7 @@ export class SessionTitles {
    *  prompt or turn end retries, and publishes `fallback` (the stored summary)
    *  so a backend that can't generate titles is no worse off than before. */
   private async requestGenerateTitle(
-    session: Session,
+    session: TitledSession,
     description: string,
     fallback: TitleFallback | undefined,
   ): Promise<void> {
