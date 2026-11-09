@@ -1,6 +1,6 @@
 /**
  * The replay of a session's subagents, for `session/resume` with
- * `replayFrom`, as the bridge replays them (`RfdSubagentReplay`).
+ * `replayFrom`, as the v1 core replays them (`RfdSubagentReplay`).
  *
  * Claude Code keeps each subagent's history in its own transcript, and its
  * metadata file names the Agent or Task call that launched it (see
@@ -218,7 +218,7 @@ export class SubagentReplay {
   }
 
   /**
-   * After the response, as the bridge sends them (`currentStates`): the
+   * After the response, as the v1 core sends them (`currentStates`): the
    * current state of each replayed child that the live session does not
    * track, since its process is gone, so its replayed end. A `cwd` that is
    * gone, such as a worktree that Claude Code removed, is cleared. Then each

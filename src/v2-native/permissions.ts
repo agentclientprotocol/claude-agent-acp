@@ -61,7 +61,7 @@ export interface PermissionHost {
    * `toolCallId` of `toolName` (see `SessionTasks.requestShows`).
    */
   requestShows(target: RequestTarget, toolName: string, toolCallId: string): void;
-  /** The subject's tool call, with the `_meta` that the client holds of it, as on the bridge. */
+  /** The subject's tool call, with the `_meta` that the client holds of it. */
   toolCallSubject<T extends ToolCallUpdate>(sessionId: string, toolCall: T): T;
   /**
    * Whether the tool use is of work that a cancel stopped before the client

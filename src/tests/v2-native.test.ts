@@ -667,7 +667,7 @@ describe("native ACP v2 core", () => {
         description: "Review a change",
         input: { type: "text", hint: "<pull request>" },
       },
-      // The adapter's own `/mcp`, as on the bridge.
+      // The adapter's own `/mcp`.
       expect.objectContaining({ type: "command", name: "mcp" }),
     ]);
     // Each prompt is echoed, and the session's state is reported.
@@ -721,7 +721,7 @@ describe("native ACP v2 core", () => {
         cachedWriteTokens: 0,
         totalTokens: 6,
       },
-      // As on the bridge: the turn's tokens, and its rows by model.
+      // The turn's tokens, and its rows by model.
       _meta: {
         quota: {
           token_count: {
@@ -1914,8 +1914,7 @@ describe("native ACP v2 core", () => {
       await askPermission(claude, "ExitPlanMode", { plan: "Fix it" });
     });
 
-    // The bridge keeps the old context's percentage until the next request
-    // reports usage (see "Intended differences" in docs/v2-native-core.md).
+    // After the reset, the context in use is 0, not the old context's figure.
     expect(
       client.permissionRequests.map(
         (request) =>

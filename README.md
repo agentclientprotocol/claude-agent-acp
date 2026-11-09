@@ -146,9 +146,7 @@ compaction, display terminals for commands, permission requests, elicitation, pr
 
 v2 is served by [the native v2 core](docs/v2-native-core.md), which runs straight on Claude
 Code instead of translating to v1. A v2 client that declares JetBrains AIR
-(`_meta.jetbrains.air`) gets the earlier bridge to the v1 core, which serves it the AIR
-extensions except the async task and goal ones. `CLAUDE_AGENT_ACP_V2_CORE=bridge` serves every v2
-client through the bridge, as a fallback.
+(`_meta.jetbrains.air`) also gets the AIR extensions that ACP v2 does not cover.
 
 ## Contribution Policy
 

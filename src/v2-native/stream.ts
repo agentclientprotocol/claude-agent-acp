@@ -48,8 +48,8 @@ const V2_TOOL_CALL_CAPABILITIES = ClientCapabilities.from(undefined, { v2: true 
 
 /**
  * The v1 capabilities the shared mapping reads. Every v2 client takes
- * `plan_update` with a markdown plan, as on the bridge (`v1InitializeRequest`):
- * an approved ExitPlanMode's plan goes out as one.
+ * `plan_update` with a markdown plan, so an approved ExitPlanMode's plan
+ * goes out as one.
  */
 const V2_CLIENT_CAPABILITIES: AcpClientCapabilities = { plan: {} };
 
@@ -98,7 +98,7 @@ export class SessionOutput {
   private readonly dispatched = new Set<string>();
   /**
    * Whether the output comes from work that a `session/cancel` stopped, until
-   * its idle. As on the bridge, the session's streamed deltas still go out,
+   * its idle. The session's streamed deltas still go out,
    * and of its consolidated messages only the tool results of the calls that
    * the client holds, where an error result ends a run that the cancel
    * aborted (`cancelled`). On the root, this covers the main conversation's
@@ -173,7 +173,7 @@ export class SessionOutput {
 
   /**
    * A consolidated assistant message. Of its text and thinking, only what did
-   * not stream as deltas goes out, as on the bridge (`unstreamedRemainder`):
+   * not stream as deltas goes out (`unstreamedRemainder`):
    * the tail of a block whose stream was cut short, or the whole message when
    * it never streamed (a gateway without streaming). Its tool uses then get
    * their complete input. A subagent's message on the root session goes
@@ -281,7 +281,7 @@ export class SessionOutput {
       : message.parent_tool_use_id;
     if (toolCallId === null || !this.emittedToolCalls.has(toolCallId)) return;
     // A subagent's beat, on its own session, names the Agent call that runs
-    // it, as on the bridge. A tool call is never its own parent.
+    // it. A tool call is never its own parent.
     const parentToolUseId =
       this.subagent && message.parent_tool_use_id !== toolCallId
         ? (message.parent_tool_use_id ?? undefined)
@@ -317,8 +317,8 @@ export class SessionOutput {
   /**
    * The tool call of a permission request that the stream never shows, such
    * as SandboxNetworkAccess's, before the request: the client holds it, and
-   * {@link toolCallStatus} ends it once the request is answered, as on the
-   * bridge (`ensureToolCallEmitted`).
+   * {@link toolCallStatus} ends it once the request is answered, as on v1
+   * (`ensureToolCallEmitted`).
    */
   permissionToolCall(toolName: string, toolCallId: string, input: unknown): void {
     if (this.emittedToolCalls.has(toolCallId)) return;
@@ -333,7 +333,7 @@ export class SessionOutput {
 
   /**
    * Claude Code denied a tool use without asking (a rule, the classifier or
-   * the mode): its tool call fails with the reason, as on the bridge. A tool
+   * the mode): its tool call fails with the reason. A tool
    * call that the client does not hold, such as dropped work's, is left out.
    */
   permissionDenied(message: SDKPermissionDeniedMessage, parentToolUseId?: string): void {
@@ -462,7 +462,7 @@ export class SessionOutput {
     },
     transform: (notification: AcpSessionNotification) => AcpSessionNotification = (n) => n,
   ): void {
-    // A replay renders the history on its own, as the bridge's does: each
+    // A replay renders the history on its own: each
     // replayed tool call goes out whole, whatever the live session sent.
     const live = !options.replay;
     this.emit(

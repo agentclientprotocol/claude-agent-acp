@@ -9,7 +9,7 @@
  * states, and its permission requests, which are denied. So is a model cycle
  * that Claude Code had started on its own (a `status: requesting` frame came)
  * and that showed nothing yet when the cancel came while the session was
- * idle. The bridge drops the same work.
+ * idle.
  *
  * The interrupt stops whatever Claude Code runs when it arrives, which can be
  * a cycle that the session reads only after the cancel. That cycle ends with
@@ -24,7 +24,7 @@ import { isAbortedResult } from "../acp-agent.js";
 
 /**
  * How long `canUseTool` waits, after a cancel, for the session to read the
- * tool use that it asks about, as on the bridge.
+ * tool use that it asks about, as on v1 (`TOOL_USE_WAIT_MS`).
  */
 const TOOL_USE_WAIT_MS = 2_000;
 

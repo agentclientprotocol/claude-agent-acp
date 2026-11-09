@@ -1,5 +1,5 @@
 /**
- * Restarts of a native session's query, as the bridge restarts them: a new
+ * Restarts of a native session's query: a new
  * query resumes the same Claude session under the same id, and takes over
  * from the old one between turns.
  *
@@ -12,7 +12,7 @@
  *   its next turn boundary: no turn is open, no prompt of the session waits
  *   to go to Claude Code or in its queue, and no subagent runs. Prompts that
  *   come meanwhile wait, and go to the new query. The request that changed
- *   the route answers once every live session restarted, as on the bridge.
+ *   the route answers once every live session restarted.
  *   A session that cannot start again stops: its requests then fail with
  *   what happened, until a resume starts it again.
  * - The additional directories: a resume of the active session with other
@@ -32,7 +32,7 @@
  * (their terminals exit), as when a query ends. The new query starts without
  * the effort of the setup's `_meta`, and the client's choices are set again
  * on it (`SessionConfig.restoreFrom`), which then reports its options in a
- * `config_option_update`, as on the bridge. One restart of a session runs at
+ * `config_option_update`. One restart of a session runs at
  * a time: a route restart waits for an account restart that runs.
  *
  * A `session/cancel` or `session/close` answers the prompts that wait for a

@@ -2,18 +2,13 @@
  * The native ACP v2 core: serves ACP v2 straight from Claude Code, without
  * `ClaudeAcpAgent`.
  *
- * The bridge in `src/v2/` serves v2 by converting each request to v1 and
- * running it through the v1 core, which holds turns open, matches echoes,
- * and keeps the v1 and AIR extensions. This core serves only v2, so it keeps
- * none of that: each session mirrors its Claude Code query (see
+ * The adapter's ACP v2 implementation. Unlike the v1 core, it holds no turn
+ * open and matches no echoes: each session mirrors its Claude Code query (see
  * `session.ts`). It shares the protocol-neutral pieces with v1: the SDK
  * message mapping, tool call rendering, permission options, and the mode
  * catalog. It serves a JetBrains AIR client the AIR extensions that v2 does
  * not cover (see `air.ts`). What it does not serve yet is listed in
  * `docs/v2-native-core.md`.
- *
- * The default v2 core. `CLAUDE_AGENT_ACP_V2_CORE=bridge` selects the bridge
- * instead (see `serve.ts`).
  */
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
@@ -204,7 +199,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
   ): Promise<CreateElicitationResponse> {
     // The v1 types accept a property schema with any tag; the v2 types accept
     // one only in a received value. An MCP server's schema is relayed
-    // unchanged, as on the bridge, so this cast does not check it.
+    // unchanged, as on v1, so this cast does not check it.
     return this.ctx.request(
       v2.methods.client.elicitation.create,
       request as v2.CreateElicitationRequest,
@@ -239,8 +234,8 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
   // --- Requests --------------------------------------------------------------
 
   /**
-   * The bridge's handshake. An AIR client gets the AIR capabilities that this
-   * core serves in the response's `_meta` (see `air.ts`).
+   * The v2 handshake. An AIR client gets the AIR capabilities that this core
+   * serves in the response's `_meta` (see `air.ts`).
    */
   initialize(request: v2.InitializeRequest): v2.InitializeResponse {
     this.clientCapabilities = request.capabilities;
@@ -276,7 +271,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
    *
    * Not `async`, and the session's promise is returned as is: the response
    * then goes out before the turn's `running`, which the session sends right
-   * after it resolves the prompt, as on the bridge. Nothing enforces this
+   * after it resolves the prompt. Nothing enforces this
    * order but the number of promise hops (v2 allows either), and the golden
    * files of the scenarios (`acp-scenarios-v2.test.ts`) hold it.
    */
@@ -304,9 +299,8 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
   }
 
   /**
-   * Copies the session's transcript into a new session, as the bridge does
-   * (`forkSession`), and starts it from the copy, so the client can prompt
-   * it at once.
+   * Copies the session's transcript into a new session (`forkSession`), and
+   * starts it from the copy, so the client can prompt it at once.
    */
   async forkSession(params: v2.ForkSessionRequest): Promise<v2.ForkSessionResponse> {
     if (this.ownerOfChild(params.sessionId)) throw restrictedChild(params.sessionId, "fork");
@@ -382,7 +376,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       const end = replayEndUpdate(this.clientCapabilities);
       if (end) this.send({ sessionId, update: end });
     }
-    // The current title, after the replay and before the state, as on the bridge.
+    // The current title, after the replay and before the state.
     await session.reports.publishTitle();
     for (const notification of session.resumeSnapshot()) this.send(notification);
     const response = await this.setupFields(session);
@@ -390,7 +384,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     // The response ends the replay, and the replayed children's states before
     // it are history: their current states follow it. Nothing enforces that
     // the timer runs after the response goes out; it relies on the response
-    // being written when this handler returns, as the bridge's
+    // being written when this handler returns, as the v1 core's
     // `afterSetupResponse` does.
     if (subagents) setTimeout(() => subagents.afterResponse(), 0);
     return response;
@@ -534,7 +528,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
    * Starts the query of the live session `sessionId` again, resuming its
    * conversation (see `restarts.ts`). Claude Code writes the conversation at
    * the first prompt, so a session never prompted has none to resume: it
-   * starts afresh under the same id, as on the bridge.
+   * starts afresh under the same id.
    */
   private async restartSession(sessionId: string, params: SetupParams): Promise<NativeSession> {
     try {
@@ -577,7 +571,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
 
   /**
    * Starts the query of a session: a new one, or `resume` of a stored one
-   * (also a fork's copy). Its options follow the bridge's: the client's
+   * (also a fork's copy). Its options are the client's
    * `_meta.claudeCode.options` under the ones this core controls.
    */
   private async startSession(
@@ -589,9 +583,9 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
   ): Promise<NativeSession> {
     const request = await validatedSetup(params);
     const client = clientOptions(params._meta);
-    // After a provider change that is still listing its models, as on the bridge.
+    // After a provider change that is still listing its models.
     await this.auth.routeSettled();
-    // The resumed transcript's last model and mode, as on the bridge.
+    // The resumed transcript's last model and mode.
     const resumed =
       resume === undefined
         ? undefined
@@ -658,7 +652,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       ...(thinking !== undefined && { thinking }),
       // Claude Code's interrupt then spares background tasks, which the
       // client stops one at a time: `session/cancel` must leave listed work
-      // running. Before the client's options, as on the bridge.
+      // running. Before the client's options.
       perTaskStopAffordance: true,
       // AIR's predicted follow-up prompt (see `reports.ts`), as on v1. Only
       // AIR gets it, so no other client's session spends a request on it.
@@ -708,7 +702,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
         SubagentStart: [subagent.SubagentStart],
         SubagentStop: [subagent.SubagentStop],
         PostToolUseFailure: [subagent.PostToolUseFailure],
-        // An Edit or Write shows its exact patch before it runs, as on the bridge.
+        // An Edit or Write shows its exact patch before it runs.
         PreToolUse: [subagent.PreToolUse, fileChangePreviewHook(session, this.logger)],
         PostToolUse: [
           subagent.PostToolUse,
@@ -825,8 +819,8 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
 }
 
 /**
- * The setup request in v1 form, once it is valid: the MCP transports as the
- * bridge checks them, a `systemPrompt` that the session can apply
+ * The setup request in v1 form, once it is valid: the MCP transports that
+ * `V2_SESSION_CAPABILITIES` lists, a `systemPrompt` that the session can apply
  * (`clientSystemPrompt`), an absolute `cwd` that is a directory, and
  * absolute additional directories. Every setup path calls it before it acts,
  * so an invalid request creates, resumes or forks nothing.

@@ -1,5 +1,5 @@
 /**
- * The configuration of each child session, as the bridge reports it
+ * The configuration of each child session, as the v1 core reports it
  * (`NativeSubagentRuntime.reportConfiguration`): the options that the
  * child's hooks report (its mode, model after a `PostModelSwitch`, effort and
  * agent type, see `subagentHookOptions`) and the model of its responses. Each
@@ -13,7 +13,7 @@ import type { AgentInfo, HookCallbackMatcher, HookInput } from "@anthropic-ai/cl
 import type { SubagentModels } from "../native-subagents.js";
 import { orderedSubagentConfiguration, subagentHookOptions } from "../subagent-configuration.js";
 
-/** The most children not announced yet whose options wait, as on the bridge. */
+/** The most children not announced yet whose options wait. */
 const MAX_PENDING_CHILDREN = 64;
 
 /** What the configurations need of their root session. */
@@ -97,7 +97,7 @@ export class ChildConfigurations {
 
 /**
  * The hook that reports a subagent's hooks to `report`, for each hook event
- * that the bridge reads them from. The hook makes no decision.
+ * that reports them. The hook makes no decision.
  */
 export function subagentHooks(
   report: (input: HookInput) => void,

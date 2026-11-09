@@ -3,15 +3,13 @@
  * a person types in another client of the session over Remote Control.
  *
  * The command, its listing, and its reply are the v1 core's
- * (`remote-control.ts`), which the bridge serves to v2 clients. The command
+ * (`remote-control.ts`). The command
  * runs as a local command of its own turn, as v2 asks of one ("Local handling
  * still uses the foreground lifecycle"): its prompt is inserted as a
  * live-only `user_message`, the turn reports `running`, the reply goes out,
  * and the turn ends `idle` with `end_turn`. It waits until no turn is open
  * and no prompt waits in Claude Code's queue, and the prompts after it wait
  * for it: v2 asks to hold a prompt rather than reject it while Claude works.
- * The bridge rejects the command then, and sends its reply without states
- * (see "Intended differences" in docs/v2-native-core.md).
  */
 import { randomUUID } from "node:crypto";
 import type { Query, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";

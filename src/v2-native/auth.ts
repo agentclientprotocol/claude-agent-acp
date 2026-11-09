@@ -8,7 +8,7 @@
  * `initialize`, from each session's account, after a login or a logout, and at
  * the start of each prompt (see `auth-status.ts`).
  *
- * A gateway login routes the sessions started after it, as on the bridge.
+ * A gateway login routes the sessions started after it.
  * `providers/set`, `providers/disable`, and a logout that drops a provider or
  * a gateway login also route the live sessions: each one's query restarts at
  * its next turn boundary (see `restarts.ts`), and the request answers once

@@ -1,7 +1,7 @@
 /**
  * The `--hide-claude-auth` subscription guard on the native core: this
  * integration never bills a claude.ai subscription. The policy is the v1
- * core's (`hide-claude-auth.ts`), which the bridge applies to v2 sessions:
+ * core's (`hide-claude-auth.ts`):
  *
  * - It holds while the flag is on and no provider or gateway login routes
  *   the traffic away from the CLI's own login.
@@ -17,8 +17,7 @@
  *   restarts the query at the next prompt that finds the session idle (see
  *   `restarts.ts`), so its start judges the current account.
  *
- * The `/remote-control` command that the adapter runs is not guarded, as on
- * the bridge, where it answers before the guard runs.
+ * The `/remote-control` command that the adapter runs is not guarded.
  */
 import type { AccountInfo, Query } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "../acp-agent.js";

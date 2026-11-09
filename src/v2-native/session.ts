@@ -358,7 +358,7 @@ export class NativeSession implements RequestTarget {
 
   /**
    * Replaces the session's MCP servers, as a resume of the active session
-   * asks. The same servers stay as they are, connected, as on the bridge.
+   * asks. The same servers stay as they are, connected.
    */
   async setMcpServers(servers: McpServers): Promise<void> {
     const key = JSON.stringify(servers);
@@ -382,7 +382,7 @@ export class NativeSession implements RequestTarget {
    * runs in the prompt's turn among the session's prompts, so they keep their
    * order, and a cancel or close answers a prompt that waits for it with
    * -32800 as any prompt not inserted yet. Its refusal answers the prompt.
-   * The adapter's `/remote-control` is not guarded, as on the bridge.
+   * The adapter's `/remote-control` is not guarded.
    */
   prompt(
     params: v2.PromptRequest,
@@ -395,8 +395,7 @@ export class NativeSession implements RequestTarget {
     const request: PromptRequest = v1PromptRequest(params);
     const remoteControl = this.remoteControl.mayRun(request.prompt);
     const guarded = guard && !remoteControl ? guard : undefined;
-    // As on the bridge, a prompt that the guard refuses titles nothing and
-    // sends no notice.
+    // A prompt that the guard refuses titles nothing and sends no notice.
     const sent = () => {
       this.reports.promptSent(request.prompt);
       // The notice of a mode fallback at the session's start, which sends it at once.
@@ -534,7 +533,7 @@ export class NativeSession implements RequestTarget {
    * Stops the foreground work, and answers the prompts not inserted yet with
    * -32800. The work's idle reports `cancelled`. Background work goes on.
    *
-   * The interrupt goes out also while the session is idle, as on the bridge:
+   * The interrupt goes out also while the session is idle:
    * Claude Code may run a cycle that this session has not read yet.
    */
   async cancel(): Promise<void> {
@@ -610,8 +609,8 @@ export class NativeSession implements RequestTarget {
   /**
    * Cancels as `session/cancel` does, ends the open turn with its cancelled
    * idle, then ends the query, which stops the background work too. Nothing
-   * of the session goes out after it resolves. As on the bridge, it does not
-   * wait for Claude Code to end the work: the query's end stops it, and the
+   * of the session goes out after it resolves. It does not wait for Claude
+   * Code to end the work: the query's end stops it, and the
    * tool calls that the work leaves open end `cancelled` before its idle.
    */
   close(): Promise<void> {
@@ -745,7 +744,7 @@ export class NativeSession implements RequestTarget {
   exitPlanInterrupting(toolUseId: string, reset: ClearContextReset | undefined): void {
     // The fresh context starts in the mode that the answer's mode runs as on
     // the model, such as `acceptEdits` for `auto` on a model without Auto,
-    // with no fallback notice, as the bridge starts its fresh query.
+    // with no fallback notice.
     this.clearContext.interrupting(
       toolUseId,
       reset && { ...reset, mode: this.config.effectiveMode(reset.mode) },
@@ -802,14 +801,14 @@ export class NativeSession implements RequestTarget {
 
   /**
    * Claude Code mounted a fresh conversation (such as for `/clear`), whose
-   * Task* ids and task store are independent of the previous transcript. As
-   * on the bridge, the client's plan of Task* entries is cleared before a
+   * Task* ids and task store are independent of the previous transcript. The
+   * client's plan of Task* entries is cleared before a
    * follow-up prompt can republish stale tasks, and the title and the idle
    * compaction start over. The fresh context of an approved plan sends no
-   * empty Task* plan, as the bridge's fresh query sends none.
+   * empty Task* plan.
    */
   private conversationReset(): void {
-    // First, as on the bridge: the subagents of the dropped conversation end.
+    // First, the subagents of the dropped conversation end.
     this.tasks.conversationReset();
     this.output.taskState.clear();
     if (!this.clearContext.holdsTurn()) this.output.taskPlanChanged();
@@ -908,7 +907,7 @@ export class NativeSession implements RequestTarget {
         // in. A prompt Claude Code reported `started` for is inserted already.
         if ("isReplay" in message && message.isReplay) {
           if (message.uuid && message.parent_tool_use_id === null) {
-            // A message typed in another client of the session, as on the bridge.
+            // A message typed in another client of the session.
             const remote = this.remoteControl.remoteMessage(message);
             if (remote !== undefined) this.output.userMessage(remote, message.uuid);
             this.promptStarted(message.uuid);
@@ -1042,8 +1041,8 @@ export class NativeSession implements RequestTarget {
 
   /**
    * Claude Code took in the prompt `uuid`: its `started` frame or its echo.
-   * The prompt's `user_message` comes before the turn's `running`, as on the
-   * bridge. v2 allows either order. A prompt that a cancel abandoned starts
+   * The prompt's `user_message` comes before the turn's `running`. v2 allows
+   * either order. A prompt that a cancel abandoned starts
    * nothing (see {@link StoppedWork}).
    */
   private promptStarted(uuid: string): void {
@@ -1069,7 +1068,7 @@ export class NativeSession implements RequestTarget {
    * Output of the main conversation while no turn is open starts a cycle
    * that Claude Code started on its own. Without lifecycle frames, a pushed
    * prompt's output can come before its echo, so output while one waits is
-   * that prompt's, and its echo opens the turn, as on the bridge.
+   * that prompt's, and its echo opens the turn.
    */
   private outputStarts(): void {
     if (this.foreground) return;
@@ -1096,7 +1095,7 @@ export class NativeSession implements RequestTarget {
     // A result with no open turn: a turn that sent nothing before it.
     this.openTurn(undefined);
     // A cycle that Claude Code started on its own leaves its Fast mode state
-    // to the next result of a prompt, as on the bridge.
+    // to the next result of a prompt.
     if (!(message.origin && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind))) {
       this.fastModeReported(message);
     }

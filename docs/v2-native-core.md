@@ -1,15 +1,14 @@
 # The native ACP v2 core
 
-Status: the default v2 core, for every v2 client, JetBrains AIR too. It serves AIR the AIR
-extensions that ACP v2 does not cover (see "AIR clients"). `CLAUDE_AGENT_ACP_V2_CORE=bridge`
-serves every v2 client with the bridge, as a fallback until the bridge is deleted.
+Status: the adapter's only ACP v2 implementation, for every v2 client, JetBrains AIR too. It
+serves AIR the AIR extensions that ACP v2 does not cover (see "AIR clients"). `ClaudeAcpAgent`
+(`src/acp-agent.ts`) serves ACP v1 only.
 
 ## Why
 
-The bridge (`src/v2/`, now the fallback) serves ACP v2 by converting each v2 request to v1,
-running it through `ClaudeAcpAgent`, and converting what comes back. So every v2 session on it
-runs the v1 core,
-including the machinery that exists only because of v1:
+The adapter first served ACP v2 with a bridge, which converted each v2 request to v1, ran it
+through `ClaudeAcpAgent`, and converted what came back (see "History"). So every v2 session ran
+the v1 core, including the machinery that exists only because of v1:
 
 - **Held prompts.** A v1 `session/prompt` answers when the turn ends, so the core keeps a turn
   queue and settles each turn itself. That needs echo matching, a per-uuid orphan account for
@@ -18,8 +17,8 @@ including the machinery that exists only because of v1:
   hold for background subagents (`deferredSettle`).
 - **AIR branches.** The JetBrains AIR extensions are gated on `air.client` throughout the core.
 
-The v1-only part is about 2,000 lines inline in `acp-agent.ts`, and it all runs on v2 too. For
-example, `deferredSettle` holds a v2 turn open and `v2/prompt.ts` ignores the result.
+The v1-only part is about 2,000 lines inline in `acp-agent.ts`, and on the bridge it all ran on
+v2 too. For example, `deferredSettle` held a v2 turn open, and the bridge ignored the result.
 
 ACP v2 describes a session the way Claude Code already does. A prompt is inserted into a queue
 and answered at insertion, and the session reports whether it is working. Claude Code reports
@@ -34,7 +33,7 @@ both, so a v2 core can follow Claude Code's own events instead of rebuilding a t
 | `state_update` `running`           | a turn starts: a prompt's `started` or echo, or the main conversation's output         |
 | `state_update` `idle`              | the turn's `result`, with its stop reason, usage, `_meta.quota` and error              |
 | `state_update` `requires_action`   | a turn is open and it waits on the user (see the end of this page)                     |
-| `session/cancel`                   | `interrupt({ cancelQueued: true })`, also while idle, as on the bridge                 |
+| `session/cancel`                   | `interrupt({ cancelQueued: true })`, also while idle                                   |
 | `session/resume` with `replayFrom` | `getSessionMessages`, mapped like live output                                          |
 | `session/fork`                     | `forkSession` (`fork-session.ts`), then a resume of the copy                           |
 | `availableCommands`                | `supportedCommands`, filtered by `getAvailableSlashCommands`, and the adapter's `/mcp` |
@@ -87,31 +86,30 @@ result's, also when it comes after the next cycle's first output. A placeholder 
 (`num_turns: 0` of a task notification) ends nothing: Claude Code answers queued notifications
 with one model call. The idle's usage and `_meta.quota` are the result's (`outcome.ts`, with the
 quota helpers of `session-usage.ts` that v1 uses). Without a result, a prompt's turn reports zero
-usage and a zero quota, and a cycle that Claude Code started on its own reports neither, as on
-the bridge. The stop reason is read from the result by the v1
-core's rules (`resultEnd`, `result-end.ts`). A failed turn's idle carries its error instead, built
-as the bridge builds it: an authentication failure (the assistant message's `error`, or the
+usage and a zero quota, and a cycle that Claude Code started on its own reports neither. The
+stop reason is read from the result (`resultEnd`, `result-end.ts`). A failed turn's idle carries
+its error instead: an authentication failure (the assistant message's `error`, or the
 "run /login" text) is `authRequired` (-32000), and any other failure has the assistant message's
 error kind in `data.errorKind`. Claude Code's sign-in message ("Not logged in · Please run /login")
 is not shown, live or in a replay, and fails the turn with `authRequired`. A turn whose prompt got
 `cancelled` after `started` and before a result is dead: its late result ends nothing.
 
-`session/cancel` answers every prompt not inserted yet with -32800, as the bridge does. Claude
+`session/cancel` answers every prompt not inserted yet with -32800. Claude
 Code can still run one that it had taken in before the interrupt arrived, or a cycle that it
 started while the client saw no work. The client never saw that work, so it is dropped: its
 output, its states, and its permission requests, which are denied (`stopped-work.ts`). An aborted
 result after a cancel ends the work that the interrupt stopped as `cancelled`. Claude Code's
 interrupt withdraws the open permission requests. Their end reports no `running` before the
-idle, and one that the user answers after the cancel reports `running`, as on the bridge.
+idle, and one that the user answers after the cancel reports `running`.
 
-The work that the client saw goes on until its idle, and v2 allows its updates until then. As on
-the bridge, its streamed deltas go out (text, thinking, tool use starts), and of its consolidated
+The work that the client saw goes on until its idle, and v2 allows its updates until then. Its
+streamed deltas go out (text, thinking, tool use starts), and of its consolidated
 messages only the results of the tool calls that the client holds, which an error result ends
 `cancelled`. The rest is dropped: the consolidated assistant messages (the tail of a cut-short
 text block, a tool use that never streamed) and the results of tool calls that the client never
 saw.
 
-A consolidated assistant message adds only the text that did not stream, as on the bridge
+A consolidated assistant message adds only the text that did not stream, as on v1
 (`unstreamedRemainder`): the tail of a block whose stream was cut short, or the whole text of a
 message that never streamed.
 
@@ -141,7 +139,7 @@ Code's task events (with `forwardSubagentText` and `perTaskStopAffordance`):
 | `terminal/cancel`, `tool_call/cancel`                            | `stopTask` of the listed item's task                                                                                                 |
 | a replayed child (`session/resume` with `replayFrom`)            | the subagent transcripts and metadata (`getSubagentMessages`, `subagent-replay.ts`)                                                  |
 
-These are the bridge's rules. A child's messages before its announcement wait for it, and a
+A child's messages before its announcement wait for it, and a
 child that ends before it is announced stays unexposed: its Agent call is then shown with its
 final status. A child that its parent waits on (`is_backgrounded` not `true`) is part of the
 parent's foreground work, also before its announcement: its requests block the parent too
@@ -150,12 +148,12 @@ of a foreground child's consolidated messages only the results of the tool calls
 holds go out until its run ends, as for the root, and its requests are withdrawn, also later ones.
 A foreground child that Claude Code reports after the cancel, before the stopped work's result or
 idle or the next prompt's start, is stopped the same way. A child's unfinished tool calls get their final
-status before its idle (unlike the bridge, see "Intended differences"): `cancelled` when it was
+status before its idle: `cancelled` when it was
 stopped, `failed` when it failed or a reset ended it, and otherwise a tool call that Claude
 dropped before it ran ends `cancelled`. Claude Code's later results for a stopped or failed run's
 calls are dropped. When Claude Code mounts a fresh conversation (`conversation_reset`, such as
 for `/clear`), each child that works goes `idle` with no stop reason, since nothing says how its
-run ended, and every child is forgotten, as on the bridge: a later task event of one changes
+run ended, and every child is forgotten: a later task event of one changes
 nothing. A child that a task names as its parent
 without a launch call is announced only after that parent. A
 background child is listed in its parent's `background` while it works, and cancelling the
@@ -170,18 +168,18 @@ reports before the child's announcement goes after its prompt. The client is not
 SendMessage call: once its message reaches an announced child, it is the sender's outgoing and the
 child's incoming `session_message`. A call whose message reached no child, such as one to the
 parent, is shown with its final status. A call whose permission request came before its tool use
-streamed stays shown, as on the bridge, since the request showed it: its updates go out, and its
+streamed stays shown, since the request showed it: its updates go out, and its
 message goes to the child only. A child's completed SubagentHandback call is its message
 to its parent, and its run's result is then no reply. Claude Code resumes an agent from before a
 restart under the SendMessage call that resumed it, with a `task_started` or with the call's
 `resumedAgentId` result alone. The child is restored from the session's
-subagent history (`subagentLineage`), as on the bridge: its ancestors are announced first, with
+subagent history (`subagentLineage`): its ancestors are announced first, with
 no state, and the session handles its next message, or the result's own updates, only after the
 history is read. An agent that the history cannot place stays unexposed, as the RFD forbids
 guessing a parent.
 
 After a replay's response, a replayed child whose configuration is not the `model` that the
-replay sent gets it again, as on the bridge: a live child's whole configuration (such as the mode
+replay sent gets it again: a live child's whole configuration (such as the mode
 that its hooks reported), else the model of its latest response, by the session's model list.
 
 ## AIR clients
@@ -232,7 +230,7 @@ its `error`). The goal and async task stop extensions are v1 only.
 Not served yet: the AIR tool call contract (`commandTitle`, `subagent`, `skill`, `mcp` and
 `is_mcp_tool_call` keys, `rawInputRendering`, and the AIR shapes of `rawInput`, `rawOutput` and
 exit codes), which the shared renderer gives only with `air.client`, and the `kind` and
-`skillPath` keys of modes and skill commands. Neither core serves `sessionIndex` on v2.
+`skillPath` keys of modes and skill commands. `sessionIndex` is not served on v2.
 
 ## Layout
 
@@ -259,7 +257,7 @@ exit codes), which the shared renderer gives only with `air.client`, and the `ki
   Without form elicitation, AskUserQuestion is disallowed and the refusal fallback is not
   declared. An MCP server's request in a mode the client did not advertise, or that the client
   answers with an error, is answered `cancel`.
-- `src/v2-native/config.ts`: the config options, built and set as the bridge builds and sets them
+- `src/v2-native/config.ts`: the config options, built and set as v1 builds and sets them
   (`buildConfigOptions` and `configOptionValue`): mode, model (also by an alias such as `opus`),
   effort, Fast mode and ultracode (boolean options), and the custom main-thread agents
   (`supportedAgents`). Effort, Fast mode, ultracode and agent are set with `applyFlagSettings`.
@@ -271,18 +269,18 @@ exit codes), which the shared renderer gives only with `air.client`, and the `ki
   `fast_mode_state` (on `init` and on results of prompts) updates the Fast mode option, with a
   notice when it turns off a Fast mode the user had on. A value that names no entry is rejected
   with -32602 ("Invalid value for config option model: not-a-model") and changes nothing, as on
-  the bridge and v1, which share `configOptionValue`. A model alias names an entry only by whole
+  v1, which shares `configOptionValue`. A model alias names an entry only by whole
   words (`resolveModelPreference`): `opus`, `opusplan`, `claude-sonnet-5[1m]` and provider ids
   such as `us.anthropic.claude-sonnet-5-v1:0` do, `not-a-model`, `son` and `foo-sonnet` do not.
 - `src/v2-native/clear-context.ts`: ExitPlanMode's "Yes, clear context" option, offered to the
-  root's plan as on the bridge. The answer interrupts the cycle, and the turn stays open: the
+  root's plan. The answer interrupts the cycle, and the turn stays open: the
   session sends Claude Code `/clear`, then sets the chosen mode and sends "Implement the following
-  plan" in the fresh conversation. The client sees what the bridge sends: the plan's tool call
+  plan" in the fresh conversation. The client sees the plan's tool call
   `completed`, the options, a `usage_update` of an empty context, the markdown plan, then the
-  plan's run in the same turn, whose idle has the whole turn's usage. The bridge starts a fresh
-  query instead; `/clear` is Claude Code's own fresh conversation, and keeps the query's tasks and
-  MCP servers.
-- `src/v2-native/setup.ts`: what session setup adds on the bridge's rules: the client's
+  plan's run in the same turn, whose idle has the whole turn's usage. v1 starts a fresh query
+  instead (`clear-context-coordinator.ts`); `/clear` is Claude Code's own fresh conversation, and
+  keeps the query's tasks and MCP servers.
+- `src/v2-native/setup.ts`: what session setup adds on v1's rules: the client's
   `_meta.claudeCode.options`, `CLAUDE_MODEL_CONFIG`, the models (the `availableModels`
   allowlist, `ANTHROPIC_MODEL` and the settings' `model`, the resumed transcript's model), the
   current title on resume, and AIR's `loadReplayEnd` event.
@@ -297,12 +295,12 @@ exit codes), which the shared renderer gives only with `air.client`, and the `ki
 - `src/v2-native/auth.ts`: `_auth/status_update`, gateway `auth/login`, `auth/logout`, and
   `providers/*`, on the v1 core's state rules (`AuthStatusReporter`, `providers.ts`). The
   identity is read after `initialize`, from each session's account, after a login or logout, and
-  at the start of each prompt, as on the bridge. A gateway login routes the sessions started
-  after it, as on the bridge. `providers/set`, `providers/disable`, and an `auth/logout` that
+  at the start of each prompt. A gateway login routes the sessions started after it.
+  `providers/set`, `providers/disable`, and an `auth/logout` that
   drops a provider or a gateway login route the live sessions too (see `restarts.ts`).
-- `src/v2-native/restarts.ts`: restarts of a session's query, as the bridge's: a new query
+- `src/v2-native/restarts.ts`: restarts of a session's query, as on v1: a new query
   resumes the same Claude session without the setup's `_meta` effort, then the old one ends at
-  its next turn boundary, and the client's choices are set again as the bridge's
+  its next turn boundary, and the client's choices are set again as v1's
   `restoreSessionChoices` sets them (model, mode and pre-plan mode, ultracode, Fast mode, the
   effort pin, the agent the client picked) and sent in a `config_option_update`. For a new route,
   each live session restarts at its next turn boundary (no turn open, no prompt of the session
@@ -310,11 +308,12 @@ exit codes), which the shared renderer gives only with `air.client`, and the `ki
   and go to the new query, and the request answers once every session restarted. A route restart
   waits for an account restart of the session that runs. A resume of the active session with
   other additional directories restarts it the same way: Claude Code reads them only when its
-  process starts. A session whose query does not start again stops (see "Intended differences").
+  process starts. A session whose query does not start again stops (see "Differences from the
+  bridge").
   A `session/cancel` or `session/close` answers the waiting prompts with -32800. The old query's
   background commands end with it: their terminals exit before the list drops them.
 - `src/v2-native/subscription-guard.ts`: the `--hide-claude-auth` subscription guard, on the
-  rules of `hide-claude-auth.ts`, which the bridge applies to v2 sessions. While no provider or
+  rules of `hide-claude-auth.ts`, which v1 applies too. While no provider or
   gateway login routes the traffic, a session does not start, and a prompt is refused before
   insertion, on an account that a claude.ai subscription would pay for (`authRequired` with the
   `claude_subscription_not_supported` reason) or that holds no accepted credential. A turn that
@@ -324,36 +323,35 @@ exit codes), which the shared renderer gives only with `air.client`, and the `ki
   prompt among the session's prompts, so a cancel or close answers one that waits for it with
   -32800, and the prompts keep their order.
 - `src/v2-native/remote-control.ts`: the adapter's `/remote-control`, listed and run on the v1
-  core's rules (`remote-control.ts`), as a local command of its own turn (see "Intended
-  differences"), and the messages typed in another client of the session (a human-origin prompt
-  echo that this session did not send), shown as user messages, as on the bridge.
+  core's rules (`remote-control.ts`), as a local command of its own turn (see "Differences from
+  the bridge"), and the messages typed in another client of the session (a human-origin prompt
+  echo that this session did not send), shown as user messages.
 - `src/v2-native/reports.ts`: usage, notices, compactions, titles, and the idle
   compaction (see the table above), and the hooks that feed them (PostCompact, TaskCreated,
-  TaskCompleted). The context window is seeded as on the bridge (`context-window.ts`): a window
+  TaskCompleted). The context window is seeded as on v1 (`context-window.ts`): a window
   that a result of any session on the same backend reported, else a guess from the model's names
   refined by a background `getContextUsage`, until the session's own result reports it.
 
-About 5,500 lines in total. The native core shares these with v1 and the bridge:
+About 5,500 lines in total, and the v2 wire conversions of `src/v2/`. The native core shares
+these with the v1 core:
 
 - the SDK message mapping and tool call rendering (`toAcpNotifications`,
   `streamEventToAcpNotifications`, `tool-calls/*`)
 - permission presentation, options and decoding (`permissions/*`)
 - the mode catalog (`buildAvailableModes`)
 - `promptToClaude`
-- the v2 converters (`v2/session.ts`, `v2/permission.ts`, `v2/prompt.ts`)
-- the `background` stamping and the `cancel` advertisement of listed items (`V2Background`)
 - the background command helpers: `backgroundBashTaskFromToolResult`, `withRunningTerminal`,
   `withRunningToolCall`, `BackgroundOutputTail`
-- the bridge's pure subagent helpers (`native-subagents.ts`: `rfdLabels`, `subagentIdentity`,
+- the pure subagent helpers (`native-subagents.ts`: `rfdLabels`, `subagentIdentity`,
   `linkedSessionMessages`, `launchReply`, `unexposedControlFallback`, `childModelOption`,
   `responseModelEntry`, `rfdEndState`, `handbackMessage`, `resumedNativeSubagentId`,
   `sendMessageResume`), and the subagent history readers (`subagentHistory`, `subagentLineage`,
   `readSubagentMessages`, `firstResponseModel`, `replaySubagentTerminalState`)
 
-These pieces were extracted so that both cores use the same code:
+These pieces were extracted from the v1 core so that both cores use the same code:
 
 - `V2UpdateTranslator` and `replayClear` (`v2/update-translator.ts`), taken from the bridge's
-  client connection
+  client connection, and the other conversions of `src/v2/` that the bridge used
 - `terminalAuthMethods` (`auth-methods.ts`), taken from `ClaudeAcpAgent.initialize`
 - `sdkMcpServers` (`mcp-servers.ts`), taken from `ClaudeAcpAgent.createSession`
 - `resolveThinkingConfig` and `parseModelConfig` (`session-env.ts`), and `sessionSystemPrompt`
@@ -394,7 +392,7 @@ These pieces were extracted so that both cores use the same code:
 - the context window (`context-window.ts`): the cross-session cache, its provider key, the
   seed, and `readContextWindow`, taken from `acp-agent.ts`
 - `modelRefusalFallback` (`session-notices.ts`): the notice of a refusal fallback, taken from
-  the bridge's `model_refusal_fallback` handler
+  `ClaudeAcpAgent`'s `model_refusal_fallback` handler
 - `subagentHookOptions` and `orderedSubagentConfiguration` (`subagent-configuration.ts`): a
   child's options from a hook, and their order, taken from `subagentConfigurationHook` and
   `NativeSubagentRuntime.publishConfiguration`. `AGENT_CONFIG_ID` moved to
@@ -404,25 +402,22 @@ These pieces were extracted so that both cores use the same code:
 
 ## How it is checked
 
-- `src/tests/acp-v2.test.ts`, the bridge's v2 tests, runs against both cores: the `unit`
-  project of `vitest.config.ts` runs it on the bridge (`V2_CORE_UNDER_TEST=bridge`), and the
-  `v2-native-core` project runs it again with `V2_CORE_UNDER_TEST=native`,
-  so `npm run test:run` and CI cover both. Tests that check a core's internals, or a listed
-  difference, branch on `NATIVE_CORE`.
+- `src/tests/acp-v2.test.ts` drives the v2 surface through the protocol router with the SDK's
+  v2 client, which validates every message against the v2 schema. It started as the bridge's
+  v2 tests, and ran against both cores until the bridge was deleted.
 
 - `src/tests/v2-native.test.ts` drives the core with a Claude Code double, message by message:
   insertion, folding, lifecycle failures, cancel, permission states, config, local commands,
   a crashed query, and replay.
-- `src/tests/acp-scenarios-v2.test.ts`, the bridge's v2 scenarios, also runs in the
-  `v2-native-core` project. On the native core, all 40 scenarios pass, send only schema-valid v2,
-  report each tool call with a title first, and equal the bridge's golden files
+- `src/tests/acp-scenarios-v2.test.ts` runs the 40 scenarios on v2: they pass, send only
+  schema-valid v2, report each tool call with a title first, and equal the golden files
   (`acp-scenarios/__snapshots__/v2/`) in full: requests, responses, notifications, permission
-  requests, elicitations and errors. The native run only reads the golden files, also under
-  `-u`. No scenario has an allowance for an intended difference.
-- The scenario double now sends `session_state_changed` when the query asks for it, as the real
-  CLI does. The bridge and v1 scenario golden files did not change.
+  requests, elicitations and errors. The bridge recorded those golden files, and the native core
+  matched them before the bridge was deleted.
+- The scenario double sends `session_state_changed` when the query asks for it, as the real
+  CLI does.
 - `src/tests/v2-native-integration.test.ts` (`npm run test:integration`) runs the adapter's
-  process on the default v2 core against the bundled Claude Code CLI, so a CLI that changes the
+  process on v2 against the bundled Claude Code CLI, so a CLI that changes the
   frames the core relies on fails it:
   - a prompt answers at insertion, then the turn goes `running` → `idle` with `end_turn`
   - a permission request goes `running` → `requires_action` → `running`
@@ -431,95 +426,89 @@ These pieces were extracted so that both cores use the same code:
 - A manual run against the bundled Claude Code CLI also checked that Bash runs as display
   terminals.
 
-## Intended differences from the bridge
+## Differences from the bridge
 
-- A cancel right after `running`, before any output: the bridge sends `idle(cancelled)` at once,
+Where the bridge's v2 behavior differed, the native core follows the spec (or, where noted, the
+order of its setup). The bridge's behavior is in the past tense.
+
+- A cancel right after `running`, before any output: the bridge sent `idle(cancelled)` at once,
   without usage. The native core sends it once Claude Code's aborted result arrives, with that
   result's usage, as v2 asks ("After all ongoing operations have been successfully aborted ...
-  the Agent MUST send an idle `state_update`"). Seen with `scripts/compare-v2-cores.mjs`
-  (`cancel-at-start`).
+  the Agent MUST send an idle `state_update`").
 
 - A v2 AIR client gets only the AIR extensions that v2 does not cover (see "AIR clients"). The
-  bridge serves it the v1 core's AIR extensions: `sessionFailure` records (with the "Retrying
+  bridge served it the v1 core's AIR extensions: `sessionFailure` records (with the "Retrying
   Claude" API retry warnings) and AIR's subagent form, which reports no `background` list, and
   the AIR tool call contract. The native core serves v2's subagent sessions, `background` lists
   and failed idles instead.
 - `/remote-control` runs as a local command of its own turn, as v2 asks: `running`, the reply,
   then `idle` with `end_turn`. Sent while Claude works, it waits for the work to end, and the
   prompts after it wait for it: v2 asks to hold a prompt, not to reject it, while foreground work
-  runs. The bridge rejects it then (-32600), and otherwise reports no state around it. Its reply
-  has no `messageId`, which v2 requires of a chunk, so a v2 client never gets it.
+  runs. The bridge rejected it then (-32600), and otherwise reported no state around it. Its reply
+  had no `messageId`, which v2 requires of a chunk, so a v2 client never got it.
 - Resuming the active session with other MCP servers keeps its work going and replaces the
   servers on the running query (`setMcpServers`), as v2 asks ("Ongoing work continues, and the
-  request's MCP servers and workspace roots replace the previous ones"). The bridge tears the
-  session down and starts a new query, which cancels its running work.
+  request's MCP servers and workspace roots replace the previous ones"). The bridge tore the
+  session down and started a new query, which cancelled its running work.
 - A stopped child's unfinished tool calls end before the idle that reports its cancel, as v2 asks
-  of the updates after `session/cancel`. The bridge ends them after the idle. A child that a
+  of the updates after `session/cancel`. The bridge ended them after the idle. A child that a
   `conversation_reset` ends gets its tool calls ended `failed` before its idle too: v2 asks for a
-  final status of a turn's tool calls before its idle. The bridge leaves them open.
+  final status of a turn's tool calls before its idle. The bridge left them open.
 - A SendMessage call that its permission request showed, and whose message goes to the child
   only, names its sender in the child's `session_message` (`senderSessionId`), as the RFD asks
-  ("Agents **SHOULD** include participant IDs on the first `session_message`"). The bridge leaves
+  ("Agents **SHOULD** include participant IDs on the first `session_message`"). The bridge left
   the sender out.
 - A resume of a session that is not active replays after Claude Code started, so a replayed
-  child's `model` is the session's model list entry at once. The bridge replays while Claude Code
-  starts, without the list: it sends the model's id, then the entry after the response. The client
-  ends with the same configuration. This is no spec rule: it follows from the order of the setup.
+  child's `model` is the session's model list entry at once. The bridge replayed while Claude Code
+  started, without the list: it sent the model's id, then the entry after the response. The client
+  ended with the same configuration. This is no spec rule: it follows from the order of the setup.
 - While the root's turn waits on foreground subagents, it reports `requires_action` only when each
   of them waits on the user. One that still makes progress keeps the turn `running`, as v2 asks.
-  The bridge reports `requires_action` as soon as one of them asks.
+  The bridge reported `requires_action` as soon as one of them asked.
 - ExitPlanMode of a subagent offers no "clear context" option: a fresh context continues the
-  root's turn, and cannot clear a subagent's context. The bridge offers it to a subagent's plan
+  root's turn, and cannot clear a subagent's context. The bridge offered it to a subagent's plan
   too.
 - An MCP server's URL elicitation that the user accepts keeps the work `requires_action` until
   Claude Code reports it complete (`elicitation_complete`), the tool use ends, or the turn ends:
-  `accept` only consents to open the URL. The bridge reports `running` at the answer.
+  `accept` only consents to open the URL. The bridge reported `running` at the answer.
 - A session whose query ended without `session/close` (Claude Code exited, or a restart's new
   query did not start) stays active, as v2 keeps a session active until its close or the end of
   the connection. Its requests fail with -32603 and what happened ("Claude Code stopped. Resume
   the session to continue."), until a resume starts it again from its transcript. A close ends
-  it, and -32002 follows. The bridge drops the session, so the client gets -32002.
+  it, and -32002 follows. The bridge dropped the session, so the client got -32002.
 - A prompt that the `--hide-claude-auth` guard still judges keeps its place: a `/remote-control`
   sent after it waits for it, as v2 asks that held prompts be inserted in the order received. The
-  bridge runs `/remote-control` before its guard, so it inserts the command first.
+  bridge ran `/remote-control` before its guard, so it inserted the command first.
 - A replayed tool call that the transcript gives no result, such as one that ran when Claude Code
   was killed, ends `failed` after the replay, as v2 asks of replayed work that no longer runs. The
-  calls that the active session still runs stay open. The bridge leaves such a call pending.
+  calls that the active session still runs stay open. The bridge left such a call pending.
 - After Claude Code mounts a fresh conversation (`conversation_reset`, such as for `/clear`), the
-  context in use is 0, so ExitPlanMode's option reads "clear context (0% used)". The bridge keeps
-  the old context's figure until the next model request reports usage. This is no spec rule: the
-  bridge's figure is stale.
+  context in use is 0, so ExitPlanMode's option reads "clear context (0% used)". The bridge kept
+  the old context's figure until the next model request reported usage. This is no spec rule: the
+  bridge's figure was stale.
 
 ## Not served yet
 
 To an AIR client: the AIR tool call contract and the `kind` and `skillPath` keys (see "AIR
-clients"). Nothing else that the bridge serves to v2 clients. Neither core serves
-these:
+clients"). To any v2 client:
 
-- API retries and prompt suggestions to a client that is not AIR: both cores send prompt
-  suggestions to AIR only, and the bridge sends API retries to AIR only.
-- A `replayFrom` cursor other than `start`: both cores reject it with -32602, such as "Replaying
+- API retries and prompt suggestions to a client that is not AIR. v1 sends both to AIR only too.
+- A `replayFrom` cursor other than `start`: the core rejects it with -32602, such as "Replaying
   from a \_message cursor is not supported", as the spec asks of a cursor type that the Agent does
-  not support. Neither replays from another position or resumes without a replay.
-- The v1-only features: steering (`_session/steering`, whose `steering` marker
-  `v2InitializeResponse` drops), and AIR's async task stop and goal extensions.
+  not support. It does not replay from another position or resume without a replay.
+- The v1-only features: steering (`_session/steering`, whose `steering` marker the v2
+  `initialize` response does not carry), and AIR's async task stop and goal extensions.
 
-## Replacing the bridge
+## History
 
-1. Move the SDK mapping out of `acp-agent.ts`: `toAcpNotifications`,
-   `streamEventToAcpNotifications`, `promptToClaude`, `messageIdForGrouping`, and the helpers
-   they use. The native core imports them from `acp-agent.ts` today, which is its only tie to
-   the v1 core's module.
-2. Port the gaps one feature at a time, each in a module that the native core owns. Some are
-   typed for v1 (`native-subagents.ts`, `background-work.ts`).
-3. Done: `native` is the default v2 core, and both cores stay on the v2 tests and scenarios.
-   `CLAUDE_AGENT_ACP_V2_CORE=bridge` selects the bridge. A v2 AIR client gets the native core
-   too, with the AIR extensions that v2 does not cover (see "AIR clients").
-4. Later: delete the bridge. That is `v2/agent.ts`, `v2/prompt.ts`, `v2/background.ts`, the
-   v1 request conversions, and the v2 paths of `ClaudeAcpAgent`. Those paths are the `v2` option, the
-   `foreground` and `background` hooks, `ForegroundEvents`, `foregroundWork`, and the
-   `this.v2` branches. The v1 core then serves v1 and AIR only. `ClientCapabilities.v2` stays:
-   the shared renderer uses it.
+The bridge (`src/v2/agent.ts` and the v2 mode of `ClaudeAcpAgent`) served v2 by converting each
+v2 request to v1 and back. The native core replaced it step by step: the shared pieces moved out
+of `ClaudeAcpAgent` (see the list above), the gaps were ported one feature at a time, and the
+native core became the default, also for AIR, with both cores held to the same v2 tests and
+scenarios. Then the bridge was deleted. What remains of `src/v2/` are the v2 wire conversions
+that the native core uses: the session setup, config, prompt and permission conversions, the
+`initialize` capabilities, `V2UpdateTranslator` with its terminals and tool call `_meta`, and the
+`background` lists (`V2Background`).
 
 ## Spec checks
 
@@ -530,8 +519,7 @@ Beyond the scenarios, `v2-native.test.ts` covers these requirements of the draft
   of one that Claude Code had taken in already is dropped, its tool uses denied.
 - A cancel that ended only queued prompts leaves the next turn's stop reason alone.
 - `session/close` sends the cancelled work's final updates and `idle(cancelled)` before its
-  response, and nothing after. As on the bridge, it ends the work at once, without waiting for
-  Claude Code.
+  response, and nothing after. It ends the work at once, without waiting for Claude Code.
 - Closing or deleting a session that does not exist succeeds.
 - Stopped work gives its unfinished tool calls a final status before its idle: `cancelled`
   after a cancel, `failed` when the query ends. At any other end, a tool call that Claude dropped

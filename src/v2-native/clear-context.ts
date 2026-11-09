@@ -10,10 +10,9 @@
  * sends the plan as the prompt "Implement the following plan". The turn ends
  * with that prompt's result, with the usage of the whole turn.
  *
- * The bridge starts a fresh query instead (`clear-context-coordinator.ts`).
- * This core keeps the query: `/clear` is Claude Code's own way to start a
- * fresh conversation, and the query's tasks, MCP servers and settings stay.
- * The client sees the same: the accepted plan's tool call `completed`, the
+ * The query stays, unlike v1's fresh query (`clear-context-coordinator.ts`):
+ * `/clear` is Claude Code's own way to start a fresh conversation, and the
+ * query's tasks, MCP servers and settings stay. The client sees the accepted plan's tool call `completed`, the
  * options with the new mode, a `usage_update` of an empty context, the plan
  * as the session's markdown plan, then the plan's run in the open turn, with
  * no `user_message` for the adapter's prompts.
@@ -84,8 +83,7 @@ export class ClearContext {
   /**
    * A user message of the main conversation. Returns the rewrite of its
    * updates: the accepted plan's tool result, which Claude Code reports as a
-   * rejection, goes out `completed`, without the rejection's text, as on the
-   * bridge.
+   * rejection, goes out `completed`, without the rejection's text.
    */
   toolResults(message: {
     type: string;

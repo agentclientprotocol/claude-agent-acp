@@ -115,7 +115,7 @@ export async function sessionModels(
 
 /**
  * The update that ends a replay, for a client that declares AIR's
- * `loadReplayEnd` capability, as the bridge sends it.
+ * `loadReplayEnd` capability, as v1 sends it.
  */
 export function replayEndUpdate(
   capabilities: v2.ClientCapabilities | null | undefined,

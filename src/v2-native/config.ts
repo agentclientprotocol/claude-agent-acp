@@ -21,7 +21,7 @@
  * switch leaves the session in it.
  *
  * The changes of one session run one at a time, in the order they came, as
- * the bridge's `serializeConfigurationChange` runs them: a change awaits
+ * the v1 core's `serializeConfigurationChange` runs them: a change awaits
  * Claude Code between its steps, and a model switch rebuilds every option at
  * its end, so a change that ran meanwhile would be lost.
  */
@@ -348,7 +348,7 @@ export class SessionConfig {
 
   /**
    * Sets the choices of `previous`, the config of the query that this one
-   * replaced (see `restarts.ts`), as the bridge's `restoreSessionChoices`
+   * replaced (see `restarts.ts`), as the v1 core's `restoreSessionChoices`
    * does: the model, then the mode, which the model decides, and its
    * pre-plan mode, then ultracode, Fast mode, the effort pin (after
    * ultracode, which its flag carries) and the agent the client picked. A
@@ -491,8 +491,7 @@ export class SessionConfig {
   /**
    * Claude Code switched the model without the adapter: a typed `/model`, or
    * a refusal fallback. Returns whether the options changed. A model that the
-   * option does not list is recorded by its id, which the option then lists,
-   * as on the bridge.
+   * option does not list is recorded by its id, which the option then lists.
    */
   modelSwitched(model: string): Promise<boolean> {
     return this.serialized(async () => {

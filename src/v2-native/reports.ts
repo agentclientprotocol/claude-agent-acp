@@ -85,7 +85,7 @@ export interface ReportsSetup {
    * Whether the session asks the user to sign in to an MCP server that needs
    * it (see `SessionElicitations.authenticateMcpServers`): the client renders
    * URL elicitations and the query can authenticate. Its startup then sends
-   * no "needs authentication" notice, as on the bridge.
+   * no "needs authentication" notice.
    */
   mcpOAuth: boolean;
   /** The query, for its context window (`getContextUsage`). */
@@ -163,7 +163,7 @@ export class SessionReports {
     this.mcpOAuth = setup.mcpOAuth;
     this.settings = setup.settings;
     this.query = setup.query;
-    // From the same env the query got, as on the bridge.
+    // From the same env the query got.
     this.providerCacheKey = providerCacheKeyFor(setup.env);
     this.seedContextWindow(setup.model.id, setup.model.info);
     this.idleCompaction = new IdleCompaction(
@@ -284,8 +284,8 @@ export class SessionReports {
 
   /**
    * The session's model is `id` now: the idle compaction's request describes
-   * the old one, and the context window is seeded for the new one, as on the
-   * bridge (`applyConfigOptionValue`). Nothing changes for the same model.
+   * the old one, and the context window is seeded for the new one, as on v1
+   * (`applyConfigOptionValue`). Nothing changes for the same model.
    */
   modelChanged(id: string, info: ModelInfo | undefined): void {
     if (id === this.modelId) return;

@@ -1,8 +1,8 @@
 /**
  * How a turn of a native ACP v2 session ends: the stop reason, usage, error
  * and `_meta.quota` of its `idle`. The stop reason is read from Claude Code's
- * result by the v1 core's rules (`resultEnd`), and the error as the bridge
- * builds it for a failed prompt: an authentication failure is `authRequired`
+ * result by the v1 core's rules (`resultEnd`), and the error as v1 answers a
+ * failed prompt: an authentication failure is `authRequired`
  * (-32000), and any other carries the assistant message's error kind
  * (`data.errorKind`).
  */
@@ -50,7 +50,7 @@ export type IdleOutcome = Extract<
   }
 >;
 
-/** What a prompt's turn that ended without a result spent, as the bridge reports it. */
+/** What a prompt's turn that ended without a result spent. */
 const NOTHING_SPENT: AccumulatedUsage = {
   inputTokens: 0,
   outputTokens: 0,
@@ -64,9 +64,7 @@ const NOTHING_SPENT: AccumulatedUsage = {
  * `prompted`: a prompt started the turn. Without a result, such as when an
  * interrupt stopped the work before its result, a prompt's turn reports zero
  * usage and a zero quota, and a cycle that Claude Code started on its own
- * reports neither, as on the bridge (whose prompt turns report the turn's
- * tally, which is zero then). A failed turn reports its error instead, as the
- * bridge does.
+ * reports neither. A failed turn reports its error instead.
  */
 export function idleOutcome(
   end: TurnEnd | undefined,
@@ -80,15 +78,15 @@ export function idleOutcome(
       ? { usage: { ...NOTHING_SPENT, totalTokens: 0 }, _meta: quotaMeta(NOTHING_SPENT, {}) }
       : {};
   if (cancelled) return { stopReason: "cancelled", ...spent };
-  // The bridge fails the turn at Claude Code's sign-in message.
+  // Claude Code's sign-in message fails the turn.
   if (report?.loginRequired) return failed(RequestError.authRequired());
   if (!end) return { stopReason: "end_turn", ...spent };
   const { result } = end;
   const ended = resultEnd(result);
   if (!("error" in ended)) return { stopReason: ended.stopReason, ...spent };
   const kind = report?.errorKind;
-  // As on the bridge, only these subtypes read the assistant's error kind for
-  // the failure's category.
+  // Only these subtypes read the assistant's error kind for the failure's
+  // category.
   const authFailure =
     (result.subtype === "success" && isLoginRequiredText(ended.error)) ||
     ((result.subtype === "success" || result.subtype === "error_during_execution") &&
@@ -114,8 +112,7 @@ function failed(error: RequestError): IdleOutcome {
 /**
  * What the assistant messages of the open turn reported about its end: the
  * error kind of a failed API request, Claude Code's sign-in message, and a
- * refusal's explanation. Read from the main conversation's messages, as on
- * the bridge.
+ * refusal's explanation. Read from the main conversation's messages.
  */
 export class TurnReport {
   errorKind: SDKAssistantMessageError | undefined;

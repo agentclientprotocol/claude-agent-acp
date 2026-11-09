@@ -1,6 +1,6 @@
 /**
  * The PreToolUse hook that shows an Edit's or Write's exact patch before the
- * tool runs, as the bridge does (`ClaudeAcpAgent.fileChangePreviewHook`).
+ * tool runs, also when no permission request shows it.
  *
  * A v2 diff cannot hold the input's snippet, so without it an auto-approved
  * Edit would show its change only once it is done. Claude Code runs the tool
