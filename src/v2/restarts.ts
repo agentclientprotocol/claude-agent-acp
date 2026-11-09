@@ -37,7 +37,9 @@
  * (their terminals exit), as when a query ends. The new query starts without
  * the effort of the setup's `_meta`, and the client's choices are set again
  * on it (`SessionConfig.restoreFrom`), which then reports its options in a
- * `config_option_update`. One restart of a session runs at
+ * `config_option_update`. Ending the old query withdraws its MCP OAuth
+ * runs, and the new one starts OAuth for the setup's MCP servers that still
+ * need it, as a setup does. One restart of a session runs at
  * a time: a route restart waits for an account restart that runs, as for a
  * busy session.
  *
@@ -51,6 +53,7 @@ import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { Logger } from "../acp-agent.js";
 import { withoutEffort } from "../session-effort.js";
 import type { V2Session } from "./session.js";
+import { afterSetupResponse } from "./setup.js";
 
 /** The request that set the session up, whose options a restart starts with again. */
 export type SetupParams = v2.NewSessionRequest | v2.ResumeSessionRequest | v2.ForkSessionRequest;
@@ -148,6 +151,14 @@ export class SessionRestarts {
       return this.hold(sessionId, this.swap(sessionId, session, { keepOnFailure: true }));
     }
     return undefined;
+  }
+
+  /**
+   * Whether a restart runs: its new query starts MCP OAuth once it took
+   * over, so the setup response of the session it replaces need not.
+   */
+  restarting(sessionId: string): boolean {
+    return this.swaps.has(sessionId);
   }
 
   /** What a request other than a prompt waits for: a restart that runs. */
@@ -293,6 +304,9 @@ export class SessionRestarts {
         sessionId,
         update: { sessionUpdate: "config_option_update", configOptions: session.config.options() },
       });
+      // Closing the old query withdrew its MCP OAuth runs. The servers of a
+      // resume that came during the restart are tracked by now.
+      afterSetupResponse(session, this.setups.get(sessionId) ?? params);
     })().finally(() => {
       if (this.swaps.get(sessionId) === run) this.swaps.delete(sessionId);
       if (this.retiring.get(sessionId) === previous) this.retiring.delete(sessionId);

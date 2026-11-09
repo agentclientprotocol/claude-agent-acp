@@ -142,6 +142,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         applyFlagSettings: fake.applyFlagSettings,
         rewindFiles: fake.rewindFiles,
         mcpServerStatus: async () => sdk.mcpServers,
+        setMcpServers: async () => ({ added: [], removed: [], errors: {} }),
         // A server that needs OAuth: Claude Code returns its authorization URL.
         mcpAuthenticate: async () => ({
           authUrl: "https://mcp.example.com/authorize",
@@ -667,6 +668,66 @@ describe("ACP v2 core", () => {
         const restarts = (agents[0] as unknown as { restarts: { setups: Map<string, unknown> } })
           .restarts;
         expect(restarts.setups.has(response.sessionId)).toBe(false);
+      });
+    });
+
+    describe("MCP OAuth", () => {
+      const linear = { type: "http" as const, name: "linear", url: "https://mcp.example.com/mcp" };
+      /** A client that leaves each OAuth elicitation open until the agent withdraws it. */
+      const oauthClient = () => {
+        const withdrawn: number[] = [];
+        const client = v2Client({
+          answerElicitation: (_, signal) =>
+            new Promise((resolve) =>
+              signal.addEventListener("abort", () => {
+                withdrawn.push(client.elicitations.length);
+                resolve({ action: "cancel" });
+              }),
+            ),
+        });
+        return { client, withdrawn };
+      };
+      const initialize = (agent: v2.ClientContext) =>
+        agent.request(v2.methods.agent.initialize, {
+          protocolVersion: v2.PROTOCOL_VERSION,
+          info: { name: "v2-test-client", version: "1.0.0" },
+          capabilities: { elicitation: { url: {} } },
+        });
+
+      it("starts OAuth again on the new query of a restart that withdrew it", async () => {
+        // The server stays `needs-auth`: the user has not signed in yet.
+        sdk.mcpServers = [{ name: "linear", status: "needs-auth" }];
+        const { client, withdrawn } = oauthClient();
+        await client.connect(async (agent) => {
+          await initialize(agent);
+          await agent.request(v2.methods.agent.session.new, { cwd, mcpServers: [linear] });
+          await vi.waitFor(() => expect(client.elicitations).toHaveLength(1));
+          await setProvider(agent);
+          await vi.waitFor(() => expect(client.elicitations).toHaveLength(2));
+          // The old query's elicitation was withdrawn before the new one went out.
+          expect(withdrawn).toEqual([1]);
+        });
+      });
+
+      it("starts OAuth only on the new query of a resume with other additional directories", async () => {
+        sdk.mcpServers = [{ name: "linear", status: "needs-auth" }];
+        const extra = await mkdtemp(path.join(tempDir, "extra-"));
+        const { client, withdrawn } = oauthClient();
+        await client.connect(async (agent) => {
+          await initialize(agent);
+          const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+          await agent.request(v2.methods.agent.session.resume, {
+            sessionId,
+            cwd,
+            mcpServers: [linear],
+            additionalDirectories: [extra],
+          });
+          await vi.waitFor(() => expect(sdk.processes[0].close).toHaveBeenCalled());
+          await vi.waitFor(() => expect(client.elicitations).toHaveLength(1));
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          expect(client.elicitations).toHaveLength(1);
+          expect(withdrawn).toEqual([]);
+        });
       });
     });
 

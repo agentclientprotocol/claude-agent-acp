@@ -256,7 +256,9 @@ exit codes), which the shared renderer gives only with `air.client`, and the `ki
   for AskUserQuestion (on the session of the agent that asks), for an MCP server's form, and for
   the refusal fallback's consent prompt. A URL for an MCP server's URL request and for MCP OAuth.
   All but MCP OAuth are open requests of their session, like permission requests: a cancel or a
-  close withdraws them. MCP OAuth starts after the setup response, and a close withdraws it.
+  close withdraws them. MCP OAuth starts after the setup response, and a close withdraws it. A
+  restart of the query (`restarts.ts`) withdraws it on the old query and starts it again on the
+  new one.
   Without form elicitation, AskUserQuestion is disallowed and the refusal fallback is not
   declared. An MCP server's request in a mode the client did not advertise, or that the client
   answers with an error, is answered `cancel`.

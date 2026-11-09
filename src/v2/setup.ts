@@ -27,6 +27,8 @@ import {
   withCurrentModelInfo,
 } from "../session-model.js";
 import type { SettingsManager } from "../settings.js";
+import type { SetupParams } from "./restarts.js";
+import type { V2Session } from "./session.js";
 
 /** The SDK options a client passes in `_meta.claudeCode.options`. */
 export function clientOptions(meta: unknown): Options | undefined {
@@ -109,4 +111,20 @@ export function replayEndUpdate(
     sessionUpdate: "session_info_update",
     _meta: withAirMeta(undefined, AIR_LOAD_REPLAY_END_KEY, true),
   };
+}
+
+/**
+ * Starts OAuth for the setup request's MCP servers that need it, once the
+ * setup response is sent: v2 asks for no elicitation before it. The handler
+ * returns the response right after this call, and the SDK writes it before a
+ * timer runs. Nothing else orders the two. A restart calls it on the new
+ * query too: closing the old one withdrew the old one's OAuth runs.
+ */
+export function afterSetupResponse(session: V2Session, params: SetupParams): void {
+  // The setup already rejected servers of an unknown transport.
+  const names = (params.mcpServers ?? []).flatMap((server) =>
+    typeof server.name === "string" ? [server.name] : [],
+  );
+  if (names.length === 0) return;
+  setTimeout(() => session.elicitations.authenticateMcpServers(names), 0);
 }
