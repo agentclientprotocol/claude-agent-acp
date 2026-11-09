@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.102.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.101.1...v0.102.0) (2026-11-09)
+
+
+### Features
+
+* list workflow phases and agents on the workflow card ([#1552](https://github.com/agentclientprotocol/claude-agent-acp/issues/1552)) ([176ae06](https://github.com/agentclientprotocol/claude-agent-acp/commit/176ae0634c2ef7cb0549339f4b9824884574b2f0))
+* send the checklist as a plan operation and remove plans on reset ([#1554](https://github.com/agentclientprotocol/claude-agent-acp/issues/1554)) ([766fd14](https://github.com/agentclientprotocol/claude-agent-acp/commit/766fd142f60bda2f434d55baaa8e72939f215800))
+
+
+### Bug Fixes
+
+* report v2 background tasks without a tool call as their own tool call ([#1556](https://github.com/agentclientprotocol/claude-agent-acp/issues/1556)) ([d098fb0](https://github.com/agentclientprotocol/claude-agent-acp/commit/d098fb08d54f521d5056d920ebcc5a2656334083))
+* update to @anthropic-ai/claude-agent-sdk 0.3.321 ([#1557](https://github.com/agentclientprotocol/claude-agent-acp/issues/1557)) ([855447c](https://github.com/agentclientprotocol/claude-agent-acp/commit/855447c7cd41aa566bdf361d6d59e6a5b038fe6e))
+
 ## [0.101.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.101.0...v0.101.1) (2026-11-09)
 
 
