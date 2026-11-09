@@ -1728,6 +1728,54 @@ describe("ACP v2 core", () => {
     expect(client.sessionUpdates.at(-1)).toMatchObject({ state: "idle", stopReason: "end_turn" });
   });
 
+  it.each([
+    ["a cycle of Claude Code's own ended", "cycle"],
+    ["a prompt started", "prompt"],
+  ])(
+    "does not read a later aborted result as cancelled by a cancel of an idle session once %s",
+    async (_, after) => {
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const sessionId = response.sessionId;
+        // Claude Code runs nothing: the interrupt stops nothing and sends nothing.
+        await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+        await vi.waitFor(() => expect(claude.interrupt).toHaveBeenCalled());
+        if (after === "cycle") {
+          // Say, a background task ended: Claude Code starts a cycle after the interrupt.
+          claude.send(cycleStart());
+          claude.send(result());
+          claude.send(sessionState("idle"));
+          await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+          claude.send(cycleStart());
+        } else {
+          const answer = agent.request(v2.methods.agent.session.prompt, {
+            sessionId,
+            prompt: PROMPT,
+          });
+          claude.send(lifecycle(await claude.prompt(0), "started"));
+          await answer;
+        }
+        // Then an interrupt of Claude Code's remote control stops the work.
+        claude.send(
+          result({
+            subtype: "error_during_execution",
+            is_error: true,
+            terminal_reason: "aborted_streaming",
+          }),
+        );
+        claude.send(sessionState("idle"));
+        await vi.waitFor(() =>
+          expect(client.states()).toEqual(
+            after === "cycle" ? ["running", "idle", "running", "idle"] : ["running", "idle"],
+          ),
+        );
+      });
+
+      expect(client.sessionUpdates.at(-1)).toMatchObject({ state: "idle", stopReason: "error" });
+    },
+  );
+
   it("sends no permission request of a session after session/close answered", async () => {
     const client = v2Client();
     const decision = await client.connect(async (agent) => {
