@@ -30924,3 +30924,23 @@ describe("permission_denied", () => {
     expect(denials(updates)).toHaveLength(1);
   });
 });
+
+describe("asyncTaskDetails negotiation", () => {
+  function agent() {
+    return new ClaudeAcpAgent({ sessionUpdate: async () => {} } as unknown as AcpClient, {
+      log: () => {},
+      error: () => {},
+    });
+  }
+
+  it("advertises stoppable monitors only to a client that asks for them", async () => {
+    const asked = await agent().initialize({
+      protocolVersion: 1,
+      clientCapabilities: { _meta: { asyncTaskDetails: { monitors: true } } },
+    });
+    expect(asked._meta?.asyncTaskDetails).toEqual({ monitors: true });
+
+    const silent = await agent().initialize({ protocolVersion: 1, clientCapabilities: {} });
+    expect(silent._meta).not.toHaveProperty("asyncTaskDetails");
+  });
+});

@@ -163,6 +163,7 @@ import {
   backgroundBashTaskFromToolResult,
   backgroundedBashToolCallIds,
   clientSupportsAsyncTasks,
+  clientAsyncTaskDetails,
 } from "./async-tasks.js";
 import {
   type BackgroundSink,
@@ -3131,6 +3132,10 @@ export class ClaudeAcpAgent {
         steering: {
           supported: true,
         },
+        // Only to a client that asked: the client opts in to stoppable monitor tasks.
+        ...(clientAsyncTaskDetails(this.clientCapabilities).monitors
+          ? { asyncTaskDetails: { monitors: true } }
+          : {}),
       },
     };
   }
@@ -4776,6 +4781,7 @@ export class ClaudeAcpAgent {
       async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
       {
         notices: supportsNotices,
+        monitors: clientAsyncTaskDetails(this.clientCapabilities).monitors,
         // A task that a subagent tool call started belongs to the child
         // session of that tool call, like the tool call itself.
         routeOf: (toolCallId) =>
