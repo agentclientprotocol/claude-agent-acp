@@ -1,4 +1,4 @@
-# The native ACP v2 core
+# The ACP v2 agent
 
 Status: the adapter's only ACP v2 implementation, for every v2 client, JetBrains AIR too. It
 serves AIR the AIR extensions that ACP v2 does not cover (see "AIR clients"). `ClaudeAcpAgent`
@@ -41,7 +41,7 @@ both, so a v2 core can follow Claude Code's own events instead of rebuilding a t
 | `elicitation/complete`             | `system/elicitation_complete`, and an MCP OAuth sign-in that finished                  |
 | output updates                     | the shared SDK mapping (`toAcpNotifications`), translated by `V2UpdateTranslator`      |
 
-The reports that are not Claude's output come from `src/v2-native/reports.ts`, built as on v1:
+The reports that are not Claude's output come from `src/v2/reports.ts`, built as on v1:
 
 | ACP v2                                  | Claude Code                                                                     |
 | --------------------------------------- | ------------------------------------------------------------------------------- |
@@ -61,7 +61,7 @@ The reports that are not Claude's output come from `src/v2-native/reports.ts`, b
 | `running`, then `idle`, no user_message | the adapter's idle `/compact` (`IdleCompaction`)                                |
 
 The session keeps little of its own: a map of prompts that are not inserted yet, whether a turn
-is open, and its count of open permission requests and elicitations (`src/v2-native/session.ts`).
+is open, and its count of open permission requests and elicitations (`src/v2/session.ts`).
 
 Claude Code's `session_state_changed` is not the foreground state. It stays `running` while
 background subagents work: across the turn's `result`, the next prompts' turns, and the turn
@@ -186,7 +186,7 @@ that its hooks reported), else the model of its latest response, by the session'
 
 A v2 client that declares `_meta.jetbrains.air` in `initialize` gets the AIR extensions of
 `docs/air-extensions.md` that ACP v2 does not cover, with the wire output that the v1 core gives
-AIR. `src/v2-native/air.ts` reads what the client declared, and every other client gets none of
+AIR. `src/v2/air.ts` reads what the client declared, and every other client gets none of
 them. The `initialize` response lists the served capabilities that AIR's agent declaration
 lists: `_meta.jetbrains.air.capabilities` is `["agentFileChangeReport", "recommendedValue"]`.
 
@@ -234,22 +234,22 @@ exit codes), which the shared renderer gives only with `air.client`, and the `ki
 
 ## Layout
 
-- `src/v2-native/agent.ts`: the request handlers, session setup, and the SDK `query` options.
-- `src/v2-native/session.ts`: one session: its prompts, its state, and the routing of the
+- `src/v2/agent.ts`: the request handlers, session setup, and the SDK `query` options.
+- `src/v2/session.ts`: one session: its prompts, its state, and the routing of the
   query's messages.
-- `src/v2-native/outcome.ts`: the stop reason, usage, error and `_meta.quota` of each idle.
-- `src/v2-native/stopped-work.ts`: the work that a cancel stopped before the client saw it.
-- `src/v2-native/stream.ts`: the SDK output, and replayed history, as v2 updates.
-- `src/v2-native/tasks.ts`: Claude Code's tasks: subagents as child sessions, and the
+- `src/v2/outcome.ts`: the stop reason, usage, error and `_meta.quota` of each idle.
+- `src/v2/stopped-work.ts`: the work that a cancel stopped before the client saw it.
+- `src/v2/stream.ts`: the SDK output, and replayed history, as v2 updates.
+- `src/v2/tasks.ts`: Claude Code's tasks: subagents as child sessions, and the
   `background` list of each session (see above).
-- `src/v2-native/subagent-replay.ts`: the subagents' histories in a replay, with SendMessage
+- `src/v2/subagent-replay.ts`: the subagents' histories in a replay, with SendMessage
   deliveries, hand-backs and model changes as live, and a notice for the subagents whose history
   is missing (a launch without metadata, a transcript that cannot be read).
-- `src/v2-native/child-config.ts`: each child session's configuration, and the hooks that
+- `src/v2/child-config.ts`: each child session's configuration, and the hooks that
   report it.
-- `src/v2-native/permissions.ts`: `canUseTool` as v2 permission requests, on the session of the
+- `src/v2/permissions.ts`: `canUseTool` as v2 permission requests, on the session of the
   agent that asks.
-- `src/v2-native/elicitation.ts`: elicitations, for the modes the client advertised. A form
+- `src/v2/elicitation.ts`: elicitations, for the modes the client advertised. A form
   for AskUserQuestion (on the session of the agent that asks), for an MCP server's form, and for
   the refusal fallback's consent prompt. A URL for an MCP server's URL request and for MCP OAuth.
   All but MCP OAuth are open requests of their session, like permission requests: a cancel or a
@@ -257,7 +257,7 @@ exit codes), which the shared renderer gives only with `air.client`, and the `ki
   Without form elicitation, AskUserQuestion is disallowed and the refusal fallback is not
   declared. An MCP server's request in a mode the client did not advertise, or that the client
   answers with an error, is answered `cancel`.
-- `src/v2-native/config.ts`: the config options, built and set as v1 builds and sets them
+- `src/v2/config.ts`: the config options, built and set as v1 builds and sets them
   (`buildConfigOptions` and `configOptionValue`): mode, model (also by an alias such as `opus`),
   effort, Fast mode and ultracode (boolean options), and the custom main-thread agents
   (`supportedAgents`). Effort, Fast mode, ultracode and agent are set with `applyFlagSettings`.
@@ -272,7 +272,7 @@ exit codes), which the shared renderer gives only with `air.client`, and the `ki
   v1, which shares `configOptionValue`. A model alias names an entry only by whole
   words (`resolveModelPreference`): `opus`, `opusplan`, `claude-sonnet-5[1m]` and provider ids
   such as `us.anthropic.claude-sonnet-5-v1:0` do, `not-a-model`, `son` and `foo-sonnet` do not.
-- `src/v2-native/clear-context.ts`: ExitPlanMode's "Yes, clear context" option, offered to the
+- `src/v2/clear-context.ts`: ExitPlanMode's "Yes, clear context" option, offered to the
   root's plan. The answer interrupts the cycle, and the turn stays open: the
   session sends Claude Code `/clear`, then sets the chosen mode and sends "Implement the following
   plan" in the fresh conversation. The client sees the plan's tool call
@@ -280,25 +280,25 @@ exit codes), which the shared renderer gives only with `air.client`, and the `ki
   plan's run in the same turn, whose idle has the whole turn's usage. v1 starts a fresh query
   instead (`clear-context-coordinator.ts`); `/clear` is Claude Code's own fresh conversation, and
   keeps the query's tasks and MCP servers.
-- `src/v2-native/setup.ts`: what session setup adds on v1's rules: the client's
+- `src/v2/setup.ts`: what session setup adds on v1's rules: the client's
   `_meta.claudeCode.options`, `CLAUDE_MODEL_CONFIG`, the models (the `availableModels`
   allowlist, `ANTHROPIC_MODEL` and the settings' `model`, the resumed transcript's model), the
   current title on resume, and AIR's `loadReplayEnd` event.
-- `src/v2-native/commands.ts`: the command list, and the adapter's `/mcp`, whose server list
+- `src/v2/commands.ts`: the command list, and the adapter's `/mcp`, whose server list
   replaces Claude Code's text before the turn's idle. The list has the adapter's `/remote-control`
   when the query serves Remote Control.
-- `src/v2-native/file-preview.ts`: the PreToolUse hook that shows an Edit's or Write's exact
+- `src/v2/file-preview.ts`: the PreToolUse hook that shows an Edit's or Write's exact
   patch before it runs.
-- `src/v2-native/air.ts`: the AIR extensions that the client takes, and the AIR capabilities of
+- `src/v2/air.ts`: the AIR extensions that the client takes, and the AIR capabilities of
   the `initialize` response (see "AIR clients").
-- `src/v2-native/file-changes.ts`: AIR's file-change reports of a session's turns.
-- `src/v2-native/auth.ts`: `_auth/status_update`, gateway `auth/login`, `auth/logout`, and
+- `src/v2/file-changes.ts`: AIR's file-change reports of a session's turns.
+- `src/v2/auth.ts`: `_auth/status_update`, gateway `auth/login`, `auth/logout`, and
   `providers/*`, on the v1 core's state rules (`AuthStatusReporter`, `providers.ts`). The
   identity is read after `initialize`, from each session's account, after a login or logout, and
   at the start of each prompt. A gateway login routes the sessions started after it.
   `providers/set`, `providers/disable`, and an `auth/logout` that
   drops a provider or a gateway login route the live sessions too (see `restarts.ts`).
-- `src/v2-native/restarts.ts`: restarts of a session's query, as on v1: a new query
+- `src/v2/restarts.ts`: restarts of a session's query, as on v1: a new query
   resumes the same Claude session without the setup's `_meta` effort, then the old one ends at
   its next turn boundary, and the client's choices are set again as v1's
   `restoreSessionChoices` sets them (model, mode and pre-plan mode, ultracode, Fast mode, the
@@ -309,10 +309,10 @@ exit codes), which the shared renderer gives only with `air.client`, and the `ki
   waits for an account restart of the session that runs. A resume of the active session with
   other additional directories restarts it the same way: Claude Code reads them only when its
   process starts. A session whose query does not start again stops (see "Differences from the
-  bridge").
+  old v2 bridge").
   A `session/cancel` or `session/close` answers the waiting prompts with -32800. The old query's
   background commands end with it: their terminals exit before the list drops them.
-- `src/v2-native/subscription-guard.ts`: the `--hide-claude-auth` subscription guard, on the
+- `src/v2/subscription-guard.ts`: the `--hide-claude-auth` subscription guard, on the
   rules of `hide-claude-auth.ts`, which v1 applies too. While no provider or
   gateway login routes the traffic, a session does not start, and a prompt is refused before
   insertion, on an account that a claude.ai subscription would pay for (`authRequired` with the
@@ -322,17 +322,17 @@ exit codes), which the shared renderer gives only with `air.client`, and the `ki
   restart fails that prompt and keeps the session, for a retry after a sign-in. The guard judges a
   prompt among the session's prompts, so a cancel or close answers one that waits for it with
   -32800, and the prompts keep their order.
-- `src/v2-native/remote-control.ts`: the adapter's `/remote-control`, listed and run on the v1
+- `src/v2/remote-control.ts`: the adapter's `/remote-control`, listed and run on the v1
   core's rules (`remote-control.ts`), as a local command of its own turn (see "Differences from
-  the bridge"), and the messages typed in another client of the session (a human-origin prompt
+  the old v2 bridge"), and the messages typed in another client of the session (a human-origin prompt
   echo that this session did not send), shown as user messages.
-- `src/v2-native/reports.ts`: usage, notices, compactions, titles, and the idle
+- `src/v2/reports.ts`: usage, notices, compactions, titles, and the idle
   compaction (see the table above), and the hooks that feed them (PostCompact, TaskCreated,
   TaskCompleted). The context window is seeded as on v1 (`context-window.ts`): a window
   that a result of any session on the same backend reported, else a guess from the model's names
   refined by a background `getContextUsage`, until the session's own result reports it.
 
-About 5,500 lines in total, and the v2 wire conversions of `src/v2/`. The native core shares
+About 5,500 lines in total, plus the v2 wire conversions (see "History"). The v2 agent shares
 these with the v1 core:
 
 - the SDK message mapping and tool call rendering (`toAcpNotifications`,
@@ -351,7 +351,7 @@ these with the v1 core:
 These pieces were extracted from the v1 core so that both cores use the same code:
 
 - `V2UpdateTranslator` and `replayClear` (`v2/update-translator.ts`), taken from the bridge's
-  client connection, and the other conversions of `src/v2/` that the bridge used
+  client connection, and the other v2 wire conversions that the bridge used
 - `terminalAuthMethods` (`auth-methods.ts`), taken from `ClaudeAcpAgent.initialize`
 - `sdkMcpServers` (`mcp-servers.ts`), taken from `ClaudeAcpAgent.createSession`
 - `resolveThinkingConfig` and `parseModelConfig` (`session-env.ts`), and `sessionSystemPrompt`
@@ -404,19 +404,19 @@ These pieces were extracted from the v1 core so that both cores use the same cod
 
 - `src/tests/acp-v2.test.ts` drives the v2 surface through the protocol router with the SDK's
   v2 client, which validates every message against the v2 schema. It started as the bridge's
-  v2 tests, and ran against both cores until the bridge was deleted.
+  v2 tests, and ran against both the bridge and the v2 agent until the bridge was deleted.
 
-- `src/tests/v2-native.test.ts` drives the core with a Claude Code double, message by message:
+- `src/tests/v2.test.ts` drives the core with a Claude Code double, message by message:
   insertion, folding, lifecycle failures, cancel, permission states, config, local commands,
   a crashed query, and replay.
 - `src/tests/acp-scenarios-v2.test.ts` runs the 40 scenarios on v2: they pass, send only
   schema-valid v2, report each tool call with a title first, and equal the golden files
   (`acp-scenarios/__snapshots__/v2/`) in full: requests, responses, notifications, permission
-  requests, elicitations and errors. The bridge recorded those golden files, and the native core
+  requests, elicitations and errors. The bridge recorded those golden files, and the v2 agent
   matched them before the bridge was deleted.
 - The scenario double sends `session_state_changed` when the query asks for it, as the real
   CLI does.
-- `src/tests/v2-native-integration.test.ts` (`npm run test:integration`) runs the adapter's
+- `src/tests/v2-integration.test.ts` (`npm run test:integration`) runs the adapter's
   process on v2 against the bundled Claude Code CLI, so a CLI that changes the
   frames the core relies on fails it:
   - a prompt answers at insertion, then the turn goes `running` → `idle` with `end_turn`
@@ -426,20 +426,20 @@ These pieces were extracted from the v1 core so that both cores use the same cod
 - A manual run against the bundled Claude Code CLI also checked that Bash runs as display
   terminals.
 
-## Differences from the bridge
+## Differences from the old v2 bridge
 
-Where the bridge's v2 behavior differed, the native core follows the spec (or, where noted, the
+Where the old v2 bridge's behavior differed, the v2 agent follows the spec (or, where noted, the
 order of its setup). The bridge's behavior is in the past tense.
 
 - A cancel right after `running`, before any output: the bridge sent `idle(cancelled)` at once,
-  without usage. The native core sends it once Claude Code's aborted result arrives, with that
+  without usage. The v2 agent sends it once Claude Code's aborted result arrives, with that
   result's usage, as v2 asks ("After all ongoing operations have been successfully aborted ...
   the Agent MUST send an idle `state_update`").
 
 - A v2 AIR client gets only the AIR extensions that v2 does not cover (see "AIR clients"). The
   bridge served it the v1 core's AIR extensions: `sessionFailure` records (with the "Retrying
   Claude" API retry warnings) and AIR's subagent form, which reports no `background` list, and
-  the AIR tool call contract. The native core serves v2's subagent sessions, `background` lists
+  the AIR tool call contract. The v2 agent serves v2's subagent sessions, `background` lists
   and failed idles instead.
 - `/remote-control` runs as a local command of its own turn, as v2 asks: `running`, the reply,
   then `idle` with `end_turn`. Sent while Claude works, it waits for the work to end, and the
@@ -501,18 +501,20 @@ clients"). To any v2 client:
 
 ## History
 
-The bridge (`src/v2/agent.ts` and the v2 mode of `ClaudeAcpAgent`) served v2 by converting each
-v2 request to v1 and back. The native core replaced it step by step: the shared pieces moved out
-of `ClaudeAcpAgent` (see the list above), the gaps were ported one feature at a time, and the
-native core became the default, also for AIR, with both cores held to the same v2 tests and
-scenarios. Then the bridge was deleted. What remains of `src/v2/` are the v2 wire conversions
-that the native core uses: the session setup, config, prompt and permission conversions, the
-`initialize` capabilities, `V2UpdateTranslator` with its terminals and tool call `_meta`, and the
+The old v2 bridge (the former `src/v2/agent.ts` and the v2 mode of `ClaudeAcpAgent`) served v2
+by converting each v2 request to v1 and back. The v2 agent, built beside it in its own
+directory, replaced it step by step: the shared pieces moved out of `ClaudeAcpAgent` (see the
+list above), the gaps were ported one feature at a time, and the v2 agent became the default,
+also for AIR, with both implementations held to the same v2 tests and scenarios. Then the bridge
+was deleted, and the v2 agent moved into `src/v2/`, beside the bridge's v2 wire conversions that
+it kept: the session setup and config conversions (`session-requests.ts`), the prompt and
+permission conversions (`prompt.ts`, `permissions.ts`), the `initialize` capabilities
+(`initialize.ts`), `V2UpdateTranslator` with its terminals and tool call `_meta`, and the
 `background` lists (`V2Background`).
 
 ## Spec checks
 
-Beyond the scenarios, `v2-native.test.ts` covers these requirements of the draft spec:
+Beyond the scenarios, `v2.test.ts` covers these requirements of the draft spec:
 
 - A cancel covers only the prompts received before it. A later prompt waits for the interrupt,
   whose `cancelQueued` would end it otherwise. Every covered prompt fails at once, and the run
