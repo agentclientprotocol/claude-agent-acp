@@ -225,6 +225,47 @@ describe("native agent file-change report", () => {
     );
   });
 
+  it("keeps reporting after the workspace moved to another directory", async () => {
+    const oldCwd = fs.realpathSync.native(
+      fs.mkdtempSync(path.join(os.tmpdir(), "native-file-report-old-")),
+    );
+    const newCwd = fs.realpathSync.native(
+      fs.mkdtempSync(path.join(os.tmpdir(), "native-file-report-new-")),
+    );
+    try {
+      const reports: AgentFileChangeReportResult[] = [];
+      const support = createSupport({
+        cwd: oldCwd,
+        publish: async (result) => void reports.push(result),
+      });
+      const turn = requestedTurn(support, "request-moved");
+      support.setWorkspace(newCwd);
+
+      await support.report(turn, {
+        rewindFiles: vi.fn(async () => ({
+          canRewind: true,
+          filesChanged: [path.join(newCwd, "src/moved.ts"), path.join(oldCwd, "src/stale.ts")],
+        })),
+      });
+
+      // The stale path is outside the moved workspace's roots, so the report
+      // marks itself truncated while it keeps the path that is inside.
+      expect(reports).toEqual([
+        {
+          version: 1,
+          requestId: "request-moved",
+          status: "reported",
+          paths: [path.join(newCwd, "src/moved.ts")],
+          declaredComplete: false,
+          truncated: true,
+        },
+      ]);
+    } finally {
+      fs.rmSync(oldCwd, { recursive: true, force: true });
+      fs.rmSync(newCwd, { recursive: true, force: true });
+    }
+  });
+
   it("fails open when report publication fails", async () => {
     const logError = vi.fn();
     const support = createSupport({

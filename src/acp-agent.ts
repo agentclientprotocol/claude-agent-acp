@@ -107,6 +107,7 @@ import {
 } from "./goal-extension.js";
 import { blobResourceToClaude } from "./blob-resources.js";
 import { promptSuggestionsMeta, promptSuggestionText } from "./prompt-suggestions.js";
+import { moveSessionCwd, promptCwdFromMeta } from "./prompt-cwd.js";
 import { sanitizeTitle, SessionTitles } from "./session-titles.js";
 import {
   AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
@@ -3957,6 +3958,24 @@ export class ClaudeAcpAgent {
     // settles. Fail clearly and let the client start a fresh session.
     if (session.queryClosed) {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+    }
+
+    // A prompt can carry the working directory the client navigated to since
+    // the last turn (`_meta.claudeCode.cwd`, see `moveSessionCwd`). The move
+    // happens before the prompt runs and only between turns: ACP serializes
+    // prompts, but a turn can still be queued behind a cancel window.
+    const requestedCwd = promptCwdFromMeta(params._meta);
+    if (requestedCwd !== undefined && requestedCwd !== session.cwd) {
+      if (this.claudeIsWorking(params.sessionId, session)) {
+        throw RequestError.invalidRequest(
+          undefined,
+          "The working directory can't be changed while Claude is working. Try again when the turn ends.",
+        );
+      }
+      await moveSessionCwd(session, requestedCwd, {
+        validateCwd: (cwd) => this.validateCwd(cwd),
+        fingerprint: computeSessionFingerprint,
+      });
     }
 
     const remoteControlCommand = parseRemoteControlCommand(params.prompt);
