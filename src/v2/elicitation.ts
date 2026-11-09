@@ -8,7 +8,7 @@ import {
   withAirMeta,
 } from "../air-extension.js";
 
-/** Copies AIR companion keys into request metadata. The v2 property types do not retain `_meta`. */
+/** Copies companion keys for AIR clients whose Kotlin v2 property models omit `_meta`. */
 export function v2ElicitationRequest(
   request: CreateElicitationRequest,
 ): v2.CreateElicitationRequest {

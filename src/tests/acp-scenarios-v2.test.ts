@@ -218,7 +218,7 @@ describe("AIR task scenarios on ACP v2", () => {
     ).toEqual([]);
     expect(updates).toContainEqual(
       expect.objectContaining({
-        sessionUpdate: name.startsWith("subagent") ? "subagent_spawned" : "async_task_spawned",
+        sessionUpdate: name.startsWith("subagent") ? "_subagent_update" : "_async_task_spawned",
       }),
     );
     const followup = updates

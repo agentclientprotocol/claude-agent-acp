@@ -38,11 +38,11 @@ export function v2SessionUpdate(
       return update;
     case "subagent_spawned":
     case "subagent_state_update":
+      return { ...update, sessionUpdate: "_subagent_update" };
     case "async_task_spawned":
     case "async_task_progress":
     case "async_task_state_update":
-      // AIR negotiates these extensions on both protocol versions.
-      return update as unknown as v2.SessionUpdate;
+      return { ...update, sessionUpdate: `_${update.sessionUpdate}` as const };
     case "agent_message_chunk":
     case "agent_thought_chunk":
     case "user_message_chunk": {

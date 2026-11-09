@@ -1278,6 +1278,9 @@ This section covers only the AIR bridge.
 - The agent advertises `nativeSubagentSessions` and `agentCapabilities.sessionCapabilities.subagents` to AIR.
 - A client that is not AIR and declares `clientCapabilities.subagents` gets the revised RFD instead (`subagent_update`, `session_message`), see the README.
 - The AIR subagent and async task extensions work on ACP v1 and ACP v2.
+  ACP v2 uses `_subagent_update` for both subagent updates.
+  It uses `_async_task_spawned`, `_async_task_progress`, and `_async_task_state_update` for task updates.
+  The payload fields stay the same.
   ACP v2 also serves `_session/async_task/stop` and advertises `asyncTasks`.
 - With native sessions, the adapter sends `subagent_spawned` and `subagent_state_update`.
   The child output goes to the child session. The Agent or Task tool call is not the subagent card.
@@ -1705,7 +1708,7 @@ The `compaction_update` form carries no `_meta`.
 Without form elicitation support, the adapter disables the tool when it creates the Claude session.
 
 Each question gets a select field and a companion text field named `Other`.
-For AIR on ACP v1, the companion field carries `_meta.jetbrains.air.customAnswer`:
+For AIR on both ACP versions, the companion field carries `_meta.jetbrains.air.customAnswer`:
 
 ```json
 { "questionId": "<select field key>", "isCustomAnswer": true }
@@ -1724,8 +1727,10 @@ On ACP v2, the request also lists the companion field keys in `_meta.jetbrains.a
 { "jetbrains": { "air": { "version": 1, "customAnswerFields": ["question_0_custom"] } } }
 ```
 
-The v2 property types do not retain `_meta`.
-AIR reads the request list to show the companion with its question.
+The TypeScript SDK retains property `_meta` on both protocol versions.
+Some AIR clients use Kotlin v2 property models that omit this metadata.
+These clients read the request list to show the companion with its question.
+The adapter retains both property markers for clients that can read them.
 The field keys and the response content stay the same in both versions.
 A client that is not AIR gets no `customAnswerFields` key.
 

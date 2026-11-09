@@ -39,6 +39,7 @@ import {
   v2ConfigOptions,
 } from "../v2/session.js";
 import { startupFailure } from "./helpers.js";
+import { validateV2Message } from "./acp-scenarios/schema.js";
 import packageJson from "../../package.json" with { type: "json" };
 
 const execFileSpy = vi.hoisted(() => vi.fn());
@@ -220,6 +221,9 @@ function v2Client({
       },
     )
     .onNotification(v2.methods.client.session.update, ({ params }) => {
+      expect(
+        validateV2Message({ kind: "notification", method: "session/update", payload: params }),
+      ).toEqual([]);
       sessionUpdates.push(params);
     })
     .onRequest(v2.methods.client.elicitation.create, ({ params, signal }) => {
@@ -1514,7 +1518,7 @@ describe("ACP v2 prompts", () => {
     });
 
     const spawn = client.sessionUpdates.find(
-      ({ update }) => update.sessionUpdate === (air ? "subagent_spawned" : "subagent_update"),
+      ({ update }) => update.sessionUpdate === (air ? "_subagent_update" : "subagent_update"),
     )?.update as { sessionId?: string; subagentSessionId?: string } | undefined;
     const childSessionId = air ? spawn?.subagentSessionId : spawn?.sessionId;
     expect(childSessionId).toBeDefined();
@@ -1577,8 +1581,8 @@ describe("ACP v2 prompts", () => {
           ]),
     ]);
     if (air) {
-      expect(client.updates("subagent_state_update")).toContainEqual({
-        sessionUpdate: "subagent_state_update",
+      expect(client.updates("_subagent_update")).toContainEqual({
+        sessionUpdate: "_subagent_update",
         subagentSessionId: childSessionId,
         state: "completed",
       });
@@ -4418,7 +4422,7 @@ describe("ACP v2 requests that subagents make", () => {
       expect(client.sessionUpdates).toContainEqual(
         expect.objectContaining({
           update: expect.objectContaining({
-            sessionUpdate: "subagent_spawned",
+            sessionUpdate: "_subagent_update",
             subagentSessionId: id,
             prompt: `Look around ${id}`,
           }),
@@ -4427,7 +4431,7 @@ describe("ACP v2 requests that subagents make", () => {
       expect(client.sessionUpdates).toContainEqual(
         expect.objectContaining({
           update: expect.objectContaining({
-            sessionUpdate: "subagent_state_update",
+            sessionUpdate: "_subagent_update",
             subagentSessionId: id,
             state: "completed",
           }),
@@ -6422,7 +6426,7 @@ describe("ACP v2 AIR task control", () => {
       expect(client.sessionUpdates).toContainEqual({
         sessionId,
         update: expect.objectContaining({
-          sessionUpdate: "async_task_spawned",
+          sessionUpdate: "_async_task_spawned",
           asyncTaskId: "bash_1",
           canStop: true,
         }),
@@ -6434,7 +6438,7 @@ describe("ACP v2 AIR task control", () => {
       expect(client.sessionUpdates).toContainEqual({
         sessionId,
         update: expect.objectContaining({
-          sessionUpdate: "async_task_state_update",
+          sessionUpdate: "_async_task_state_update",
           asyncTaskId: "bash_1",
           state: "stopped",
         }),
@@ -6459,6 +6463,24 @@ describe("ACP v2 AIR task control", () => {
 });
 
 describe("ACP v2 session translation", () => {
+  it.each([
+    "subagent_spawned",
+    "subagent_state_update",
+    "async_task_spawned",
+    "async_task_progress",
+    "async_task_state_update",
+  ])("rejects the unprefixed extension tag %s", (sessionUpdate) => {
+    expect(
+      validateV2Message({
+        kind: "notification",
+        method: "session/update",
+        payload: { sessionId: "s", update: { sessionUpdate } },
+      }),
+    ).toEqual([
+      `notification session/update has an unknown unprefixed sessionUpdate '${sessionUpdate}'`,
+    ]);
+  });
+
   it("renames the group id of grouped select options", () => {
     expect(
       v2ConfigOptions([
