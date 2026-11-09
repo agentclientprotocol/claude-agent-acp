@@ -2545,9 +2545,6 @@ describe("ACP v2 prompts", () => {
         });
         await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
         await agent.notify(v2.methods.agent.session.cancel, { sessionId: root });
-        // The native core sends no interrupt while the session is idle: it has
-        // no foreground work to stop. The stop is then Claude Code's own.
-        if (process.env.V2_CORE_UNDER_TEST === "native") interrupted.resolve();
         await vi.waitFor(() =>
           expect(
             client
