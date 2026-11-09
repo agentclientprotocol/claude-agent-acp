@@ -215,8 +215,8 @@ function connectRouter(protocols?: AcpProtocols): v2.Stream {
   return { readable: toClient.readable, writable: toAgent.writable };
 }
 
-/** The native core's session `sessionId` (a `NativeSession`), for waits on its internals. */
-function nativeSession(sessionId: string): any {
+/** The v2 core's session `sessionId` (a `V2Session`), for waits on its internals. */
+function v2Session(sessionId: string): any {
   return (agents[0] as unknown as { sessions: Map<string, unknown> }).sessions.get(sessionId);
 }
 
@@ -227,7 +227,7 @@ function nativeSession(sessionId: string): any {
 async function waitForQueuedPrompt(sessionId: string): Promise<void> {
   await vi.waitFor(() =>
     expect(
-      [...nativeSession(sessionId).pending.values()].filter(
+      [...v2Session(sessionId).pending.values()].filter(
         (prompt: { pushed: boolean }) => prompt.pushed,
       ),
     ).toHaveLength(1),
@@ -412,7 +412,7 @@ describe("ACP protocol routing", () => {
 
     // The v2 app registers neither `_session/async_task/stop` nor `_session/goal`.
     // The core lists only the AIR extensions that v2 does not cover (see
-    // "AIR clients" in docs/v2-native-core.md).
+    // "AIR clients" in docs/acp-v2.md).
     const air = (response._meta as any)?.jetbrains?.air;
     expect(air.capabilities).toEqual(["agentFileChangeReport", "recommendedValue"]);
     expect(air.capabilities).not.toContain("asyncTasks");
@@ -5299,7 +5299,7 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
     const client = await promptAndWait(2, async (agent, sessionId, client) => {
       await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toEqual(endedTurn));
       await vi.waitFor(() =>
-        expect(nativeSession(sessionId).stopped.modelRequestSinceResult).toBe(true),
+        expect(v2Session(sessionId).stopped.modelRequestSinceResult).toBe(true),
       );
       await agent.notify(v2.methods.agent.session.cancel, { sessionId });
     });
@@ -7232,7 +7232,7 @@ describe("ACP v2 requests that a cancel withdraws", () => {
         await wait(client);
         // The first is still open, so the answer changes nothing.
         answer.resolve(allowOnce);
-        await vi.waitFor(() => expect(nativeSession(sessionId).requests.size).toBe(1));
+        await vi.waitFor(() => expect(v2Session(sessionId).requests.size).toBe(1));
         await agent.notify(v2.methods.agent.session.cancel, { sessionId });
       });
 

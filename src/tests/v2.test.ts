@@ -1,5 +1,5 @@
 /**
- * The native ACP v2 core (`src/v2-native/`), driven through the protocol
+ * The ACP v2 core (`src/v2/`), driven through the protocol
  * router with the SDK's v2 client app, which validates every response and
  * session update against the v2 schema.
  *
@@ -193,7 +193,7 @@ let tempDir: string;
 let cwd: string;
 
 beforeEach(async () => {
-  tempDir = await mkdtemp(path.join(os.tmpdir(), "acp-v2-native-"));
+  tempDir = await mkdtemp(path.join(os.tmpdir(), "acp-v2-"));
   cwd = await mkdtemp(path.join(tempDir, "project-"));
   vi.stubEnv("CLAUDE_CONFIG_DIR", path.join(tempDir, "claude"));
   sdk.processes = [];
@@ -211,8 +211,8 @@ afterEach(async () => {
   await rm(tempDir, { recursive: true, force: true, maxRetries: 10 });
 });
 
-/** A v2 client of the native core that records the session updates it receives. */
-function nativeClient({
+/** A v2 client of the v2 core that records the session updates it receives. */
+function v2Client({
   answerPermission = () => ({ outcome: { outcome: "cancelled" } }),
   answerElicitation = () => ({ action: "cancel" }),
 }: {
@@ -232,7 +232,7 @@ function nativeClient({
   /** The ids of the `elicitation/complete` notifications. */
   const completedElicitations: string[] = [];
   const app = v2
-    .client({ name: "native-test-client" })
+    .client({ name: "v2-test-client" })
     .onNotification(v2.methods.client.session.update, ({ params }) => {
       notifications.push(params);
       sessionUpdates.push(params.update);
@@ -279,7 +279,7 @@ function nativeClient({
 async function openSession(agent: v2.ClientContext, capabilities: v2.ClientCapabilities = {}) {
   await agent.request(v2.methods.agent.initialize, {
     protocolVersion: v2.PROTOCOL_VERSION,
-    info: { name: "native-test-client", version: "1.0.0" },
+    info: { name: "v2-test-client", version: "1.0.0" },
     capabilities,
   });
   const response = await agent.request(v2.methods.agent.session.new, { cwd });
@@ -469,13 +469,13 @@ function updatesOf(
   return notifications.flatMap((n) => (n.sessionId === sessionId ? [n.update] : []));
 }
 
-describe("native ACP v2 core", () => {
+describe("ACP v2 core", () => {
   it("advertises the v2 session baseline with fork, and terminal logins", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     const response = await client.connect((agent) =>
       agent.request(v2.methods.agent.initialize, {
         protocolVersion: v2.PROTOCOL_VERSION,
-        info: { name: "native-test-client", version: "1.0.0" },
+        info: { name: "v2-test-client", version: "1.0.0" },
         capabilities: { auth: { terminal: {} } },
       }),
     );
@@ -489,12 +489,12 @@ describe("native ACP v2 core", () => {
   });
 
   it("routes the sessions started after a gateway login through the gateway", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     const baseUrl = "https://gateway.example.com";
     await client.connect(async (agent) => {
       await agent.request(v2.methods.agent.initialize, {
         protocolVersion: v2.PROTOCOL_VERSION,
-        info: { name: "native-test-client", version: "1.0.0" },
+        info: { name: "v2-test-client", version: "1.0.0" },
         capabilities: { auth: { _meta: { gateway: true } } },
       });
       await agent.request(v2.methods.agent.auth.login, {
@@ -522,7 +522,7 @@ describe("native ACP v2 core", () => {
       });
 
     it("restarts the query only once the background subagents ended", async () => {
-      const client = nativeClient();
+      const client = v2Client();
       await client.connect(async (agent) => {
         const { response, claude } = await openSession(agent);
         void agent.request(v2.methods.agent.session.prompt, {
@@ -551,7 +551,7 @@ describe("native ACP v2 core", () => {
     });
 
     it("answers a prompt that waits for the restart with -32800 on session/cancel", async () => {
-      const client = nativeClient();
+      const client = v2Client();
       await client.connect(async (agent) => {
         const { response, claude } = await openSession(agent);
         const sessionId = response.sessionId;
@@ -575,7 +575,7 @@ describe("native ACP v2 core", () => {
     });
 
     it("ends the old query only after a turn that Claude Code started on it while the new one started", async () => {
-      const client = nativeClient();
+      const client = v2Client();
       await client.connect(async (agent) => {
         const { claude } = await openSession(agent);
         const started = Promise.withResolvers<void>();
@@ -604,7 +604,7 @@ describe("native ACP v2 core", () => {
     });
 
     it("forgets a session that session/close closed while its restart ran", async () => {
-      const client = nativeClient();
+      const client = v2Client();
       await client.connect(async (agent) => {
         const { response } = await openSession(agent);
         const started = Promise.withResolvers<void>();
@@ -628,7 +628,7 @@ describe("native ACP v2 core", () => {
     });
 
     it("stops a session whose query does not start again under the new route", async () => {
-      const client = nativeClient();
+      const client = v2Client();
       await client.connect(async (agent) => {
         const { response } = await openSession(agent);
         sdk.startFailure = new Error("Claude Code could not start");
@@ -656,7 +656,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("answers session/new with the mode and model options and the commands", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     const { response, claude } = await client.connect((agent) => openSession(agent));
 
     expect(response.configOptions?.map((option) => option.configId)).toEqual(["mode", "model"]);
@@ -676,7 +676,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("answers a prompt when Claude Code starts it, and reports the work until the turn's result", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
       const answer = agent.request(v2.methods.agent.session.prompt, {
@@ -739,7 +739,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("inserts a prompt that Claude Code folds into the running work at its echo", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
       const answer = agent.request(v2.methods.agent.session.prompt, {
@@ -762,7 +762,7 @@ describe("native ACP v2 core", () => {
     ["discarded", -32603],
     ["refused", -32603],
   ])("fails a prompt that Claude Code %s", async (state, code) => {
-    const client = nativeClient();
+    const client = v2Client();
     const error = await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
       const answer = agent.request(v2.methods.agent.session.prompt, {
@@ -777,7 +777,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("cancels the work and the prompts not inserted yet with one interrupt", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
       const sessionId = response.sessionId;
@@ -806,7 +806,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("reports requires_action while a permission request is open, and running once answered", async () => {
-    const client = nativeClient({
+    const client = v2Client({
       answerPermission: (request) => ({
         outcome: { outcome: "selected", optionId: request.options[0].optionId },
       }),
@@ -836,7 +836,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("reads a dismissed permission request as the user refusing the tool", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     const decision = await client.connect(async (agent) => {
       const { claude } = await openSession(agent);
       return claude.options.canUseTool!(
@@ -855,7 +855,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("sets a config option on the query and sends it as an update too", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     const { claude, configOptions } = await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
       const { configOptions } = await agent.request(v2.methods.agent.session.setConfigOption, {
@@ -877,7 +877,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("forwards the result of a local command, which streamed no text", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
       const answer = agent.request(v2.methods.agent.session.prompt, {
@@ -902,7 +902,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("sends the title that Claude Code stored, once its session state is idle", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
       vi.mocked(getSessionInfo).mockResolvedValueOnce({
@@ -931,11 +931,11 @@ describe("native ACP v2 core", () => {
   });
 
   it("reports a client MCP server that failed to start as a notice, once", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     await client.connect(async (agent) => {
       await agent.request(v2.methods.agent.initialize, {
         protocolVersion: v2.PROTOCOL_VERSION,
-        info: { name: "native-test-client", version: "1.0.0" },
+        info: { name: "v2-test-client", version: "1.0.0" },
         capabilities: {},
       });
       await agent.request(v2.methods.agent.session.new, {
@@ -972,7 +972,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("replaces Claude Code's text of /mcp with the server list, before the turn's idle", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     sdk.mcpServers = [{ name: "linear", status: "connected" }];
     await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
@@ -1000,7 +1000,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("fails the pending prompts and ends the work when Claude Code exits", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     const error = await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
       claude.send(cycleStart());
@@ -1029,7 +1029,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("starts a session whose query ended again on resume", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
       claude.end(new Error("Claude Code process exited with code 1"));
@@ -1061,7 +1061,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("ends the work at the turn's result while background subagents keep Claude Code running", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
       const answer = agent.request(v2.methods.agent.session.prompt, {
@@ -1088,7 +1088,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("does not report a later turn as cancelled after a cancel that only ended queued prompts", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
       const sessionId = response.sessionId;
@@ -1113,7 +1113,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("drops the run of a prompt that a cancel answered after Claude Code took it in, and denies its tools", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     const decision = await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
       const sessionId = response.sessionId;
@@ -1159,7 +1159,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("ends a turn cancelled when a cancel comes while an approved plan waits for its fresh context", async () => {
-    const client = nativeClient({
+    const client = v2Client({
       answerPermission: () => ({
         outcome: { outcome: "selected", optionId: "exit-plan-clear-auto" },
       }),
@@ -1237,7 +1237,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("ends a cycle at its own result, not at a placeholder or at the idle of the turn before", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     await client.connect(async (agent) => {
       const { claude } = await openSession(agent);
       claude.send(cycleStart());
@@ -1257,7 +1257,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("reports a tool call that Claude dropped before it ran as cancelled at the turn's end", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     await client.connect(async (agent) => {
       const { claude } = await openSession(agent);
       claude.send({
@@ -1291,7 +1291,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("pushes a prompt sent after session/cancel only once the interrupt is done", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
       const sessionId = response.sessionId;
@@ -1313,7 +1313,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("closes active work with its cancelled idle before the response, and nothing after", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     let updatesAtResponse = 0;
     await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
@@ -1337,7 +1337,7 @@ describe("native ACP v2 core", () => {
     ["session/close", v2.methods.agent.session.close],
     ["session/delete", v2.methods.agent.session.delete],
   ])("answers %s of a session that does not exist with an empty result", async (_, method) => {
-    const client = nativeClient();
+    const client = v2Client();
     const response = await client.connect(async (agent) => {
       await openSession(agent);
       return agent.request(method, { sessionId: randomUUID() });
@@ -1347,7 +1347,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("rejects a config value whose type does not match the option", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     const error = await client.connect(async (agent) => {
       const { response } = await openSession(agent);
       return agent
@@ -1364,7 +1364,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("rejects additional directories that are not absolute", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     const error = await client.connect(async (agent) => {
       await openSession(agent);
       return agent
@@ -1394,12 +1394,12 @@ describe("native ACP v2 core", () => {
         message: { id: "msg_a", role: "assistant", content: [{ type: "text", text: "Done" }] },
       },
     ]);
-    const client = nativeClient();
+    const client = v2Client();
     const sessionId = randomUUID();
     await client.connect(async (agent) => {
       await agent.request(v2.methods.agent.initialize, {
         protocolVersion: v2.PROTOCOL_VERSION,
-        info: { name: "native-test-client", version: "1.0.0" },
+        info: { name: "v2-test-client", version: "1.0.0" },
         capabilities: {},
       });
       await agent.request(v2.methods.agent.session.resume, {
@@ -1446,11 +1446,11 @@ describe("native ACP v2 core", () => {
         content: [{ type: "tool_use", id: "toolu_make", name: "Bash", input: { command: "make" } }],
       }),
     ] as never);
-    const client = nativeClient();
+    const client = v2Client();
     await client.connect(async (agent) => {
       await agent.request(v2.methods.agent.initialize, {
         protocolVersion: v2.PROTOCOL_VERSION,
-        info: { name: "native-test-client", version: "1.0.0" },
+        info: { name: "v2-test-client", version: "1.0.0" },
         capabilities: {},
       });
       await agent.request(v2.methods.agent.session.resume, {
@@ -1492,11 +1492,11 @@ describe("native ACP v2 core", () => {
       ),
       entry("u2", { role: "user", content: "Go on" }),
     ] as never);
-    const client = nativeClient();
+    const client = v2Client();
     await client.connect(async (agent) => {
       await agent.request(v2.methods.agent.initialize, {
         protocolVersion: v2.PROTOCOL_VERSION,
-        info: { name: "native-test-client", version: "1.0.0" },
+        info: { name: "v2-test-client", version: "1.0.0" },
         capabilities: {},
       });
       await agent.request(v2.methods.agent.session.resume, {
@@ -1529,7 +1529,7 @@ describe("native ACP v2 core", () => {
     ],
     ["the turn that a cancelled frame closed", ["cancelled", "late"]],
   ])("skips the late result of a dead turn: %s", async (_, events) => {
-    const client = nativeClient();
+    const client = v2Client();
     await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
       const sessionId = response.sessionId;
@@ -1587,7 +1587,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("keeps dropping a prompt's run when another abandoned prompt's cancelled frame comes", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
       const sessionId = response.sessionId;
@@ -1625,7 +1625,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("sends no permission request of a session after session/close answered", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     const decision = await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
       await agent.request(v2.methods.agent.session.close, { sessionId: response.sessionId });
@@ -1638,7 +1638,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("does not show Claude Code's sign-in message, and fails the turn with authRequired", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     await client.connect(async (agent) => {
       const { claude } = await openSession(agent);
       claude.send(cycleStart());
@@ -1682,7 +1682,7 @@ describe("native ACP v2 core", () => {
       { code: -32603, data: { errorKind: "rate_limit" } },
     ],
   ])("reports %s, from the assistant message's error", async (_, kind, text, error) => {
-    const client = nativeClient();
+    const client = v2Client();
     await client.connect(async (agent) => {
       const { claude } = await openSession(agent);
       claude.send(cycleStart());
@@ -1715,7 +1715,7 @@ describe("native ACP v2 core", () => {
       { stopReason: "max_turn_requests" },
     ],
   ])("reads %s from the result as the v1 core does", async (_, fields, expected) => {
-    const client = nativeClient();
+    const client = v2Client();
     await client.connect(async (agent) => {
       const { claude } = await openSession(agent);
       claude.send(cycleStart());
@@ -1727,7 +1727,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("answers a refusal with the explanation of model_refusal_no_fallback when the message has none", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     await client.connect(async (agent) => {
       const { claude } = await openSession(agent);
       claude.send(cycleStart());
@@ -1767,7 +1767,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("denies the AskUserQuestion of a prompt that a cancel answered, without asking", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     const decision = await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent, { elicitation: { form: {} } });
       const sessionId = response.sessionId;
@@ -1809,7 +1809,7 @@ describe("native ACP v2 core", () => {
       },
       { value: "haiku", displayName: "Haiku", description: "Fast", supportsAutoMode: false },
     ];
-    const client = nativeClient();
+    const client = v2Client();
     const modes = await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
       const sessionId = response.sessionId;
@@ -1839,7 +1839,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("follows a model switch that Claude Code made without the adapter", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     await client.connect(async (agent) => {
       const { claude } = await openSession(agent);
       const hook = claude.options.hooks?.PostModelSwitch?.at(-1)?.hooks[0];
@@ -1867,7 +1867,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("names the MCP server of a tool in the permission request", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     await client.connect(async (agent) => {
       const { claude } = await openSession(agent);
       await askPermission(
@@ -1887,7 +1887,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("offers clearing the context at 0% used after Claude Code mounted a fresh conversation", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
       const prompted = agent.request(v2.methods.agent.session.prompt, {
@@ -1927,7 +1927,7 @@ describe("native ACP v2 core", () => {
   });
 
   it("lists bypass before auto in ExitPlanMode's options after plan mode left bypass", async () => {
-    const client = nativeClient();
+    const client = v2Client();
     await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
       const sessionId = response.sessionId;
@@ -1952,11 +1952,11 @@ describe("native ACP v2 core", () => {
   it("disposes the settings of a session that fails to start", async () => {
     const initialized = vi.spyOn(SettingsManager.prototype, "initialize");
     const disposed = vi.spyOn(SettingsManager.prototype, "dispose");
-    const client = nativeClient();
+    const client = v2Client();
     const error = await client.connect(async (agent) => {
       await agent.request(v2.methods.agent.initialize, {
         protocolVersion: v2.PROTOCOL_VERSION,
-        info: { name: "native-test-client", version: "1.0.0" },
+        info: { name: "v2-test-client", version: "1.0.0" },
         capabilities: {},
       });
       return agent
@@ -1975,7 +1975,7 @@ describe("native ACP v2 core", () => {
 
   describe("subagents and background work", () => {
     it("announces a subagent before its traffic, and reports its runs on its own stream", async () => {
-      const client = nativeClient();
+      const client = v2Client();
       const agentId = "a7f0c1";
       const sessionId = await client.connect(async (agent) => {
         const { response, claude } = await openSession(agent);
@@ -2045,7 +2045,7 @@ describe("native ACP v2 core", () => {
     });
 
     it("lists a background subagent while it works, after the turn's idle", async () => {
-      const client = nativeClient();
+      const client = v2Client();
       const agentId = "a5966d";
       const sessionId = await client.connect(async (agent) => {
         const { response, claude } = await openSession(agent);
@@ -2092,7 +2092,7 @@ describe("native ACP v2 core", () => {
     });
 
     it("announces a nested subagent on its parent subagent's stream", async () => {
-      const client = nativeClient();
+      const client = v2Client();
       await client.connect(async (agent) => {
         const { claude } = await openSession(agent);
         claude.send(cycleStart());
@@ -2111,7 +2111,7 @@ describe("native ACP v2 core", () => {
 
     it("asks a subagent's permission on its session, and blocks the work that waits on it", async () => {
       let answer = (_: v2.RequestPermissionResponse) => {};
-      const client = nativeClient({
+      const client = v2Client({
         answerPermission: () => new Promise((resolve) => (answer = resolve)),
       });
       await client.connect(async (agent) => {
@@ -2152,7 +2152,7 @@ describe("native ACP v2 core", () => {
     });
 
     it("stops a subagent's run on session/cancel of its session, and leaves the parent's work alone", async () => {
-      const client = nativeClient();
+      const client = v2Client();
       await client.connect(async (agent) => {
         const { claude } = await openSession(agent);
         claude.send(cycleStart());
@@ -2199,7 +2199,7 @@ describe("native ACP v2 core", () => {
     ])(
       "gives a %s run's tool call that never ran its final status before the child's idle",
       async (status, toolStatus, stopReason) => {
-        const client = nativeClient();
+        const client = v2Client();
         await client.connect(async (agent) => {
           const { claude } = await openSession(agent);
           claude.send(cycleStart());
@@ -2232,7 +2232,7 @@ describe("native ACP v2 core", () => {
 
     it("reports a child running again when Claude Code refuses to stop it", async () => {
       let answer = (_: v2.RequestPermissionResponse) => {};
-      const client = nativeClient({
+      const client = v2Client({
         answerPermission: () => new Promise((resolve) => (answer = resolve)),
       });
       await client.connect(async (agent) => {
@@ -2265,7 +2265,7 @@ describe("native ACP v2 core", () => {
 
     it("reports the root running again when the interrupt fails, and lets its subagent ask again", async () => {
       let answer = (_: v2.RequestPermissionResponse) => {};
-      const client = nativeClient({
+      const client = v2Client({
         answerPermission: () => new Promise((resolve) => (answer = resolve)),
       });
       const decision = await client.connect(async (agent) => {
@@ -2295,7 +2295,7 @@ describe("native ACP v2 core", () => {
     });
 
     it("stops a foreground subagent that Claude Code reports after the root's cancel, until the cancelled work's result", async () => {
-      const client = nativeClient();
+      const client = v2Client();
       await client.connect(async (agent) => {
         const { response, claude } = await openSession(agent);
         claude.send(cycleStart());
@@ -2344,7 +2344,7 @@ describe("native ACP v2 core", () => {
     });
 
     it("sends a subagent's request on its session when it is announced while the request is built", async () => {
-      const client = nativeClient({ answerPermission: () => new Promise(() => {}) });
+      const client = v2Client({ answerPermission: () => new Promise(() => {}) });
       await client.connect(async (agent) => {
         const { claude } = await openSession(agent);
         const child = subagent("child", "toolu_launch");
@@ -2377,7 +2377,7 @@ describe("native ACP v2 core", () => {
     });
 
     it("announces a nested subagent that no launch call names only after its parent", async () => {
-      const client = nativeClient();
+      const client = v2Client();
       await client.connect(async (agent) => {
         const { claude } = await openSession(agent);
         const outer = subagent("outer", "toolu_outer");
@@ -2405,7 +2405,7 @@ describe("native ACP v2 core", () => {
     });
 
     it("keeps the root running while another foreground subagent makes progress", async () => {
-      const client = nativeClient({ answerPermission: () => new Promise(() => {}) });
+      const client = v2Client({ answerPermission: () => new Promise(() => {}) });
       await client.connect(async (agent) => {
         const { claude } = await openSession(agent);
         claude.send(cycleStart());
@@ -2432,7 +2432,7 @@ describe("native ACP v2 core", () => {
     });
 
     it("sends a background child's listed terminal before the child's state on resume", async () => {
-      const client = nativeClient();
+      const client = v2Client();
       await client.connect(async (agent) => {
         const { response, claude } = await openSession(agent);
         const sessionId = response.sessionId;
@@ -2516,7 +2516,7 @@ describe("native ACP v2 core", () => {
           },
         ],
       ]);
-      const client = nativeClient();
+      const client = v2Client();
       await client.connect(async (agent) => {
         const { response, claude } = await openSession(agent);
         const sessionId = response.sessionId;
@@ -2561,7 +2561,7 @@ describe("native ACP v2 core", () => {
       ["session/prompt", v2.methods.agent.session.prompt, { prompt: PROMPT }],
       ["session/close", v2.methods.agent.session.close, {}],
     ])("rejects %s on a subagent's session", async (_, method, params) => {
-      const client = nativeClient();
+      const client = v2Client();
       const error = await client.connect(async (agent) => {
         const { claude } = await openSession(agent);
         claude.send(cycleStart());
@@ -2585,7 +2585,7 @@ describe("native ACP v2 core", () => {
     });
 
     it("keeps a background command's terminal running and listed until its task ends", async () => {
-      const client = nativeClient();
+      const client = v2Client();
       const sessionId = await client.connect(async (agent) => {
         const { response, claude } = await openSession(agent);
         claude.send(cycleStart());
@@ -2674,7 +2674,7 @@ describe("native ACP v2 core", () => {
     ])(
       "asks Claude Code for the requests that a client with %s renders",
       async (_, elicitation, expected) => {
-        const client = nativeClient();
+        const client = v2Client();
         const { claude } = await client.connect((agent) => openSession(agent, { elicitation }));
 
         const { options } = claude;
@@ -2697,7 +2697,7 @@ describe("native ACP v2 core", () => {
     ])(
       "marks a skipped question as unanswered only when the turn's system/init %s the capability",
       async (_, capabilities, annotations) => {
-        const client = nativeClient({
+        const client = v2Client({
           answerElicitation: () => ({ action: "accept", content: {} }),
         });
         const decision = await client.connect(async (agent) => {
@@ -2735,7 +2735,7 @@ describe("native ACP v2 core", () => {
     );
 
     it("completes an MCP server's URL elicitation when Claude Code reports it complete", async () => {
-      const client = nativeClient();
+      const client = v2Client();
       await client.connect(async (agent) => {
         const { claude } = await openSession(agent, { elicitation: { url: {} } });
         claude.send({
@@ -2751,7 +2751,7 @@ describe("native ACP v2 core", () => {
     });
 
     it("keeps the work requires_action after the user accepts an MCP server's URL until Claude Code reports it complete", async () => {
-      const client = nativeClient({ answerElicitation: () => ({ action: "accept" }) });
+      const client = v2Client({ answerElicitation: () => ({ action: "accept" }) });
       await client.connect(async (agent) => {
         const { claude } = await openSession(agent, { elicitation: { url: {} } });
         claude.send(cycleStart());
@@ -2788,11 +2788,11 @@ describe("native ACP v2 core", () => {
 
     it("starts OAuth for the MCP servers of a forked session", async () => {
       sdk.mcpServers = [{ name: "linear", status: "needs-auth" }];
-      const client = nativeClient();
+      const client = v2Client();
       await client.connect(async (agent) => {
         await agent.request(v2.methods.agent.initialize, {
           protocolVersion: v2.PROTOCOL_VERSION,
-          info: { name: "native-test-client", version: "1.0.0" },
+          info: { name: "v2-test-client", version: "1.0.0" },
           capabilities: { elicitation: { url: {} } },
         });
         await agent.request(v2.methods.agent.session.fork, {
@@ -2810,7 +2810,7 @@ describe("native ACP v2 core", () => {
       // The server stays `needs-auth`: the user has not signed in yet.
       sdk.mcpServers = [{ name: "linear", status: "needs-auth" }];
       let cancelled = false;
-      const client = nativeClient({
+      const client = v2Client({
         answerElicitation: (_, signal) =>
           new Promise((resolve) =>
             signal.addEventListener("abort", () => {
@@ -2822,7 +2822,7 @@ describe("native ACP v2 core", () => {
       const cancelledAtClose = await client.connect(async (agent) => {
         await agent.request(v2.methods.agent.initialize, {
           protocolVersion: v2.PROTOCOL_VERSION,
-          info: { name: "native-test-client", version: "1.0.0" },
+          info: { name: "v2-test-client", version: "1.0.0" },
           capabilities: { elicitation: { url: {} } },
         });
         const { sessionId } = await agent.request(v2.methods.agent.session.new, {
@@ -2858,11 +2858,11 @@ describe("native ACP v2 core", () => {
       ],
       ["any other client no AIR key", {}, undefined],
     ])("advertises to %s", async (_, capabilities, expected) => {
-      const client = nativeClient();
+      const client = v2Client();
       const response = await client.connect((agent) =>
         agent.request(v2.methods.agent.initialize, {
           protocolVersion: v2.PROTOCOL_VERSION,
-          info: { name: "native-test-client", version: "1.0.0" },
+          info: { name: "v2-test-client", version: "1.0.0" },
           capabilities,
         }),
       );
@@ -2895,7 +2895,7 @@ describe("native ACP v2 core", () => {
             supportedEffortLevels: levels,
           },
         ];
-        const client = nativeClient();
+        const client = v2Client();
         const { response, claude } = await client.connect((agent) =>
           openSession(agent, capabilities),
         );
@@ -2934,7 +2934,7 @@ describe("native ACP v2 core", () => {
       ["an AIR client the AIR presentation", air(), true],
       ["any other client none", {}, false],
     ])("gives a permission request of %s", async (_, capabilities, airClient) => {
-      const client = nativeClient();
+      const client = v2Client();
       await client.connect(async (agent) => {
         const { claude } = await openSession(agent, capabilities);
         // A subagent's request, on its session, of a tool that the stream did not show yet.
@@ -2984,7 +2984,7 @@ describe("native ACP v2 core", () => {
     ])(
       "marks AskUserQuestion's custom answer field for %s only",
       async (_, capabilities, marked) => {
-        const client = nativeClient({
+        const client = v2Client({
           answerElicitation: () => ({ action: "accept", content: {} }),
         });
         await client.connect(async (agent) => {
@@ -3039,7 +3039,7 @@ describe("native ACP v2 core", () => {
     ])(
       "sends %s the predicted follow-up prompt, cleared at the next prompt and at a reset",
       async (_, capabilities, predicted) => {
-        const client = nativeClient();
+        const client = v2Client();
         const suggestion = (text: string) => ({
           type: "prompt_suggestion",
           suggestion: text,
@@ -3095,11 +3095,11 @@ describe("native ACP v2 core", () => {
     );
 
     it("leaves the predicted prompt off when the client's options turn it off", async () => {
-      const client = nativeClient();
+      const client = v2Client();
       await client.connect(async (agent) => {
         await agent.request(v2.methods.agent.initialize, {
           protocolVersion: v2.PROTOCOL_VERSION,
-          info: { name: "native-test-client", version: "1.0.0" },
+          info: { name: "v2-test-client", version: "1.0.0" },
           capabilities: air(),
         });
         await agent.request(v2.methods.agent.session.new, {
@@ -3121,7 +3121,7 @@ describe("native ACP v2 core", () => {
         });
 
       it("lists the files of the prompt's checkpoint at its turn's end, before the idle", async () => {
-        const client = nativeClient();
+        const client = v2Client();
         const changed = path.join(await realpath(cwd), "src", "App.ts");
         const { claude, sessionId, uuid } = await client.connect(async (agent) => {
           const { response, claude } = await openSession(agent, air("agentFileChangeReport"));
@@ -3162,7 +3162,7 @@ describe("native ACP v2 core", () => {
       });
 
       it("reports a prompt that a cancel ended unavailable, without reading a checkpoint", async () => {
-        const client = nativeClient();
+        const client = v2Client();
         const { claude, sessionId } = await client.connect(async (agent) => {
           const { response, claude } = await openSession(agent, air("agentFileChangeReport"));
           const answer = agent.request(v2.methods.agent.session.prompt, {
@@ -3186,7 +3186,7 @@ describe("native ACP v2 core", () => {
         ["an AIR client without the capability", air()],
         ["any other client", {}],
       ])("sends %s no report and keeps checkpoints off", async (_, capabilities) => {
-        const client = nativeClient();
+        const client = v2Client();
         const claude = await client.connect(async (agent) => {
           const { response, claude } = await openSession(agent, capabilities);
           const answer = agent.request(v2.methods.agent.session.prompt, {
@@ -3212,13 +3212,13 @@ describe("native ACP v2 core", () => {
   it.each([
     { client: "a plain", capabilities: {} },
     { client: "an AIR", capabilities: AIR_CAPABILITIES },
-  ] as const)("serves $client v2 client with the native core", async ({ capabilities }) => {
+  ] as const)("serves $client v2 client with the v2 core", async ({ capabilities }) => {
     const v1Agents: { dispose(): Promise<void> }[] = [];
-    const nativeAgents: AgentHandle[] = [];
+    const v2Agents: AgentHandle[] = [];
     const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
     const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
     acpProtocolRouter(undefined, (agent) => v1Agents.push(agent), "v2", {
-      onV2Agent: (agent) => nativeAgents.push(agent),
+      onV2Agent: (agent) => v2Agents.push(agent),
     }).connect({ readable: toAgent.readable, writable: toClient.writable });
     try {
       await v2
@@ -3230,9 +3230,9 @@ describe("native ACP v2 core", () => {
             capabilities,
           }),
         );
-      expect({ native: nativeAgents.length, v1: v1Agents.length }).toEqual({ native: 1, v1: 0 });
+      expect({ v2: v2Agents.length, v1: v1Agents.length }).toEqual({ v2: 1, v1: 0 });
     } finally {
-      await Promise.all([...v1Agents, ...nativeAgents].map((agent) => agent.dispose()));
+      await Promise.all([...v1Agents, ...v2Agents].map((agent) => agent.dispose()));
     }
   });
 });

@@ -1,6 +1,6 @@
 /**
  * Every scenario of `acp-scenarios/scenarios.ts` on the experimental ACP v2
- * core (`src/v2-native/`): through the protocol router, with the SDK's v2
+ * core (`src/v2/`): through the protocol router, with the SDK's v2
  * client.
  *
  * - Status: each scenario passes, every prompt turn ending with a stop reason,

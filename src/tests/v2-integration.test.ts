@@ -7,13 +7,13 @@ import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import { nodeToWebReadable, nodeToWebWritable } from "../utils.js";
 
 /**
- * The ACP v2 core (`src/v2-native/`) against the bundled Claude Code
+ * The ACP v2 core (`src/v2/`) against the bundled Claude Code
  * CLI, in the adapter's own process as a client starts it. The doubles of
- * `v2-native.test.ts` send the frames the core builds its turn model on
+ * `v2.test.ts` send the frames the core builds its turn model on
  * (`command_lifecycle`, `session_state_changed`, `interrupt({ cancelQueued })`);
  * these cases check that the real CLI still sends them. They cost API usage.
  */
-describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("native v2 core with Claude Code", () => {
+describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("v2 core with Claude Code", () => {
   let child: ChildProcess;
   let agent: v2.ClientContext;
   let cwd: string;
@@ -28,7 +28,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("native v2 core with Claude 
   }, 120_000);
 
   beforeEach(async () => {
-    cwd = await mkdtemp(path.join(os.tmpdir(), "v2-native-integration-"));
+    cwd = await mkdtemp(path.join(os.tmpdir(), "v2-integration-"));
     await writeFile(path.join(cwd, "file.txt"), "one\n");
     updates.length = 0;
     permissionAnswer = "allow_once";
@@ -38,7 +38,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("native v2 core with Claude 
       stdio: ["pipe", "pipe", "inherit"],
     });
     const connection = v2
-      .client({ name: "v2-native-integration" })
+      .client({ name: "v2-integration" })
       .onNotification(v2.methods.client.session.update, ({ params }) => {
         updates.push(params);
         for (const notify of waiters.splice(0)) notify();
@@ -53,7 +53,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("native v2 core with Claude 
     agent = connection.agent;
     await agent.request(v2.methods.agent.initialize, {
       protocolVersion: v2.PROTOCOL_VERSION,
-      info: { name: "v2-native-integration", version: "1" },
+      info: { name: "v2-integration", version: "1" },
       capabilities: {},
     });
   }, 60_000);
