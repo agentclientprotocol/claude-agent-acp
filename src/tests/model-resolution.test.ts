@@ -73,8 +73,26 @@ describe("resolveModelPreference - resolvedModel matching", () => {
     expect(resolveModelPreference(LIVE_SHAPED_MODELS, "claude-opus-4-8")?.value).toBe("opus[1m]");
   });
 
-  it("returns null for a preference that matches nothing", () => {
-    expect(resolveModelPreference(LIVE_SHAPED_MODELS, "claude-gpt-99")).toBeNull();
+  // Words match whole: "a" is inside "Default", "son" inside "sonnet".
+  it.each(["claude-gpt-99", "not-a-model", "a", "son", "foo-sonnet", "not-default-model", "best"])(
+    "returns null for %s, which names no model",
+    (preference) => {
+      expect(resolveModelPreference(LIVE_SHAPED_MODELS, preference)).toBeNull();
+    },
+  );
+
+  it.each([
+    ["us.anthropic.claude-sonnet-5-v1:0", "sonnet"],
+    ["global.anthropic.claude-haiku-4-5-20251001-v1:0", "haiku"],
+    ["anthropic/claude-sonnet-5:batch", "sonnet"],
+    ["claude-opus-4-8@20260101", "opus[1m]"],
+    ["claude-sonnet-5-fast", "sonnet"],
+    ["claude-haiku-4-5", "haiku"],
+    ["opusplan", "opus[1m]"],
+    ["opus", "opus[1m]"],
+    ["Sonnet 5", "sonnet"],
+  ])("resolves the spelling %s to %s", (preference, value) => {
+    expect(resolveModelPreference(LIVE_SHAPED_MODELS, preference)?.value).toBe(value);
   });
 
   it("matches a '-1m' id-suffix preference against a '[1m]'-spelled resolvedModel", () => {

@@ -963,21 +963,67 @@ describe("ACP v2 sessions", () => {
     });
 
     it.each([
-      ["a select value for a boolean option", { configId: "fast", type: "id", value: "on" }],
-      ["a boolean for a select option", { configId: "effort", type: "boolean", value: true }],
-      ["a level the model does not offer", { configId: "effort", type: "id", value: "max" }],
-    ] as const)("rejects %s", async (_case, request) => {
-      const client = v2Client();
-      await client.app.connectWith(connectRouter(), async (agent) => {
-        await initializeV2(agent);
-        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
-        await expect(
-          agent.request(v2.methods.agent.session.setConfigOption, { sessionId, ...request }),
-        ).rejects.toMatchObject({ code: -32602 });
-        await client.authUpdate(1);
-      });
-      expect(sdk.flagSettings).toEqual([]);
-    });
+      [
+        "a select value for a boolean option",
+        { configId: "fast", type: "id", value: "on" },
+        'Config option fast takes a boolean value, but received: "on"',
+      ],
+      [
+        "a boolean for a select option",
+        { configId: "effort", type: "boolean", value: true },
+        "Config option effort takes a string value, but received: true",
+      ],
+      [
+        "a level the model does not offer",
+        { configId: "effort", type: "id", value: "max" },
+        "Invalid value for config option effort: max",
+      ],
+      // "a" is a substring of "claude": a substring match would pick Opus.
+      [
+        "a model the session does not offer",
+        { configId: "model", type: "id", value: "not-a-model" },
+        "Invalid value for config option model: not-a-model",
+      ],
+      [
+        "a mode the session does not offer",
+        { configId: "mode", type: "id", value: "not-a-mode" },
+        "Invalid value for config option mode: not-a-mode",
+      ],
+      [
+        "an agent the session does not offer",
+        { configId: "agent", type: "id", value: "not-an-agent" },
+        "Invalid value for config option agent: not-an-agent",
+      ],
+    ] as const)(
+      "rejects %s and leaves the options as they were",
+      async (_case, request, message) => {
+        const models: Array<string | undefined> = [];
+        sdk.setModel = async (model) => {
+          models.push(model);
+        };
+        const client = v2Client();
+        const { created, listed } = await client.app.connectWith(connectRouter(), async (agent) => {
+          await initializeV2(agent);
+          const created = await agent.request(v2.methods.agent.session.new, { cwd });
+          const { sessionId } = created;
+          await expect(
+            agent.request(v2.methods.agent.session.setConfigOption, { sessionId, ...request }),
+          ).rejects.toMatchObject({ code: -32602, message: expect.stringContaining(message) });
+          // Setting a valid value again returns every option's current value.
+          const listed = await agent.request(v2.methods.agent.session.setConfigOption, {
+            sessionId,
+            configId: "agent",
+            type: "id",
+            value: "default",
+          });
+          await client.authUpdate(1);
+          return { created, listed };
+        });
+        expect(sdk.flagSettings).toEqual([{ agent: null }]);
+        expect(models).toEqual([]);
+        expect(values(listed.configOptions)).toEqual(values(created.configOptions));
+      },
+    );
 
     it("rebuilds the options for a model switch, and clears an effort the new model lacks", async () => {
       const client = v2Client();

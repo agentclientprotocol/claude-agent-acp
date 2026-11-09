@@ -84,35 +84,54 @@ function versionedModelDisplayName(model: ModelInfo): string {
   return `${withoutContext} ${version}${contextSuffix[0]}`;
 }
 
-function tokenizeModelPreference(model: string): { tokens: string[]; contextHint?: string } {
-  const lower = model.trim().toLowerCase();
-  const contextHint = lower.match(MODEL_CONTEXT_HINT_PATTERN)?.[1]?.toLowerCase();
-  const tokens = lower
-    .replace(MODEL_CONTEXT_HINT_PATTERN, " $1 ")
+function modelWords(value: string): string[] {
+  return value
+    .toLowerCase()
     .split(/[^a-z0-9]+/)
-    .filter(Boolean)
-    .map((token) => {
-      if (token === "opusplan") return "opus";
-      if (token === "best" || token === "default") return "";
-      return token;
-    })
-    .filter((token) => token && token !== "claude")
-    .filter((token) => /[a-z]/.test(token) || token.endsWith("m"));
-  return { tokens, contextHint };
+    .filter(Boolean);
 }
 
-function scoreModelMatch(model: ModelInfo, tokens: string[], contextHint?: string): number {
-  const haystack = `${model.value} ${model.displayName}`.toLowerCase();
-  let score = 0;
-  let nonHintMatched = false;
-  for (const token of tokens) {
-    if (!haystack.includes(token)) continue;
-    if (token !== contextHint) nonHintMatched = true;
-    score += token === contextHint ? 3 : 1;
+/** Whether `needle`'s words appear in `haystack`'s words, adjacent and in
+ *  order: "opus" in "claude-opus-4-5", but not "son" in "sonnet" or "a" in
+ *  "Default (recommended)". */
+function containsWords(haystack: string, needle: string): boolean {
+  const words = modelWords(haystack);
+  const wanted = modelWords(needle);
+  if (wanted.length === 0) return false;
+  for (let start = 0; start + wanted.length <= words.length; start++) {
+    if (wanted.every((word, offset) => words[start + offset] === word)) return true;
   }
-  return contextHint && !nonHintMatched ? 0 : score;
+  return false;
 }
 
+/** The words of `preference` that name a model: without what
+ *  `normalizeModelId` drops (provider prefixes, dates, `-v1:0`, `-fast`,
+ *  context hints), version numbers, "claude", and "best"/"default".
+ *  "us.anthropic.claude-sonnet-4-5-v1:0" gives ["sonnet"], "opusplan" gives
+ *  ["opus"]. */
+function modelPreferenceTokens(preference: string): string[] {
+  return modelWords(normalizeModelId(preference))
+    .map((token) => (token === "opusplan" ? "opus" : token))
+    .filter((token) => /[a-z]/.test(token) && !["claude", "best", "default"].includes(token));
+}
+
+/** Whether every one of `tokens` is a word of `model`'s value or display name. */
+function modelCoversTokens(model: ModelInfo, tokens: string[]): boolean {
+  const words = new Set(modelWords(`${model.value} ${model.displayName}`));
+  return tokens.length > 0 && tokens.every((token) => words.has(token));
+}
+
+/**
+ * The entry of `models` that `preference` names, or null when it names none.
+ * In order: an entry whose value, display name or `resolvedModel` equals it
+ * (in either context-hint spelling); an entry whose value or display name
+ * contains its words ("opus" for "claude-opus-4-5"), or whose value it
+ * contains while every model word of the preference is the entry's
+ * ("sonnet" for "us.anthropic.claude-sonnet-5-v1:0"); then any entry with all
+ * of its model words, preferring one with the same context hint ("sonnet[1m]"
+ * for "claude-sonnet-5-1m"). The fuzzy tiers need a compatible version, and
+ * words match whole: "not-a-model", "son" and "foo-sonnet" name no entry.
+ */
 export function resolveModelPreference(models: ModelInfo[], preference: string): ModelInfo | null {
   const trimmed = preference.trim();
   if (!trimmed) return null;
@@ -134,28 +153,26 @@ export function resolveModelPreference(models: ModelInfo[], preference: string):
   if (resolvedMatch) return resolvedMatch;
 
   const preferenceHint = contextHintOf(trimmed);
+  const tokens = modelPreferenceTokens(trimmed);
   const includesMatch = models.find((model) => {
     if (!modelVersionsCompatible(trimmed, model)) return false;
     if (contextHintOf(model.value) !== preferenceHint) return false;
-    const value = model.value.toLowerCase();
-    const display = model.displayName.toLowerCase();
-    return value.includes(lower) || display.includes(lower) || lower.includes(value);
+    return (
+      containsWords(model.value, trimmed) ||
+      containsWords(model.displayName, trimmed) ||
+      (containsWords(trimmed, model.value) && modelCoversTokens(model, tokens))
+    );
   });
   if (includesMatch) return includesMatch;
 
-  const { tokens, contextHint } = tokenizeModelPreference(trimmed);
-  if (tokens.length === 0) return null;
-  let bestMatch: ModelInfo | null = null;
-  let bestScore = 0;
-  for (const model of models) {
-    if (!modelVersionsCompatible(trimmed, model)) continue;
-    const score = scoreModelMatch(model, tokens, contextHint);
-    if (score > 0 && (!bestMatch || score > bestScore)) {
-      bestMatch = model;
-      bestScore = score;
-    }
-  }
-  return bestMatch;
+  const candidates = models.filter(
+    (model) => modelVersionsCompatible(trimmed, model) && modelCoversTokens(model, tokens),
+  );
+  return (
+    candidates.find((model) => contextHintOf(model.value) === preferenceHint) ??
+    candidates[0] ??
+    null
+  );
 }
 
 export function matchResumedModel(models: ModelInfo[], liveModel: string): ModelInfo {
