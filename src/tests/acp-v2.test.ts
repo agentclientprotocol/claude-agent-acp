@@ -735,14 +735,21 @@ describe("ACP v2 sessions", () => {
       expect(resumed).not.toHaveProperty("modes");
       expect(resumed.configOptions?.[0].configId).toBe("mode");
 
-      // v1 replays only from the start.
+      // Both cores replay only from the start. Another cursor is rejected,
+      // and the session is not resumed without its replay.
+      const queries = sdk.queryOptions.length;
+      await agent.request(v2.methods.agent.session.close, { sessionId });
       await expect(
         agent.request(v2.methods.agent.session.resume, {
           sessionId,
           cwd,
           replayFrom: { type: "_message", messageId: "m" },
         }),
-      ).rejects.toMatchObject({ code: -32602 });
+      ).rejects.toMatchObject({
+        code: -32602,
+        message: expect.stringContaining("Replaying from a _message cursor is not supported"),
+      });
+      expect(sdk.queryOptions).toHaveLength(queries);
 
       await agent.request(v2.methods.agent.session.delete, { sessionId });
       await authUpdate(1);
@@ -5756,6 +5763,209 @@ describe("ACP v2 requests that subagents make", () => {
               "claude-sonnet-4-6 Claude Sonnet 4.6",
             ],
       );
+    });
+
+    it("drops a foreground child's consolidated messages after the root's cancel, except the results of its shown tool calls", async () => {
+      const interrupted = Promise.withResolvers<void>();
+      sdk.interrupt = async () => interrupted.resolve();
+      const child = (message: Record<string, unknown>) =>
+        childMessage(options!, message, "toolu_agent-1");
+      let options: Options | undefined;
+      scriptTurns(async function* (turnOptions) {
+        options = turnOptions;
+        yield toolUseMessage(turnOptions, "toolu_agent-1", "Agent", {
+          description: "Explore the project",
+          prompt: "Look around",
+        });
+        yield taskStarted(turnOptions, "agent-1", { prompt: "Look around" });
+        yield child(
+          stream(turnOptions, {
+            type: "message_start",
+            message: { id: "msg_child", role: "assistant", content: [], usage: {} },
+          }),
+        );
+        yield child(
+          stream(turnOptions, {
+            type: "content_block_start",
+            index: 0,
+            content_block: { type: "text", text: "" },
+          }),
+        );
+        yield child(
+          stream(turnOptions, {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: "Working on" },
+          }),
+        );
+        yield child(
+          stream(turnOptions, {
+            type: "content_block_start",
+            index: 1,
+            content_block: { type: "tool_use", id: "toolu_shown", name: "Bash", input: {} },
+          }),
+        );
+        await interrupted.promise;
+        // What the child had when the interrupt arrived: the consolidated
+        // message, with the text's tail and a tool use that never streamed.
+        yield child({
+          ...assistantText(turnOptions, "", "msg_child"),
+          message: {
+            ...assistantText(turnOptions, "", "msg_child").message,
+            content: [
+              { type: "text", text: "Working on it" },
+              { type: "tool_use", id: "toolu_shown", name: "Bash", input: { command: "ls" } },
+              { type: "tool_use", id: "toolu_unseen", name: "Bash", input: { command: "pwd" } },
+            ],
+            stop_reason: "tool_use",
+          },
+        });
+        yield child({
+          type: "user",
+          message: {
+            role: "user",
+            content: ["toolu_shown", "toolu_unseen"].map((id) => ({
+              type: "tool_result",
+              tool_use_id: id,
+              content: "[Request interrupted by user for tool use]",
+              is_error: true,
+            })),
+          },
+          uuid: randomUUID(),
+          session_id: turnOptions.sessionId,
+        });
+        yield taskNotification(turnOptions, "agent-1", { status: "stopped" });
+        yield toolResultMessage(turnOptions, "toolu_agent-1", {
+          content: "[Request interrupted by user for tool use]",
+          is_error: true,
+        });
+        yield result(turnOptions, ABORTED_TOOLS);
+        yield idleState(turnOptions);
+      });
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("go") });
+        await vi.waitFor(() =>
+          expect(client.updates("tool_call_update").map((u) => u.toolCallId)).toContain(
+            "toolu_shown",
+          ),
+        );
+
+        await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+
+        await vi.waitFor(() =>
+          expect(turnTrace(client.sessionUpdates)).toContain("idle cancelled"),
+        );
+        await client.authUpdate(1);
+      });
+
+      const ofChild = client.sessionUpdates.flatMap(({ sessionId, update }) =>
+        sessionId === "agent-1" ? [update] : [],
+      );
+      expect(
+        ofChild.flatMap((update) =>
+          update.sessionUpdate === "agent_message_chunk"
+            ? [(update.content as { text: string }).text]
+            : [],
+        ),
+      ).toEqual(["Working on"]);
+      const toolCalls = ofChild.flatMap((update) =>
+        update.sessionUpdate === "tool_call_update"
+          ? [update as { toolCallId: string; status?: string }]
+          : [],
+      );
+      expect(toolCalls.some((update) => update.toolCallId === "toolu_unseen")).toBe(false);
+      expect(
+        toolCalls.filter((update) => update.toolCallId === "toolu_shown").at(-1),
+      ).toMatchObject({ status: "cancelled" });
+    });
+
+    it("ends the subagents that work when Claude Code starts a fresh conversation", async () => {
+      scriptTurns(
+        async function* (options) {
+          yield toolUseMessage(options, "toolu_agent-1", "Agent", {
+            description: "Explore the project",
+            prompt: "Look around",
+            run_in_background: true,
+          });
+          yield taskStarted(options, "agent-1", { prompt: "Look around", is_backgrounded: true });
+          yield childMessage(
+            options,
+            toolUseMessage(options, "toolu_ls", "Bash", { command: "ls" }),
+            "toolu_agent-1",
+          );
+          yield toolResultMessage(options, "toolu_agent-1", { content: "Launched." });
+          yield result(options);
+          yield idleState(options);
+        },
+        async function* (options) {
+          yield {
+            type: "conversation_reset",
+            new_conversation_id: randomUUID(),
+            uuid: randomUUID(),
+            trigger: "clear",
+            timestamp: new Date().toISOString(),
+            session_id: options.sessionId,
+          };
+          // The reset forgot the child: its later end changes nothing.
+          yield taskNotification(options, "agent-1", {});
+          yield result(options, { num_turns: 0 });
+          yield idleState(options);
+        },
+      );
+      const client = v2Client();
+      let root = "";
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        root = sessionId;
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("go") });
+        await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+        client.sessionUpdates.length = 0;
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("/clear") });
+        await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+        await client.authUpdate(1);
+      });
+
+      const trace = client.sessionUpdates.flatMap(({ sessionId, update }) => {
+        const on = sessionId === root ? "root" : sessionId;
+        const state = (value: unknown) => {
+          const { state, stopReason } = value as { state: string; stopReason?: string };
+          return `${state}${stopReason ? ` ${stopReason}` : ""}`;
+        };
+        switch (update.sessionUpdate) {
+          case "subagent_update":
+            return update.state
+              ? [`${on} subagent ${update.sessionId} ${state(update.state)}`]
+              : [];
+          case "state_update": {
+            const listed = (
+              (update as { background?: Array<{ sessionId?: string }> }).background ?? []
+            )
+              .map((item) => item.sessionId)
+              .join(",");
+            return [`${on} ${state(update)} [${listed}]`];
+          }
+          case "tool_call_update": {
+            const { toolCallId, status } = update as { toolCallId: string; status?: string };
+            return status ? [`${on} ${toolCallId} ${status}`] : [];
+          }
+          default:
+            return [];
+        }
+      });
+      // The child's run ends with no stop reason: nothing says how. Its tool
+      // call ends first, as v2 asks; the bridge leaves it open (see
+      // "Intended differences").
+      expect(trace).toEqual([
+        "root running []",
+        ...(NATIVE_CORE ? ["agent-1 toolu_ls failed"] : []),
+        "root subagent agent-1 idle",
+        "agent-1 idle []",
+        "root idle end_turn []",
+      ]);
     });
 
     it("sends a SendMessage call's message and a SubagentHandback call's report as session messages, instead of the calls", async () => {

@@ -779,6 +779,8 @@ export class NativeSession implements RequestTarget {
    * empty Task* plan, as the bridge's fresh query sends none.
    */
   private conversationReset(): void {
+    // First, as on the bridge: the subagents of the dropped conversation end.
+    this.tasks.conversationReset();
     this.output.taskState.clear();
     if (!this.clearContext.holdsTurn()) this.output.taskPlanChanged();
     this.reports.conversationReset();

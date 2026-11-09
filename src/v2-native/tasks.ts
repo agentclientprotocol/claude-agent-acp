@@ -550,7 +550,10 @@ export class SessionTasks {
   /**
    * The root's foreground work is cancelled: so is the work of the subagents
    * that it waits on. Their open requests are withdrawn. Claude Code's
-   * interrupt stops their runs, which then end `cancelled`.
+   * interrupt stops their runs, which then end `cancelled`. Until then, of
+   * their consolidated messages only the results of the tool calls that the
+   * client holds go out, as on the root and on the bridge (see
+   * `SessionOutput.cancelled`).
    */
   cancelForeground(): void {
     this.foregroundCancelled.clear();
@@ -558,6 +561,8 @@ export class SessionTasks {
       if (!this.waitsOn(agentId, undefined)) continue;
       this.withdraw(agentId);
       this.foregroundCancelled.add(agentId);
+      const output = this.children.get(agentId)?.output;
+      if (output) output.cancelled = true;
     }
   }
 
@@ -570,6 +575,7 @@ export class SessionTasks {
     for (const agentId of this.foregroundCancelled) {
       this.cancelledAgents.delete(agentId);
       const child = this.children.get(agentId);
+      if (child?.output) child.output.cancelled = false;
       if (child) this.reportChild(child);
     }
     this.foregroundCancelled.clear();
@@ -771,6 +777,35 @@ export class SessionTasks {
     }
     this.level = new Map();
     this.publish();
+  }
+
+  /**
+   * Claude Code mounted a fresh conversation (`conversation_reset`). Its
+   * subagents end, deeper ones first, as on the bridge (`finishAll`): each
+   * child that works goes `idle` with no stop reason, since nothing says how
+   * its run ended, after its unfinished tool calls end `failed`. Then every
+   * child is forgotten, as the bridge forgets them: a later event of one
+   * changes nothing, and a child not announced yet stays unexposed. Claude
+   * Code's tasks (the live subagents, background commands and other tasks)
+   * stay as its task events report them.
+   */
+  conversationReset(): void {
+    for (const child of [...this.parentsFirst()].reverse()) {
+      if (child.working) this.endRun(child, undefined);
+    }
+    this.publish();
+    for (const child of this.children.values()) this.configs.forget(child.sessionId);
+    this.children.clear();
+    this.childByToolUse.clear();
+    this.launches.clear();
+    this.pendingByLaunch.clear();
+    this.cancelledAgents.clear();
+    this.foregroundCancelled.clear();
+    this.senderByToolUse.clear();
+    this.startedHooks.clear();
+    this.hiddenSendMessages.clear();
+    this.shownSendMessages.clear();
+    this.handbacks.clear();
   }
 
   /**
@@ -1473,15 +1508,16 @@ export class SessionTasks {
   /**
    * A run of `child` ended: its unfinished tool calls get their final status,
    * except its background work, then its idle goes out, as v2 asks. A stopped
-   * run's end `cancelled` and a failed run's `failed`. At any other end, a
+   * run's end `cancelled`, and a failed run's or an unexplained end's
+   * (`undefined`, an idle with no stop reason) `failed`. At a completed end, a
    * tool call that Claude dropped before it ran ends `cancelled`, as on the
    * root (see `SessionOutput.closeUnfinished`).
    */
-  private endRun(child: Child, outcome: IdleOutcome): void {
+  private endRun(child: Child, outcome: IdleOutcome | undefined): void {
     if (!child.working) {
       // A later report of the same failure can give its error text.
       if (
-        outcome.stopReason === "error" &&
+        outcome?.stopReason === "error" &&
         outcome.error &&
         child.outcome?.stopReason === "error" &&
         !child.outcome.error
@@ -1492,15 +1528,16 @@ export class SessionTasks {
       return;
     }
     const keep = this.backgroundWork(child.sessionId);
-    if (outcome.stopReason === "end_turn") {
+    if (outcome?.stopReason === "end_turn") {
       child.output!.closeUnfinished(false, keep);
     } else {
-      const status = outcome.stopReason === "cancelled" ? "cancelled" : "failed";
+      const status = outcome?.stopReason === "cancelled" ? "cancelled" : "failed";
       const ended = child.output!.finishUnfinished(status, keep, { exitTerminals: true });
       for (const toolCallId of ended) child.stopped.add(toolCallId);
     }
     child.working = false;
     child.outcome = outcome;
+    child.output!.cancelled = false;
     if (child.launchToolUseId !== undefined) child.endedRuns.add(child.launchToolUseId);
     this.reportChild(child);
     this.cancelledAgents.delete(child.sessionId);
