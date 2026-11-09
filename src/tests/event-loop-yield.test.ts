@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import type { SessionNotification } from "@agentclientprotocol/sdk/unstable";
-import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
+import { ClaudeAcpAgent } from "../acp-agent.js";
+import type { AcpClient } from "../acp-client.js";
 import { Writable } from "node:stream";
 import { EventLoopYielder, nodeToWebWritable, Pushable } from "../utils.js";
 import {

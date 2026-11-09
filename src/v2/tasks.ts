@@ -53,7 +53,7 @@ import type {
   SDKUserMessage,
   SessionMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { Logger } from "../acp-agent.js";
+import type { Logger } from "../logger.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import { backgroundBashTaskFromToolResult, taskProgressFields } from "../async-tasks.js";
 import { BackgroundOutputTail, type BackgroundOutput } from "../background-output.js";

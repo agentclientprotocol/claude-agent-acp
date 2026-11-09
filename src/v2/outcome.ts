@@ -14,7 +14,8 @@ import type {
   SDKAssistantMessageError,
   SDKResultMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { AUTONOMOUS_RESULT_ORIGINS, isSyntheticLoginMessage } from "../acp-agent.js";
+import { AUTONOMOUS_RESULT_ORIGINS } from "../result-end.js";
+import { isSyntheticLoginMessage } from "../message-filters.js";
 import { resultEnd } from "../result-end.js";
 import { providerFailureCategory } from "../session-failure-extension.js";
 import {

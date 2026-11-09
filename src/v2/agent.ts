@@ -29,7 +29,8 @@ import {
   type SessionMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import packageJson from "../../package.json" with { type: "json" };
-import { messageIdForGrouping, type Logger } from "../acp-agent.js";
+import { messageIdForGrouping } from "../sdk-to-acp.js";
+import type { Logger } from "../logger.js";
 import { customAgents } from "../session-config-options.js";
 import { claudeCliPath } from "../claude-cli.js";
 import { clientSystemPrompt, sessionSystemPrompt } from "../client-system-prompt.js";

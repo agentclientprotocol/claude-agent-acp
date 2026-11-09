@@ -1,15 +1,9 @@
 // Export the main agent class and utilities for library usage
-export {
-  ClaudeAcpAgent,
-  isLocalCommandMetadata,
-  stripLocalCommandMetadata,
-  runAcp,
-  toAcpNotifications,
-  streamEventToAcpNotifications,
-  type ToolUpdateMeta,
-  type NewSessionMeta,
-  type SDKMessageFilter,
-} from "./acp-agent.js";
+export { ClaudeAcpAgent, runAcp } from "./acp-agent.js";
+export { isLocalCommandMetadata, stripLocalCommandMetadata } from "./message-filters.js";
+export { toAcpNotifications, streamEventToAcpNotifications } from "./sdk-to-acp.js";
+export type { NewSessionMeta, SDKMessageFilter } from "./new-session-meta.js";
+export type { ToolUpdateMeta } from "./tool-calls/renderer.js";
 export { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
 export {
   toolInfoFromToolUse,

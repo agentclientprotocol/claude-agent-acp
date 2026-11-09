@@ -6,7 +6,8 @@ import {
 } from "@agentclientprotocol/sdk/unstable";
 import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
 import { getSessionMessages, type Options } from "@anthropic-ai/claude-agent-sdk";
-import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import type { AcpClient } from "../acp-client.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import { ALLOW_BYPASS } from "../permissions/modes.js";
 import { NativeSubagentRuntime } from "../native-subagents.js";

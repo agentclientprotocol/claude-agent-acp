@@ -39,7 +39,7 @@ import * as fs from "node:fs";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk/unstable";
 import type { SessionMessage } from "@anthropic-ai/claude-agent-sdk";
-import type { Logger } from "../acp-agent.js";
+import type { Logger } from "../logger.js";
 import type { AcpSessionNotification, SubagentState } from "../acp-subagents.js";
 import {
   childModelOption,

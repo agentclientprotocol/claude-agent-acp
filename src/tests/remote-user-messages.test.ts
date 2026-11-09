@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
-import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
+import { ClaudeAcpAgent } from "../acp-agent.js";
+import type { AcpClient } from "../acp-client.js";
 import { Pushable } from "../utils.js";
 import { mockSessionState, successfulResultMessage, wrapQuery } from "./session-doubles.js";
 

@@ -9,7 +9,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Options, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
-import type { AcpClient, ClaudeAcpAgent } from "../acp-agent.js";
+import type { ClaudeAcpAgent } from "../acp-agent.js";
+import type { AcpClient } from "../acp-client.js";
 import { initializeClient } from "./helpers.js";
 import { successfulResultMessage } from "./session-doubles.js";
 

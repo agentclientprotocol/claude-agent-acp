@@ -4,7 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
 import type { ModelInfo, Query } from "@anthropic-ai/claude-agent-sdk";
-import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import type { AcpClient } from "../acp-client.js";
 import {
   createUltracodeConfigOption,
   modelSupportsUltracode,

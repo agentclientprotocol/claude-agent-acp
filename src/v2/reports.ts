@@ -22,7 +22,7 @@ import type {
   SDKPartialAssistantMessage,
   SDKResultMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { Logger } from "../acp-agent.js";
+import type { Logger } from "../logger.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import {
   ContextCompactionLifecycle,

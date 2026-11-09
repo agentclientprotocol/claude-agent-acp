@@ -23,7 +23,7 @@ import type {
   CreateElicitationResponse,
 } from "@agentclientprotocol/sdk/unstable";
 import type { CanUseTool, Options, Query } from "@anthropic-ai/claude-agent-sdk";
-import type { Logger } from "../acp-agent.js";
+import type { Logger } from "../logger.js";
 import {
   answerAskUserQuestion,
   answerMcpElicitation,

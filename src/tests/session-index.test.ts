@@ -16,7 +16,8 @@ import {
   listSessions,
 } from "@anthropic-ai/claude-agent-sdk";
 import { spawn } from "node:child_process";
-import { ClaudeAcpAgent, v1AgentApp, type AcpClient } from "../acp-agent.js";
+import { ClaudeAcpAgent, v1AgentApp } from "../acp-agent.js";
+import type { AcpClient } from "../acp-client.js";
 import {
   client as acpClient,
   type InitializeResponse,

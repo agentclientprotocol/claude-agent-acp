@@ -10,7 +10,7 @@
  * makes no permission decision, and a failure only leaves the preview out.
  */
 import type { HookCallbackMatcher } from "@anthropic-ai/claude-agent-sdk";
-import type { Logger } from "../acp-agent.js";
+import type { Logger } from "../logger.js";
 import { previewPatchContent } from "../diff.js";
 import type { PermissionHost } from "./permissions.js";
 

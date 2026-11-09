@@ -5,7 +5,8 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionNotification } from "@agentclientprotocol/sdk/unstable";
-import type { AcpClient, ClaudeAcpAgent } from "../acp-agent.js";
+import type { ClaudeAcpAgent } from "../acp-agent.js";
+import type { AcpClient } from "../acp-client.js";
 import type { TurnEvents } from "../turn-events.js";
 import { DEFAULT_CONTEXT_USAGE } from "./helpers.js";
 import { randomUUID } from "node:crypto";

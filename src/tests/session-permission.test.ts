@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import type { SessionNotification } from "@agentclientprotocol/sdk/unstable";
-import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
+import { ClaudeAcpAgent } from "../acp-agent.js";
+import type { AcpClient } from "../acp-client.js";
 import { makeMockQuery } from "./helpers.js";
 
 const SESSION_ID = "test-session-id";

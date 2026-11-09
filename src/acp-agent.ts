@@ -75,12 +75,10 @@ import {
   SDKActiveGoalMessage,
   SDKMessage,
   SDKMessageOrigin,
-  SDKPartialAssistantMessage,
   SDKSystemMessage,
   SessionMessage,
   SDKUserMessage,
   Settings,
-  SlashCommand,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
   GOAL_ACTIONS,
@@ -94,13 +92,7 @@ import {
   parseGoalRequest,
   toGoalSnapshot,
 } from "./goal-extension.js";
-import { blobResourceToClaude } from "./blob-resources.js";
-import {
-  checklistPlanUpdate,
-  resetPlanUpdates,
-  todoWritePlanUpdate,
-  type SubagentChecklists,
-} from "./plans.js";
+import { checklistPlanUpdate, resetPlanUpdates, type SubagentChecklists } from "./plans.js";
 import { PromptSuggestions } from "./prompt-suggestions.js";
 import { sanitizeTitle, SessionTitles } from "./session-titles.js";
 import {
@@ -135,11 +127,9 @@ import {
   AIR_DIFF_PATCH_CAPABILITY,
   AIR_PLAN_FILE_CAPABILITY,
   AIR_GOAL_KEY,
-  AIR_KIND_KEY,
   AIR_LOAD_REPLAY_END_CAPABILITY,
   AIR_LOAD_REPLAY_END_KEY,
   AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
-  AIR_SKILL_PATH_KEY,
   clientSupportsAirCapability,
   withAirMeta,
 } from "./air-extension.js";
@@ -174,7 +164,6 @@ import { terminalAuthMethods as authMethodsForTerminal } from "./auth-methods.js
 import { sdkMcpServers } from "./mcp-servers.js";
 import { claudeCliPath } from "./claude-cli.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
-import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
@@ -253,14 +242,11 @@ import {
 } from "./hide-claude-auth.js";
 import {
   adapterRemoteControlCommand,
-  claudeCodeOffersCommand,
   isRemoteHumanMessage,
   parseRemoteControlCommand,
-  REMOTE_CONTROL_COMMAND_NAME,
   type RemoteControlCommand,
   type RemoteControlQuery,
   runRemoteControlCommand,
-  supportsRemoteControl,
 } from "./remote-control.js";
 import {
   AGENT_FILE_CHANGE_REPORT_CAPABILITY,
@@ -291,20 +277,9 @@ import {
   sentenceCase,
 } from "./session-notices.js";
 import {
-  applyTaskCreate,
-  applyTaskList,
-  applyTaskUpdate,
-  ClaudePlanEntry,
   clearHookCallbacks,
-  completeHookCallback,
   createPostToolUseHook,
-  hasHookCallback,
   createTaskHook,
-  parseTaskCreateOutput,
-  parseTaskListOutput,
-  parseTaskUpdateOutput,
-  planEntries,
-  registerHookCallback,
   changedTaskPlanEntries,
   forgetPublishedTaskPlan,
   TaskState,
@@ -336,9 +311,7 @@ import {
   AcpToolCallRenderer,
   isFinalToolCallStatus,
   type ToolCallUpdate,
-  type ToolUpdateMeta,
 } from "./tool-calls/renderer.js";
-import { resolveSkillPath, type SkillScanCache } from "./tool-calls/reporters/interaction.js";
 import {
   messageLoopYielder,
   nodeToWebReadable,
@@ -349,24 +322,16 @@ import {
 } from "./utils.js";
 import {
   acceptedPlanToolResult,
-  approvedPlan,
   ExitPlanCoordinator,
   isExitPlanInterruptionResult,
   observeExitPlanToolResults,
-  planModeUpdate,
 } from "./exit-plan.js";
 import { AGENT_CONFIG_ID, DEFAULT_AGENT_ID } from "./session-config-ids.js";
-import { parseToolResultMeta } from "./tool-result-meta.js";
-import {
-  markerTagText,
-  type PersistedTaskNotification,
-  TASK_NOTIFICATION_TAG,
-  taskNotificationsOf,
-} from "./task-notifications.js";
+import { type PersistedTaskNotification, taskNotificationsOf } from "./task-notifications.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "./usage-markdown.js";
 
 export { DEFAULT_AGENT_ID } from "./session-config-ids.js";
-import { MCP_AVAILABLE_COMMAND, parseMcpCommand, runMcpCommand } from "./mcp-command.js";
+import { parseMcpCommand, runMcpCommand } from "./mcp-command.js";
 import { configuredSettings, resolveThinkingConfig } from "./session-env.js";
 import {
   MODE_CONFIG_ID,
@@ -470,8 +435,47 @@ export {
   MODEL_CONFIG_ID,
   resolveModelPreference,
 } from "./session-model.js";
-// Moved to result-end.ts; kept as an export for consumers that deep-import dist/acp-agent.js.
-export { isLoginRequiredText } from "./result-end.js";
+import type { AcpClient } from "./acp-client.js";
+import type { Logger } from "./logger.js";
+import {
+  isReplayHiddenMetaMessage,
+  isSyntheticLoginMessage,
+  LOCAL_ONLY_COMMANDS,
+  stripLocalCommandMetadata,
+} from "./message-filters.js";
+import type { NewSessionMeta, SDKMessageFilter } from "./new-session-meta.js";
+import { promptToClaude, SUPPORTED_PROMPT_CONTENT_TYPES } from "./prompt-to-claude.js";
+import { AUTONOMOUS_RESULT_ORIGINS, isAbortedResult } from "./result-end.js";
+import {
+  messageIdForGrouping,
+  stampParentToolUseId,
+  streamEventToAcpNotifications,
+  toAcpNotifications,
+  type StreamedToolInputCache,
+  type ToolUseCache,
+} from "./sdk-to-acp.js";
+import { getAvailableSlashCommands } from "./slash-commands.js";
+
+// Moved to their own modules; kept as exports for consumers that deep-import dist/acp-agent.js.
+export { AUTONOMOUS_RESULT_ORIGINS, isAbortedResult, isLoginRequiredText } from "./result-end.js";
+export type { AcpClient } from "./acp-client.js";
+export type { Logger } from "./logger.js";
+export {
+  isLocalCommandMetadata,
+  isReplayHiddenMetaMessage,
+  isSyntheticLoginMessage,
+  stripLocalCommandMetadata,
+} from "./message-filters.js";
+export type { NewSessionMeta, SDKMessageFilter } from "./new-session-meta.js";
+export { promptToClaude } from "./prompt-to-claude.js";
+export {
+  messageIdForGrouping,
+  streamEventToAcpNotifications,
+  toAcpNotifications,
+  type StreamedToolInputCache,
+  type ToolUseCache,
+} from "./sdk-to-acp.js";
+export { getAvailableSlashCommands } from "./slash-commands.js";
 
 /** Claude CLI emits this synthetic result when an interrupted cycle ends on
  *  queued user input before producing any assistant content. It is a hand-off
@@ -490,16 +494,6 @@ function isEmptyUserInterruptionDiagnostic(
     /(?:^|\s)last_content_type=n\/a(?:\s|$)/.test(diagnostic) &&
     /(?:^|\s)stop_reason=null(?:\s|$)/.test(diagnostic)
   );
-}
-
-/**
- * Logger interface for customizing logging output
- */
-export interface Logger {
-  log: (...args: any[]) => void;
-  error: (...args: any[]) => void;
-  /** Optional: a caller that supplies no `warn` gets its warnings on `error`. */
-  warn?: (...args: any[]) => void;
 }
 
 /** Floor after `session/cancel` before the adapter forces the active prompt
@@ -1546,36 +1540,6 @@ export type Session = {
   signOutRespawn?: Promise<void>;
 } & sessionIndex.SessionIndexFields;
 
-/** Result-message origin kinds that mark an AUTONOMOUS cycle — work the
- *  model did on its own (a task-notification followup, a peer/coordinator/
- *  observer message it handled) rather than the user's prompt. Absent,
- *  `human`, and `channel` origins are the user's own turn (this adapter's
- *  prompts arrive as the ACP channel on some CLI configurations — ALL
- *  channel servers are treated as user, so a foreign channel integration's
- *  autonomously-handled result is misclassified as the user's; accepted,
- *  see below), and `auto-continuation` continues the user's turn, so its
- *  result is the turn's real terminal.
- *
- *  Deliberately fail-OPEN: an unknown future kind defaults to the user
- *  lane — including `unclassified` (SDK 0.3.232+), the CLI's own "couldn't
- *  attribute this" marker, which gets the same safe default. Misrouting a
- *  USER result into the autonomous lane hangs the prompt un-detectably
- *  (the result is skipped, its trailing idle absorbed as owed, so the
- *  #825 detector can't fire); misrouting an autonomous result into the
- *  user lane is the bounded misattribution class this set exists to
- *  reduce.
- *
- *  Exception: a result from one of these origins that names a pending prompt
- *  in `user_message_uuids` consumed that folded prompt and takes the user
- *  lane (see the result handler). */
-export const AUTONOMOUS_RESULT_ORIGINS: ReadonlySet<SDKMessageOrigin["kind"]> = new Set([
-  "task-notification",
-  "peer",
-  "coordinator",
-  "observer",
-  "observer-activity",
-]);
-
 /** The foreground work of a session: a prompt's turn, from its insertion
  *  until its result, or a model cycle that Claude Code started on its own
  *  (see `startAutonomousCycle`). At most one cycle runs at a time, so a
@@ -1777,62 +1741,11 @@ export function computeSessionFingerprint(params: {
   );
 }
 
-export type SDKMessageFilter = {
-  type: string;
-  subtype?: string;
-  origin?: SDKMessageOrigin["kind"];
-};
-
-/**
- * Extra metadata that can be given when creating a new session.
- */
-export type NewSessionMeta = {
-  claudeCode?: {
-    /**
-     * Options forwarded to Claude Code when starting a new session.
-     * Those parameters will be ignored and managed by ACP:
-     *   - cwd
-     *   - includePartialMessages
-     *   - permissionMode
-     *   - canUseTool
-     *   - executable
-     * Those parameters will be used and updated to work with ACP:
-     *   - hooks (merged with ACP's hooks)
-     *   - mcpServers (merged with ACP's mcpServers)
-     *   - disallowedTools (merged with ACP's disallowedTools)
-     *   - tools (passed through; defaults to claude_code preset if not provided)
-     *   - allowDangerouslySkipPermissions (set to `false` to remove bypassPermissions
-     *     from this session; repeat it on session/load. `true` cannot override root)
-     */
-    options?: Options;
-    /**
-     * When set, raw SDK messages are emitted as extNotification("_claude/sdkMessage", message)
-     * in addition to normal processing.
-     * - true: emit all messages
-     * - false/undefined: emit nothing (default)
-     * - SDKMessageFilter[]: emit only messages matching at least one filter
-     */
-    emitRawSDKMessages?: boolean | SDKMessageFilter[];
-  };
-  additionalRoots?: string[];
-};
-
 /** The JSON-RPC code ACP assigns to `authRequired`. Read from the SDK so it
  *  cannot drift from the errors this agent throws. */
 const AUTH_REQUIRED_CODE = RequestError.authRequired().code;
 
 export type { ToolUpdateMeta } from "./tool-calls/renderer.js";
-
-/** Attributes a report to the Agent/Task tool call of the subagent that made it. */
-function stampParentToolUseId(update: SessionNotification["update"], parentToolUseId: string) {
-  update._meta = {
-    ...update._meta,
-    claudeCode: {
-      ...((update._meta?.claudeCode as Record<string, unknown> | undefined) ?? {}),
-      parentToolUseId,
-    },
-  };
-}
 
 const SUBAGENT_TRANSCRIPT_CAPABILITY = "subagent-transcript";
 
@@ -1871,235 +1784,10 @@ function stripSubagentTextAndThinking(content: unknown): unknown {
   );
 }
 
-export type ToolUseCache = {
-  [key: string]: {
-    type: "tool_use" | "server_tool_use" | "mcp_tool_use";
-    id: string;
-    name: string;
-    input: unknown;
-  };
-};
-
-type StreamedToolInput = {
-  id: string;
-  name: string;
-  partialJson: string;
-  inString: boolean;
-  escaped: boolean;
-  objectDepth: number;
-  arrayDepth: number;
-  /** Offset of the most recent comma at the top level of the input object
-   *  (-1 before the first). Everything before it is a complete field. */
-  lastTopLevelComma: number;
-  /** The comma offset the last emitted refinement was sliced at (-1 before the
-   *  first), so a field boundary only triggers one recovery attempt. */
-  emittedThroughComma: number;
-};
-
-export type StreamedToolInputCache = Map<string, Map<number, StreamedToolInput>>;
-
-/**
- * Advance the lexer state across the fragment appended since the last delta:
- * just enough JSON awareness (string/escape, nesting depth) to spot commas
- * that sit at the top level of the input object — everything before such a
- * comma is a set of complete fields. Returns true once the input object's
- * closing brace arrives.
- *
- * The lexer reads the fragment itself, never `partialJson` by index. V8 keeps a
- * string built with `+=` as a chain of parts, and the first index access
- * copies the whole chain into one flat string. An index scan of `partialJson`
- * would copy the whole input on each delta, so a large Write would cost
- * quadratic time. A test in `acp-agent.test.ts` checks this.
- */
-function scanStreamedToolInput(state: StreamedToolInput, fragment: string): boolean {
-  const offset = state.partialJson.length;
-  state.partialJson += fragment;
-  let complete = false;
-  for (let index = 0; index < fragment.length; index++) {
-    const character = fragment[index];
-    if (state.inString) {
-      if (state.escaped) {
-        state.escaped = false;
-      } else if (character === "\\") {
-        state.escaped = true;
-      } else if (character === '"') {
-        state.inString = false;
-      }
-      continue;
-    }
-
-    if (character === '"') {
-      state.inString = true;
-    } else if (character === "{") {
-      state.objectDepth++;
-    } else if (character === "}") {
-      state.objectDepth--;
-      if (state.objectDepth === 0) {
-        complete = true;
-      }
-    } else if (character === "[") {
-      state.arrayDepth++;
-    } else if (character === "]") {
-      state.arrayDepth--;
-    } else if (character === "," && state.objectDepth === 1 && state.arrayDepth === 0) {
-      state.lastTopLevelComma = offset + index;
-    }
-  }
-  return complete;
-}
-
-/** Parse the complete top-level fields before a top-level comma by closing the
- *  object at that boundary. */
-function recoveredToolInput(prefix: string): Record<string, unknown> | undefined {
-  try {
-    const value: unknown = JSON.parse(prefix + "}");
-    return value !== null && typeof value === "object" && !Array.isArray(value)
-      ? (value as Record<string, unknown>)
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 /** Returned to clients when a prompt or cancel targets a session whose SDK
  *  query stream has already ended (ran to `done` or died). The stream is not
  *  revivable, so the only recovery is a fresh session. */
 const SESSION_ENDED_MESSAGE = "The Claude Agent session has ended. Please start a new session.";
-
-// Slash commands that the SDK handles locally without replaying the user
-// message and without invoking the model.
-const LOCAL_ONLY_COMMANDS = new Set(["/context", "/heapdump", "/extra-usage"]);
-
-// Commands whose marker-only transcript records are ACP/client-local UI noise,
-// not model-visible user prompts. Marker-only custom slash skills are not in
-// this list, so replay can reconstruct them from `<command-name>`/`<command-args>`.
-const REPLAY_HIDDEN_COMMANDS = new Set([
-  ...LOCAL_ONLY_COMMANDS,
-  "/compact",
-  "/model",
-  "/mcp",
-  "/status",
-  "/usage",
-]);
-
-// The Claude SDK persists local slash command invocations (e.g. `/model`) and
-// their output as user messages in the session transcript, wrapping the
-// payload in these XML-like markers that the CLI uses for its own display.
-// The live prompt loop drops them; replay must strip them too or they leak
-// into the UI on session/load.
-const LOCAL_COMMAND_MARKERS = [
-  "command-name",
-  "command-message",
-  "command-args",
-  "local-command-stdout",
-  "local-command-stderr",
-].map((tag) => ({ open: `<${tag}>`, close: `</${tag}>` }));
-
-// Context the CLI injects into a user turn to steer the model, appended to
-// whatever the user typed. Nobody wrote it and no client sees it live — the
-// prompt loop's user-message skip covers the whole message — but it is
-// persisted alongside that prose, so replay would hand the client a prompt
-// with instructions in it the user never gave. A `task-notification` tells the
-// model that a background task stopped; live, the SDK `task_notification`
-// frame reports the same stop, so replay restores the task state from it (see
-// taskNotificationsOf) instead of showing it.
-const INJECTED_CONTEXT_MARKERS = ["system-reminder", TASK_NOTIFICATION_TAG].map((tag) => ({
-  open: `<${tag}>`,
-  close: `</${tag}>`,
-}));
-
-// Everything a replayed user message may be wrapped in that is not speech.
-const TRANSCRIPT_MARKERS = [...LOCAL_COMMAND_MARKERS, ...INJECTED_CONTEXT_MARKERS];
-
-// Single-pass scanner that removes each `<tag>…</tag>` marker (matching the
-// nearest closing tag of the same name, like a lazy regex would).
-function stripMarkerTags(text: string): string {
-  const dead = new Set<string>();
-  let result = "";
-  let copiedUpTo = 0;
-  let i = 0;
-  while (i < text.length) {
-    if (text[i] === "<") {
-      const marker = TRANSCRIPT_MARKERS.find(
-        (m) => !dead.has(m.open) && text.startsWith(m.open, i),
-      );
-      if (marker) {
-        const end = text.indexOf(marker.close, i + marker.open.length);
-        if (end !== -1) {
-          result += text.slice(copiedUpTo, i);
-          i = copiedUpTo = end + marker.close.length;
-          continue;
-        }
-        // No closing marker remains anywhere ahead, and `indexOf` only ever
-        // searches forward from here on, so stop treating this tag as an
-        // opener — that avoids rescanning the tail for it on every match.
-        dead.add(marker.open);
-      }
-    }
-    i++;
-  }
-  return result + text.slice(copiedUpTo);
-}
-
-function hasMarkerTag(text: string, tag: string): boolean {
-  return markerTagText(text, tag) !== undefined;
-}
-
-function commandInvocationFromMarkerOnlyText(text: string): string | null {
-  if (hasMarkerTag(text, "local-command-stdout") || hasMarkerTag(text, "local-command-stderr")) {
-    return null;
-  }
-  const commandName = markerTagText(text, "command-name")?.trim();
-  if (!commandName?.startsWith("/")) return null;
-  if (REPLAY_HIDDEN_COMMANDS.has(commandName.split(" ", 1)[0])) return null;
-
-  const commandArgs = markerTagText(text, "command-args")?.trim();
-  return commandArgs ? `${commandName} ${commandArgs}` : commandName;
-}
-
-function stripLocalCommandMetadataText(text: string): string | null {
-  const stripped = stripMarkerTags(text);
-  if (stripped.trim() !== "") return stripped;
-  return commandInvocationFromMarkerOnlyText(text);
-}
-
-/**
- * Return user-message content with local-command and injected-context marker
- * tags removed, or `null` if nothing meaningful remains (caller should skip
- * the message). Preserves real prose that's mixed in alongside the markers —
- * e.g. a message like `<command-name>…</command-name>hi` becomes `hi`, and
- * `hi<system-reminder>…</system-reminder>` becomes `hi`.
- */
-export function stripLocalCommandMetadata(content: unknown): unknown | null {
-  if (typeof content === "string") {
-    return stripLocalCommandMetadataText(content);
-  }
-  if (!Array.isArray(content)) return content;
-
-  const kept: unknown[] = [];
-  for (const block of content) {
-    if (
-      block &&
-      typeof block === "object" &&
-      "type" in block &&
-      (block as { type: unknown }).type === "text" &&
-      "text" in block &&
-      typeof (block as { text: unknown }).text === "string"
-    ) {
-      const stripped = stripLocalCommandMetadataText((block as { text: string }).text);
-      if (stripped === null) continue;
-      kept.push({ ...(block as object), text: stripped });
-    } else {
-      kept.push(block);
-    }
-  }
-  if (kept.length === 0) return null;
-  return kept;
-}
-
-export function isLocalCommandMetadata(content: unknown): boolean {
-  return stripLocalCommandMetadata(content) === null;
-}
 
 /**
  * True for a user record that the CLI wrote to tell the model that a
@@ -2119,108 +1807,6 @@ const LIMIT_FAILURE_CATEGORY = {
   error_max_turns: "context_exhausted",
   error_max_structured_output_retries: "provider_error",
 } as const satisfies Record<string, ClaudeFailureKind>;
-
-/**
- * True for the synthetic assistant message the CLI injects into the transcript
- * when a turn fails authentication (e.g. "Not logged in · Please run /login",
- * "Session expired. Please run /login to sign in again."). The `/login`
- * instruction is Claude Code TUI-specific and meaningless to ACP clients
- * (issue #863). The live prompt loop suppresses the text and fails the turn
- * with `authRequired` so the client can run its own auth flow; replay must
- * skip it too — both for parity with what the client saw live and because the
- * message stays in the transcript forever, so it would resurface on every
- * session/load even after the user has logged back in.
- *
- * Takes the API message (`message.message`), which replay only knows as
- * `unknown`. The persisted record's structured `error` marker is stripped by
- * `getSessionMessages`, and the CLI does not always set it to
- * `authentication_failed` anyway: an expired login with no refresh token
- * ("Login expired · Run /login to sign in again, …") arrives as
- * `invalid_request`. So the synthetic model + text is what both paths match on.
- * Usage-limit banners are excluded because some of them also mention `/login`
- * (to switch accounts) and have their own handling.
- */
-export function isSyntheticLoginMessage(apiMessage: unknown): boolean {
-  if (!apiMessage || typeof apiMessage !== "object") {
-    return false;
-  }
-  const { model, content } = apiMessage as { model?: unknown; content?: unknown };
-  if (model !== "<synthetic>" || !Array.isArray(content) || content.length !== 1) {
-    return false;
-  }
-  const block = content[0] as { type?: unknown; text?: unknown } | null;
-  return (
-    !!block &&
-    block.type === "text" &&
-    typeof block.text === "string" &&
-    isLoginRequiredText(block.text) &&
-    !isSyntheticUsageLimitMessage(apiMessage)
-  );
-}
-
-/** Origin kinds of the meta user messages `getSessionMessages` returns since
- *  SDK 0.3.284 (messages from other agents, sessions and channels). */
-const REPLAY_HIDDEN_META_ORIGIN_KINDS = new Set([
-  "peer",
-  "channel",
-  "observer",
-  "observer-activity",
-  "slack-ping",
-]);
-
-/**
- * True for a transcript message delivered to the model from another agent,
- * session or channel. Since SDK 0.3.284 `getSessionMessages` returns these as
- * `is_meta` user messages whose content is the full harness framing (envelope
- * XML plus the "not typed by your user" preamble). The live prompt loop never
- * renders them, so replay skips them too rather than presenting them as text
- * the user typed. Other `is_meta` messages (compact summaries) are kept.
- *
- * `is_meta` and `origin` are runtime fields not declared on `SessionMessage`.
- */
-export function isReplayHiddenMetaMessage(message: unknown): boolean {
-  if (!message || typeof message !== "object") return false;
-  const { type, is_meta, origin } = message as {
-    type?: unknown;
-    is_meta?: unknown;
-    origin?: { kind?: unknown } | null;
-  };
-  return (
-    type === "user" &&
-    is_meta === true &&
-    typeof origin?.kind === "string" &&
-    REPLAY_HIDDEN_META_ORIGIN_KINDS.has(origin.kind)
-  );
-}
-
-/**
- * Client-facing surface the agent calls back into. This is the subset of ACP
- * client methods the agent actually uses, expressed as a narrow interface so
- * tests can supply lightweight mocks. In production it is backed by
- * {@link ClientConnection} over the SDK's typed `AgentContext`.
- */
-export interface AcpClient {
-  sessionUpdate(params: AcpSessionNotification): Promise<void>;
-  /** `signal`, when aborted, sends `$/cancel_request` for the in-flight
-   *  permission request so the client can dismiss its prompt, and rejects the
-   *  call at once: a client that ignores the cancel never answers. */
-  requestPermission(
-    params: AcpPermissionRequest,
-    signal?: AbortSignal,
-  ): Promise<RequestPermissionResponse>;
-  readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse>;
-  writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse>;
-  /** `signal`, when aborted, sends `$/cancel_request` for the in-flight
-   *  elicitation so the client can dismiss its prompt, and rejects the call
-   *  at once, as {@link requestPermission} does. */
-  createElicitation(
-    params: CreateElicitationRequest,
-    signal?: AbortSignal,
-  ): Promise<CreateElicitationResponse>;
-  completeElicitation(params: CompleteElicitationNotification): Promise<void>;
-  /** Send a custom (extension) notification, e.g. `_claude/sdkMessage`. */
-  extNotification(method: string, params: Record<string, unknown>): Promise<void>;
-}
 
 /**
  * Bridges {@link AcpClient} to the connection-scoped {@link AgentContext}
@@ -11518,14 +11104,6 @@ function blocksForeground(session: Session, agentID: string | undefined): boolea
   return true;
 }
 
-/** Whether Claude Code ended the work of `result` because an interrupt
- *  stopped it, while the model streamed or while a tool ran. */
-export function isAbortedResult(result: Extract<SDKMessage, { type: "result" }>): boolean {
-  return (
-    result.terminal_reason === "aborted_streaming" || result.terminal_reason === "aborted_tools"
-  );
-}
-
 /** Error kinds this adapter invents itself, alongside the SDK's categorical
  *  `SDKAssistantMessageError` kinds: `no_result` marks a turn the SDK declared
  *  over without ever emitting its result (issue #825). */
@@ -11545,309 +11123,6 @@ function errorKindData(
   errorKind: AgentErrorKind | undefined,
 ): { errorKind: AgentErrorKind } | undefined {
   return errorKind ? { errorKind } : undefined;
-}
-
-export function getAvailableSlashCommands(
-  commands: SlashCommand[],
-  // Names the CLI tagged terminal-bound on `system`/init (their UX lives in
-  // the CLI's own terminal, which ACP clients aren't) — filtered alongside
-  // the static list. Raw CLI names, matched before the MCP rename.
-  terminalCommands?: readonly string[],
-  // The session cwd of an AIR client, or undefined for every other client.
-  // AIR gets the kind and the SKILL.md path of each skill command.
-  airSkillCwd?: string,
-  // The resolved SKILL.md paths of the session, keyed by the cwd and the name.
-  skillPaths?: Map<string, string | undefined>,
-  query?: Query,
-  // The skill files Claude Code reports (`getContextUsage().skills.skillFrontmatter`).
-  // A listed skill gets its path from here; one that is not listed, or has no
-  // path (remote connections), is looked up on disk.
-  skillFiles?: ReadonlyMap<string, { path?: string }>,
-): AvailableCommand[] {
-  // The container listings of this one pass, so a list of a hundred commands lists each container once.
-  const skillScans: SkillScanCache = new Map();
-  const skillPath = (name: string, cwd: string): string | undefined => {
-    const key = `${cwd}\0${name}`;
-    if (skillPaths?.has(key)) return skillPaths.get(key);
-    const resolved = resolveSkillPath(name, cwd, skillScans);
-    skillPaths?.set(key, resolved);
-    return resolved;
-  };
-
-  const UNSUPPORTED_COMMANDS = [
-    "clear",
-    "cost",
-    "keybindings-help",
-    "login",
-    "logout",
-    "output-style:new",
-    "release-notes",
-    "todos",
-  ];
-
-  const remoteControlCommands: AvailableCommand[] =
-    query && supportsRemoteControl(query)
-      ? [
-          {
-            name: REMOTE_CONTROL_COMMAND_NAME,
-            description:
-              "Continue this session from claude.ai/code or the Claude mobile app; `off` disconnects",
-            input: { hint: "[session name | off]" },
-          },
-        ]
-      : [];
-
-  // The adapter replaces the terminal text of `/mcp` and runs its actions,
-  // even when Claude Code tags the command terminal-bound.
-  const advertised = commands
-    .filter((command) => command.name !== "mcp" && !terminalCommands?.includes(command.name))
-    .map((command) => {
-      const input = command.argumentHint
-        ? {
-            hint: Array.isArray(command.argumentHint)
-              ? command.argumentHint.join(" ")
-              : command.argumentHint,
-          }
-        : null;
-      let name = command.name;
-      const mcpPrompt = command.name.endsWith(" (MCP)");
-      if (mcpPrompt) {
-        name = `mcp:${name.replace(" (MCP)", "")}`;
-      }
-      const skillFile = airSkillCwd && !mcpPrompt ? skillFiles?.get(command.name) : undefined;
-      const skillMdPath =
-        skillFile?.path ??
-        (airSkillCwd && !command.builtin && !mcpPrompt
-          ? skillPath(command.name, airSkillCwd)
-          : undefined);
-      return {
-        name,
-        description: command.description || "",
-        input,
-        ...(skillMdPath
-          ? {
-              _meta: withAirMeta(
-                withAirMeta(undefined, AIR_KIND_KEY, "skill"),
-                AIR_SKILL_PATH_KEY,
-                skillMdPath,
-              ),
-            }
-          : skillFile
-            ? // A skill without a file (bundled with the CLI, like `simplify`, or a remote connection): kind only.
-              { _meta: withAirMeta(undefined, AIR_KIND_KEY, "skill") }
-            : {}),
-      };
-    })
-    .filter((command: AvailableCommand) => !UNSUPPORTED_COMMANDS.includes(command.name));
-
-  // Command names must not contain whitespace and must be unique. A name
-  // like "my command" is dropped, and of two commands named "review" only the
-  // first is kept.
-  const names = new Set<string>();
-  return [
-    ...advertised,
-    MCP_AVAILABLE_COMMAND,
-    ...remoteControlCommands.filter(
-      (command) => !claudeCodeOffersCommand(commands, terminalCommands, command.name),
-    ),
-  ].filter((command) => {
-    if (/\s/.test(command.name) || names.has(command.name)) return false;
-    names.add(command.name);
-    return true;
-  });
-}
-
-function formatUriAsLink(uri: string): string {
-  try {
-    if (uri.startsWith("file://")) {
-      const path = uri.slice(7); // Remove "file://"
-      const name = path.split("/").pop() || path;
-      return `[@${name}](${uri})`;
-    } else if (uri.startsWith("zed://")) {
-      const parts = uri.split("/");
-      const name = parts[parts.length - 1] || uri;
-      return `[@${name}](${uri})`;
-    }
-    return uri;
-  } catch {
-    return uri;
-  }
-}
-
-/** The prompt content block types that `promptToClaude` converts. The agent
- *  advertises no `audio` prompt capability. */
-const SUPPORTED_PROMPT_CONTENT_TYPES: readonly string[] = [
-  "text",
-  "image",
-  "resource_link",
-  "resource",
-];
-
-export function promptToClaude(prompt: PromptRequest): SDKUserMessage {
-  const content: any[] = [];
-  const context: any[] = [];
-
-  const firstText = prompt.prompt.find((chunk) => chunk.type === "text");
-  for (const chunk of prompt.prompt) {
-    switch (chunk.type) {
-      case "text": {
-        let text = chunk.text;
-        // A slash command is the first text block. Change
-        // `/mcp:server:command args` to `/server:command (MCP) args`; the
-        // arguments can span lines.
-        const mcpMatch =
-          chunk === firstText ? text.match(/^\/mcp:([^:\s]+):(\S+)(?:\s+([\s\S]*))?$/) : null;
-        if (mcpMatch) {
-          const [, server, command, args] = mcpMatch;
-          text = `/${server}:${command} (MCP)${args ? ` ${args}` : ""}`;
-        }
-        content.push({ type: "text", text });
-        break;
-      }
-      case "resource_link": {
-        const formattedUri = formatUriAsLink(chunk.uri);
-        content.push({
-          type: "text",
-          text: formattedUri,
-        });
-        break;
-      }
-      case "resource": {
-        const { uri } = chunk.resource;
-        // A blob resource becomes an image or document block, or its decoded
-        // text. A v1 prompt skips a blob of any other type, e.g.
-        // `application/zip`; a v2 prompt rejects it (see `v1PromptRequest`).
-        const blob = "blob" in chunk.resource ? blobResourceToClaude(chunk.resource) : undefined;
-        const text =
-          "text" in chunk.resource
-            ? chunk.resource.text
-            : blob?.kind === "text"
-              ? blob.text
-              : undefined;
-        if (blob?.kind === "image" || blob?.kind === "document") {
-          content.push({ type: "text", text: formatUriAsLink(uri) }, blob.block);
-        } else if (text !== undefined) {
-          content.push({ type: "text", text: formatUriAsLink(uri) });
-          context.push({
-            type: "text",
-            text: `\n<context ref="${uri}">\n${text}\n</context>`,
-          });
-        }
-        break;
-      }
-      case "image":
-        if (chunk.data) {
-          content.push({
-            type: "image",
-            source: {
-              type: "base64",
-              data: chunk.data,
-              media_type: chunk.mimeType,
-            },
-          });
-        } else if (chunk.uri && chunk.uri.startsWith("http")) {
-          content.push({
-            type: "image",
-            source: {
-              type: "url",
-              url: chunk.uri,
-            },
-          });
-        }
-        break;
-      // Ignore audio and other unsupported types
-      default:
-        break;
-    }
-  }
-
-  content.push(...context);
-
-  return {
-    type: "user",
-    message: {
-      role: "user",
-      content: content,
-    },
-    session_id: prompt.sessionId,
-    parent_tool_use_id: null,
-    // ACP prompts are the user's own input relayed by the client. Stamp the
-    // provenance explicitly: per the SDK, a host wrapping keyboard input must
-    // send `{kind: "human"}` — an absent `origin` is treated as unattributed
-    // and fails closed at the CLI's strict isHuman() trust gates (e.g. the
-    // ultracode keyword opt-in honors only human-originated turns).
-    origin: { kind: "human" },
-  };
-}
-
-/**
- * Resolves the ACP `messageId` for a Claude SDK message (live) or a persisted
- * transcript message (replay) so chunk grouping is identical in both views.
- *
- * Assistant turns are keyed by the Anthropic API message id (`message.id`),
- * which is identical at `message_start`, on the consolidated assistant message,
- * and in the persisted transcript — unlike the per-`stream_event` uuid, which is
- * unique per event and never persisted. User messages have no API id, but they
- * are never streamed, so their (stable) SDK uuid is used instead. ACP message
- * ids are opaque strings, so no particular format is required.
- */
-export function messageIdForGrouping(message: {
-  type?: string;
-  uuid?: string | null;
-  message?: unknown;
-}): string | undefined {
-  if (message.type === "assistant") {
-    const inner = message.message;
-    const apiId =
-      inner && typeof inner === "object" && "id" in inner
-        ? (inner as { id?: unknown }).id
-        : undefined;
-    if (typeof apiId === "string" && apiId.length > 0) {
-      return apiId;
-    }
-  }
-  return typeof message.uuid === "string" && message.uuid.length > 0 ? message.uuid : undefined;
-}
-
-/**
- * Stamps an ACP `messageId` onto a session update, but only on the message/
- * thought chunk variants that carry one — tool_call/plan/etc. updates never do.
- * No-op when `messageId` is falsy, so callers can pass it through unconditionally.
- */
-function applyMessageId(
-  update: SessionNotification["update"],
-  messageId: string | undefined,
-): void {
-  if (
-    messageId &&
-    (update.sessionUpdate === "agent_message_chunk" ||
-      update.sessionUpdate === "user_message_chunk" ||
-      update.sessionUpdate === "agent_thought_chunk")
-  ) {
-    update.messageId = messageId;
-  }
-}
-
-/** Built-in tools that drive the task list (headless/SDK sessions use these
- *  instead of TodoWrite). Their tool_use/tool_result are surfaced as `plan`
- *  snapshots rather than as tool_calls. */
-function isTaskTool(toolName: string): boolean {
-  return (
-    toolName === "TaskCreate" ||
-    toolName === "TaskUpdate" ||
-    toolName === "TaskList" ||
-    toolName === "TaskGet"
-  );
-}
-
-/** Whether the streamed tool_use path surfaces this tool as a standalone
- *  `tool_call`. TodoWrite is rendered as a `plan` and Task* tools are
- *  suppressed (their plan snapshot is emitted at tool_result time), so neither
- *  produces a streamed tool_call/tool_call_update — which means a
- *  permission-surfaced tool_call for them (see `ensureToolCallEmitted`) must be
- *  resolved explicitly at tool_result time. */
-function shouldEmitToolCall(toolName: string): boolean {
-  return toolName !== "TodoWrite" && !isTaskTool(toolName);
 }
 
 const MAX_TOOL_CALL_PARENTS = 1000;
@@ -11931,24 +11206,6 @@ function toolCallFieldsOf(session: {
   return (session.toolCallFields ??= new ToolCallFieldTracker());
 }
 
-/**
- * Convert an SDKAssistantMessage (Claude) to a SessionNotification (ACP).
- * Only handles text, image, and thinking chunks for now.
- */
-/**
- * The renderer of the notification functions: the agent's tool call
- * capabilities when they are passed, else those of the ACP capabilities.
- */
-function toolCallRenderer(options?: {
-  clientCapabilities?: ClientCapabilities;
-  toolCallCapabilities?: ToolCallClientCapabilities;
-  replay?: boolean;
-}): AcpToolCallRenderer {
-  return options?.toolCallCapabilities
-    ? new AcpToolCallRenderer(options.toolCallCapabilities, options.replay)
-    : AcpToolCallRenderer.for(options?.clientCapabilities, options?.replay);
-}
-
 const MAX_RESOLVED_TOOL_NAMES = 1000;
 
 /** Keeps the tool names of the tool results in `content` before the tool use cache drops them. */
@@ -11968,627 +11225,6 @@ function rememberResolvedToolNames(
       const oldest = names.keys().next().value;
       if (oldest !== undefined) names.delete(oldest);
     }
-  }
-}
-
-export function toAcpNotifications(
-  content: string | ContentBlockParam[] | BetaContentBlock[] | BetaRawContentBlockDelta[],
-  role: "assistant" | "user",
-  sessionId: string,
-  toolUseCache: ToolUseCache,
-  client: AcpClient,
-  logger: Logger,
-  options?: {
-    registerHooks?: boolean;
-    clientCapabilities?: ClientCapabilities;
-    // The agent's tool call capabilities. They win over clientCapabilities,
-    // and carry what ACP capabilities cannot (ToolCallClientCapabilities.v2).
-    toolCallCapabilities?: ToolCallClientCapabilities;
-    parentToolUseId?: string | null;
-    cwd?: string;
-    taskState?: TaskState;
-    // The subagent TodoWrite checklists that the client holds in the session.
-    // Mutated in place.
-    subagentChecklists?: SubagentChecklists;
-    // Tracks tool_use ids already emitted as a `tool_call` so a permission
-    // request (which emits the tool_call eagerly) and the streamed tool_use
-    // chunk don't both emit one — whichever arrives second emits a
-    // `tool_call_update` instead. Mutated in place. When omitted, the
-    // tool_call/update decision falls back to `toolUseCache` presence (the
-    // historical single-source behavior).
-    emittedToolCalls?: Set<string>;
-    // False while the input of a streamed tool_use still streams: the first
-    // tool_call then leaves `rawInput` out, and the consolidated message
-    // sends it once it is complete.
-    inputComplete?: boolean;
-    // Remembers the fields sent for each open tool call. When present, a
-    // tool_call_update carries only the fields that changed, and an update
-    // with nothing new is dropped. Mutated in place.
-    toolCallFields?: ToolCallFieldTracker;
-    // Opaque id identifying the message these chunks belong to (ACP message ids
-    // are opaque strings — no particular format is required). Attached to
-    // user/agent message and thought chunks so clients can group streamed chunks
-    // into a single message. Omit it (leave undefined) when unknown — never send
-    // an explicit `null`.
-    messageId?: string;
-    // The SDK user message's `tool_use_result`: the structured Output object of
-    // the tool_result this message carries (shape is per-tool). Used to render
-    // Agent/Task results from the structured subagent report instead of the raw
-    // text (which ends in a model-directed agentId/usage trailer).
-    toolUseResult?: unknown;
-    // The SDK user message's `tool_result_meta` sidecar, passed raw (it's
-    // untyped in sdk.d.ts) and validated by `parseToolResultMeta`. Stamps
-    // denied/interrupted tool_call_updates with why the tool never ran.
-    toolResultMeta?: unknown;
-    // True when the content is a result of the work that a `session/cancel`
-    // stopped. An error result then ends a run that the cancel aborted,
-    // whichever kind the SDK stamped on it (see `resultStatus`).
-    cancelled?: boolean;
-    // True when the content comes from the history of a loaded session.
-    replay?: boolean;
-  },
-): SessionNotification[] {
-  const taskState = options?.taskState ?? new Map();
-  const registerHooks = options?.registerHooks !== false;
-  const renderer = toolCallRenderer(options);
-  if (typeof content === "string") {
-    if (content.length === 0) {
-      return [];
-    }
-    const update: SessionNotification["update"] = {
-      sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
-      content: {
-        type: "text",
-        text: content,
-      },
-    };
-    applyMessageId(update, options?.messageId);
-
-    if (options?.parentToolUseId) stampParentToolUseId(update, options.parentToolUseId);
-
-    return [{ sessionId, update }];
-  }
-
-  // `tool_use_result` is message-level and carries no tool_use_id of its own:
-  // it describes "the" tool_result block of the message it rode in on. If
-  // several tool_result blocks were ever batched into one message it couldn't
-  // be attributed, so it is only honored when the message carries exactly one.
-  const toolUseResult =
-    options?.toolUseResult !== undefined &&
-    content.filter((c) => typeof c === "object" && c !== null && c.type === "tool_result")
-      .length === 1
-      ? options.toolUseResult
-      : undefined;
-
-  // Unlike `tool_use_result`, entries carry their own tool_use_id, so batched
-  // messages need no single-block guard.
-  const toolResultMeta = parseToolResultMeta(options?.toolResultMeta);
-  const output = [];
-  // Only handle the first chunk for streaming; extend as needed for batching
-  for (const chunk of content) {
-    let update: SessionNotification["update"] | null = null;
-    // The tool call that this chunk finishes, if it is a tool result.
-    let finishedToolCallId: string | undefined;
-    // The plan that this chunk approves, if it is an ExitPlanMode result.
-    let approvedPlanUpdate: SessionNotification["update"] | undefined;
-    switch (chunk.type) {
-      case "text":
-      case "text_delta": {
-        if (chunk.text) {
-          update = {
-            sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
-            content: {
-              type: "text",
-              text: chunk.text,
-            },
-          };
-        }
-        break;
-      }
-      case "image":
-        update = {
-          sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
-          content: {
-            type: "image",
-            data: chunk.source.type === "base64" ? chunk.source.data : "",
-            mimeType: chunk.source.type === "base64" ? chunk.source.media_type : "",
-            uri: chunk.source.type === "url" ? chunk.source.url : undefined,
-          },
-        };
-        break;
-      case "thinking":
-      case "thinking_delta": {
-        // Recent models default `thinking.display` to "omitted", which streams
-        // signature-only thinking blocks whose text is empty.
-        if (chunk.thinking) {
-          update = {
-            sessionUpdate: "agent_thought_chunk",
-            content: {
-              type: "text",
-              text: chunk.thinking,
-            },
-          };
-        }
-        break;
-      }
-      case "tool_use":
-      case "server_tool_use":
-      case "mcp_tool_use": {
-        const alreadyCached = chunk.id in toolUseCache;
-        toolUseCache[chunk.id] = chunk;
-        if (chunk.name === "TodoWrite") {
-          // @ts-expect-error - sometimes input is empty object or undefined
-          if (Array.isArray(chunk.input?.todos)) {
-            update = todoWritePlanUpdate(planEntries(chunk.input as { todos: ClaudePlanEntry[] }), {
-              planOperations: options?.clientCapabilities?.plan != null,
-              parentToolUseId: options?.parentToolUseId,
-              // With native subagent sessions, an update of a subagent goes
-              // to the subagent's session (see NativeSubagentRuntime).
-              childSessions: clientSupportsSubagents(options?.clientCapabilities),
-              shown: options?.subagentChecklists,
-            });
-          }
-        } else if (isTaskTool(chunk.name)) {
-          // Task* tool_use is suppressed; the plan update is emitted at
-          // tool_result time once we have the task ID (for TaskCreate) and
-          // confirmation that the change took effect.
-        } else {
-          // Only register hooks on first encounter to avoid double-firing
-          if (registerHooks && !alreadyCached) {
-            // Capture the tool name in the closure rather than re-reading the
-            // cache when the hook fires. The cache entry is pruned at
-            // tool_result time, and a PostToolUse hook can fire after that, so
-            // closing over the name keeps the diff working without depending on
-            // (or pinning) the cache entry's lifetime.
-            const toolName = chunk.name;
-            const hookToolCallId = chunk.id;
-            registerHookCallback(
-              chunk.id,
-              {
-                onPostToolUseHook: async (toolUseId, _toolInput, toolResponse) => {
-                  // The final diff of an Edit or a Write replaces the
-                  // optimistic content built from the input. Only the marker
-                  // fields of the tool_response travel: the rest repeats
-                  // output that the content already carries.
-                  const update = await renderer.hookResult(
-                    { id: toolUseId, name: toolName },
-                    toolResponse,
-                    options?.cwd,
-                  );
-                  if (!update) return;
-                  if (options?.parentToolUseId) {
-                    stampParentToolUseId(update, options.parentToolUseId);
-                  }
-                  // The final result may replace a pinned approval patch.
-                  if (
-                    options?.toolCallFields &&
-                    !options.toolCallFields.apply(update, { replacePinnedContent: true })
-                  ) {
-                    return;
-                  }
-                  await client.sessionUpdate({ sessionId, update });
-                },
-                onRelease: () => options?.toolCallFields?.finishHook(hookToolCallId),
-              },
-              sessionId,
-            );
-          }
-
-          let rawInput;
-          try {
-            rawInput = JSON.parse(JSON.stringify(chunk.input));
-          } catch {
-            // ignore if we can't turn it to JSON
-          }
-          const toolUse = { id: chunk.id, name: chunk.name, input: rawInput };
-
-          // Emit a `tool_call` only the first time this id surfaces to the
-          // client; afterwards refine it with a `tool_call_update`. The first
-          // surface may be this stream chunk OR an earlier permission request
-          // (see `ensureToolCallEmitted`), so emission is tracked separately
-          // from `toolUseCache`. Without an `emittedToolCalls` set we fall back
-          // to cache presence — the historical streaming-only behavior.
-          const emittedToolCalls = options?.emittedToolCalls;
-          const alreadyEmitted = emittedToolCalls ? emittedToolCalls.has(chunk.id) : alreadyCached;
-          emittedToolCalls?.add(chunk.id);
-
-          // A permission request surfaced the tool call with its complete
-          // input. The empty input at the stream start has nothing to add.
-          if (alreadyEmitted && options?.inputComplete === false) break;
-          update = alreadyEmitted
-            ? // Already surfaced (full assistant message after streaming, or a
-              // permission request emitted it first): refine it with the
-              // complete input.
-              renderer.refinement(toolUse, options?.cwd)
-            : // First surface (streaming content_block_start or replay).
-              renderer.toolCall(toolUse, {
-                cwd: options?.cwd,
-                inputComplete: options?.inputComplete,
-              });
-        }
-        break;
-      }
-
-      case "advisor_tool_result": {
-        // Advisor results arrive in assistant content, including encrypted advice.
-        // Resolve the server tool through the normal result path without rendering
-        // opaque ciphertext. Server tools have no later PostToolUse hook to await.
-        const result = chunk.content;
-        unregisterHookCallback(chunk.tool_use_id);
-        output.push(
-          ...toAcpNotifications(
-            [
-              {
-                type: "tool_result",
-                tool_use_id: chunk.tool_use_id,
-                is_error: result.type === "advisor_tool_result_error",
-                content:
-                  result.type === "advisor_result"
-                    ? result.text
-                    : result.type === "advisor_redacted_result"
-                      ? "Advisor guidance applied server-side."
-                      : `Advisor error: ${result.error_code}`,
-              },
-            ],
-            role,
-            sessionId,
-            toolUseCache,
-            client,
-            logger,
-            options,
-          ),
-        );
-        break;
-      }
-
-      case "tool_result":
-      case "tool_search_tool_result":
-      case "web_fetch_tool_result":
-      case "web_search_tool_result":
-      case "code_execution_tool_result":
-      case "bash_code_execution_tool_result":
-      case "text_editor_code_execution_tool_result":
-      case "mcp_tool_result": {
-        const wasEmitted = options?.emittedToolCalls?.has(chunk.tool_use_id) === true;
-        options?.emittedToolCalls?.delete(chunk.tool_use_id);
-        completeHookCallback(chunk.tool_use_id);
-        finishedToolCallId = chunk.tool_use_id;
-        // Why this is_error result carries harness prose instead of tool
-        // output (user-rejected / interrupted / …), when the SDK said so.
-        // Spread into the claudeCode meta of every update emitted below; the
-        // untracked-tool fallback can't carry it (claudeCode metas always
-        // carry `toolName`, which is unknown there).
-        const nonExecution = toolResultMeta?.get(chunk.tool_use_id);
-        const toolUse = toolUseCache[chunk.tool_use_id];
-        if (!toolUse) {
-          // The permission flow may have surfaced this tool_call even though
-          // its tool_use never reached the cache (e.g. the assistant message
-          // carrying it was dropped by the cancelled-turn guard and a straggler
-          // result landed later). Resolve the surfaced call anyway so it can't
-          // stay pending in the client forever; without the cache entry the
-          // tool name is unknown, so no claudeCode meta is attached.
-          if (wasEmitted) {
-            output.push({
-              sessionId,
-              update: {
-                toolCallId: chunk.tool_use_id,
-                sessionUpdate: "tool_call_update" as const,
-                status: renderer.resultStatus(
-                  "is_error" in chunk && chunk.is_error === true,
-                  nonExecution,
-                  { cancelled: options?.cancelled },
-                ),
-                rawOutput: chunk.content,
-              },
-            });
-          }
-          logger.error(
-            `[claude-agent-acp] Got a tool result for tool use that wasn't tracked: ${chunk.tool_use_id}`,
-          );
-          break;
-        }
-
-        // A permission request may have surfaced a plan-rendered (TodoWrite) or
-        // suppressed (Task*) tool as a real tool_call so the request referenced
-        // a tool call the client knows about (see `ensureToolCallEmitted`,
-        // issue #851). The branches below never emit a tool_call_update for
-        // those tools, which would leave the surfaced call pending in the
-        // client forever — resolve it here. `wasEmitted` is only ever true for
-        // these tools via the permission flow: the streamed plan/suppressed
-        // branches don't record emissions.
-        if (wasEmitted && !shouldEmitToolCall(toolUse.name)) {
-          output.push({
-            sessionId,
-            update: {
-              _meta: {
-                claudeCode: {
-                  toolName: toolUse.name,
-                  ...(nonExecution ?? {}),
-                  ...(options?.parentToolUseId ? { parentToolUseId: options.parentToolUseId } : {}),
-                },
-              } satisfies ToolUpdateMeta,
-              toolCallId: chunk.tool_use_id,
-              sessionUpdate: "tool_call_update" as const,
-              status: renderer.resultStatus(
-                "is_error" in chunk && chunk.is_error === true,
-                nonExecution,
-                { cancelled: options?.cancelled },
-              ),
-              rawOutput: chunk.content,
-            },
-          });
-        }
-
-        if (isTaskTool(toolUse.name)) {
-          // Headless/SDK sessions emit Task* tools instead of TodoWrite.
-          // TaskCreate / TaskUpdate mutate the accumulated task list. TaskList
-          // reconciles it from the SDK's authoritative snapshot, which repairs
-          // resumed or compacted sessions whose creating calls are no longer in
-          // replay history. TaskGet is read-only and remains suppressed. Plan
-          // updates always carry the full accumulated snapshot, mirroring the
-          // legacy TodoWrite behavior.
-          const isError = "is_error" in chunk && chunk.is_error;
-          let shouldEmitTaskPlan = false;
-          if (!isError) {
-            if (toolUse.name === "TaskCreate") {
-              applyTaskCreate(
-                taskState,
-                toolUse.input as Parameters<typeof applyTaskCreate>[1],
-                parseTaskCreateOutput(toolUseResult) ?? parseTaskCreateOutput(chunk.content),
-              );
-              shouldEmitTaskPlan = true;
-            } else if (toolUse.name === "TaskUpdate") {
-              const input = toolUse.input as Parameters<typeof applyTaskUpdate>[1];
-              const output =
-                parseTaskUpdateOutput(toolUseResult, input?.taskId) ??
-                parseTaskUpdateOutput(chunk.content, input?.taskId);
-              // Older CLI transcripts have no structured output, so retain the
-              // input-based fallback. When an output is available, only apply a
-              // confirmed update for the same task.
-              if (!output || (output.success && output.taskId === input?.taskId)) {
-                applyTaskUpdate(taskState, input);
-                shouldEmitTaskPlan = true;
-              }
-            } else if (toolUse.name === "TaskList") {
-              const output =
-                parseTaskListOutput(toolUseResult) ?? parseTaskListOutput(chunk.content);
-              if (output) {
-                applyTaskList(taskState, output);
-                shouldEmitTaskPlan = true;
-              }
-            }
-          }
-          const entries = shouldEmitTaskPlan
-            ? changedTaskPlanEntries(taskState, renderer.capabilities.air.client)
-            : undefined;
-          if (entries) {
-            update = checklistPlanUpdate(entries, options?.clientCapabilities?.plan != null);
-          }
-        } else if (toolUse.name !== "TodoWrite") {
-          // A command sends its output first, then the exit and the status.
-          const [finalUpdate, ...rest] = renderer
-            .result(toolUse, chunk as Parameters<AcpToolCallRenderer["result"]>[1], {
-              structured: toolUseResult,
-              nonExecution,
-              cancelled: options?.cancelled,
-            })
-            .reverse();
-          for (const outputUpdate of rest.reverse()) {
-            if (options?.parentToolUseId) {
-              stampParentToolUseId(outputUpdate, options.parentToolUseId);
-            }
-            output.push({ sessionId, update: outputUpdate });
-          }
-          // An approved plan of the main conversation becomes the session's
-          // markdown plan, after the tool call's result. An approval that
-          // clears the context ends the tool with an error result instead, and
-          // the restart into the fresh context publishes that plan (see
-          // ExitPlanCoordinator.restart).
-          if (
-            toolUse.name === "ExitPlanMode" &&
-            options?.clientCapabilities?.plan &&
-            !options.parentToolUseId &&
-            !("is_error" in chunk && chunk.is_error)
-          ) {
-            const plan = approvedPlan(toolUse.input, toolUseResult);
-            if (plan) {
-              approvedPlanUpdate = planModeUpdate(
-                plan,
-                renderer.capabilities.air.client ? toolUse.id : undefined,
-              );
-            }
-          }
-          update = finalUpdate;
-        }
-        // The tool_use is fully resolved now — drop it so a long session doesn't
-        // retain every tool call. The PostToolUse hook (Edit/Write diffs) closes
-        // over the tool name and no longer reads the cache, so pruning here is
-        // safe regardless of hook/result ordering.
-        delete toolUseCache[chunk.tool_use_id];
-        break;
-      }
-
-      case "document":
-      case "search_result":
-      case "redacted_thinking":
-      case "input_json_delta":
-      case "citations_delta":
-      case "signature_delta":
-      case "container_upload":
-      case "compaction":
-      case "compaction_delta":
-      case "fallback":
-      case "mcp_tool_listing":
-        break;
-
-      default:
-        unreachable(chunk, logger);
-        break;
-    }
-    if (update) {
-      if (options?.parentToolUseId) stampParentToolUseId(update, options.parentToolUseId);
-      applyMessageId(update, options?.messageId);
-      // A tool result is final, so it may replace a pinned approval patch,
-      // for example with the error text of a rejected Edit.
-      if (
-        !options?.toolCallFields ||
-        options.toolCallFields.apply(update, {
-          replacePinnedContent: finishedToolCallId !== undefined,
-        })
-      ) {
-        output.push({ sessionId, update });
-      }
-    }
-    if (approvedPlanUpdate) output.push({ sessionId, update: approvedPlanUpdate });
-    if (finishedToolCallId !== undefined) {
-      // The PostToolUse hook can still send the final diff, so the fields
-      // stay tracked until its callback leaves the registry.
-      options?.toolCallFields?.finishResult(
-        finishedToolCallId,
-        hasHookCallback(finishedToolCallId),
-      );
-    }
-  }
-
-  return output;
-}
-
-export function streamEventToAcpNotifications(
-  message: SDKPartialAssistantMessage,
-  sessionId: string,
-  toolUseCache: ToolUseCache,
-  client: AcpClient,
-  logger: Logger,
-  options?: {
-    clientCapabilities?: ClientCapabilities;
-    // See toAcpNotifications.
-    toolCallCapabilities?: ToolCallClientCapabilities;
-    cwd?: string;
-    taskState?: TaskState;
-    subagentChecklists?: SubagentChecklists;
-    emittedToolCalls?: Set<string>;
-    toolCallFields?: ToolCallFieldTracker;
-    messageId?: string;
-    streamedToolInputs?: StreamedToolInputCache;
-  },
-): SessionNotification[] {
-  const event = message.event;
-  const streamKey = message.parent_tool_use_id ?? "";
-  const streamedToolInputs = options?.streamedToolInputs;
-  const forwardedOptions = {
-    clientCapabilities: options?.clientCapabilities,
-    toolCallCapabilities: options?.toolCallCapabilities,
-    parentToolUseId: message.parent_tool_use_id,
-    cwd: options?.cwd,
-    taskState: options?.taskState,
-    subagentChecklists: options?.subagentChecklists,
-    emittedToolCalls: options?.emittedToolCalls,
-    toolCallFields: options?.toolCallFields,
-    messageId: options?.messageId,
-  };
-  switch (event.type) {
-    case "content_block_start": {
-      const block = event.content_block;
-      if (
-        streamedToolInputs &&
-        (block.type === "tool_use" ||
-          block.type === "server_tool_use" ||
-          block.type === "mcp_tool_use")
-      ) {
-        let inputsForMessage = streamedToolInputs.get(streamKey);
-        if (!inputsForMessage) {
-          inputsForMessage = new Map();
-          streamedToolInputs.set(streamKey, inputsForMessage);
-        }
-        inputsForMessage.set(event.index, {
-          id: block.id,
-          name: block.name,
-          partialJson: "",
-          inString: false,
-          escaped: false,
-          objectDepth: 0,
-          arrayDepth: 0,
-          lastTopLevelComma: -1,
-          emittedThroughComma: -1,
-        });
-      }
-      // The input of a streamed tool_use starts empty and streams after this
-      // event, so the tool_call waits for the complete input.
-      return toAcpNotifications([block], "assistant", sessionId, toolUseCache, client, logger, {
-        ...forwardedOptions,
-        inputComplete: false,
-      });
-    }
-    case "content_block_delta": {
-      if (event.delta.type === "input_json_delta") {
-        const streamedInput = streamedToolInputs?.get(streamKey)?.get(event.index);
-        if (!streamedInput) return [];
-
-        if (scanStreamedToolInput(streamedInput, event.delta.partial_json)) {
-          // Input complete: the consolidated assistant message replays the
-          // block with its full input and refines the call there; emitting
-          // here too would send a duplicate identical update.
-          const inputsForMessage = streamedToolInputs?.get(streamKey);
-          inputsForMessage?.delete(event.index);
-          if (inputsForMessage?.size === 0) streamedToolInputs?.delete(streamKey);
-          return [];
-        }
-        if (streamedInput.lastTopLevelComma <= streamedInput.emittedThroughComma) {
-          return [];
-        }
-        streamedInput.emittedThroughComma = streamedInput.lastTopLevelComma;
-        const input = recoveredToolInput(
-          streamedInput.partialJson.slice(0, streamedInput.lastTopLevelComma),
-        );
-        if (!input) return [];
-        // TodoWrite and the Task* tools never surfaced a tool_call to refine.
-        if (!shouldEmitToolCall(streamedInput.name)) return [];
-        const update: SessionNotification["update"] = toolCallRenderer(options).partialRefinement(
-          streamedInput,
-          input,
-          options?.cwd,
-        );
-        if (message.parent_tool_use_id) stampParentToolUseId(update, message.parent_tool_use_id);
-        applyMessageId(update, options?.messageId);
-        // A refinement resends only what changed: rawInput grows with every
-        // field, and title, kind, and locations usually stay the same.
-        if (options?.toolCallFields && !options.toolCallFields.apply(update)) return [];
-        return [{ sessionId, update }];
-      }
-      return toAcpNotifications(
-        [event.delta],
-        "assistant",
-        sessionId,
-        toolUseCache,
-        client,
-        logger,
-        forwardedOptions,
-      );
-    }
-    // No content. `ping` is a Messages-API keep-alive event that the SDK's
-    // `BetaRawMessageStreamEvent` union doesn't include even though the
-    // wire format emits it; the `as never` cast lets us no-op it here
-    // instead of letting it fall through to `unreachable`.
-    case "ping" as never:
-    case "message_delta":
-      return [];
-    // A message boundary ends every input stream on this lane: message_stop is
-    // the normal end, and a message_start clears anything a prior message on
-    // the lane left behind (e.g. a stream cut short mid-block).
-    case "message_start":
-    case "message_stop":
-      streamedToolInputs?.delete(streamKey);
-      return [];
-    case "content_block_stop": {
-      const inputsForMessage = streamedToolInputs?.get(streamKey);
-      inputsForMessage?.delete(event.index);
-      if (inputsForMessage?.size === 0) streamedToolInputs?.delete(streamKey);
-      return [];
-    }
-
-    default:
-      unreachable(event, logger);
-      return [];
   }
 }
 

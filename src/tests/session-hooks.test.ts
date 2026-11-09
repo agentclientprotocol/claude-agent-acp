@@ -11,7 +11,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { NewSessionRequest } from "@agentclientprotocol/sdk/unstable";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
+import { ClaudeAcpAgent } from "../acp-agent.js";
+import type { AcpClient } from "../acp-client.js";
 
 function sse(type: string, data: object): string {
   return `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;

@@ -9,7 +9,8 @@ import type {
   SessionNotification,
 } from "@agentclientprotocol/sdk/unstable";
 import { describe, expect, it } from "vitest";
-import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
+import { ClaudeAcpAgent } from "../acp-agent.js";
+import type { AcpClient } from "../acp-client.js";
 
 type JsonObject = Record<string, unknown>;
 

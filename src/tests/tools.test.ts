@@ -22,7 +22,9 @@ import {
   BetaBashCodeExecutionResultBlock,
   BetaBashCodeExecutionToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/beta.mjs";
-import { AcpClient, toAcpNotifications, ToolUseCache, Logger } from "../acp-agent.js";
+import { AcpClient } from "../acp-client.js";
+import { toAcpNotifications, ToolUseCache } from "../sdk-to-acp.js";
+import { Logger } from "../logger.js";
 import {
   toolUpdateFromToolResult,
   createPostToolUseHook,
