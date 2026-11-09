@@ -23,14 +23,11 @@ import {
 
 type ToolUses = Record<string, { name: string; input: unknown } | undefined>;
 
-/** A requested report, by its prompt. */
-type Report = NativeFileChangeReportTurn & { settled: boolean };
-
 export class TurnFileChanges {
   /** The reports of the prompts that are not inserted yet, by prompt uuid. */
-  private readonly pending = new Map<string, Report>();
+  private readonly pending = new Map<string, NativeFileChangeReportTurn>();
   /** The reports of the prompts that the open turn serves. */
-  private readonly turn: Report[] = [];
+  private readonly turn: NativeFileChangeReportTurn[] = [];
   /** The tool uses of subagents in the open turn, for their file edits. */
   private subagentToolUses: ToolUses = {};
 
@@ -50,8 +47,7 @@ export class TurnFileChanges {
   /** A `session/prompt` came: its `_meta` may ask for a report. */
   requested(promptUuid: string, meta: unknown): void {
     const fileChangeReport = this.reporter.request(meta);
-    if (fileChangeReport)
-      this.pending.set(promptUuid, { promptUuid, fileChangeReport, settled: false });
+    if (fileChangeReport) this.pending.set(promptUuid, { promptUuid, fileChangeReport });
   }
 
   /** The prompt failed before Claude Code inserted it: -32800 for a cancel, or another error. */
