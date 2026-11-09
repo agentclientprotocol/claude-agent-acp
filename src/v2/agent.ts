@@ -32,10 +32,8 @@ import {
   v2NewSessionResponse,
   v2ResumeSessionResponse,
 } from "./session.js";
-import { v2ChildStateUpdate, v2SessionUpdate } from "./session-update.js";
-import { V2Terminals } from "./terminal.js";
-import { V2ToolCallMeta } from "./tool-call-meta.js";
-import { v2RestartedToolCall } from "./tool-call.js";
+import { v2ChildStateUpdate } from "./session-update.js";
+import { replayClear, V2UpdateTranslator } from "./update-translator.js";
 
 /**
  * The ACP v2 surface, for one connection.
@@ -152,8 +150,7 @@ export function v2AgentApp(
     )
     .onRequest(v2.methods.agent.session.close, async ({ params }) => {
       const response = await agent.closeSession(params);
-      client.terminals.forget(params.sessionId);
-      client.toolCallMeta.forget(params.sessionId);
+      client.translator.forget(params.sessionId);
       return response;
     })
     .onRequest(v2.methods.agent.session.delete, ({ params }) => agent.deleteSession(params))
@@ -266,14 +263,11 @@ class V2ClientConnection implements AcpClient {
    */
   private readonly replayedChildStates = new Map<string, v2.UpdateSessionNotification>();
 
-  /** The display terminals of the commands that the agent runs. */
-  readonly terminals = new V2Terminals();
-
-  /** The `_meta` that the client stores for each tool call. */
-  readonly toolCallMeta = new V2ToolCallMeta();
+  /** Turns the agent's v1 updates into v2 updates (terminals, tool call `_meta`). */
+  readonly translator = new V2UpdateTranslator();
 
   /** The `background` list of each session's `state_update`s. */
-  readonly background = new V2Background(this.terminals);
+  readonly background = new V2Background(this.translator.terminals);
 
   constructor(
     private readonly ctx: v2.AgentContext,
@@ -350,10 +344,13 @@ class V2ClientConnection implements AcpClient {
         this.replayRoots.get(notification.sessionId) ?? notification.sessionId,
       );
     }
-    const updates = this.v2Updates(notification.sessionId, update).flatMap((v2Update) => {
-      const clear = this.replayClear(notification.sessionId, v2Update);
-      return clear ? [clear, v2Update] : [v2Update];
-    });
+    const updates = this.translator
+      .updates(notification.sessionId, update, this.replays.has(notification.sessionId))
+      .flatMap((v2Update) => {
+        const cleared = this.replays.get(notification.sessionId);
+        const clear = cleared && replayClear(cleared, v2Update);
+        return clear ? [clear, v2Update] : [v2Update];
+      });
     // A subagent's work state also goes to the child's own stream, after the
     // parent's copy. During a replay, only its last state goes, after the
     // replay (see `replayedChildStates`).
@@ -376,64 +373,12 @@ class V2ClientConnection implements AcpClient {
     );
   }
 
-  /**
-   * The v2 updates of a v1 update: for a tool call report, the updates of its
-   * terminal first (see {@link V2Terminals}), then the report itself, with the
-   * `_meta` keys that it changes (see {@link V2ToolCallMeta}), and during a
-   * replay the `_meta` of a tool call that the report cleared.
-   */
-  private v2Updates(
-    sessionId: string,
-    update: AcpSessionNotification["update"],
-  ): v2.SessionUpdate[] {
-    if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") {
-      const v2Update = v2SessionUpdate(update);
-      return v2Update ? [v2Update] : [];
-    }
-    const { terminal, report } = this.terminals.split(sessionId, update);
-    if (!report) return terminal;
-    const starts = report.sessionUpdate === "tool_call";
-    const replaying = this.replays.has(sessionId);
-    // A v1 `tool_call` starts the tool call afresh, but v2 only has updates,
-    // which keep each field they leave out. The client may already hold this
-    // id: from an earlier report on this connection, or, during a replay, from
-    // before it (a client that resumes a session it showed before).
-    const restarts =
-      starts && (replaying || this.toolCallMeta.reported(sessionId, report.toolCallId));
-    const [reported, metaPatch] = this.toolCallMeta.apply(sessionId, report, starts, replaying);
-    const reportUpdate = restarts ? v2RestartedToolCall(reported) : v2SessionUpdate(reported);
-    const metaUpdate = metaPatch
-      ? v2SessionUpdate({ sessionUpdate: "tool_call_update", ...metaPatch })
-      : undefined;
-    return [
-      ...terminal,
-      ...(reportUpdate ? [reportUpdate] : []),
-      ...(metaUpdate ? [metaUpdate] : []),
-    ];
-  }
-
-  /**
-   * The update that clears the message of a replayed chunk, when it is the
-   * first replayed chunk of that message (see {@link replaying}).
-   */
-  private replayClear(sessionId: string, update: v2.SessionUpdate): v2.SessionUpdate | undefined {
-    const cleared = this.replays.get(sessionId);
-    if (!cleared) return undefined;
-    const kind = MESSAGE_OF_CHUNK.get(update.sessionUpdate);
-    if (!kind) return undefined;
-    const { messageId } = update as { messageId: string };
-    const key = `${kind} ${messageId}`;
-    if (cleared.has(key)) return undefined;
-    cleared.add(key);
-    return emptyMessage(kind, messageId);
-  }
-
   async requestPermission(
     params: AcpPermissionRequest,
     signal?: AbortSignal,
   ): Promise<RequestPermissionResponse> {
     // The subject is an update of the tool call, with its stored `_meta`.
-    const toolCall = this.toolCallMeta.subject(params.sessionId, params.toolCall);
+    const toolCall = this.translator.toolCallMeta.subject(params.sessionId, params.toolCall);
     const response = await this.ctx.request(
       v2.methods.client.session.requestPermission,
       v2PermissionRequest({ ...params, toolCall }),
@@ -469,28 +414,6 @@ class V2ClientConnection implements AcpClient {
 
   writeTextFile(): Promise<never> {
     return Promise.reject(new Error("ACP v2 has no client file system"));
-  }
-}
-
-/** The message update of each message chunk. */
-const MESSAGE_OF_CHUNK = new Map<string, "user_message" | "agent_message" | "agent_thought">([
-  ["user_message_chunk", "user_message"],
-  ["agent_message_chunk", "agent_message"],
-  ["agent_thought_chunk", "agent_thought"],
-]);
-
-function emptyMessage(
-  kind: "user_message" | "agent_message" | "agent_thought",
-  messageId: string,
-): v2.SessionUpdate {
-  const message = { messageId, content: [] };
-  switch (kind) {
-    case "user_message":
-      return { ...message, sessionUpdate: kind };
-    case "agent_message":
-      return { ...message, sessionUpdate: kind };
-    default:
-      return { ...message, sessionUpdate: kind };
   }
 }
 

@@ -67,7 +67,6 @@ import {
   getSessionMessages,
   HookCallback,
   listSessions,
-  McpServerConfig,
   McpServerStatus,
   ModelInfo,
   ModelUsage,
@@ -184,7 +183,8 @@ import {
   notLoggedInAuthStatus,
   sameAuthStatus,
 } from "./auth-status.js";
-import { agentCommand } from "./agent-command.js";
+import { terminalAuthMethods as authMethodsForTerminal } from "./auth-methods.js";
+import { sdkMcpServers } from "./mcp-servers.js";
 import { claudeCliPath } from "./claude-cli.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
@@ -2968,87 +2968,11 @@ export class ClaudeAcpAgent {
     const supportsTerminalAuth = request.clientCapabilities?.auth?.terminal === true;
     const supportsMetaTerminalAuth = request.clientCapabilities?._meta?.["terminal-auth"] === true;
 
-    // Detect remote environments where the OAuth browser redirect to localhost
-    // won't work. This matches the SDK's internal isRemote check. In these cases,
-    // the `auth login` subcommand would fall back to a device-code-like manual
-    // flow, which doesn't work well over ACP, so we offer the TUI login instead.
-    const isRemote = !!(
-      process.env.NO_BROWSER ||
-      process.env.SSH_CONNECTION ||
-      process.env.SSH_CLIENT ||
-      process.env.SSH_TTY ||
-      process.env.CLAUDE_CODE_REMOTE
-    );
-    const terminalAuthMethods: AuthMethod[] = [];
+    const terminalAuthMethods = authMethodsForTerminal({
+      terminal: supportsTerminalAuth,
+      metaTerminal: supportsMetaTerminalAuth,
+    });
 
-    if (isRemote) {
-      const remoteLoginMethod: AuthMethod = {
-        description: "Run `claude /login` in the terminal",
-        name: "Log in with Claude",
-        id: "claude-login",
-        type: "terminal",
-        args: ["--cli"],
-      };
-
-      if (supportsMetaTerminalAuth) {
-        const agent = agentCommand();
-        remoteLoginMethod._meta = {
-          "terminal-auth": {
-            command: agent.command,
-            args: [...agent.args, "--cli"],
-            label: "Claude Login",
-          },
-        };
-      }
-
-      if (!shouldHideClaudeAuth() && (supportsTerminalAuth || supportsMetaTerminalAuth)) {
-        terminalAuthMethods.push(remoteLoginMethod);
-      }
-    } else {
-      const claudeLoginMethod: AuthMethod = {
-        description: "Use Claude subscription ",
-        name: "Claude Subscription",
-        id: "claude-ai-login",
-        type: "terminal",
-        args: ["--cli", "auth", "login", "--claudeai"],
-      };
-
-      const consoleLoginMethod: AuthMethod = {
-        description: "Use Anthropic Console (API usage billing)",
-        name: "Anthropic Console",
-        id: "console-login",
-        type: "terminal",
-        args: ["--cli", "auth", "login", "--console"],
-      };
-
-      if (supportsMetaTerminalAuth) {
-        const agent = agentCommand();
-        claudeLoginMethod._meta = {
-          "terminal-auth": {
-            command: agent.command,
-            args: [...agent.args, "--cli", "auth", "login", "--claudeai"],
-            label: "Claude Login",
-          },
-        };
-        consoleLoginMethod._meta = {
-          "terminal-auth": {
-            command: agent.command,
-            args: [...agent.args, "--cli", "auth", "login", "--console"],
-            label: "Anthropic Console Login",
-          },
-        };
-      }
-
-      if (!shouldHideClaudeAuth() && (supportsTerminalAuth || supportsMetaTerminalAuth)) {
-        terminalAuthMethods.push(claudeLoginMethod);
-      }
-      if (supportsTerminalAuth || supportsMetaTerminalAuth) {
-        terminalAuthMethods.push(consoleLoginMethod);
-      }
-    }
-
-    // The subagents RFD has only the client capability. AIR's draft also had
-    // this agent capability, which AIR gets (`docs/air-extensions.md`).
     const sessionCapabilities: SubagentAwareSessionCapabilities = {
       additionalDirectories: {},
       close: {},
@@ -12037,31 +11961,7 @@ export class ClaudeAcpAgent {
     await settingsManager.initialize();
     timing.phase("settings");
 
-    const mcpServers: Record<string, McpServerConfig> = {};
-    if (Array.isArray(params.mcpServers)) {
-      for (const server of params.mcpServers) {
-        if ("type" in server && (server.type === "http" || server.type === "sse")) {
-          // HTTP or SSE type MCP server
-          mcpServers[server.name] = {
-            type: server.type,
-            url: server.url,
-            headers: server.headers
-              ? Object.fromEntries(server.headers.map((e) => [e.name, e.value]))
-              : undefined,
-          };
-        } else if (!("type" in server)) {
-          // Stdio type MCP server (with or without explicit type field)
-          mcpServers[server.name] = {
-            type: "stdio",
-            command: server.command,
-            args: server.args,
-            env: server.env
-              ? Object.fromEntries(server.env.map((e) => [e.name, e.value]))
-              : undefined,
-          };
-        }
-      }
-    }
+    const mcpServers = sdkMcpServers(params.mcpServers);
 
     const customInstructions = airCustomInstructions(params._meta);
     let systemPrompt: Options["systemPrompt"] =

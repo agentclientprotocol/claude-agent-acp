@@ -145,7 +145,7 @@ export const V2_SESSION_CAPABILITIES: v2.SessionCapabilities = {
 };
 
 /** v2 names the id of a method `methodId`, requires `type`, and lists `env` as name and value pairs. */
-function v2AuthMethod(method: AuthMethod): v2.AuthMethod {
+export function v2AuthMethod(method: AuthMethod): v2.AuthMethod {
   if ("type" in method && method.type === "terminal") {
     const { id, env, ...terminal } = method;
     return {
