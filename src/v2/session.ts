@@ -1203,6 +1203,8 @@ export class V2Session implements RequestTarget {
       if (this.cancelledWork) this.output.closeUnfinished(true);
       else this.output.finishUnfinished("failed");
       this.fileChanges?.turnClosed(this.cancelledWork);
+      // As `closeTurn`: a compaction still `in_progress` ends before the idle.
+      this.reports.turnEnded();
       this.foreground = false;
       this.reportedState = "idle";
       this.send({

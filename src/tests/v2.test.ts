@@ -1071,6 +1071,41 @@ describe("ACP v2 core", () => {
     ]);
   });
 
+  it("ends an open compaction before the idle when Claude Code exits during it", async () => {
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      const { response, claude } = await openSession(agent);
+      const answer = agent.request(v2.methods.agent.session.prompt, {
+        sessionId: response.sessionId,
+        prompt: [{ type: "text", text: "/compact" }],
+      });
+      await claude.prompt(0);
+      claude.send(cycleStart());
+      claude.send({
+        type: "system",
+        subtype: "status",
+        status: "compacting",
+        session_id: response.sessionId,
+        uuid: "compact-1",
+      });
+      claude.end(new Error("Claude Code process exited with code 1"));
+      await answer.catch(() => {});
+      await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+    });
+
+    expect(
+      client.sessionUpdates.filter(
+        (update) =>
+          update.sessionUpdate === "compaction_update" || update.sessionUpdate === "state_update",
+      ),
+    ).toMatchObject([
+      { sessionUpdate: "state_update", state: "running" },
+      { sessionUpdate: "compaction_update", compactionId: "compact-1", status: "in_progress" },
+      { sessionUpdate: "compaction_update", compactionId: "compact-1", status: "cancelled" },
+      { sessionUpdate: "state_update", state: "idle", stopReason: "error" },
+    ]);
+  });
+
   it("starts a session whose query ended again on resume", async () => {
     const client = v2Client();
     await client.connect(async (agent) => {
