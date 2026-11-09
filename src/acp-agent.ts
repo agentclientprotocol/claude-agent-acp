@@ -430,6 +430,7 @@ import {
   providerCacheKeyFor,
   readContextWindow,
 } from "./context-window.js";
+import { isLoginRequiredText, resultEnd } from "./result-end.js";
 import { STARTUP_FAILURE_RESULTS_ENV, startupFailureError } from "./startup-failure.js";
 import { recordStreamedDelta, unstreamedRemainder, type StreamedBlock } from "./streamed-text.js";
 import { subagentHookOptions } from "./subagent-configuration.js";
@@ -2094,16 +2095,12 @@ function isTaskNotificationRecord(message: unknown): boolean {
   return origin?.kind === "task-notification" && origin.subkind === undefined;
 }
 
-/**
- * True when CLI error text tells the user to sign in with `/login`. The CLI
- * words this several ways — "Not logged in · Please run /login", "Not logged
- * in · Run /login", "Login expired · Run /login to sign in again, or
- * re-authenticate your Anthropic profile" — so match the "run /login"
- * instruction rather than one sentence.
- */
-export function isLoginRequiredText(text: string): boolean {
-  return /\brun \/login\b/i.test(text);
-}
+/** The session failure of an error result at one of Claude Code's limits. */
+const LIMIT_FAILURE_CATEGORY = {
+  error_max_budget_usd: "budget_exhausted",
+  error_max_turns: "context_exhausted",
+  error_max_structured_output_retries: "provider_error",
+} as const satisfies Record<string, ClaudeFailureKind>;
 
 /**
  * True for the synthetic assistant message the CLI injects into the transcript
@@ -6737,26 +6734,29 @@ export class ClaudeAcpAgent {
                 );
               }
 
+              // The stop reason or the error, by the rules both cores share.
+              const ended = resultEnd(message);
               switch (message.subtype) {
                 case "success": {
-                  if (message.is_error && isLoginRequiredText(message.result)) {
-                    await failActiveWithSessionFailure(
-                      "auth_required",
-                      RequestError.authRequired(),
-                      message.result,
-                    );
-                    break;
-                  }
-                  if (message.stop_reason === "max_tokens") {
-                    stopReason = "max_tokens";
-                    break;
-                  }
-                  if (message.is_error) {
+                  if ("error" in ended) {
+                    if (ended.loginRequired) {
+                      await failActiveWithSessionFailure(
+                        "auth_required",
+                        RequestError.authRequired(),
+                        ended.error,
+                      );
+                      break;
+                    }
                     await failActiveWithSessionFailure(
                       providerFailureCategory(lastAssistantError, lastAssistantWasUsageLimit),
-                      internalErrorForClient(errorKindData(lastAssistantError), message.result),
-                      lastAssistantFailureTitle ?? message.result,
+                      internalErrorForClient(errorKindData(lastAssistantError), ended.error),
+                      lastAssistantFailureTitle ?? ended.error,
                     );
+                    break;
+                  }
+                  // `end_turn` keeps the stop reason as it was.
+                  if (ended.stopReason !== "end_turn") {
+                    stopReason = ended.stopReason;
                     break;
                   }
                   // The result text is forwarded in two cases. Local-only
@@ -6805,66 +6805,29 @@ export class ClaudeAcpAgent {
                   }
                   break;
                 }
-                case "error_during_execution": {
-                  if (message.stop_reason === "max_tokens") {
-                    stopReason = "max_tokens";
-                    break;
-                  }
-                  if (message.is_error) {
+                case "error_during_execution":
+                  if ("error" in ended) {
                     await failActiveWithSessionFailure(
                       providerFailureCategory(lastAssistantError, lastAssistantWasUsageLimit),
-                      internalErrorForClient(
-                        errorKindData(lastAssistantError),
-                        message.errors.join(", ") || message.subtype,
-                      ),
-                      lastAssistantFailureTitle ?? (message.errors.join(", ") || message.subtype),
+                      internalErrorForClient(errorKindData(lastAssistantError), ended.error),
+                      lastAssistantFailureTitle ?? ended.error,
                     );
                     break;
                   }
-                  stopReason = "end_turn";
+                  stopReason = ended.stopReason;
                   break;
-                }
                 case "error_max_budget_usd":
-                  if (message.is_error) {
-                    await failActiveWithSessionFailure(
-                      "budget_exhausted",
-                      internalErrorForClient(
-                        errorKindData(lastAssistantError),
-                        message.errors.join(", ") || message.subtype,
-                      ),
-                      message.errors.join(", ") || message.subtype,
-                    );
-                    break;
-                  }
-                  stopReason = "max_turn_requests";
-                  break;
                 case "error_max_turns":
-                  if (message.is_error) {
-                    await failActiveWithSessionFailure(
-                      "context_exhausted",
-                      internalErrorForClient(
-                        errorKindData(lastAssistantError),
-                        message.errors.join(", ") || message.subtype,
-                      ),
-                      message.errors.join(", ") || message.subtype,
-                    );
-                    break;
-                  }
-                  stopReason = "max_turn_requests";
-                  break;
                 case "error_max_structured_output_retries":
-                  if (message.is_error) {
+                  if ("error" in ended) {
                     await failActiveWithSessionFailure(
-                      "provider_error",
-                      internalErrorForClient(
-                        errorKindData(lastAssistantError),
-                        message.errors.join(", ") || message.subtype,
-                      ),
-                      message.errors.join(", ") || message.subtype,
+                      LIMIT_FAILURE_CATEGORY[message.subtype],
+                      internalErrorForClient(errorKindData(lastAssistantError), ended.error),
+                      ended.error,
                     );
                     break;
                   }
-                  stopReason = "max_turn_requests";
+                  stopReason = ended.stopReason;
                   break;
                 default:
                   unreachable(message, this.logger);

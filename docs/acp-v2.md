@@ -376,7 +376,8 @@ These pieces were extracted from the v1 core so that both cores use the same cod
   text and thinking, and what a consolidated message adds to it, taken from `acp-agent.ts`
 - the token usage helpers (`session-usage.ts`): usage snapshots, the `_meta.quota` shape, the
   `modelUsage` increments and the context window guess, taken from `acp-agent.ts`
-- `resultEnd` (`result-end.ts`): the stop reason of a result, taken from `autonomousCycleEnd`
+- `resultEnd` (`result-end.ts`): the stop reason or error of a result, taken from the subtype
+  switch of v1's prompt loop, which reads its results with it too
 - `permissionToolCallMeta` (`permissions/presentation.ts`): the `_meta.claudeCode` of a
   permission request's tool call (`mcpServer`, the parent tool use), taken from `canUseTool`
 - `informationalNotice` and `mcpServerStartupNotice` (`session-notices.ts`), and

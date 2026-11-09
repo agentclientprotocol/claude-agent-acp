@@ -1733,6 +1733,11 @@ describe("ACP v2 core", () => {
       { subtype: "error_max_budget_usd", is_error: false },
       { stopReason: "max_turn_requests" },
     ],
+    [
+      "the turn limit at the token limit",
+      { subtype: "error_max_turns", is_error: false, stop_reason: "max_tokens" },
+      { stopReason: "max_turn_requests" },
+    ],
   ])("reads %s from the result as the v1 core does", async (_, fields, expected) => {
     const client = v2Client();
     await client.connect(async (agent) => {

@@ -1,8 +1,9 @@
 /**
  * How a turn of an ACP v2 session ends: the stop reason, usage, error
- * and `_meta.quota` of its `idle`. The stop reason is read from Claude Code's
- * result by the v1 core's rules (`resultEnd`), and the error as v1 answers a
- * failed prompt: an authentication failure is `authRequired`
+ * and `_meta.quota` of its `idle`. Whether Claude Code's result failed the
+ * turn, and its stop reason or error text, follow the rules that the v1 core
+ * reads its results with too (`resultEnd`). The error is the one v1 answers a
+ * failed prompt with: an authentication failure is `authRequired`
  * (-32000), and any other carries the assistant message's error kind
  * (`data.errorKind`).
  */
@@ -13,11 +14,7 @@ import type {
   SDKAssistantMessageError,
   SDKResultMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import {
-  AUTONOMOUS_RESULT_ORIGINS,
-  isLoginRequiredText,
-  isSyntheticLoginMessage,
-} from "../acp-agent.js";
+import { AUTONOMOUS_RESULT_ORIGINS, isSyntheticLoginMessage } from "../acp-agent.js";
 import { resultEnd } from "../result-end.js";
 import { providerFailureCategory } from "../session-failure-extension.js";
 import {
@@ -88,7 +85,7 @@ export function idleOutcome(
   // Only these subtypes read the assistant's error kind for the failure's
   // category.
   const authFailure =
-    (result.subtype === "success" && isLoginRequiredText(ended.error)) ||
+    ended.loginRequired ||
     ((result.subtype === "success" || result.subtype === "error_during_execution") &&
       providerFailureCategory(kind) === "auth_required");
   return failed(
