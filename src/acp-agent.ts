@@ -361,7 +361,7 @@ import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "./u
 
 export { DEFAULT_AGENT_ID } from "./session-config-ids.js";
 import { MCP_AVAILABLE_COMMAND, parseMcpCommand, runMcpCommand } from "./mcp-command.js";
-import { configuredSettings, parseModelConfig, resolveThinkingConfig } from "./session-env.js";
+import { configuredSettings, resolveThinkingConfig } from "./session-env.js";
 import {
   MODE_CONFIG_ID,
   resolveInitialPermissionMode,
@@ -10475,9 +10475,6 @@ export class ClaudeAcpAgent {
       this.logger,
     );
 
-    // Parse model configuration from environment (e.g. Bedrock model overrides)
-    const modelConfig = parseModelConfig(process.env.CLAUDE_MODEL_CONFIG);
-
     // Elicitation modes the connected client advertised. We only forward
     // elicitations (and only re-enable AskUserQuestion) for modes the client
     // can actually render.
@@ -10541,10 +10538,10 @@ export class ClaudeAcpAgent {
     // into the query.
     const resolvedProvider = this.resolveProviderConfig();
     const providerEnv = createEnvForProvider(resolvedProvider);
+    // With the model configuration of the environment (e.g. Bedrock model overrides).
     const configuredSettingsObject = await configuredSettings(
       userProvidedOptions?.settings,
       params.cwd,
-      modelConfig,
     );
     // Claude Code applies env from settings.json after the subprocess env. Put
     // an active ACP route in the programmatic settings tier too so user/project

@@ -357,7 +357,7 @@ These pieces were extracted from the v1 core so that both cores use the same cod
   client connection, and the other v2 wire conversions that the bridge used
 - `terminalAuthMethods` (`auth-methods.ts`), taken from `ClaudeAcpAgent.initialize`
 - `sdkMcpServers` (`mcp-servers.ts`), taken from `ClaudeAcpAgent.createSession`
-- `resolveThinkingConfig` and `parseModelConfig` (`session-env.ts`), and `sessionSystemPrompt`
+- `resolveThinkingConfig` and `configuredSettings` (`session-env.ts`), and `sessionSystemPrompt`
   (`client-system-prompt.ts`), taken from `ClaudeAcpAgent.createSession`
 - `getAvailableSlashCommands`, exported from `acp-agent.ts`
 - `/remote-control` (`remote-control.ts`): its parsing, the check that Claude Code does not offer

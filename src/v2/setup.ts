@@ -11,7 +11,6 @@ import {
   type ModelInfo,
   type Options,
   type Query,
-  type Settings,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger, NewSessionMeta } from "../acp-agent.js";
 import {
@@ -20,10 +19,6 @@ import {
   clientSupportsAirCapability,
   withAirMeta,
 } from "../air-extension.js";
-import {
-  configuredSettings as sharedConfiguredSettings,
-  parseModelConfig,
-} from "../session-env.js";
 import {
   applyAvailableModelsAllowlist,
   getAvailableModels,
@@ -35,22 +30,6 @@ import type { SettingsManager } from "../settings.js";
 /** The SDK options a client passes in `_meta.claudeCode.options`. */
 export function clientOptions(meta: unknown): Options | undefined {
   return (meta as NewSessionMeta | undefined)?.claudeCode?.options;
-}
-
-/**
- * The programmatic settings of a session, before the provider routing: the
- * models of `CLAUDE_MODEL_CONFIG`, then the client's `settings` option, an
- * object or a file path relative to `cwd`.
- */
-export function configuredSettings(
-  client: Options | undefined,
-  cwd: string,
-): Promise<Settings | undefined> {
-  return sharedConfiguredSettings(
-    client?.settings,
-    cwd,
-    parseModelConfig(process.env.CLAUDE_MODEL_CONFIG),
-  );
 }
 
 /** The core's hooks, after the client's own hooks of the same event. */

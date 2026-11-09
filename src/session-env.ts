@@ -47,7 +47,8 @@ export function resolveThinkingConfig(
     : { type: "enabled", budgetTokens: parsed, ...(display && { display }) };
 }
 
-export function parseModelConfig(
+/** The `CLAUDE_MODEL_CONFIG` JSON: Bedrock model overrides and an allowlist, say. */
+function parseModelConfig(
   raw: string | undefined,
 ): { modelOverrides?: Record<string, string>; availableModels?: string[] } | undefined {
   if (!raw) return undefined;
@@ -63,14 +64,15 @@ export function parseModelConfig(
 
 /**
  * The programmatic settings of a session, before the provider routing: the
- * models of `modelConfig` (`CLAUDE_MODEL_CONFIG`), then the client's
- * `settings` option, an object or a file path relative to `cwd`.
+ * models of `CLAUDE_MODEL_CONFIG`, then the client's `settings` option, an
+ * object or a file path relative to `cwd`. Throws for a `CLAUDE_MODEL_CONFIG`
+ * that is no JSON object, before it reads the file.
  */
 export async function configuredSettings(
   provided: Options["settings"],
   cwd: string,
-  modelConfig: ReturnType<typeof parseModelConfig>,
 ): Promise<Settings | undefined> {
+  const modelConfig = parseModelConfig(process.env.CLAUDE_MODEL_CONFIG);
   const object =
     typeof provided === "string"
       ? (JSON.parse(await fs.readFile(path.resolve(cwd, provided), "utf8")) as Settings)

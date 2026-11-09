@@ -41,7 +41,7 @@ import { sdkMcpServers } from "../mcp-servers.js";
 import { ALLOW_BYPASS, autoModeDisabled } from "../permissions/modes.js";
 import { readResumedTail, resumedModelFromTranscript } from "../resumed-session.js";
 import { mergeEffortSettings } from "../session-effort.js";
-import { resolveThinkingConfig } from "../session-env.js";
+import { configuredSettings, resolveThinkingConfig } from "../session-env.js";
 import { resolveInitialPermissionMode } from "../session-mode.js";
 import { sanitizeTitle } from "../session-titles.js";
 import { SettingsManager } from "../settings.js";
@@ -60,13 +60,7 @@ import { canUseTool, denyingStoppedWork } from "./permissions.js";
 import { reportHooks } from "./reports.js";
 import { SessionRestarts, type SetupParams } from "./restarts.js";
 import { V2Session, type SessionConnection } from "./session.js";
-import {
-  clientOptions,
-  configuredSettings,
-  replayEndUpdate,
-  sessionModels,
-  withClientHooks,
-} from "./setup.js";
+import { clientOptions, replayEndUpdate, sessionModels, withClientHooks } from "./setup.js";
 import type { SubagentReplay } from "./subagent-replay.js";
 import { SubscriptionGuard } from "./subscription-guard.js";
 import { restrictedChild } from "./tasks.js";
@@ -596,7 +590,7 @@ class V2Agent implements AgentHandle, SessionConnection {
             }
           : await readResumedTail(resume, this.logger);
     // Read before the settings watchers open: only a failed query start disposes them.
-    const configured = await configuredSettings(client, request.cwd);
+    const configured = await configuredSettings(client?.settings, request.cwd);
     const pathToClaudeCodeExecutable = await claudeCliPath();
     const settings = new SettingsManager(request.cwd, { logger: this.logger });
     await settings.initialize();
