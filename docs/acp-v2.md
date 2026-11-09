@@ -52,11 +52,12 @@ The reports that are not Claude's output come from `src/v2/reports.ts`, built as
 | `_meta.quota` of the turn's `idle`      | the `result`'s `usage` and its increment of `modelUsage`                        |
 | `notice`                                | `informational` (not level `info`), a client MCP server `failed` at `init`      |
 | `notice` and the `model` option         | `model_refusal_fallback` (the swap of a `retry` that is not `local`)            |
-| an empty Task\* plan, the title again   | `conversation_reset` (also the idle compaction starts over)                     |
+| `plan_removed`, the title again         | `conversation_reset` (also the idle compaction starts over)                     |
 | `compaction_update`, summary chunks     | `status` `compacting` and `compact_result`, `compact_boundary`, `PostCompact`   |
 | `compaction_update` on replay           | a transcript message with `isCompactSummary`                                    |
 | `session_info_update` (title)           | `SessionTitles`: the title Claude Code stores or generates, read at `idle`      |
 | `plan_update` of the Task\* list        | TaskCreate/TaskUpdate/TaskList results, the TaskCreated and TaskCompleted hooks |
+| `plan_removed` of `plan`                | an empty TodoWrite or Task\* list                                               |
 | `tool_call_update` progress             | `tool_progress`                                                                 |
 | `running`, then `idle`, no user_message | the adapter's idle `/compact` (`IdleCompaction`)                                |
 
@@ -137,6 +138,8 @@ Code's task events (with `forwardSubagentText` and `perTaskStopAffordance`):
 | `session/cancel` of a child                                      | `stopTask(agentId)`                                                                                                                  |
 | `background` of a session                                        | its background subagents, commands (terminals), task tool calls and other tasks                                                      |
 | `terminal/cancel`, `tool_call/cancel`                            | `stopTask` of the listed item's task                                                                                                 |
+| the adapter's tool call `task_<taskId>`, listed in `background`  | a live task that no tool call or terminal stands for, such as one a hook started or one that started after its tool call returned    |
+| title and body of a workflow's tool call                         | `task_progress` of a `local_workflow` task, with its `workflow_progress` phases and agents (`workflow-progress.ts`)                  |
 | a replayed child (`session/resume` with `replayFrom`)            | the subagent transcripts and metadata (`getSubagentMessages`, `subagent-replay.ts`)                                                  |
 
 A child's messages before its announcement wait for it, and a
@@ -282,13 +285,16 @@ exit codes), which the shared renderer gives only with `air.client`, and the `ki
   keeps the query's tasks and MCP servers.
 - `src/v2/setup.ts`: what session setup adds on v1's rules: the client's
   `_meta.claudeCode.options`, `CLAUDE_MODEL_CONFIG`, the models (the `availableModels`
-  allowlist, `ANTHROPIC_MODEL` and the settings' `model`, the resumed transcript's model), the
+  allowlist, `ANTHROPIC_MODEL` and the settings' `model`, the resumed transcript's model, whose
+  row keeps its family alias as on v1 (`aliasResumedModelRow`, such as `fable`)), the
   current title on resume, and AIR's `loadReplayEnd` event.
 - `src/v2/commands.ts`: the command list, and the adapter's `/mcp`, whose server list
   replaces Claude Code's text before the turn's idle. The list has the adapter's `/remote-control`
   when the query serves Remote Control.
 - `src/v2/file-preview.ts`: the PreToolUse hook that shows an Edit's or Write's exact
-  patch before it runs.
+  patch before it runs. A patch whose tool call the client does not hold yet waits for the
+  call's first publication by the stream or a permission request: a workflow's agents run the
+  hook without streaming their tool uses, and a call shown by the hook alone would never end.
 - `src/v2/air.ts`: the AIR extensions that the client takes, and the AIR capabilities of
   the `initialize` response (see "AIR clients").
 - `src/v2/file-changes.ts`: AIR's file-change reports of a session's turns.
