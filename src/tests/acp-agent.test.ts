@@ -421,6 +421,74 @@ describe("task plan lifecycle", () => {
       ).toEqual(expected);
     },
   );
+
+  it("keeps a subagent's checklist apart from the main one, and removes both on a conversation reset", async () => {
+    const todoWrite = (id: string, content: string, parentToolUseId: string | null) => ({
+      type: "assistant",
+      message: {
+        id: `msg_${id}`,
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [
+          {
+            type: "tool_use",
+            id,
+            name: "TodoWrite",
+            input: { todos: [{ content, status: "in_progress", activeForm: content }] },
+          },
+        ],
+        stop_reason: "tool_use",
+        stop_sequence: null,
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+      parent_tool_use_id: parentToolUseId,
+      uuid: randomUUID(),
+      session_id: "test-session",
+    });
+    const { agent, updates } = setup(new Map(), async function* (input) {
+      const iter = input[Symbol.asyncIterator]();
+      const first = await iter.next();
+      yield userEcho(first.value);
+      yield todoWrite("toolu_main_todo", "Main step", null);
+      yield todoWrite("toolu_agent_todo", "Agent step", "toolu_agent");
+      yield successfulResult();
+
+      const second = await iter.next();
+      yield userEcho(second.value);
+      yield {
+        type: "conversation_reset",
+        new_conversation_id: randomUUID(),
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      yield successfulResult();
+    });
+    await initializeClient(agent, { plan: {} });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "Plan" }] });
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/clear" }] });
+
+    const entries = (content: string) => [{ content, status: "in_progress", priority: "medium" }];
+    expect(
+      updates
+        .map((notification) => notification.update)
+        .filter((update) => planUpdateKinds.has(update.sessionUpdate)),
+    ).toEqual([
+      {
+        sessionUpdate: "plan_update",
+        plan: { type: "items", planId: "plan", entries: entries("Main step") },
+      },
+      {
+        sessionUpdate: "plan_update",
+        plan: { type: "items", planId: "plan:toolu_agent", entries: entries("Agent step") },
+        _meta: { claudeCode: { parentToolUseId: "toolu_agent" } },
+      },
+      { sessionUpdate: "plan_removed", planId: "plan" },
+      { sessionUpdate: "plan_removed", planId: "plan:toolu_agent" },
+      { sessionUpdate: "plan_removed", planId: "plan-mode" },
+    ]);
+  });
 });
 
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration", () => {
@@ -5225,6 +5293,7 @@ describe("permission request cancellation", () => {
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
+      subagentChecklists: new Set(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
@@ -15023,6 +15092,7 @@ describe("session/close", () => {
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
+      subagentChecklists: new Set(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
@@ -15146,6 +15216,7 @@ describe("session/delete", () => {
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
+      subagentChecklists: new Set(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
@@ -15310,6 +15381,7 @@ describe("getOrCreateSession param change detection", () => {
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
+      subagentChecklists: new Set(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
@@ -19847,6 +19919,7 @@ describe("post-error recovery", () => {
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
+      subagentChecklists: new Set(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
@@ -28359,6 +28432,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
+      subagentChecklists: new Set(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
@@ -30268,6 +30342,7 @@ describe("agent selection config option", () => {
         contextWindowAuthoritative: false,
         providerCacheKey: "default",
         taskState: new Map(),
+        subagentChecklists: new Set(),
         toolUseCache: {},
         emittedToolCalls: new Set(),
         liveBackgroundTasks: new Map(),

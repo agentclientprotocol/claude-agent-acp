@@ -4402,6 +4402,96 @@ describe("ACP v2 requests that subagents make", () => {
     });
   });
 
+  it("shows a subagent's checklist in the subagent's session, apart from the root's", async () => {
+    const todoWrite = (
+      options: Options,
+      id: string,
+      content: string,
+      parentToolUseId: string | null,
+    ) => ({
+      type: "assistant",
+      message: {
+        id: `msg_${id}`,
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [
+          {
+            type: "tool_use",
+            id,
+            name: "TodoWrite",
+            input: { todos: [{ content, status: "pending", activeForm: content }] },
+          },
+        ],
+        stop_reason: "tool_use",
+        stop_sequence: null,
+        usage: { input_tokens: 3, output_tokens: 2 },
+      },
+      parent_tool_use_id: parentToolUseId,
+      uuid: randomUUID(),
+      session_id: options.sessionId,
+    });
+    scriptTurns(async function* (options) {
+      yield todoWrite(options, "toolu_main_todo", "Main step", null);
+      yield {
+        type: "assistant",
+        message: {
+          id: "msg_agent",
+          type: "message",
+          role: "assistant",
+          model: "claude-sonnet-4-6",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_agent-1",
+              name: "Agent",
+              input: { description: "Explore the project", prompt: "Look around" },
+            },
+          ],
+          stop_reason: "tool_use",
+          stop_sequence: null,
+          usage: { input_tokens: 3, output_tokens: 2 },
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield taskStarted(options, "agent-1", { prompt: "Look around" });
+      yield todoWrite(options, "toolu_agent_todo", "Agent step", "toolu_agent-1");
+      yield result(options);
+      yield idleState(options);
+    });
+    const client = await promptToIdle(v2Client());
+
+    const root = client.sessionUpdates.find(
+      ({ update }) => update.sessionUpdate === "user_message",
+    )!.sessionId;
+    expect(
+      client.sessionUpdates.flatMap(({ sessionId, update }) =>
+        update.sessionUpdate === "plan_update"
+          ? [{ on: sessionId === root ? "root" : sessionId, plan: update.plan }]
+          : [],
+      ),
+    ).toEqual([
+      {
+        on: "root",
+        plan: {
+          type: "items",
+          planId: "plan",
+          entries: [{ content: "Main step", status: "pending", priority: "medium" }],
+        },
+      },
+      {
+        on: "agent-1",
+        plan: {
+          type: "items",
+          planId: "plan",
+          entries: [{ content: "Agent step", status: "pending", priority: "medium" }],
+        },
+      },
+    ]);
+  });
+
   describe("background work", () => {
     /** Claude Code's live background task set. */
     const level = (options: Options, tasks: Array<Record<string, unknown>>) => ({
