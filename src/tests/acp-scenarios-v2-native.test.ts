@@ -59,12 +59,7 @@ const PASSES = "passes";
  * The scenarios that stop on the native core, each with the reason, as the
  * native core reports it.
  */
-const NATIVE_STOPS: Record<string, string> = {
-  // AskUserQuestion needs a form elicitation, which the native core does not
-  // send: it disallows the tool, and the scenario's script, which calls it
-  // anyway, then ends the stream.
-  "ask-user-question": "Internal error: Claude Code stopped. Resume the session to continue.",
-};
+const NATIVE_STOPS: Record<string, string> = {};
 
 /**
  * The scenarios whose session updates equal the bridge's v2 golden file.

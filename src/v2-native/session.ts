@@ -17,8 +17,8 @@
  *   background subagents work, which v2 lists as background work instead
  *   (`background`), so it only ends a turn that ended without a result.
  * - `requires_action` is this session's own: a turn is open, and a
- *   permission request of this session is open, or of a subagent that the
- *   turn waits on.
+ *   permission request or elicitation of this session is open, or of a
+ *   subagent that the turn waits on.
  * - Subagents are child sessions, and background work is listed on every
  *   state (see {@link SessionTasks}).
  * - `session/cancel` is Claude Code's interrupt with `cancelQueued`, which
@@ -33,6 +33,9 @@ import { randomUUID } from "node:crypto";
 import {
   RequestError,
   type AvailableCommand,
+  type CompleteElicitationNotification,
+  type CreateElicitationRequest,
+  type CreateElicitationResponse,
   type PromptRequest,
 } from "@agentclientprotocol/sdk/unstable";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
@@ -44,11 +47,13 @@ import type {
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { isLoginRequiredText, promptToClaude, type Logger } from "../acp-agent.js";
+import type { ElicitationSupport } from "../elicitation.js";
 import { Pushable } from "../utils.js";
 import { v1PromptRequest } from "../v2/prompt.js";
 import { V2Background } from "../v2/background.js";
 import type { V2UpdateTranslator } from "../v2/update-translator.js";
 import type { SessionConfig } from "./config.js";
+import { SessionElicitations } from "./elicitation.js";
 import { SessionOutput } from "./stream.js";
 import { SessionTasks, type RequestTarget } from "./tasks.js";
 
@@ -62,6 +67,13 @@ export interface SessionConnection {
     request: v2.RequestPermissionRequest,
     signal: AbortSignal,
   ): Promise<v2.RequestPermissionResponse>;
+  /** The elicitation modes that the client advertised. */
+  readonly elicitation: ElicitationSupport;
+  createElicitation(
+    request: CreateElicitationRequest,
+    signal: AbortSignal,
+  ): Promise<CreateElicitationResponse>;
+  completeElicitation(params: CompleteElicitationNotification): Promise<void>;
   /** The session's query ended on its own: the session is no longer active. */
   ended(sessionId: string): void;
 }
@@ -92,7 +104,7 @@ export class NativeSession implements RequestTarget {
   /** The state the client was told last. */
   private reportedState: ForegroundState = "idle";
   private openRequests = 0;
-  /** The open permission requests, aborted by `session/cancel`. */
+  /** The open permission requests and elicitations, aborted by `session/cancel`. */
   private readonly requestAborts = new Set<AbortController>();
   /** Whether `session/cancel` stops the open turn: its idle reports `cancelled`. */
   private cancelledWork = false;
@@ -117,6 +129,7 @@ export class NativeSession implements RequestTarget {
   /** The `background` lists of the session and its children, stamped on each state. */
   private readonly background: V2Background;
   readonly tasks: SessionTasks;
+  readonly elicitations: SessionElicitations;
   config!: SessionConfig;
 
   constructor(
@@ -152,6 +165,15 @@ export class NativeSession implements RequestTarget {
       this.output,
     );
     this.tasks.hostRequest = (request, signal) => connection.requestPermission(request, signal);
+    this.elicitations = new SessionElicitations({
+      sessionId,
+      logger: connection.logger,
+      support: connection.elicitation,
+      createElicitation: (request, signal) => connection.createElicitation(request, signal),
+      completeElicitation: (params) => connection.completeElicitation(params),
+      target: (agentId) => this.target(agentId),
+      query: () => this.query,
+    });
     // The session reports its background work: every state carries a list.
     this.background.changed({ sessionId, items: [], state: undefined });
   }
@@ -286,8 +308,9 @@ export class NativeSession implements RequestTarget {
     this.closing ??= (async () => {
       await this.cancel();
       // v2 asks to withdraw every request of the session before the close
-      // response, also its background subagents'.
+      // response, also its background subagents' and the MCP OAuth runs'.
       this.tasks.withdrawAll();
+      this.elicitations.close();
       await this.settled(CLOSE_TIMEOUT_MS);
       // Claude Code did not end the work in time: it ends with the query.
       if (this.foreground) {
@@ -317,22 +340,34 @@ export class NativeSession implements RequestTarget {
     return this.tasks.target(agentId, this);
   }
 
-  async requestPermission(
+  requestPermission(
     request: v2.RequestPermissionRequest,
     toolSignal: AbortSignal,
   ): Promise<v2.RequestPermissionResponse> {
+    return this.openRequest(toolSignal, async (signal) => {
+      try {
+        // The subject is an upsert of the tool call: the client may see the
+        // request before the tool use streams.
+        return await this.connection.requestPermission(request, signal);
+      } catch (error) {
+        if (signal.aborted) return { outcome: { outcome: "cancelled" } };
+        throw error;
+      }
+    });
+  }
+
+  /** Runs `send` as an open request of this session (see {@link RequestTarget.openRequest}). */
+  async openRequest<T>(
+    toolSignal: AbortSignal,
+    send: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
     const abort = new AbortController();
     const signal = AbortSignal.any([toolSignal, abort.signal]);
     this.requestAborts.add(abort);
     this.openRequests++;
     this.reportState();
     try {
-      // The subject is an upsert of the tool call: the client may see the
-      // request before the tool use streams.
-      return await this.connection.requestPermission(request, signal);
-    } catch (error) {
-      if (signal.aborted) return { outcome: { outcome: "cancelled" } };
-      throw error;
+      return await send(signal);
     } finally {
       this.requestAborts.delete(abort);
       this.openRequests--;
@@ -402,8 +437,12 @@ export class NativeSession implements RequestTarget {
       case "system":
         switch (message.subtype) {
           case "init":
+            this.elicitations.init(message.capabilities);
             // Each turn starts with one, also a turn that no prompt started.
             this.openTurn(undefined);
+            return;
+          case "elicitation_complete":
+            this.elicitations.completed(message.elicitation_id);
             return;
           case "session_state_changed":
             // The turn's `result` ends it. An idle without one ends it too,
