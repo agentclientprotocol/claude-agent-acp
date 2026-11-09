@@ -568,6 +568,30 @@ describe("ACP v2 core", () => {
       });
     });
 
+    it("sends a prompt that waited for the restart to the new query, and forgets it", async () => {
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const started = Promise.withResolvers<void>();
+        sdk.startGate = started.promise;
+        const set = setProvider(agent);
+        await vi.waitFor(() => expect(sdk.processes).toHaveLength(2));
+        const answer = agent.request(v2.methods.agent.session.prompt, {
+          sessionId: response.sessionId,
+          prompt: PROMPT,
+        });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        started.resolve();
+        await set;
+        sdk.processes[1].send(lifecycle(await sdk.processes[1].prompt(0), "started"));
+        await answer;
+        expect(claude.prompts).toHaveLength(0);
+        const restarts = (agents[0] as unknown as { restarts: { held: Map<string, unknown> } })
+          .restarts;
+        expect(restarts.held.size).toBe(0);
+      });
+    });
+
     it("answers a prompt that waits for the restart with -32800 on session/cancel", async () => {
       const client = v2Client();
       await client.connect(async (agent) => {

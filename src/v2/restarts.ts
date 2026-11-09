@@ -309,6 +309,7 @@ export class SessionRestarts {
       if (!holds) this.held.set(sessionId, (holds = new Set()));
       const settle = (error?: unknown) => {
         if (!holds.delete(settle)) return;
+        if (holds.size === 0 && this.held.get(sessionId) === holds) this.held.delete(sessionId);
         if (error === undefined) resolve();
         else reject(error);
       };
