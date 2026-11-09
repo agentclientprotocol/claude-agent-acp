@@ -49,9 +49,11 @@ const V2_TOOL_CALL_CAPABILITIES = ClientCapabilities.from(undefined, { v2: true 
 /**
  * The v1 capabilities the shared mapping reads. Every v2 client takes
  * `plan_update` with a markdown plan, so an approved ExitPlanMode's plan
- * goes out as one.
+ * goes out as one. Every v2 client also gets a session per subagent
+ * (`tasks.ts`), so a subagent's TodoWrite checklist is that session's `plan`
+ * rather than `plan:<parentToolUseId>` in its parent's session.
  */
-const V2_CLIENT_CAPABILITIES: AcpClientCapabilities = { plan: {} };
+const V2_CLIENT_CAPABILITIES = { plan: {}, subagents: {} } as AcpClientCapabilities;
 
 type AssistantContent = SDKAssistantMessage["message"]["content"];
 type UserContent = SDKUserMessage["message"]["content"];

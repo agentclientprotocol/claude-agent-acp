@@ -58,6 +58,7 @@ The reports that are not Claude's output come from `src/v2/reports.ts`, built as
 | `session_info_update` (title)           | `SessionTitles`: the title Claude Code stores or generates, read at `idle`      |
 | `plan_update` of the Task\* list        | TaskCreate/TaskUpdate/TaskList results, the TaskCreated and TaskCompleted hooks |
 | `plan_removed` of `plan`                | an empty TodoWrite or Task\* list                                               |
+| `plan_update` of `plan` in a child      | a TodoWrite whose `parent_tool_use_id` is the child's launch call               |
 | `tool_call_update` progress             | `tool_progress`                                                                 |
 | `running`, then `idle`, no user_message | the adapter's idle `/compact` (`IdleCompaction`)                                |
 
