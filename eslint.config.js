@@ -69,6 +69,14 @@ export default [
       "src/v2/ must not import the v1 agent. Move what both versions need into a shared module in src/.",
     ),
   },
+  // `src/v1/` must not import the v2 agent.
+  {
+    files: ["src/v1/**/*.ts"],
+    rules: protocolBoundary(
+      "^(\\.\\./)+v2/",
+      "src/v1/ must not import the v2 agent. Move what both versions need into a shared module in src/.",
+    ),
+  },
   // Shared modules must not import either agent. The entry points wire the agents up.
   {
     files: ["src/**/*.ts"],
