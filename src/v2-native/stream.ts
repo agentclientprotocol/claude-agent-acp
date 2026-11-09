@@ -7,6 +7,10 @@
  * {@link V2UpdateTranslator} turns into v2 updates. It knows nothing about
  * prompts or turns: the session decides what the output belongs to.
  */
+import type {
+  ClientCapabilities as AcpClientCapabilities,
+  ToolCallContent,
+} from "@agentclientprotocol/sdk/unstable";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type {
   SDKAssistantMessage,
@@ -26,12 +30,22 @@ import {
   type ToolUseCache,
 } from "../acp-agent.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
+import { ContextCompactionLifecycle, isCompactSummaryMessage } from "../context-compaction.js";
+import { assistantMessageText } from "../session-failure-extension.js";
 import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
+import { AcpToolCallRenderer } from "../tool-calls/renderer.js";
 import { replayClear, type V2UpdateTranslator } from "../v2/update-translator.js";
 
 /** Every v2 client gets the same tool call reports: v2 diffs and display terminals. */
 const V2_TOOL_CALL_CAPABILITIES = ClientCapabilities.from(undefined, { v2: true });
+
+/**
+ * The v1 capabilities the shared mapping reads. Every v2 client takes
+ * `plan_update` with a markdown plan, as on the bridge (`v1InitializeRequest`):
+ * an approved ExitPlanMode's plan goes out as one.
+ */
+const V2_CLIENT_CAPABILITIES: AcpClientCapabilities = { plan: {} };
 
 type AssistantContent = SDKAssistantMessage["message"]["content"];
 type UserContent = SDKUserMessage["message"]["content"];
@@ -50,6 +64,8 @@ export class SessionOutput {
   private agentText = false;
   /** During {@link replay}, the messages that it has cleared so far. */
   private replayCleared: Set<string> | undefined;
+  /** During {@link replay}, the replayed tool uses, apart from the live ones. */
+  private replayToolUses: ToolUseCache | undefined;
 
   constructor(
     readonly sessionId: string,
@@ -141,6 +157,31 @@ export class SessionOutput {
     );
   }
 
+  /**
+   * Shows `content`, the exact patch of an Edit or Write, on its tool call
+   * before the tool runs (see `file-preview.ts`). A hook can come before the
+   * streamed tool_use: the tool call then goes out with the patch, and the
+   * streamed tool_use refines it. Either way the streamed input's diff does
+   * not replace the patch.
+   */
+  preview(toolName: string, toolCallId: string, input: unknown, content: ToolCallContent[]): void {
+    if (!this.emittedToolCalls.has(toolCallId)) {
+      this.emittedToolCalls.add(toolCallId);
+      const update = new AcpToolCallRenderer(V2_TOOL_CALL_CAPABILITIES).toolCall(
+        { id: toolCallId, name: toolName, input },
+        { cwd: this.cwd, previewContent: content },
+      );
+      this.toolCallFields.apply(update);
+      this.toolCallFields.pinContent(toolCallId, content);
+      this.emit([{ sessionId: this.sessionId, update }]);
+      return;
+    }
+    const update = { sessionUpdate: "tool_call_update" as const, toolCallId, content };
+    if (!this.toolCallFields.apply(update)) return;
+    this.toolCallFields.pinContent(toolCallId, content);
+    this.emit([{ sessionId: this.sessionId, update }]);
+  }
+
   /** The tool uses of the session's tool calls, by id. */
   toolUses(): Readonly<ToolUseCache> {
     return this.toolUseCache;
@@ -174,6 +215,8 @@ export class SessionOutput {
             messageId: inner.id ?? message.uuid,
             replay: true,
           });
+        } else if (isCompactSummaryMessage(message) && message.uuid) {
+          this.replayCompaction(message.uuid, assistantMessageText(message.message));
         } else if (message.type === "user" && inner.content !== undefined) {
           // `null`: the message was command metadata alone.
           const content = stripLocalCommandMetadata(inner.content);
@@ -186,7 +229,24 @@ export class SessionOutput {
       }
     } finally {
       this.replayCleared = undefined;
+      this.replayToolUses = undefined;
     }
+  }
+
+  /**
+   * A compaction in the history, as the bridge replays it: Claude Code keeps
+   * the summary as a user message with continuation instructions, and the
+   * client gets it as one completed `compaction_update` at its position,
+   * keyed by that message's uuid.
+   */
+  private replayCompaction(uuid: string, summary: string | undefined): void {
+    const lifecycle = new ContextCompactionLifecycle(
+      async (notification) => this.emit([notification]),
+      { sessionId: this.sessionId, presentation: "compaction_update" },
+    );
+    lifecycle.recordSummary(summary);
+    // It sends its update before its first await.
+    void lifecycle.finish(uuid, "completed");
   }
 
   /** Agent text that is not a model message, such as a local command's result. */
@@ -215,19 +275,24 @@ export class SessionOutput {
     },
     transform: (notification: AcpSessionNotification) => AcpSessionNotification = (n) => n,
   ): void {
+    // A replay renders the history on its own, as the bridge's does: each
+    // replayed tool call goes out whole, whatever the live session sent.
+    const live = !options.replay;
     this.emit(
       toAcpNotifications(
         content,
         role,
         this.sessionId,
-        this.toolUseCache,
+        live ? this.toolUseCache : (this.replayToolUses ??= {}),
         this.hookClient,
         this.logger,
         {
+          clientCapabilities: V2_CLIENT_CAPABILITIES,
           toolCallCapabilities: V2_TOOL_CALL_CAPABILITIES,
           cwd: this.cwd,
-          emittedToolCalls: this.emittedToolCalls,
-          toolCallFields: this.toolCallFields,
+          ...(live
+            ? { emittedToolCalls: this.emittedToolCalls, toolCallFields: this.toolCallFields }
+            : {}),
           parentToolUseId,
           // A replayed tool use runs no hook that could report its result.
           registerHooks: !options.replay,

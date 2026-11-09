@@ -110,6 +110,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         supportedCommands: async () => [
           { name: "review", description: "Review a change", argumentHint: "<pull request>" },
         ],
+        mcpServerStatus: async () => [{ name: "linear", status: "connected" }],
         interrupt: fake.interrupt,
         setPermissionMode: fake.setPermissionMode,
         setModel: fake.setModel,
@@ -328,7 +329,7 @@ function updatesOf(
 }
 
 describe("native ACP v2 core", () => {
-  it("advertises the v2 session baseline without fork, and terminal logins", async () => {
+  it("advertises the v2 session baseline with fork, and terminal logins", async () => {
     const client = nativeClient();
     const response = await client.connect((agent) =>
       agent.request(v2.methods.agent.initialize, {
@@ -339,7 +340,7 @@ describe("native ACP v2 core", () => {
     );
 
     expect(response.protocolVersion).toBe(2);
-    expect(response.capabilities?.session?.fork).toBeUndefined();
+    expect(response.capabilities?.session?.fork).toEqual({});
     expect(response.capabilities?.session?.prompt).toEqual({ image: {}, embeddedContext: {} });
     expect((response.authMethods ?? []).map((method) => method.methodId)).toContain(
       "console-login",
@@ -383,6 +384,8 @@ describe("native ACP v2 core", () => {
         description: "Review a change",
         input: { type: "text", hint: "<pull request>" },
       },
+      // The adapter's own `/mcp`, as on the bridge.
+      expect.objectContaining({ type: "command", name: "mcp" }),
     ]);
     // Each prompt is echoed, and the session's state is reported.
     expect(claude.options.extraArgs).toMatchObject({ "replay-user-messages": "" });
@@ -588,6 +591,33 @@ describe("native ACP v2 core", () => {
         content: { type: "text", text: "Context: 12k tokens" },
       }),
     );
+  });
+
+  it("replaces Claude Code's text of /mcp with the server list, before the turn's idle", async () => {
+    const client = nativeClient();
+    await client.connect(async (agent) => {
+      const { response, claude } = await openSession(agent);
+      const answer = agent.request(v2.methods.agent.session.prompt, {
+        sessionId: response.sessionId,
+        prompt: [{ type: "text", text: "/mcp" }],
+      });
+      const prompt = await claude.prompt(0);
+      claude.send(lifecycle(prompt, "started"));
+      await answer;
+      claude.send(result({ result: "1 MCP server connected. Run /mcp in the terminal." }));
+      claude.send(sessionState("idle"));
+      await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+    });
+
+    const output = client.sessionUpdates.flatMap((update) =>
+      update.sessionUpdate === "agent_message_chunk"
+        ? [(update.content as { text: string }).text]
+        : update.sessionUpdate === "state_update"
+          ? [update.state]
+          : [],
+    );
+    expect(output).toEqual(["running", expect.stringContaining("linear"), "idle"]);
+    expect(output.join()).not.toContain("in the terminal");
   });
 
   it("fails the pending prompts and ends the work when Claude Code exits", async () => {
@@ -820,7 +850,8 @@ describe("native ACP v2 core", () => {
         messageId: "msg_a",
         content: { type: "text", text: "Done" },
       },
-      { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn", background: [] },
+      // A snapshot, not a completion: no stop reason.
+      { sessionUpdate: "state_update", state: "idle", background: [] },
     ]);
   });
 

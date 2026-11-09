@@ -24,13 +24,17 @@ import {
   query,
   type Options,
   type SDKUserMessage,
+  type SessionMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import packageJson from "../../package.json" with { type: "json" };
-import type { Logger } from "../acp-agent.js";
+import { messageIdForGrouping, type Logger } from "../acp-agent.js";
 import { claudeCliPath } from "../claude-cli.js";
-import { clientSystemPrompt, sdkSystemPrompt } from "../client-system-prompt.js";
+import { clientSystemPrompt, sessionSystemPrompt } from "../client-system-prompt.js";
+import { forkSession } from "../fork-session.js";
 import { sdkMcpServers } from "../mcp-servers.js";
 import { ALLOW_BYPASS, autoModeDisabled } from "../permissions/modes.js";
+import { readResumedTail, resumedModelFromTranscript } from "../resumed-session.js";
+import { resolveThinkingConfig } from "../session-env.js";
 import { buildAvailableModes, resolveInitialPermissionMode } from "../session-mode.js";
 import { sanitizeTitle } from "../session-titles.js";
 import { SettingsManager } from "../settings.js";
@@ -38,12 +42,21 @@ import { STARTUP_FAILURE_RESULTS_ENV, startupFailureError } from "../startup-fai
 import { createPostToolUseHook } from "../tools.js";
 import { Pushable } from "../utils.js";
 import { V2_SESSION_CAPABILITIES } from "../v2/initialize.js";
-import { v1NewSessionRequest, v2AvailableCommands } from "../v2/session.js";
+import { v1ForkSessionRequest, v1NewSessionRequest } from "../v2/session.js";
 import { V2UpdateTranslator } from "../v2/update-translator.js";
 import { NativeAuth } from "./auth.js";
 import { SessionConfig } from "./config.js";
+import { fileChangePreviewHook } from "./file-preview.js";
 import { canUseTool } from "./permissions.js";
 import { NativeSession, type SessionConnection } from "./session.js";
+import {
+  clientOptions,
+  configuredSettings,
+  replayEndUpdate,
+  sessionInfoUpdate,
+  sessionModels,
+  withClientHooks,
+} from "./setup.js";
 import { restrictedChild } from "./tasks.js";
 
 /** The sessions per `session/list` page. */
@@ -77,6 +90,7 @@ export function nativeV2AgentApp(
       )
       .onRequest(v2.methods.agent.session.new, ({ params }) => agent.newSession(params))
       .onRequest(v2.methods.agent.session.resume, ({ params }) => agent.resumeSession(params))
+      .onRequest(v2.methods.agent.session.fork, ({ params }) => agent.forkSession(params))
       .onRequest(v2.methods.agent.session.list, ({ params }) => agent.listSessions(params))
       .onRequest(v2.methods.agent.session.close, ({ params }) => agent.closeSession(params))
       .onRequest(v2.methods.agent.session.delete, ({ params }) => agent.deleteSession(params))
@@ -98,15 +112,12 @@ export function nativeV2AgentApp(
   );
 }
 
-/** The capabilities of the native core: the bridge's, without fork. */
-const NATIVE_SESSION_CAPABILITIES: v2.SessionCapabilities = Object.fromEntries(
-  Object.entries(V2_SESSION_CAPABILITIES).filter(([capability]) => capability !== "fork"),
-);
-
 class NativeV2Agent implements AgentHandle, SessionConnection {
   readonly sessions = new Map<string, NativeSession>();
   readonly translator = new V2UpdateTranslator();
   readonly auth: NativeAuth;
+  /** What the client declared in `initialize`. */
+  private clientCapabilities: v2.ClientCapabilities | null | undefined;
 
   constructor(
     private readonly ctx: v2.AgentContext,
@@ -143,13 +154,23 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
 
   // --- Requests --------------------------------------------------------------
 
+  /**
+   * The bridge's handshake, without the AIR extensions, which this core does
+   * not serve (see docs/v2-native-core.md).
+   */
   initialize(request: v2.InitializeRequest): v2.InitializeResponse {
+    this.clientCapabilities = request.capabilities;
     const { authMethods, _meta } = this.auth.initialize(request.capabilities);
     return {
       protocolVersion: v2.PROTOCOL_VERSION,
       info: { name: packageJson.name, title: "Claude Agent", version: packageJson.version },
-      // `providers/list`, `set`, and `disable`, served for every client.
-      capabilities: { session: NATIVE_SESSION_CAPABILITIES, providers: {}, _meta },
+      capabilities: {
+        session: V2_SESSION_CAPABILITIES,
+        // `providers/list`, `set`, and `disable`, served for every client.
+        providers: {},
+        // A prompt that comes while Claude works waits in Claude Code's queue.
+        _meta: { claudeCode: { promptQueueing: true }, ..._meta },
+      },
       authMethods,
     };
   }
@@ -168,6 +189,23 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
   }
 
   /**
+   * Copies the session's transcript into a new session, as the bridge does
+   * (`forkSession`), and starts it from the copy, so the client can prompt
+   * it at once.
+   */
+  async forkSession(params: v2.ForkSessionRequest): Promise<v2.ForkSessionResponse> {
+    if (this.ownerOfChild(params.sessionId)) throw restrictedChild(params.sessionId, "fork");
+    // Rejects a bad `cwd` or MCP server before the transcript is copied.
+    await validatedSetup(params);
+    const { sessionId } = await forkSession(v1ForkSessionRequest(params), {
+      logger: this.logger,
+      messageIdForGrouping,
+    });
+    const session = await this.startSession(sessionId, params, sessionId);
+    return { sessionId, ...(await this.setupFields(session)) };
+  }
+
+  /**
    * Resumes a stored session, or attaches to a live one. With `replayFrom:
    * { type: "start" }` the stored history replays first. Either way, the
    * state snapshot goes out after any replay and before the response.
@@ -182,6 +220,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     }
     if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "resume");
     let session = this.sessions.get(sessionId);
+    let history: Promise<SessionMessage[]> | undefined;
     if (session) {
       // Resuming the active session synchronizes it again. Its work goes on,
       // and the request's MCP servers replace the session's.
@@ -198,13 +237,26 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
           `Session ${sessionId} is active with other additional directories: close it, then resume it with these`,
         );
       }
-      await session.setMcpServers(sdkMcpServers(request.mcpServers));
+      await session.setMcpServers({
+        ...clientOptions(params._meta)?.mcpServers,
+        ...sdkMcpServers(request.mcpServers),
+      });
     } else {
-      session = await this.startSession(sessionId, params, sessionId);
+      // One read of the transcript serves the replay and the resumed model.
+      history = replayFrom != null ? getSessionMessages(sessionId, { dir: params.cwd }) : undefined;
+      // A failed start leaves it unawaited.
+      history?.catch(() => {});
+      session = await this.startSession(sessionId, params, sessionId, history);
     }
     if (replayFrom != null) {
-      session.output.replay(await getSessionMessages(sessionId, { dir: session.cwd }));
+      session.output.replay(await (history ?? getSessionMessages(sessionId, { dir: session.cwd })));
+      const end = replayEndUpdate(this.clientCapabilities);
+      if (end) this.send({ sessionId, update: end });
     }
+    // v2 asks for the current title after the replay and before the
+    // response, also without a replay: the client may hold a stale one.
+    const info = await sessionInfoUpdate(sessionId, session.cwd, this.logger);
+    if (info) this.send({ sessionId, update: info });
     for (const notification of session.resumeSnapshot()) this.send(notification);
     return this.setupFields(session);
   }
@@ -328,44 +380,82 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
 
   // --- Session setup -----------------------------------------------------------
 
-  /** The config options and commands of a setup response. */
+  /**
+   * The config options and commands of a setup response. When reading the
+   * commands fails, the response goes without them, and an
+   * `available_commands_update` with the commands, read again, follows it.
+   */
   private async setupFields(session: NativeSession): Promise<{
     configOptions: v2.SessionConfigOption[];
     availableCommands?: v2.AvailableCommand[];
   }> {
-    const commands = await session.commands().catch((error) => {
-      // The session works without its command list; the response goes without it.
+    const commands = await session.commands.list().catch((error: unknown) => {
       this.logger.error(`Session ${session.sessionId}: failed to read its commands`, error);
+      // After the response, which the SDK sends once this handler returns.
+      setTimeout(() => {
+        session.sendCommands().catch((error: unknown) => {
+          this.logger.error(`Session ${session.sessionId}: failed to send its commands`, error);
+        });
+      }, 0);
       return [];
     });
     return {
       configOptions: session.config.options(),
-      ...(commands.length > 0 ? { availableCommands: v2AvailableCommands(commands) } : {}),
+      // The draft leaves out an empty list.
+      ...(commands.length > 0 ? { availableCommands: commands } : {}),
     };
   }
 
-  /** Starts the query of a session: a new one, or `resume` of a stored one. */
+  /**
+   * Starts the query of a session: a new one, or `resume` of a stored one
+   * (also a fork's copy). Its options follow the bridge's: the client's
+   * `_meta.claudeCode.options` under the ones this core controls.
+   */
   private async startSession(
     sessionId: string,
-    params: v2.NewSessionRequest | v2.ResumeSessionRequest,
+    params: v2.NewSessionRequest | v2.ResumeSessionRequest | v2.ForkSessionRequest,
     resume: string | undefined,
+    /** The resumed transcript, when the caller reads it anyway (a replay). */
+    history?: Promise<SessionMessage[]>,
   ): Promise<NativeSession> {
     const request = await validatedSetup(params);
+    const client = clientOptions(params._meta);
+    // The resumed transcript's last model and mode, as on the bridge.
+    const resumed =
+      resume === undefined
+        ? undefined
+        : history
+          ? {
+              ...(await readResumedTail(resume, this.logger, false)),
+              model: await history.then(resumedModelFromTranscript, () => undefined),
+            }
+          : await readResumedTail(resume, this.logger);
     const settings = new SettingsManager(request.cwd, { logger: this.logger });
     await settings.initialize();
+    // A client can remove bypass from the session with `false`.
     const allowBypass =
       ALLOW_BYPASS &&
-      settings.getSettings().permissions?.disableBypassPermissionsMode !== "disable";
+      settings.getSettings().permissions?.disableBypassPermissionsMode !== "disable" &&
+      client?.allowDangerouslySkipPermissions !== false;
     const allowAuto = !autoModeDisabled(settings.getSettings());
     const { mode } = resolveInitialPermissionMode(
-      { defaultMode: settings.getSettings().permissions?.defaultMode },
+      {
+        resumed: resumed?.permissionMode,
+        defaultMode: settings.getSettings().permissions?.defaultMode,
+      },
       this.logger,
       { allowBypass, allowAuto },
     );
-    settings.dispose();
     // The settings keep the values they read: their cwd and key helper.
     const authStarted = this.auth.sessionStarting(settings);
     const routing = this.auth.routing();
+    const configured = await configuredSettings(client, request.cwd);
+    const thinking = resolveThinkingConfig(
+      process.env.MAX_THINKING_TOKENS,
+      process.env.CLAUDE_CODE_THINKING_DISPLAY,
+      this.logger,
+    );
+    const mcpServers = { ...client?.mcpServers, ...sdkMcpServers(request.mcpServers) };
 
     const clientPrompt = clientSystemPrompt(request.systemPrompt);
     const input = new Pushable<SDKUserMessage>();
@@ -377,31 +467,48 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       input,
     );
     const options: Options = {
-      systemPrompt: clientPrompt
-        ? sdkSystemPrompt(clientPrompt, undefined)
-        : { type: "preset", preset: "claude_code" },
+      systemPrompt: sessionSystemPrompt(clientPrompt, params._meta?.systemPrompt),
       settingSources: ["user", "project", "local"],
-      ...(routing.settings ? { settings: routing.settings } : {}),
+      ...(thinking !== undefined && { thinking }),
+      // Claude Code's interrupt then spares background tasks, which the
+      // client stops one at a time: `session/cancel` must leave listed work
+      // running. Before the client's options, as on the bridge.
+      perTaskStopAffordance: true,
+      ...client,
+      // Claude Code applies the env of settings.json after the process env:
+      // the route goes into the programmatic settings too.
+      ...(routing.settings
+        ? {
+            settings: {
+              ...configured,
+              ...routing.settings,
+              env: { ...configured?.env, ...routing.settings.env },
+            },
+          }
+        : configured && { settings: configured }),
       cwd: request.cwd,
-      additionalDirectories: request.additionalDirectories ?? [],
+      additionalDirectories: [
+        ...(client?.additionalDirectories ?? []),
+        ...(request.additionalDirectories ?? []),
+      ],
       includePartialMessages: true,
       // A subagent's text, for its own session's stream (see `tasks.ts`).
       forwardSubagentText: true,
-      // Claude Code's interrupt then spares background tasks, which the
-      // client stops one at a time: `session/cancel` must leave listed work
-      // running.
-      perTaskStopAffordance: true,
-      mcpServers: sdkMcpServers(request.mcpServers),
+      mcpServers,
       permissionMode: mode,
       allowDangerouslySkipPermissions: allowBypass,
       canUseTool: canUseTool(session),
       pathToClaudeCodeExecutable: await claudeCliPath(),
       // Echoes each prompt that Claude Code takes in (see `NativeSession`).
-      extraArgs: { "replay-user-messages": "" },
+      extraArgs: { ...client?.extraArgs, "replay-user-messages": "" },
       // AskUserQuestion needs a form elicitation, which this core does not send.
-      disallowedTools: ["AskUserQuestion"],
-      tools: { type: "preset", preset: "claude_code" },
-      hooks: {
+      disallowedTools: [...(client?.disallowedTools ?? []), "AskUserQuestion"],
+      tools:
+        client?.tools ??
+        (params._meta?.disableBuiltInTools === true
+          ? []
+          : { type: "preset", preset: "claude_code" }),
+      hooks: withClientHooks(client?.hooks, {
         SubagentStart: [
           {
             hooks: [
@@ -415,6 +522,8 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
             ],
           },
         ],
+        // An Edit or Write shows its exact patch before it runs, as on the bridge.
+        PreToolUse: [fileChangePreviewHook((agentId) => session.target(agentId), this.logger)],
         PostToolUse: [
           {
             hooks: [
@@ -422,9 +531,10 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
             ],
           },
         ],
-      },
+      }),
       env: {
         ...process.env,
+        ...client?.env,
         // The gateway login or the provider (see `auth.ts`).
         ...routing.env,
         // `session_state_changed`, which is the session's state.
@@ -449,13 +559,35 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       throw startupFailureError(error) ?? error;
     }
     authStarted(sessionId, initialization.account);
-    const models = routing.models(initialization.models);
-    const currentModel =
-      models.find((model) => model.value === "default")?.value ?? models[0]?.value ?? "default";
+    let models;
+    try {
+      models = await sessionModels(
+        q,
+        initialization.models,
+        settings,
+        routing.models,
+        routing.narrowsModels,
+        resumed,
+        sessionId,
+        this.logger,
+      );
+    } catch (error) {
+      // Claude Code refused a fresh session's model pin.
+      q.close();
+      throw error;
+    } finally {
+      settings.dispose();
+    }
     const availableModes = buildAvailableModes({ allowBypass, allowAuto });
     session.start(
       q,
-      new SessionConfig(q, { currentModeId: mode, availableModes }, models, currentModel),
+      new SessionConfig(
+        q,
+        { currentModeId: mode, availableModes },
+        models.models,
+        models.modelInfos,
+      ),
+      mcpServers,
     );
     this.sessions.set(sessionId, session);
     return session;
@@ -467,7 +599,9 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
  * system prompt as the bridge checks them, an absolute `cwd` that is a
  * directory, and absolute additional directories.
  */
-async function validatedSetup(params: v2.NewSessionRequest | v2.ResumeSessionRequest) {
+async function validatedSetup(
+  params: v2.NewSessionRequest | v2.ResumeSessionRequest | v2.ForkSessionRequest,
+) {
   const request = v1NewSessionRequest({ ...params, mcpServers: params.mcpServers ?? [] });
   const { cwd } = request;
   if (!path.isAbsolute(cwd)) {

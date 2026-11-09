@@ -50,11 +50,19 @@ vi.mock("node:child_process", async () => {
 /** What the mocked Claude Agent SDK saw and answers. Reset before each test. */
 const sdk = vi.hoisted(() => ({
   queryOptions: [] as Options[],
-  /** What Claude Code sends, given the prompts it receives (see `scriptTurns`). */
+  /**
+   * What Claude Code sends, given the prompts it receives (see `scriptTurns`).
+   * By default it sends nothing and, like the real CLI, runs until its input
+   * ends.
+   */
   run: async function* (
-    _prompts: AsyncIterable<SDKUserMessage>,
+    prompts: AsyncIterable<SDKUserMessage>,
     _options: Options,
-  ): AsyncGenerator<Record<string, unknown>> {},
+  ): AsyncGenerator<Record<string, unknown>> {
+    const input = prompts[Symbol.asyncIterator]();
+    while (!(await input.next()).done);
+    yield* [];
+  },
   /** Claude Code receives an interrupt, as `cancel()` sends one. */
   interrupt: async (): Promise<void> => {},
   /** Claude Code stops one task, as `cancel()` does for a child session. */
@@ -354,6 +362,12 @@ describe("ACP protocol routing", () => {
     });
 
     // The v2 app registers neither `_session/async_task/stop` nor `_session/goal`.
+    // The native core serves none of the AIR extensions (they are v1-core
+    // features, see docs/v2-native-core.md), so it advertises no AIR entry.
+    if (process.env.V2_CORE_UNDER_TEST === "native") {
+      expect(response._meta?.jetbrains).toBeUndefined();
+      return;
+    }
     const air = (response._meta as any)?.jetbrains?.air;
     expect(air.capabilities).toContain("sessionFailure");
     expect(air.capabilities).not.toContain("asyncTasks");
@@ -698,15 +712,20 @@ describe("ACP v2 sessions", () => {
     expect(client.updates("config_option_update")).toEqual([]);
   });
 
-  it("tells the agent that a v2 client takes notices and compaction updates", async () => {
-    const { app, authUpdate } = v2Client();
-    await app.connectWith(connectRouter(), async (agent) => {
-      await initializeV2(agent);
-      await authUpdate(1);
-    });
-    expect(clientSupportsNotices(agents[0].clientCapabilities)).toBe(true);
-    expect(clientSupportsCompactionUpdates(agents[0].clientCapabilities)).toBe(true);
-  });
+  // The v1 client capabilities that the bridge hands `ClaudeAcpAgent`. The
+  // native core has no such object: it sends v2 updates itself.
+  it.skipIf(process.env.V2_CORE_UNDER_TEST === "native")(
+    "tells the agent that a v2 client takes notices and compaction updates",
+    async () => {
+      const { app, authUpdate } = v2Client();
+      await app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        await authUpdate(1);
+      });
+      expect(clientSupportsNotices(agents[0].clientCapabilities)).toBe(true);
+      expect(clientSupportsCompactionUpdates(agents[0].clientCapabilities)).toBe(true);
+    },
+  );
 
   it("forwards the URL elicitation of MCP OAuth to a v2 client", async () => {
     let statusCall = 0;
@@ -1527,7 +1546,14 @@ describe("ACP v2 prompts", () => {
         _meta: { jetbrains: { air: { version: 1, loadReplayEnd: true } } },
       },
     });
-    expect(atResponse.at(-1)?.update).toEqual({ sessionUpdate: "state_update", state: "idle" });
+    // The bridge gives an AIR client AIR's subagent form, which reports no
+    // `background` list. The native core serves every client the v2 form,
+    // with the list.
+    expect(atResponse.at(-1)?.update).toEqual({
+      sessionUpdate: "state_update",
+      state: "idle",
+      ...(process.env.V2_CORE_UNDER_TEST === "native" ? { background: [] } : {}),
+    });
     expect(client.sessionUpdates.filter(isEnd)).toHaveLength(1);
   });
 

@@ -25,16 +25,18 @@ both, so a v2 core can follow Claude Code's own events instead of rebuilding a t
 
 ## How it maps
 
-| ACP v2                             | Claude Code                                                                       |
-| ---------------------------------- | --------------------------------------------------------------------------------- |
-| `session/prompt` answers           | `command_lifecycle` `started` for the prompt's uuid, or the prompt's echo         |
-| `session/prompt` fails             | `command_lifecycle` `cancelled` (-32800), `discarded` or `refused` (-32603)       |
-| `state_update` `running`           | a turn starts: a prompt's `started`, or the turn's `system/init`                  |
-| `state_update` `idle`              | the turn's `result`, with its stop reason, usage and error                        |
-| `state_update` `requires_action`   | a turn is open and a permission request of the session is open                    |
-| `session/cancel`                   | `interrupt({ cancelQueued: true })`, which also ends the queued prompts           |
-| `session/resume` with `replayFrom` | `getSessionMessages`, mapped like live output                                     |
-| output updates                     | the shared SDK mapping (`toAcpNotifications`), translated by `V2UpdateTranslator` |
+| ACP v2                             | Claude Code                                                                            |
+| ---------------------------------- | -------------------------------------------------------------------------------------- |
+| `session/prompt` answers           | `command_lifecycle` `started` for the prompt's uuid, or the prompt's echo              |
+| `session/prompt` fails             | `command_lifecycle` `cancelled` (-32800), `discarded` or `refused` (-32603)            |
+| `state_update` `running`           | a turn starts: a prompt's `started`, or the turn's `system/init`                       |
+| `state_update` `idle`              | the turn's `result`, with its stop reason, usage and error                             |
+| `state_update` `requires_action`   | a turn is open and a permission request of the session is open                         |
+| `session/cancel`                   | `interrupt({ cancelQueued: true })`, which also ends the queued prompts                |
+| `session/resume` with `replayFrom` | `getSessionMessages`, mapped like live output                                          |
+| `session/fork`                     | `forkSession` (`fork-session.ts`), then a resume of the copy                           |
+| `availableCommands`                | `supportedCommands`, filtered by `getAvailableSlashCommands`, and the adapter's `/mcp` |
+| output updates                     | the shared SDK mapping (`toAcpNotifications`), translated by `V2UpdateTranslator`      |
 
 The session keeps little of its own: a map of prompts that are not inserted yet, whether a turn
 is open, and its count of open permission requests (`src/v2-native/session.ts`).
@@ -95,6 +97,14 @@ close, resume, delete and config changes on it fail with -32602.
 - `src/v2-native/permissions.ts`: `canUseTool` as v2 permission requests, on the session of the
   agent that asks.
 - `src/v2-native/config.ts`: the mode and model config options.
+- `src/v2-native/setup.ts`: what session setup adds on the bridge's rules: the client's
+  `_meta.claudeCode.options`, `CLAUDE_MODEL_CONFIG`, the models (the `availableModels`
+  allowlist, `ANTHROPIC_MODEL` and the settings' `model`, the resumed transcript's model), the
+  current title on resume, and AIR's `loadReplayEnd` event.
+- `src/v2-native/commands.ts`: the command list, and the adapter's `/mcp`, whose server list
+  replaces Claude Code's text before the turn's idle.
+- `src/v2-native/file-preview.ts`: the PreToolUse hook that shows an Edit's or Write's exact
+  patch before it runs.
 - `src/v2-native/auth.ts`: `_auth/status_update`, gateway `auth/login`, `auth/logout`, and
   `providers/*`, on the v1 core's state rules (`AuthStatusReporter`, `providers.ts`). The
   identity is read after `initialize`, from each session's account, after a login or logout, and
@@ -118,6 +128,9 @@ These pieces were extracted so that both cores use the same code:
   client connection
 - `terminalAuthMethods` (`auth-methods.ts`), taken from `ClaudeAcpAgent.initialize`
 - `sdkMcpServers` (`mcp-servers.ts`), taken from `ClaudeAcpAgent.createSession`
+- `resolveThinkingConfig` and `parseModelConfig` (`session-env.ts`), and `sessionSystemPrompt`
+  (`client-system-prompt.ts`), taken from `ClaudeAcpAgent.createSession`
+- `getAvailableSlashCommands`, exported from `acp-agent.ts`
 - `AuthStatusReporter` and `cliLogout` (`auth-status-reporter.ts`): the `authStatus` state, the
   `claude auth status` probe and the `_auth/status_update` pushes, taken from `ClaudeAcpAgent`
 - the provider routing (`providers.ts`): `ProviderConfig`, the gateway login methods and their
@@ -149,11 +162,13 @@ These pieces were extracted so that both cores use the same code:
 - Output that comes after `session/cancel`, until the turn's `result`, is still sent: the work is
   still stopping. The bridge drops the output of stopped work.
 - A text block that an interrupt cut short does not get its tail from the consolidated message.
+- An AIR client gets no AIR extensions: `initialize` advertises no `_meta.jetbrains.air`, and its
+  state updates carry the v2 `background` list. The bridge gives it AIR's subagent form, which
+  reports no list. AIR's `loadReplayEnd` event, which the client declares, is sent.
+- `/remote-control` is not listed: this core does not serve it.
 
 ## Not served yet
 
-- Session methods:
-  - `session/fork` (not advertised)
 - A gateway login, `providers/set`, `providers/disable` or `auth/logout` routes only the sessions
   started after it. The bridge recreates the queries of live sessions between turns; on the
   native core they keep their route until they are closed and resumed.
@@ -173,21 +188,17 @@ These pieces were extracted so that both cores use the same code:
   - quota `_meta`
   - `session_info_update` (titles)
   - notices (API retries, rate limits, model fallback)
-  - compaction updates
+  - live compaction updates (a replay sends each compaction as one completed `compaction_update`)
   - prompt suggestions
   - task-hook plans (TaskCreate)
-- An Edit's patch before it runs (the bridge's PreToolUse preview). The permission request does
-  show it.
 - Session options:
-  - `_meta.claudeCode.options`
-  - effort, fast mode, ultracode and agent options
-  - the thinking and model env (`MAX_THINKING_TOKENS`, `CLAUDE_MODEL_CONFIG`)
-  - the `availableModels` allowlist
-  - model preference from settings (the model starts at `default`)
+  - effort, fast mode, ultracode and agent options (the bridge's `buildConfigOptions` and their
+    set paths)
+  - a resume of the active session with other MCP servers calls `setMcpServers`; the bridge
+    recreates the query
 - Resume:
-  - the mode and model of the transcript's last turn
-  - replaying compactions
   - `replayFrom` other than `start`
+  - the notice for subagent history that a replay cannot restore
 - ExitPlanMode's "clear context" option.
 - The v1-only features: AIR extensions, steering, Remote Control, idle compaction, the Claude
   subscription guard, MCP startup failure notices, and file change reports.

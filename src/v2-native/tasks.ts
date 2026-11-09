@@ -67,6 +67,8 @@ export interface TaskHost {
 export interface RequestTarget {
   readonly sessionId: string;
   readonly cwd: string;
+  /** The output of the session, which holds its tool calls. */
+  readonly output: SessionOutput;
   /** Whether a cancel stops the work that the request belongs to. */
   cancelling(): boolean;
   requestPermission(
@@ -303,6 +305,7 @@ export class SessionTasks {
     return {
       sessionId: child.sessionId,
       cwd: child.cwd ?? this.host.cwd,
+      output: child.output,
       cancelling: () => child.cancelled,
       requestPermission: (request, signal) => this.childRequest(child, request, signal),
     };
