@@ -131,6 +131,7 @@ import {
   sameModelEntry,
   sendMessageResume,
   sendMessageResumePrompt,
+  subagentRoleMeta,
   type SubagentModels,
 } from "./native-subagents.js";
 import {
@@ -9734,6 +9735,7 @@ export class ClaudeAcpAgent {
         parentToolUseId?: string;
         name: string;
         task: string;
+        role?: unknown;
         reconstructable: boolean;
         announced: boolean;
         terminalState?: "completed" | "failed" | "cancelled";
@@ -9804,6 +9806,7 @@ export class ClaudeAcpAgent {
             ...(ownerToolUseId ? { parentToolUseId: ownerToolUseId } : {}),
             name,
             task,
+            role: input.subagent_type,
             reconstructable: true,
             announced: false,
             terminalState: replayTerminalStates.get(block.id),
@@ -9852,6 +9855,7 @@ export class ClaudeAcpAgent {
             update: {
               sessionUpdate: "subagent_spawned",
               subagentSessionId: child.sessionId,
+              ...subagentRoleMeta(subagents.agents.get(parentToolUseId)?.agentType ?? child.role),
               name: child.name,
               task: child.task,
               capabilities: {},
