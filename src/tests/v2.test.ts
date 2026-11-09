@@ -2712,6 +2712,104 @@ describe("ACP v2 core", () => {
         "idle []",
       ]);
     });
+
+    it("keeps a background command's terminal running when a resume replays its result", async () => {
+      const toolUse = assistant("msg_bash", [
+        {
+          type: "tool_use",
+          id: "toolu_bg",
+          name: "Bash",
+          input: { command: "make test", run_in_background: true },
+        },
+      ]);
+      const toolResult = {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_bg",
+            content: "Command running in background with ID: bg1.",
+          },
+        ],
+      };
+      const client = v2Client();
+      let resumedAt = 0;
+      const sessionId = await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        claude.send(cycleStart());
+        claude.send(toolUse);
+        claude.send({
+          type: "system",
+          subtype: "task_started",
+          task_id: "bg1",
+          task_type: "local_bash",
+          description: "make test",
+          tool_use_id: "toolu_bg",
+          is_backgrounded: true,
+          uuid: randomUUID(),
+        });
+        claude.send({
+          type: "system",
+          subtype: "background_tasks_changed",
+          tasks: [{ task_id: "bg1", task_type: "local_bash", description: "make test" }],
+          uuid: randomUUID(),
+        });
+        claude.send({
+          type: "user",
+          message: toolResult,
+          tool_use_result: { stdout: "", stderr: "", interrupted: false, backgroundTaskId: "bg1" },
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+        });
+        claude.send(result());
+        await vi.waitFor(() => expect(client.states()).toEqual(["running", "running", "idle"]));
+        const entry = (type: string, uuid: string, message: unknown) => ({
+          type,
+          uuid,
+          session_id: response.sessionId,
+          parent_tool_use_id: null,
+          parent_agent_id: null,
+          message,
+        });
+        vi.mocked(getSessionMessages).mockResolvedValueOnce([
+          entry("assistant", "a1", toolUse.message),
+          entry("user", "u1", toolResult),
+        ] as never);
+        resumedAt = client.notifications.length;
+        await agent.request(v2.methods.agent.session.resume, {
+          sessionId: response.sessionId,
+          cwd,
+          replayFrom: { type: "start" },
+        });
+        claude.send({
+          type: "system",
+          subtype: "task_notification",
+          task_id: "bg1",
+          tool_use_id: "toolu_bg",
+          status: "completed",
+          output_file: "",
+          summary: "",
+          uuid: randomUUID(),
+        });
+        await vi.waitFor(() => expect(client.states()).toHaveLength(5));
+        return response.sessionId;
+      });
+
+      const trace = updatesOf(client.notifications.slice(resumedAt), sessionId).flatMap((update) =>
+        update.sessionUpdate === "terminal_update"
+          ? [update.exitStatus ? "exit" : update.capabilities ? "cancellable" : "terminal"]
+          : update.sessionUpdate === "state_update"
+            ? [`${update.state} ${JSON.stringify(update.background)}`]
+            : [],
+      );
+      // The snapshot's current state of the listed terminal, then its exit with its task.
+      expect(trace.filter((entry) => entry !== "terminal")).toEqual([
+        "cancellable",
+        'idle [{"terminalId":"toolu_bg","type":"terminal"}]',
+        "exit",
+        "idle []",
+      ]);
+    });
   });
 
   describe("elicitations", () => {

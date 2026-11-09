@@ -391,11 +391,14 @@ export class SessionOutput {
    * ran when Claude Code was killed, ends `failed` after the replay, as v2
    * asks of replayed work that no longer runs. The calls that the live
    * session holds open, and those in `live` (its background work), go on.
+   * `running` rewrites the replayed results of that background work as live,
+   * so that they do not end it (see `SessionTasks.replayedBackground`).
    */
   replay(
     messages: SessionMessage[],
     hooks?: ReplayHooks,
     live: ReadonlySet<string> = new Set(),
+    running?: (notification: AcpSessionNotification) => AcpSessionNotification,
   ): void {
     this.replayCleared = new Set();
     this.replayHooks = hooks;
@@ -426,10 +429,13 @@ export class SessionOutput {
           let content = stripLocalCommandMetadata(inner.content);
           if (content !== null && hooks?.userContent) content = hooks.userContent(message, content);
           if (content === null) continue;
-          this.content(content as UserContent, "user", null, {
-            messageId: message.uuid,
-            replay: true,
-          });
+          this.content(
+            content as UserContent,
+            "user",
+            null,
+            { messageId: message.uuid, replay: true },
+            running,
+          );
         }
         hooks?.replayed(message);
       }

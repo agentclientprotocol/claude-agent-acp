@@ -365,6 +365,7 @@ class V2Agent implements AgentHandle, SessionConnection {
         messages,
         subagents?.hooks(session.output, messages),
         session.tasks.backgroundWork(sessionId),
+        session.tasks.replayedBackground(sessionId),
       );
       subagents?.finish();
       const end = replayEndUpdate(this.clientCapabilities);

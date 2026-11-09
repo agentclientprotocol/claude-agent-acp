@@ -1627,6 +1627,26 @@ export class SessionTasks {
     return work;
   }
 
+  /**
+   * Rewrites a replayed update of `sessionId`'s background work as the live
+   * tool result was (see `toolResult`): a running command's result keeps its
+   * terminal running, and a running task's tool call stays `in_progress`.
+   */
+  replayedBackground(
+    sessionId: string,
+  ): (notification: AcpSessionNotification) => AcpSessionNotification {
+    const terminals = [...this.terminals.values()]
+      .filter((terminal) => terminal.output.sessionId === sessionId)
+      .map((terminal) => terminal.toolCallId);
+    const toolCalls = this.backgroundCalls(sessionId);
+    type Notification = Parameters<typeof withRunningTerminal>[0];
+    return (notification) =>
+      withRunningToolCall(
+        terminals.reduce(withRunningTerminal, notification as Notification),
+        toolCalls,
+      ) as AcpSessionNotification;
+  }
+
   private childState(child: Child): ChildState {
     if (!child.working) return "idle";
     return child.openRequests > 0 ? "requires_action" : "running";
