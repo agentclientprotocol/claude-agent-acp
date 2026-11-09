@@ -129,6 +129,8 @@ resume, delete and config changes on it fail with -32602. A session started with
 - `src/v2-native/agent.ts`: the request handlers, session setup, and the SDK `query` options.
 - `src/v2-native/session.ts`: one session: its prompts, its state, and the routing of the
   query's messages.
+- `src/v2-native/outcome.ts`: the stop reason, usage, error and `_meta.quota` of each idle.
+- `src/v2-native/stopped-work.ts`: the work that a cancel stopped before the client saw it.
 - `src/v2-native/stream.ts`: the SDK output, and replayed history, as v2 updates.
 - `src/v2-native/tasks.ts`: Claude Code's tasks: subagents as child sessions, and the
   `background` list of each session (see above).
@@ -160,7 +162,7 @@ resume, delete and config changes on it fail with -32602. A session started with
   compaction (see the table above), and the hooks that feed them (PostCompact, TaskCreated,
   TaskCompleted).
 
-About 2,600 lines in total. The native core shares these with v1 and the bridge:
+About 5,500 lines in total. The native core shares these with v1 and the bridge:
 
 - the SDK message mapping and tool call rendering (`toAcpNotifications`,
   `streamEventToAcpNotifications`, `tool-calls/*`)
