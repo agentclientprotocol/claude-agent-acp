@@ -1,5 +1,5 @@
 /**
- * ExitPlanMode's "Yes, clear context" option on the native v2 core: the
+ * ExitPlanMode's "Yes, clear context" option on the v2 core: the
  * approved plan runs in a fresh context, in the same turn.
  *
  * The answer denies ExitPlanMode with an interrupt (`permissions/effects.ts`),

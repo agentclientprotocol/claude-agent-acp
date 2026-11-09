@@ -1,6 +1,6 @@
 /**
  * OAuth for the MCP servers that Claude Code reports as `needs-auth`, as an
- * ACP URL elicitation. Protocol-neutral: the v1 core and the native v2 core
+ * ACP URL elicitation. Protocol-neutral: the v1 core and the v2 core
  * both start it once a session's setup response is sent.
  */
 import { randomUUID } from "node:crypto";

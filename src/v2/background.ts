@@ -1,6 +1,6 @@
 /**
  * The `background` lists of a v2 session and of its subagent sessions (see
- * `src/v2-native/tasks.ts`, which builds them).
+ * `tasks.ts`, which builds them).
  *
  * A session that reports its background work gets its list on every
  * `state_update` of its own stream, as v2 requires, from the list the core

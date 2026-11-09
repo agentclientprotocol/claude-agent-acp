@@ -1,5 +1,5 @@
 /**
- * The connection's `authStatus` state, shared by the v1 core and the native v2
+ * The connection's `authStatus` state, shared by the v1 core and the v2
  * core: the last identity it reported, the `claude auth status --json` probe,
  * and the `_auth/status_update` pushes (see `auth-status.ts` for when each
  * core reads the identity).

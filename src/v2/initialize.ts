@@ -8,7 +8,7 @@ import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import { SYSTEM_PROMPT_CAPABILITY } from "../client-system-prompt.js";
 
 /**
- * The session capabilities that the v2 core (`src/v2-native/`) serves.
+ * The session capabilities that the v2 core serves.
  *
  * - The session baseline: `session/new`, `list`, `resume` (with replay),
  *   `close`, `prompt`, `cancel`, and `update`.

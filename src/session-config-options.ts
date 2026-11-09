@@ -1,5 +1,5 @@
 /**
- * The config options of a session, as both the v1 core and the native v2 core
+ * The config options of a session, as both the v1 core and the v2 core
  * build them: mode, model, effort, Fast mode, ultracode and the main-thread
  * agent.
  */

@@ -55,9 +55,9 @@ import { AUTONOMOUS_RESULT_ORIGINS, promptToClaude, type Logger } from "../acp-a
 import type { McpCommand } from "../mcp-command.js";
 import type { ElicitationSupport } from "../elicitation.js";
 import { Pushable } from "../utils.js";
-import { v1PromptRequest } from "../v2/prompt.js";
-import { V2Background, stateUpdate as currentStateUpdate } from "../v2/background.js";
-import type { V2UpdateTranslator } from "../v2/update-translator.js";
+import { v1PromptRequest } from "./prompt.js";
+import { V2Background, stateUpdate as currentStateUpdate } from "./background.js";
+import type { V2UpdateTranslator } from "./update-translator.js";
 import { MODEL_CONFIG_ID } from "../session-model.js";
 import { modelRefusalFallback, noticeUpdate } from "../session-notices.js";
 import { planModeUpdate } from "../exit-plan.js";
@@ -102,14 +102,14 @@ export interface SessionConnection {
   ): Promise<CreateElicitationResponse>;
   completeElicitation(params: CompleteElicitationNotification): Promise<void>;
   /** The query of `session` ended on its own: the session cannot go on. */
-  ended(session: NativeSession): void;
+  ended(session: V2Session): void;
   /** A turn of the session failed for a missing login (`authRequired`). */
   signedOut(sessionId: string): void;
 }
 
 type PendingPrompt = {
   prompt: v2.ContentBlock[];
-  /** Whether the prompt went to Claude Code (see {@link NativeSession.prompt}). */
+  /** Whether the prompt went to Claude Code (see {@link V2Session.prompt}). */
   pushed: boolean;
   resolve: (response: v2.PromptResponse) => void;
   reject: (error: unknown) => void;
@@ -130,7 +130,7 @@ type McpServers = Parameters<Query["setMcpServers"]>[0];
 /** The `command_lifecycle` frame of a uuid-stamped prompt. It is not part of the SDK's types. */
 type CommandLifecycleFrame = { type: "command_lifecycle"; command_uuid: string; state: string };
 
-export class NativeSession implements RequestTarget {
+export class V2Session implements RequestTarget {
   /** The prompts not inserted yet, by uuid. */
   private readonly pending = new Map<string, PendingPrompt>();
   /** Whether a turn of Claude Code is open: the session's foreground work. */
@@ -983,7 +983,7 @@ export class NativeSession implements RequestTarget {
   /**
    * The messages that report on the session rather than carry Claude's
    * output (see {@link SessionReports}). Not reported yet: the rest (see
-   * docs/v2-native-core.md).
+   * docs/acp-v2.md).
    */
   private report(message: SDKMessage): void {
     if (message.type === "tool_progress") {

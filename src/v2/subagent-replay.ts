@@ -71,7 +71,7 @@ import {
   replaySubagentTerminalState,
 } from "../subagent-replay.js";
 import { taskNotificationsOf } from "../task-notifications.js";
-import type { V2UpdateTranslator } from "../v2/update-translator.js";
+import type { V2UpdateTranslator } from "./update-translator.js";
 import { SessionOutput, type ReplayHooks } from "./stream.js";
 import { sameDirectory } from "./tasks.js";
 

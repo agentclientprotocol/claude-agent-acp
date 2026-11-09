@@ -2,7 +2,7 @@
  * Turns the v1 session updates that the shared SDK-to-ACP mapping produces
  * (`toAcpNotifications`) into the v2 updates of one connection.
  *
- * The v2 core (`src/v2-native/`) uses it for every update that it maps from
+ * The v2 core uses it for every update that it maps from
  * the SDK stream. It holds the per-connection state that the translation
  * needs: the display terminals of commands and the `_meta` the client stores
  * for each tool call.

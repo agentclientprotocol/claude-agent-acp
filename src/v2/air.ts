@@ -1,9 +1,9 @@
 /**
- * The JetBrains AIR extensions (`docs/air-extensions.md`) that the native v2
+ * The JetBrains AIR extensions (`docs/air-extensions.md`) that the v2
  * core serves, and their negotiation. Only a client that declares
  * `_meta.jetbrains.air` in `initialize` gets them, with the wire output that
  * the v1 core gives AIR. The extensions that ACP v2 covers on its own are
- * not served (see "AIR clients" in docs/v2-native-core.md).
+ * not served (see "AIR clients" in docs/acp-v2.md).
  */
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import {

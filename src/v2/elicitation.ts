@@ -49,7 +49,7 @@ export interface ElicitationHost {
     signal: AbortSignal,
   ): Promise<CreateElicitationResponse>;
   completeElicitation(params: CompleteElicitationNotification): Promise<void>;
-  /** The session of the agent `agentId` (see `NativeSession.target`). */
+  /** The session of the agent `agentId` (see `V2Session.target`). */
   target(agentId: string | undefined): Promise<RequestTarget>;
   /** The session's query, once it started. */
   query(): Query | undefined;

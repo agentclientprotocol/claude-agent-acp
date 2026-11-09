@@ -1,7 +1,7 @@
 /**
  * The text and thinking of an assistant message that streamed live as
  * deltas, and what its consolidated message adds to them. Shared by the v1
- * core and the native v2 core.
+ * core and the v2 core.
  */
 import type { SDKPartialAssistantMessage } from "@anthropic-ai/claude-agent-sdk";
 

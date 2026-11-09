@@ -1,5 +1,5 @@
 /**
- * The connection's auth and LLM routing on the native core: the `authStatus`
+ * The connection's auth and LLM routing on the v2 core: the `authStatus`
  * extension (`_meta.authStatus` and `_auth/status_update`), the gateway logins
  * of `auth/login`, `auth/logout`, and `providers/list|set|disable`.
  *
@@ -43,7 +43,7 @@ import {
   withListedModels,
 } from "../providers.js";
 import { narrowToGatewayModels } from "../session-model.js";
-import { v2AuthMethod } from "../v2/initialize.js";
+import { v2AuthMethod } from "./initialize.js";
 
 /** The route of a session that starts now. */
 export interface SessionRouting {
@@ -69,7 +69,7 @@ export interface AuthEvents {
   probed(kind: AuthStatusKind): void;
 }
 
-export class NativeAuth {
+export class V2Auth {
   private gatewayLogin?: GatewayAuthRequest;
   private provider?: ProviderConfig;
   /** Runs `providers/set` and `providers/disable` one at a time, in arrival order. */

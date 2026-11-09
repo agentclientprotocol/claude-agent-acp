@@ -1,5 +1,5 @@
 /**
- * AIR's agent file-change report (`agentFileChangeReport`) on a native v2
+ * AIR's agent file-change report (`agentFileChangeReport`) on a v2
  * session: a `session/prompt` asks for it in `_meta.jetbrains.air`, and the
  * turn that serves the prompt ends with one `session_info_update` that lists
  * the files it changed.

@@ -1,7 +1,7 @@
 /**
  * Token usage as Claude Code reports it: the context window figures of
  * `usage_update` and the `_meta.quota` of a turn. Shared by the v1 core and
- * the native v2 core.
+ * the v2 core.
  */
 import type { ModelUsage } from "@anthropic-ai/claude-agent-sdk";
 

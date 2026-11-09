@@ -41,7 +41,7 @@ import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
 import { AcpToolCallRenderer, V2_CANCELLED } from "../tool-calls/renderer.js";
 import { changedTaskPlanEntries, unregisterHookCallback, type TaskState } from "../tools.js";
 import { recordStreamedDelta, unstreamedRemainder, type StreamedBlock } from "../streamed-text.js";
-import { replayClear, type V2UpdateTranslator } from "../v2/update-translator.js";
+import { replayClear, type V2UpdateTranslator } from "./update-translator.js";
 
 /** Every v2 client gets the same tool call reports: v2 diffs and display terminals. */
 const V2_TOOL_CALL_CAPABILITIES = ClientCapabilities.from(undefined, { v2: true });

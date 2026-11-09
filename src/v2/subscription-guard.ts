@@ -1,5 +1,5 @@
 /**
- * The `--hide-claude-auth` subscription guard on the native core: this
+ * The `--hide-claude-auth` subscription guard on the v2 core: this
  * integration never bills a claude.ai subscription. The policy is the v1
  * core's (`hide-claude-auth.ts`):
  *
@@ -33,7 +33,7 @@ import {
   warnClaudeSubscriptionGuardDegraded,
 } from "../hide-claude-auth.js";
 
-/** What the guard needs of the connection's auth state (`NativeAuth`). */
+/** What the guard needs of the connection's auth state (`V2Auth`). */
 export interface GuardAuth {
   /** Whether a provider or a gateway login routes the traffic. */
   overridesRoute(): boolean;

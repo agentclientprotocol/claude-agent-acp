@@ -1,6 +1,6 @@
 /**
  * Session options that come from the agent's environment, shared by the v1
- * core and the native v2 core.
+ * core and the v2 core.
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";

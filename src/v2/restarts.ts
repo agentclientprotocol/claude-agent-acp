@@ -1,5 +1,5 @@
 /**
- * Restarts of a native session's query: a new
+ * Restarts of a v2 session's query: a new
  * query resumes the same Claude session under the same id, and takes over
  * from the old one between turns.
  *
@@ -43,7 +43,7 @@ import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { Logger } from "../acp-agent.js";
 import { withoutEffort } from "../session-effort.js";
-import type { NativeSession } from "./session.js";
+import type { V2Session } from "./session.js";
 
 /** The request that set the session up, whose options a restart starts with again. */
 export type SetupParams = v2.NewSessionRequest | v2.ResumeSessionRequest | v2.ForkSessionRequest;
@@ -52,14 +52,14 @@ export type SetupParams = v2.NewSessionRequest | v2.ResumeSessionRequest | v2.Fo
 export interface RestartHost {
   readonly logger: Logger;
   /** The active session `sessionId`. */
-  active(sessionId: string): NativeSession | undefined;
+  active(sessionId: string): V2Session | undefined;
   /**
    * Starts a new query that resumes `sessionId`, with the options of `params`
    * and the current route. The new session is active once it resolves.
    */
-  start(sessionId: string, params: SetupParams): Promise<NativeSession>;
+  start(sessionId: string, params: SetupParams): Promise<V2Session>;
   /** `previous` could not start again: the session stops. */
-  lost(sessionId: string, previous: NativeSession): Promise<void>;
+  lost(sessionId: string, previous: V2Session): Promise<void>;
   send(notification: v2.UpdateSessionNotification): void;
 }
 
@@ -75,7 +75,7 @@ export class SessionRestarts {
   /** The restarts that run: from the new query's start to the old one's end. */
   private readonly swaps = new Map<string, Promise<void>>();
   /** The session that each running restart replaces. */
-  private readonly retiring = new Map<string, NativeSession>();
+  private readonly retiring = new Map<string, V2Session>();
   /** The sessions that `session/close` closes: a restart that runs does not track them again. */
   private readonly closingSessions = new Set<string>();
   /** The prompts that wait for a restart, each with what rejects it. */
@@ -194,7 +194,7 @@ export class SessionRestarts {
     const reroute: Reroute = { done: Promise.resolve(), started: false };
     reroute.done = (async () => {
       await waiting?.done;
-      let session: NativeSession | undefined;
+      let session: V2Session | undefined;
       for (;;) {
         // After an account restart that runs, on the session it started.
         await this.swaps.get(sessionId)?.catch(() => {});
@@ -225,14 +225,14 @@ export class SessionRestarts {
    */
   private swap(
     sessionId: string,
-    previous: NativeSession,
+    previous: V2Session,
     { keepOnFailure }: { keepOnFailure: boolean },
   ): Promise<void> {
     const run = (async () => {
       const params = this.setups.get(sessionId);
       if (!params) return;
       this.host.logger.log(`Restarting the query of session ${sessionId}`);
-      let session: NativeSession;
+      let session: V2Session;
       try {
         // The client's effort pin is restored below instead.
         session = await this.host.start(sessionId, withoutEffort(params));

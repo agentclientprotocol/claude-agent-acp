@@ -1,7 +1,7 @@
 /**
  * The configuration of a subagent's session, as its hooks report it. Both
  * the v1 core (`ClaudeAcpAgent.subagentConfigurationHook`, for both forms of
- * subagent sessions) and the native v2 core (`v2-native/child-config.ts`)
+ * subagent sessions) and the v2 core (`v2/child-config.ts`)
  * build a child's config options with these.
  */
 import type { SessionConfigOption, SessionModeState } from "@agentclientprotocol/sdk/unstable";

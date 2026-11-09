@@ -1,5 +1,5 @@
 /**
- * The reports of a native v2 session that are not Claude's output: the
+ * The reports of a v2 session that are not Claude's output: the
  * context window and cost (`usage_update`), Claude Code's warnings and MCP startup failures (`notice`), compactions
  * (`compaction_update`), the title (`session_info_update`), the predicted
  * follow-up prompt of an AIR client (`session_info_update._meta.promptSuggestions`),

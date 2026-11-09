@@ -1,5 +1,5 @@
 /**
- * Session setup of the native v2 core, on the v1 core's rules: the query
+ * Session setup of the v2 core, on the v1 core's rules: the query
  * options that `_meta.claudeCode.options` and the agent's environment add,
  * the models a session offers, and the updates that a `session/resume`
  * sends before its response.

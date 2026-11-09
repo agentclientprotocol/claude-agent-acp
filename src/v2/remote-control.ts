@@ -1,5 +1,5 @@
 /**
- * The adapter's `/remote-control` on the native core, and the messages that
+ * The adapter's `/remote-control` on the v2 core, and the messages that
  * a person types in another client of the session over Remote Control.
  *
  * The command, its listing, and its reply are the v1 core's

@@ -28,7 +28,7 @@ export class ClientCapabilities {
     /**
      * The client speaks ACP v2. Its diffs carry structured `changes` and an
      * optional git patch, which a v1 diff cannot express. Only the v2 core
-     * (`src/v2-native/`) sets this, never the capabilities that a client
+     * (`src/v2/`) sets this, never the capabilities that a client
      * sends. A v2 client also takes the terminal extension (`terminalOutput`),
      * which the v2 core sends as display terminals.
      */

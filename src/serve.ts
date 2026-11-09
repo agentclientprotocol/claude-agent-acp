@@ -1,7 +1,7 @@
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 import { v1AgentApp, type ClaudeAcpAgent, type Logger } from "./acp-agent.js";
 import { nodeToWebReadable, nodeToWebWritable } from "./utils.js";
-import { nativeV2AgentApp, type AgentHandle } from "./v2-native/agent.js";
+import { v2AgentApp, type AgentHandle } from "./v2/agent.js";
 
 /**
  * The ACP versions that the adapter serves: `v1` or `v2` alone, or both with
@@ -55,7 +55,7 @@ export function serveAcp(
  * `initialize` of a v1 client as an unsupported protocol version. `onAgent`
  * receives the agent of a v1 connection (`ClaudeAcpAgent`) once the router
  * has opened it, and `onV2Agent` the agent of a v2 connection, which the
- * native v2 core (`src/v2-native/`) serves.
+ * v2 core (`src/v2/`) serves.
  */
 export function acpProtocolRouter(
   logger: Logger | undefined,
@@ -66,7 +66,7 @@ export function acpProtocolRouter(
   const router = v2.agentProtocolRouter();
   if (protocols !== "v2") router.withV1(v1AgentApp(logger, onAgent));
   if (protocols !== "v1") {
-    router.withV2(nativeV2AgentApp(logger, onV2Agent));
+    router.withV2(v2AgentApp(logger, onV2Agent));
   }
   return router;
 }

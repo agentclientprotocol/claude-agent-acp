@@ -1,5 +1,5 @@
 /**
- * The config options of a native v2 session: its permission mode, model,
+ * The config options of a v2 session: its permission mode, model,
  * effort, Fast mode, ultracode and main-thread agent. Claude Code owns them
  * all. The session sets each on the query when the client picks a value, and
  * follows the changes it learns of (an approved plan's mode, a model switch
@@ -87,7 +87,7 @@ import {
   ultracodeSupported,
   ultracodeWorkflowsEnabled,
 } from "../session-ultracode.js";
-import { v1SetSessionConfigOptionRequest, v2ConfigOptions } from "../v2/session-requests.js";
+import { v1SetSessionConfigOptionRequest, v2ConfigOptions } from "./session-requests.js";
 
 type ConfigQuery = Pick<
   Query,

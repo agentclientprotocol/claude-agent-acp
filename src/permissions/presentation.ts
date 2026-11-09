@@ -129,7 +129,7 @@ export function buildClaudePermissionPresentation(
 /**
  * The `_meta.jetbrains.air.permission` of a permission request, from the
  * heading and explanation that {@link buildClaudePermissionPresentation}
- * built. The native v2 core adds it for an AIR client, whose tool calls it
+ * built. The v2 core adds it for an AIR client, whose tool calls it
  * renders without the AIR tool call contract.
  */
 export function airPermissionMeta({

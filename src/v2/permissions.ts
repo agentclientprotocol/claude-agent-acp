@@ -6,7 +6,8 @@
  * (`permissions/*`), so a v2 client gets the same options and the same
  * effects of each.
  */
-import type { ToolCallUpdate } from "@agentclientprotocol/sdk/unstable";
+import type { RequestPermissionResponse, ToolCallUpdate } from "@agentclientprotocol/sdk/unstable";
+import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { CanUseTool, PermissionMode, PermissionResult } from "@anthropic-ai/claude-agent-sdk";
 import { previewPatchContent } from "../diff.js";
 import { normalizeDurablePermissionChangeSet } from "../permissions/normalization.js";
@@ -15,12 +16,13 @@ import {
   airPermissionMeta,
   buildClaudePermissionPresentation,
   permissionToolCallMeta,
+  type AcpPermissionRequest,
 } from "../permissions/presentation.js";
 import { decodeClaudePermissionResponse } from "../permissions/response.js";
 import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
-import { v1PermissionResponse, v2PermissionRequest } from "../v2/permission.js";
 import type { ClearContextReset } from "../clear-context-coordinator.js";
 import type { RequestTarget } from "./tasks.js";
+import { v2ToolCallPatch } from "./tool-call.js";
 
 const V2_CAPABILITIES = ClientCapabilities.from(undefined, { v2: true });
 
@@ -224,5 +226,50 @@ export function canUseTool(host: PermissionHost): CanUseTool {
       if (modeUpdate?.type === "setMode") host.modeChanged(modeUpdate.mode);
     }
     return permissionResult;
+  };
+}
+
+/**
+ * The v2 form of a permission request.
+ *
+ * v1 asks about a tool call, whose title the prompt shows. v2 gives the prompt
+ * its own `title` and `description`, which the presentation sets for a v2
+ * client (`AcpPermissionRequest`), and asks about a `subject`: here always the tool
+ * call, as the same patch that a `tool_call_update` carries.
+ */
+export function v2PermissionRequest(request: AcpPermissionRequest): v2.RequestPermissionRequest {
+  if (request.title === undefined) {
+    throw new Error("An ACP v2 permission request needs a title");
+  }
+  return {
+    sessionId: request.sessionId,
+    title: request.title,
+    ...(request.description ? { description: request.description } : {}),
+    subject: { type: "tool_call", toolCall: v2ToolCallPatch(request.toolCall) },
+    options: request.options,
+    ...(request._meta != null ? { _meta: request._meta } : {}),
+  };
+}
+
+/**
+ * The v1 form of the answer to a permission request.
+ *
+ * v2 adds outcomes that v1 does not know, which the draft says are no
+ * approval. They become `cancelled`. In v2, `cancelled` also means that the
+ * user dismissed the prompt or the client declined it by policy. So the v2
+ * core reads a `cancelled` outcome as the user refusing the tool, unless a
+ * `session/cancel` is stopping the session's work: then the tool use is
+ * aborted, as on v1 (`canUseTool`).
+ */
+export function v1PermissionResponse(
+  response: v2.RequestPermissionResponse,
+): RequestPermissionResponse {
+  const outcome = response.outcome;
+  return {
+    outcome:
+      outcome.outcome === "selected"
+        ? (outcome as Extract<RequestPermissionResponse["outcome"], { outcome: "selected" }>)
+        : { outcome: "cancelled" },
+    ...(response._meta != null ? { _meta: response._meta } : {}),
   };
 }

@@ -1,5 +1,5 @@
 /**
- * Client-managed LLM routing, shared by the v1 core and the native v2 core:
+ * Client-managed LLM routing, shared by the v1 core and the v2 core:
  * the `main` provider of `providers/list`, `providers/set` and
  * `providers/disable`, and the legacy gateway logins (`authenticate` or
  * `auth/login` with `gateway` or `gateway-bedrock`). Each core holds its own

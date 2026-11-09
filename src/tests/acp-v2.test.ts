@@ -22,13 +22,13 @@ import type { AuthStatusUpdateNotification } from "../auth-status.js";
 import { clearContextWindowCache } from "../context-window.js";
 import { v2DiffContent } from "../diff.js";
 import { type AcpProtocols, acpProtocolRouter, acpProtocolsFromEnv } from "../serve.js";
-import { v1PermissionResponse, v2PermissionRequest } from "../v2/permission.js";
+import { v1PermissionResponse, v2PermissionRequest } from "../v2/permissions.js";
 import { v1PromptRequest } from "../v2/prompt.js";
 import { V2Terminals } from "../v2/terminal.js";
 import { V2ToolCallMeta } from "../v2/tool-call-meta.js";
 import { v2RestartedToolCall } from "../v2/tool-call.js";
 import { v2SessionUpdate } from "../v2/session-update.js";
-import type { AgentHandle } from "../v2-native/agent.js";
+import type { AgentHandle } from "../v2/agent.js";
 import {
   v1ForkSessionRequest,
   v1NewSessionRequest,

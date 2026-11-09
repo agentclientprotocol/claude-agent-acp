@@ -1,5 +1,5 @@
 /**
- * The native ACP v2 core: serves ACP v2 straight from Claude Code, without
+ * The ACP v2 core: serves ACP v2 straight from Claude Code, without
  * `ClaudeAcpAgent`.
  *
  * The adapter's ACP v2 implementation. Unlike the v1 core, it holds no turn
@@ -8,7 +8,7 @@
  * message mapping, tool call rendering, permission options, and the mode
  * catalog. It serves a JetBrains AIR client the AIR extensions that v2 does
  * not cover (see `air.ts`). What it does not serve yet is listed in
- * `docs/v2-native-core.md`.
+ * `docs/acp-v2.md`.
  */
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
@@ -48,18 +48,18 @@ import { SettingsManager } from "../settings.js";
 import { STARTUP_FAILURE_RESULTS_ENV, startupFailureError } from "../startup-failure.js";
 import { createPostToolUseHook } from "../tools.js";
 import { Pushable } from "../utils.js";
-import { V2_SESSION_CAPABILITIES } from "../v2/initialize.js";
-import { v1ForkSessionRequest, v1NewSessionRequest } from "../v2/session-requests.js";
-import { V2UpdateTranslator } from "../v2/update-translator.js";
+import { V2_SESSION_CAPABILITIES } from "./initialize.js";
+import { v1ForkSessionRequest, v1NewSessionRequest } from "./session-requests.js";
+import { V2UpdateTranslator } from "./update-translator.js";
 import { airInitializeMeta, airSupport, NO_AIR, type AirSupport } from "./air.js";
-import { NativeAuth } from "./auth.js";
+import { V2Auth } from "./auth.js";
 import { subagentHooks } from "./child-config.js";
 import { modelSwitchHook, SessionConfig } from "./config.js";
 import { fileChangePreviewHook } from "./file-preview.js";
 import { canUseTool, denyingStoppedWork } from "./permissions.js";
 import { reportHooks } from "./reports.js";
 import { SessionRestarts, type SetupParams } from "./restarts.js";
-import { NativeSession, type SessionConnection } from "./session.js";
+import { V2Session, type SessionConnection } from "./session.js";
 import {
   clientOptions,
   configuredSettings,
@@ -79,17 +79,17 @@ export interface AgentHandle {
   dispose(): Promise<void>;
 }
 
-/** The native ACP v2 surface, for one connection. */
-export function nativeV2AgentApp(
+/** The ACP v2 surface, for one connection. */
+export function v2AgentApp(
   logger: Logger | undefined,
   onAgent: (agent: AgentHandle) => void,
 ): v2.AgentApp {
-  let agent!: NativeV2Agent;
+  let agent!: V2Agent;
   return (
     v2
       .agent({ name: "claude-code-acp" })
       .onConnect((connection) => {
-        agent = new NativeV2Agent(connection.client, logger ?? console);
+        agent = new V2Agent(connection.client, logger ?? console);
         onAgent(agent);
       })
       .onRequest(v2.methods.agent.initialize, ({ params }) => agent.initialize(params))
@@ -124,8 +124,8 @@ export function nativeV2AgentApp(
   );
 }
 
-class NativeV2Agent implements AgentHandle, SessionConnection {
-  readonly sessions = new Map<string, NativeSession>();
+class V2Agent implements AgentHandle, SessionConnection {
+  readonly sessions = new Map<string, V2Session>();
   /**
    * The sessions whose query ended without `session/close`, with what to tell
    * the client. v2 keeps a session active until it is closed or the
@@ -134,7 +134,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
    */
   private readonly stopped = new Map<string, string>();
   readonly translator = new V2UpdateTranslator();
-  readonly auth: NativeAuth;
+  readonly auth: V2Auth;
   /** The `--hide-claude-auth` subscription guard (see `subscription-guard.ts`). */
   private readonly guard: SubscriptionGuard;
   /** The restarts of the sessions' queries, for a new route or account (see `restarts.ts`). */
@@ -150,7 +150,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     private readonly ctx: v2.AgentContext,
     readonly logger: Logger,
   ) {
-    this.auth = new NativeAuth(ctx, logger, {
+    this.auth = new V2Auth(ctx, logger, {
       routeChanged: () => this.restarts.reroute(),
       probed: (kind) => this.guard.probed(kind),
     });
@@ -211,7 +211,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     return this.ctx.notify(v2.methods.client.elicitation.complete, params);
   }
 
-  ended(session: NativeSession): void {
+  ended(session: V2Session): void {
     // The old query of a restart that replaced it already.
     if (this.sessions.get(session.sessionId) !== session) return;
     this.stop(session.sessionId, "Claude Code stopped. Resume the session to continue.");
@@ -265,7 +265,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
    * `session/prompt`. Each prompt reads the auth identity again, as on v1. A
    * restart of the session's query that is due runs first (see
    * `restarts.ts`), then the subscription guard judges the account, among
-   * the session's prompts (see `NativeSession.prompt`). The restart's await
+   * the session's prompts (see `V2Session.prompt`). The restart's await
    * happens only when one is due, so the prompts of a session keep their
    * order.
    *
@@ -466,7 +466,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
    * subagent's session takes no such request: the client can only watch it
    * and cancel its run.
    */
-  session(sessionId: string, method: string): NativeSession {
+  session(sessionId: string, method: string): V2Session {
     const session = this.sessions.get(sessionId);
     if (session) return session;
     if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, method);
@@ -510,7 +510,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
   }
 
   /** The root session that `sessionId` is a subagent session of. */
-  private ownerOfChild(sessionId: string): NativeSession | undefined {
+  private ownerOfChild(sessionId: string): V2Session | undefined {
     return [...this.sessions.values()].find((session) => session.tasks.hasChild(sessionId));
   }
 
@@ -530,7 +530,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
    * the first prompt, so a session never prompted has none to resume: it
    * starts afresh under the same id.
    */
-  private async restartSession(sessionId: string, params: SetupParams): Promise<NativeSession> {
+  private async restartSession(sessionId: string, params: SetupParams): Promise<V2Session> {
     try {
       return await this.startSession(sessionId, params, sessionId);
     } catch (error) {
@@ -548,7 +548,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
    * commands fails, the response goes without them, and an
    * `available_commands_update` with the commands, read again, follows it.
    */
-  private async setupFields(session: NativeSession): Promise<{
+  private async setupFields(session: V2Session): Promise<{
     configOptions: v2.SessionConfigOption[];
     availableCommands?: v2.AvailableCommand[];
   }> {
@@ -580,7 +580,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     resume: string | undefined,
     /** The resumed transcript, when the caller reads it anyway (a replay). */
     history?: Promise<SessionMessage[]>,
-  ): Promise<NativeSession> {
+  ): Promise<V2Session> {
     const request = await validatedSetup(params);
     const client = clientOptions(params._meta);
     // After a provider change that is still listing its models.
@@ -635,7 +635,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       ...(client?.additionalDirectories ?? []),
       ...(request.additionalDirectories ?? []),
     ];
-    const session = new NativeSession(
+    const session = new V2Session(
       sessionId,
       request.cwd,
       request.additionalDirectories ?? [],
@@ -686,7 +686,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       // renders. Without forms, AskUserQuestion is disallowed (below).
       ...elicitationOptions,
       pathToClaudeCodeExecutable,
-      // Echoes each prompt that Claude Code takes in (see `NativeSession`).
+      // Echoes each prompt that Claude Code takes in (see `V2Session`).
       extraArgs: { ...client?.extraArgs, "replay-user-messages": "" },
       disallowedTools: [
         ...(client?.disallowedTools ?? []),
@@ -856,7 +856,7 @@ async function validatedSetup(
  * timer runs. Nothing else orders the two.
  */
 function afterSetupResponse(
-  session: NativeSession,
+  session: V2Session,
   params: v2.NewSessionRequest | v2.ResumeSessionRequest | v2.ForkSessionRequest,
 ): void {
   // The setup already rejected servers of an unknown transport.

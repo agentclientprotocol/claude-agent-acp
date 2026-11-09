@@ -20,7 +20,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AgentHandle } from "../v2-native/agent.js";
+import type { AgentHandle } from "../v2/agent.js";
 import {
   resetIds,
   runScenarioV2,

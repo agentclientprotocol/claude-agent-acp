@@ -1,5 +1,5 @@
 /**
- * The work of a native ACP v2 session that a `session/cancel` stopped before
+ * The work of an ACP v2 session that a `session/cancel` stopped before
  * the client saw it, and the reach of the cancel's interrupt.
  *
  * A cancel answers every prompt that is not inserted yet with -32800, also

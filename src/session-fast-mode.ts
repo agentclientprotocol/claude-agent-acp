@@ -2,7 +2,7 @@
  * The Fast mode toggle of a session: its config option, the value a
  * `session/set_config_option` request sets, and the state Claude Code reports
  * (`fast_mode_state` and `fast_mode_disabled_reason`, on `system`/init and on
- * results). Shared by the v1 core and the native v2 core.
+ * results). Shared by the v1 core and the v2 core.
  */
 import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import type {

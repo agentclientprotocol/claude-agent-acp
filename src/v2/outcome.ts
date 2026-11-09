@@ -1,5 +1,5 @@
 /**
- * How a turn of a native ACP v2 session ends: the stop reason, usage, error
+ * How a turn of an ACP v2 session ends: the stop reason, usage, error
  * and `_meta.quota` of its `idle`. The stop reason is read from Claude Code's
  * result by the v1 core's rules (`resultEnd`), and the error as v1 answers a
  * failed prompt: an authentication failure is `authRequired`

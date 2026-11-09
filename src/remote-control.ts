@@ -1,7 +1,7 @@
 /**
  * `/remote-control`, which the adapter serves itself, and the messages that a
  * person types in another client of the session (claude.ai or the Claude
- * mobile app, over Remote Control). Shared by the v1 core and the native v2
+ * mobile app, over Remote Control). Shared by the v1 core and the v2
  * core, which run the command each in their own turn model.
  */
 /** The content blocks of a prompt, in v1 or v2 form: the command is one text block. */

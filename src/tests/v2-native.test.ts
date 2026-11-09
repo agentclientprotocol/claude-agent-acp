@@ -22,8 +22,8 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { acpProtocolRouter } from "../serve.js";
 import { SettingsManager } from "../settings.js";
-import type { AgentHandle } from "../v2-native/agent.js";
-import { StoppedWork } from "../v2-native/stopped-work.js";
+import type { AgentHandle } from "../v2/agent.js";
+import { StoppedWork } from "../v2/stopped-work.js";
 
 /** One Claude Code process: the prompts it reads and the messages it sends. */
 type FakeClaudeCode = {

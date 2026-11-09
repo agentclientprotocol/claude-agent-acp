@@ -1,5 +1,5 @@
 /**
- * The context window of a session's model, as both the v1 core and the native
+ * The context window of a session's model, as both the v1 core and the
  * v2 core report it in `usage_update.size`: seeded without IPC when the
  * session starts or switches models, refined by a background
  * `getContextUsage`, and learned from each result's `modelUsage`.

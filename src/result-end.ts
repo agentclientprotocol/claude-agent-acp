@@ -1,6 +1,6 @@
 /**
  * How Claude Code's `result` ends the work that it reports: the rules that the
- * ACP v2 core reads every turn's result with (`v2-native/outcome.ts`).
+ * ACP v2 core reads every turn's result with (`v2/outcome.ts`).
  */
 import type { SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
 
