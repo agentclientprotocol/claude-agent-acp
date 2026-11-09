@@ -741,6 +741,53 @@ describe("ACP v2 sessions", () => {
     });
   });
 
+  it("offers a resumed Fable 5.2 session's model as `fable`, as a new session lists it", async () => {
+    // On resume, the CLI lists the transcript's Fable row under its id, with no `fable` row.
+    const row = (value: string, resolvedModel: string, displayName: string) => ({
+      value,
+      resolvedModel,
+      displayName,
+      description: "",
+    });
+    sdk.initializationResult = async () => ({
+      models: [
+        row("default", "claude-opus-5-5", "Default (recommended)"),
+        row("claude-fable-5-2", "claude-fable-5-2", "Fable 5.2"),
+      ],
+    });
+    const setModel = vi.fn(sdkDefaults.setModel);
+    sdk.setModel = setModel;
+    scriptTurns();
+    let model: unknown;
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.close, { sessionId });
+      vi.mocked(getSessionMessages).mockResolvedValueOnce([
+        transcriptEntry("assistant", randomUUID(), {
+          id: "msg_fable",
+          role: "assistant",
+          model: "claude-fable-5-2",
+          content: [{ type: "text", text: "ok" }],
+        }),
+      ] as unknown as Awaited<ReturnType<typeof getSessionMessages>>);
+      const resumed = await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+      model = resumed.configOptions?.find((option) => option.configId === "model");
+      await client.authUpdate(1);
+    });
+
+    expect(model).toMatchObject({
+      currentValue: "fable",
+      options: [{ value: "default" }, { value: "fable", name: "Fable 5.2" }],
+    });
+    expect(setModel).not.toHaveBeenCalled();
+  });
+
   it("keeps the running turn of the active session that a resume gives other MCP servers", async () => {
     const release = Promise.withResolvers<void>();
     scriptTurns(async function* (options) {

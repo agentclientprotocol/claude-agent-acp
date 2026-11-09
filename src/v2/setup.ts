@@ -20,6 +20,7 @@ import {
   withAirMeta,
 } from "../air-extension.js";
 import {
+  aliasResumedModelRow,
   applyAvailableModelsAllowlist,
   getAvailableModels,
   type SessionModelState,
@@ -45,7 +46,8 @@ export function withClientHooks(
 }
 
 /**
- * The models of a session, as the v1 core picks them: the SDK's models
+ * The models of a session, as the v1 core picks them: the SDK's models, with
+ * a resumed session's model row under its family alias (`aliasResumedModelRow`),
  * narrowed by the settings' `availableModels` allowlist and then by the
  * provider (`narrow`), with the current model from `ANTHROPIC_MODEL`, the
  * settings' `model`, or the transcript of a resumed session
@@ -69,14 +71,16 @@ export async function sessionModels(
   allowlistedModelInfo: ModelInfo | undefined;
 }> {
   const { availableModels, modelOverrides } = settings.getSettings();
+  // A resumed Fable 5.2 session lists Fable 5.2 as `fable`, as a new session does.
+  const listed = aliasResumedModelRow(sdkModels, resumed?.model);
   const allowed = Array.isArray(availableModels)
     ? applyAvailableModelsAllowlist(
-        sdkModels,
+        listed,
         availableModels,
         modelOverrides,
         settings.getManagedDeniedModels(),
       )
-    : sdkModels;
+    : listed;
   const narrowed = narrow(allowed);
   const models = await getAvailableModels(
     query,
@@ -89,7 +93,7 @@ export async function sessionModels(
     resumed?.model,
     narrowedByProvider,
   );
-  return { models, ...withCurrentModelInfo(narrowed, sdkModels, models.currentModelId) };
+  return { models, ...withCurrentModelInfo(narrowed, listed, models.currentModelId) };
 }
 
 /**
