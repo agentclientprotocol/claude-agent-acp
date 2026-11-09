@@ -345,8 +345,7 @@ exit codes), which the shared renderer gives only with `air.client`, and the `ki
   that a result of any session on the same backend reported, else a guess from the model's names
   refined by a background `getContextUsage`, until the session's own result reports it.
 
-About 5,500 lines in total, plus the v2 wire conversions (see "History"). The v2 agent shares
-these with the v1 core:
+The v2 agent shares these with the v1 core:
 
 - the SDK message mapping and tool call rendering (`toAcpNotifications`,
   `streamEventToAcpNotifications`, `tool-calls/*`)
