@@ -522,7 +522,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
           },
         ],
         // An Edit or Write shows its exact patch before it runs, as on the bridge.
-        PreToolUse: [fileChangePreviewHook((agentId) => session.target(agentId), this.logger)],
+        PreToolUse: [fileChangePreviewHook(session, this.logger)],
         PostToolUse: [
           {
             hooks: [

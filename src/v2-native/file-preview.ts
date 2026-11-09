@@ -11,22 +11,21 @@
 import type { HookCallbackMatcher } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "../acp-agent.js";
 import { previewPatchContent } from "../diff.js";
-import type { RequestTarget } from "./tasks.js";
+import type { PermissionHost } from "./permissions.js";
 
-/** The session of a tool use: the root's, or a subagent's (`agentId`). */
-export type PreviewTargets = (agentId: string | undefined) => Promise<RequestTarget>;
+/** The session of a tool use (the root's, or a subagent's), and the tool uses that a cancel drops. */
+export type PreviewHost = Pick<PermissionHost, "target" | "dropsToolUse">;
 
-export function fileChangePreviewHook(
-  targets: PreviewTargets,
-  logger: Logger,
-): HookCallbackMatcher {
+export function fileChangePreviewHook(host: PreviewHost, logger: Logger): HookCallbackMatcher {
   return {
     matcher: "Edit|Write",
     hooks: [
-      async (input, toolUseID) => {
+      async (input, toolUseID, { signal }) => {
         if (input.hook_event_name !== "PreToolUse" || !toolUseID) return { continue: true };
         try {
-          const target = await targets(input.agent_id);
+          // Work that the client was told never ran shows nothing, as in `canUseTool`.
+          if (await host.dropsToolUse(toolUseID, input.agent_id, signal)) return { continue: true };
+          const target = await host.target(input.agent_id);
           // The work a cancel stopped shows nothing, as in `canUseTool`.
           if (target.cancelling()) return { continue: true };
           const toolInput = (input.tool_input ?? {}) as Record<string, unknown>;
