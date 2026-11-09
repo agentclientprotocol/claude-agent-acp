@@ -33,6 +33,7 @@ import type { NativeSubagent } from "./native-subagents.js";
 import { type AcpToolCallRenderer, V2_CANCELLED, V2_PAUSED } from "./tool-calls/renderer.js";
 import { type BackgroundOutput, BackgroundOutputTail } from "./background-output.js";
 import type { TaskProgressFields } from "./async-tasks.js";
+import { type WorkflowSnapshot, workflowSnapshotText } from "./workflow-progress.js";
 import { textContent } from "./tool-calls/content.js";
 
 /** An item of a `background` list. */
@@ -75,9 +76,12 @@ export type BackgroundLevel = Map<
     taskType: string;
     description: string;
     parentTaskId?: string;
-    progress?: TaskProgressFields;
+    progress?: WorkflowCardProgress;
   }
 >;
+
+/** What a workflow card shows: the task's progress fields and its latest phase and agent list. */
+export type WorkflowCardProgress = TaskProgressFields & { workflow?: WorkflowSnapshot };
 
 /** The work state of a session, as its `state_update` names it. */
 export type WorkStateName = "idle" | "running" | "requires_action" | "unknown";
@@ -291,8 +295,11 @@ export class SessionBackgroundWork {
     return toolCallUpdate(this.sessionId, toolCall, { status: paused ? V2_PAUSED : "in_progress" });
   }
 
-  /** Updates an existing workflow card without changing its work state. */
-  taskProgress(taskId: string, progress: TaskProgressFields): AcpSessionNotification | undefined {
+  /**
+   * Updates an existing workflow card without changing its work state. A
+   * report without `workflow` keeps the last phase and agent list.
+   */
+  taskProgress(taskId: string, progress: WorkflowCardProgress): AcpSessionNotification | undefined {
     const task = this.level.get(taskId);
     if (!task || task.taskType !== "local_workflow") return undefined;
     const previous = workflowProgress(task.progress);
@@ -609,7 +616,7 @@ function toolCallUpdate(
 }
 
 /** The latest workflow activity, rendered as one replaceable tool-card body. */
-function workflowProgress(progress: TaskProgressFields | undefined) {
+function workflowProgress(progress: WorkflowCardProgress | undefined) {
   if (!progress || Object.keys(progress).length === 0) return undefined;
   const activity = progress.description ?? progress.summary;
   const usage = progress.usage;
@@ -619,6 +626,7 @@ function workflowProgress(progress: TaskProgressFields | undefined) {
     usage
       ? `${usage.totalTokens.toLocaleString("en-US")} tokens · ${usage.toolUses.toLocaleString("en-US")} tool calls · ${Math.floor(usage.durationMs / 1000)}s`
       : undefined,
+    progress.workflow ? workflowSnapshotText(progress.workflow) : undefined,
   ]
     .filter((part) => part !== undefined)
     .join("\n\n");
