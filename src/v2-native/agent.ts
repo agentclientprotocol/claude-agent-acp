@@ -264,14 +264,26 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
    * the session's prompts (see `NativeSession.prompt`). The restart's await
    * happens only when one is due, so the prompts of a session keep their
    * order.
+   *
+   * Not `async`, and the session's promise is returned as is: the response
+   * then goes out before the turn's `running`, which the session sends right
+   * after it resolves the prompt, as on the bridge. Nothing enforces this
+   * order but the number of promise hops (v2 allows either), and the golden
+   * files of the scenarios (`acp-scenarios-v2.test.ts`) hold it.
    */
-  async prompt(params: v2.PromptRequest): Promise<v2.PromptResponse> {
-    this.session(params.sessionId, "prompt");
-    this.auth.promptStarted(params.sessionId);
-    const restart = this.restarts.beforePrompt(params.sessionId);
-    if (restart) await restart;
-    const session = this.session(params.sessionId, "prompt");
-    return session.prompt(params, (query) => this.guard.beforePrompt(params.sessionId, query));
+  prompt(params: v2.PromptRequest): Promise<v2.PromptResponse> {
+    const prompt = () =>
+      this.session(params.sessionId, "prompt").prompt(params, (query) =>
+        this.guard.beforePrompt(params.sessionId, query),
+      );
+    try {
+      this.session(params.sessionId, "prompt");
+      this.auth.promptStarted(params.sessionId);
+      const restart = this.restarts.beforePrompt(params.sessionId);
+      return restart ? restart.then(prompt) : prompt();
+    } catch (error) {
+      return Promise.reject(error);
+    }
   }
 
   async newSession(params: v2.NewSessionRequest): Promise<v2.NewSessionResponse> {
