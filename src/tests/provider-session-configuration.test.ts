@@ -752,7 +752,10 @@ describe("provider updates preserve session configuration", { timeout: 10_000 },
     await agent.dispose();
     const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
     const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
-    acpProtocolRouter({ log() {}, error() {} }, (created) => (agent = created)).connect({
+    // The bridge: this test reads the v1 core's agent that serves the v2 session.
+    acpProtocolRouter({ log() {}, error() {} }, (created) => (agent = created), "auto", {
+      v2Core: "bridge",
+    }).connect({
       readable: toAgent.readable,
       writable: toClient.writable,
     });

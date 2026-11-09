@@ -27,19 +27,19 @@ export function acpProtocolsFromEnv(value: string | undefined): AcpProtocols {
 /**
  * The implementation that serves ACP v2:
  *
- * - `bridge` (the default): `src/v2/`, which converts each v2 request to v1
- *   and serves it with `ClaudeAcpAgent`.
- * - `native`: `src/v2-native/`, which serves v2 straight from Claude Code.
- *   Experimental: see `docs/v2-native-core.md` for what it does not serve.
+ * - `native` (the default): `src/v2-native/`, which serves v2 straight from
+ *   Claude Code. See `docs/v2-native-core.md` for what it does not serve.
+ * - `bridge`: `src/v2/`, which converts each v2 request to v1 and serves it
+ *   with `ClaudeAcpAgent`. The fallback until the bridge is deleted.
  */
 export type V2Core = "bridge" | "native";
 
 /**
- * Reads `CLAUDE_AGENT_ACP_V2_CORE`: unset or empty is `bridge`. Throws on any
+ * Reads `CLAUDE_AGENT_ACP_V2_CORE`: unset or empty is `native`. Throws on any
  * value other than `bridge` and `native`.
  */
 export function v2CoreFromEnv(value: string | undefined): V2Core {
-  if (value === undefined || value === "") return "bridge";
+  if (value === undefined || value === "") return "native";
   if (value === "bridge" || value === "native") return value;
   throw new Error(
     `CLAUDE_AGENT_ACP_V2_CORE must be "bridge" or "native", not ${JSON.stringify(value)}`,
@@ -77,16 +77,17 @@ export function serveAcp(
  * the draft ACP v2, and every other client gets ACP v1. With `v1`, a v2
  * client is negotiated down to v1. With `v2`, the router rejects the
  * `initialize` of a v1 client as an unsupported protocol version. `onAgent`
- * receives the agent of the connection once the router has opened it, and
+ * receives the v1 core's agent of the connection once the router has opened
+ * it (a v1 connection, or a v2 one with `v2Core: "bridge"`), and
  * `onNativeAgent` the agent of a v2 connection that the native core serves
- * (`v2Core: "native"`).
+ * (`v2Core: "native"`, the default).
  */
 export function acpProtocolRouter(
   logger: Logger | undefined,
   onAgent: (agent: ClaudeAcpAgent) => void,
   protocols: AcpProtocols = "auto",
   {
-    v2Core = "bridge",
+    v2Core = "native",
     onNativeAgent = () => {},
   }: { v2Core?: V2Core; onNativeAgent?: (agent: AgentHandle) => void } = {},
 ): v2.AgentProtocolRouter {

@@ -2775,11 +2775,46 @@ describe("native ACP v2 core", () => {
   });
 
   it("reads which v2 core to serve from CLAUDE_AGENT_ACP_V2_CORE", () => {
-    expect(v2CoreFromEnv(undefined)).toBe("bridge");
-    expect(v2CoreFromEnv("")).toBe("bridge");
+    expect(v2CoreFromEnv(undefined)).toBe("native");
+    expect(v2CoreFromEnv("")).toBe("native");
     expect(v2CoreFromEnv("native")).toBe("native");
+    expect(v2CoreFromEnv("bridge")).toBe("bridge");
     expect(() => v2CoreFromEnv("v2")).toThrow(/CLAUDE_AGENT_ACP_V2_CORE/);
   });
+
+  it.each([
+    { v2Core: undefined, served: "native" },
+    { v2Core: "native", served: "native" },
+    { v2Core: "bridge", served: "bridge" },
+  ] as const)(
+    "serves v2 with the $served core when v2Core is $v2Core",
+    async ({ v2Core, served }) => {
+      const v1Agents: { dispose(): Promise<void> }[] = [];
+      const nativeAgents: AgentHandle[] = [];
+      const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
+      const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
+      acpProtocolRouter(undefined, (agent) => v1Agents.push(agent), "v2", {
+        v2Core,
+        onNativeAgent: (agent) => nativeAgents.push(agent),
+      }).connect({ readable: toAgent.readable, writable: toClient.writable });
+      try {
+        await v2
+          .client({ name: "test-client" })
+          .connectWith({ readable: toClient.readable, writable: toAgent.writable }, (agent) =>
+            agent.request(v2.methods.agent.initialize, {
+              protocolVersion: v2.PROTOCOL_VERSION,
+              info: { name: "test-client", version: "1" },
+              capabilities: {},
+            }),
+          );
+        expect({ native: nativeAgents.length, bridge: v1Agents.length }).toEqual(
+          served === "native" ? { native: 1, bridge: 0 } : { native: 0, bridge: 1 },
+        );
+      } finally {
+        await Promise.all([...v1Agents, ...nativeAgents].map((agent) => agent.dispose()));
+      }
+    },
+  );
 });
 
 describe("StoppedWork", () => {

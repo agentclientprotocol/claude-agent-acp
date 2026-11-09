@@ -10,7 +10,8 @@
  * message mapping, tool call rendering, permission options, and the mode
  * catalog. What it does not serve yet is listed in `docs/v2-native-core.md`.
  *
- * Opt in with `CLAUDE_AGENT_ACP_V2_CORE=native` (see `serve.ts`).
+ * The default v2 core. `CLAUDE_AGENT_ACP_V2_CORE=bridge` selects the bridge
+ * instead (see `serve.ts`).
  */
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";

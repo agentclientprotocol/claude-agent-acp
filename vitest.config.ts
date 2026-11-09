@@ -34,7 +34,9 @@ export default defineConfig({
         test: {
           ...shared,
           name: "unit",
-          env,
+          // acp-v2.test.ts and acp-scenarios-v2.test.ts run on the bridge here,
+          // whatever the default v2 core is.
+          env: { ...env, V2_CORE_UNDER_TEST: "bridge" },
           include: [
             "src/**/*.{test,spec}.{js,mjs,cjs,ts,mts,cts,jsx,tsx}",
             // Release tooling lives in scripts/ rather than src/ so it stays outside tsc's
@@ -44,8 +46,8 @@ export default defineConfig({
         },
       },
       {
-        // The bridge's ACP v2 tests and v2 scenarios again, against the
-        // native v2 core (`src/v2-native/`), so both cores are held to them.
+        // The ACP v2 tests and v2 scenarios again, against the native v2 core
+        // (`src/v2-native/`), so both cores are held to them.
         resolve,
         test: {
           ...shared,

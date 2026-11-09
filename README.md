@@ -144,9 +144,9 @@ with replay, `session/close`, `session/prompt`, `session/cancel`), `session/dele
 compaction, display terminals for commands, permission requests, elicitation, providers, auth, and
 [subagents](#subagent-sessions). Steering and the AIR extensions are v1 only for now.
 
-`CLAUDE_AGENT_ACP_V2_CORE=native` serves v2 with an experimental core that runs straight on
-Claude Code instead of translating to v1. It serves less of the list above for now; see
-[the native v2 core](docs/v2-native-core.md).
+v2 is served by [the native v2 core](docs/v2-native-core.md), which runs straight on Claude
+Code instead of translating to v1. `CLAUDE_AGENT_ACP_V2_CORE=bridge` serves v2 through the
+earlier bridge to the v1 core instead, as a fallback.
 
 ## Contribution Policy
 

@@ -104,7 +104,7 @@ class Run {
       env: {
         ...process.env,
         CLAUDE_AGENT_ACP_PROTOCOL: "v2",
-        ...(this.core === "native" ? { CLAUDE_AGENT_ACP_V2_CORE: "native" } : {}),
+        CLAUDE_AGENT_ACP_V2_CORE: this.core,
       },
       stdio: ["pipe", "pipe", "pipe"],
       cwd: this.cwd,

@@ -1,12 +1,13 @@
 # The native ACP v2 core
 
-Status: experimental, opt-in with `CLAUDE_AGENT_ACP_V2_CORE=native`. The default v2 core is
-still the bridge.
+Status: the default v2 core. `CLAUDE_AGENT_ACP_V2_CORE=bridge` serves v2 with the bridge
+instead, as a fallback until the bridge is deleted.
 
 ## Why
 
-The adapter serves ACP v2 through a bridge today: `src/v2/` converts each v2 request to v1, runs
-it through `ClaudeAcpAgent`, and converts what comes back. So every v2 session runs the v1 core,
+The bridge (`src/v2/`, now the fallback) serves ACP v2 by converting each v2 request to v1,
+running it through `ClaudeAcpAgent`, and converting what comes back. So every v2 session on it
+runs the v1 core,
 including the machinery that exists only because of v1:
 
 - **Held prompts.** A v1 `session/prompt` answers when the turn ends, so the core keeps a turn
@@ -347,8 +348,9 @@ These pieces were extracted so that both cores use the same code:
 
 ## How it is checked
 
-- `src/tests/acp-v2.test.ts`, the bridge's v2 tests, runs against both cores: the
-  `v2-native-core` project of `vitest.config.ts` runs it again with `V2_CORE_UNDER_TEST=native`,
+- `src/tests/acp-v2.test.ts`, the bridge's v2 tests, runs against both cores: the `unit`
+  project of `vitest.config.ts` runs it on the bridge (`V2_CORE_UNDER_TEST=bridge`), and the
+  `v2-native-core` project runs it again with `V2_CORE_UNDER_TEST=native`,
   so `npm run test:run` and CI cover both. Tests that check a core's internals, or a listed
   difference, branch on `NATIVE_CORE`.
 
@@ -448,10 +450,10 @@ Nothing that the bridge serves to v2 clients. Neither core serves these:
    the v1 core's module.
 2. Port the gaps one feature at a time, each in a module that the native core owns. Some are
    typed for v1 (`native-subagents.ts`, `background-work.ts`).
-3. Keep both cores on the v2 tests and scenarios, and make `native` the default once it serves
-   what v2 clients need.
-4. Delete the bridge: `v2/agent.ts`, `v2/prompt.ts`, `v2/background.ts`, the v1 request
-   conversions, and the v2 paths of `ClaudeAcpAgent`. Those paths are the `v2` option, the
+3. Done: `native` is the default v2 core, and both cores stay on the v2 tests and scenarios.
+   `CLAUDE_AGENT_ACP_V2_CORE=bridge` selects the bridge.
+4. Later: delete the bridge. That is `v2/agent.ts`, `v2/prompt.ts`, `v2/background.ts`, the
+   v1 request conversions, and the v2 paths of `ClaudeAcpAgent`. Those paths are the `v2` option, the
    `foreground` and `background` hooks, `ForegroundEvents`, `foregroundWork`, and the
    `this.v2` branches. The v1 core then serves v1 and AIR only. `ClientCapabilities.v2` stays:
    the shared renderer uses it.
