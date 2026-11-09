@@ -3,10 +3,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ModelInfo, Options } from "@anthropic-ai/claude-agent-sdk";
-import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import { ClaudeAcpAgent, FAST_MODE_CONFIG_ID, type AcpClient } from "../acp-agent.js";
 import { AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY } from "../air-extension.js";
-import { acpProtocolRouter } from "../serve.js";
 import { initializeClient, makeMockQuery } from "./helpers.js";
 import { successfulResultMessage, userEcho } from "./session-doubles.js";
 
@@ -746,54 +744,5 @@ describe("provider updates preserve session configuration", { timeout: 10_000 },
 
     expect(lastQuery().state).toMatchObject({ model: "opus", effort: "high" });
     expect(lastQuery().request.options.env?.ANTHROPIC_BASE_URL).toBe("https://recovered.example");
-  });
-
-  it("publishes the restored configuration through the v2 protocol router", async () => {
-    await agent.dispose();
-    const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
-    const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
-    // The bridge: this test reads the v1 core's agent that serves the v2 session.
-    acpProtocolRouter({ log() {}, error() {} }, (created) => (agent = created), "auto", {
-      v2Core: "bridge",
-    }).connect({
-      readable: toAgent.readable,
-      writable: toClient.writable,
-    });
-    const received: v2.UpdateSessionNotification[] = [];
-    await v2
-      .client({ name: "provider-test" })
-      .onNotification(v2.methods.client.session.update, ({ params }) => void received.push(params))
-      .connectWith({ readable: toClient.readable, writable: toAgent.writable }, async (client) => {
-        await client.request(v2.methods.agent.initialize, {
-          protocolVersion: v2.PROTOCOL_VERSION,
-          info: { name: "provider-test", version: "1" },
-          capabilities: AIR_CAPABILITIES,
-        });
-        await client.request(v2.methods.agent.providers.set, PROVIDER);
-        const { sessionId } = await client.request(v2.methods.agent.session.new, { cwd });
-        for (const [configId, value] of [
-          ["model", "opus"],
-          ["effort", "high"],
-        ]) {
-          await client.request(v2.methods.agent.session.setConfigOption, {
-            sessionId,
-            configId,
-            value,
-            type: "id",
-          });
-        }
-
-        await client.request(v2.methods.agent.providers.set, PROVIDER);
-
-        const config = received.findLast(
-          ({ update }) => update.sessionUpdate === "config_option_update",
-        );
-        expect(config?.update).toMatchObject({
-          configOptions: expect.arrayContaining([
-            expect.objectContaining({ configId: "model", currentValue: "opus" }),
-            expect.objectContaining({ configId: "effort", currentValue: "high" }),
-          ]),
-        });
-      });
   });
 });

@@ -20,7 +20,7 @@ import {
   type Options,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { acpProtocolRouter, v2CoreFromEnv } from "../serve.js";
+import { acpProtocolRouter } from "../serve.js";
 import { SettingsManager } from "../settings.js";
 import type { AgentHandle } from "../v2-native/agent.js";
 import { StoppedWork } from "../v2-native/stopped-work.js";
@@ -251,8 +251,7 @@ function nativeClient({
   const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
   const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
   acpProtocolRouter(undefined, () => {}, "v2", {
-    v2Core: "native",
-    onNativeAgent: (agent) => agents.push(agent),
+    onV2Agent: (agent) => agents.push(agent),
   }).connect({ readable: toAgent.readable, writable: toClient.writable });
   /** The `state_update`s of root sessions, not subagents', as their states. */
   const states = () => {
@@ -3210,50 +3209,33 @@ describe("native ACP v2 core", () => {
     });
   });
 
-  it("reads which v2 core to serve from CLAUDE_AGENT_ACP_V2_CORE", () => {
-    expect(v2CoreFromEnv(undefined)).toBe("native");
-    expect(v2CoreFromEnv("")).toBe("native");
-    expect(v2CoreFromEnv("native")).toBe("native");
-    expect(v2CoreFromEnv("bridge")).toBe("bridge");
-    expect(() => v2CoreFromEnv("v2")).toThrow(/CLAUDE_AGENT_ACP_V2_CORE/);
-  });
-
   const AIR_CAPABILITIES = { _meta: { jetbrains: { air: { version: 1, capabilities: [] } } } };
   it.each([
-    { v2Core: undefined, client: "a plain", capabilities: {}, served: "native" },
-    { v2Core: "native", client: "a plain", capabilities: {}, served: "native" },
-    { v2Core: "bridge", client: "a plain", capabilities: {}, served: "bridge" },
-    { v2Core: undefined, client: "an AIR", capabilities: AIR_CAPABILITIES, served: "native" },
-    { v2Core: "bridge", client: "an AIR", capabilities: AIR_CAPABILITIES, served: "bridge" },
-  ] as const)(
-    "serves $client v2 client with the $served core when v2Core is $v2Core",
-    async ({ v2Core, capabilities, served }) => {
-      const v1Agents: { dispose(): Promise<void> }[] = [];
-      const nativeAgents: AgentHandle[] = [];
-      const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
-      const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
-      acpProtocolRouter(undefined, (agent) => v1Agents.push(agent), "v2", {
-        v2Core,
-        onNativeAgent: (agent) => nativeAgents.push(agent),
-      }).connect({ readable: toAgent.readable, writable: toClient.writable });
-      try {
-        await v2
-          .client({ name: "test-client" })
-          .connectWith({ readable: toClient.readable, writable: toAgent.writable }, (agent) =>
-            agent.request(v2.methods.agent.initialize, {
-              protocolVersion: v2.PROTOCOL_VERSION,
-              info: { name: "test-client", version: "1" },
-              capabilities,
-            }),
-          );
-        expect({ native: nativeAgents.length, bridge: v1Agents.length }).toEqual(
-          served === "native" ? { native: 1, bridge: 0 } : { native: 0, bridge: 1 },
+    { client: "a plain", capabilities: {} },
+    { client: "an AIR", capabilities: AIR_CAPABILITIES },
+  ] as const)("serves $client v2 client with the native core", async ({ capabilities }) => {
+    const v1Agents: { dispose(): Promise<void> }[] = [];
+    const nativeAgents: AgentHandle[] = [];
+    const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
+    const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
+    acpProtocolRouter(undefined, (agent) => v1Agents.push(agent), "v2", {
+      onV2Agent: (agent) => nativeAgents.push(agent),
+    }).connect({ readable: toAgent.readable, writable: toClient.writable });
+    try {
+      await v2
+        .client({ name: "test-client" })
+        .connectWith({ readable: toClient.readable, writable: toAgent.writable }, (agent) =>
+          agent.request(v2.methods.agent.initialize, {
+            protocolVersion: v2.PROTOCOL_VERSION,
+            info: { name: "test-client", version: "1" },
+            capabilities,
+          }),
         );
-      } finally {
-        await Promise.all([...v1Agents, ...nativeAgents].map((agent) => agent.dispose()));
-      }
-    },
-  );
+      expect({ native: nativeAgents.length, v1: v1Agents.length }).toEqual({ native: 1, v1: 0 });
+    } finally {
+      await Promise.all([...v1Agents, ...nativeAgents].map((agent) => agent.dispose()));
+    }
+  });
 });
 
 describe("StoppedWork", () => {

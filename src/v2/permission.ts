@@ -1,6 +1,7 @@
 /**
- * The v2 form of the permission requests that `ClaudeAcpAgent` sends, and the
- * v1 form of their answers.
+ * The v2 form of the permission requests that the shared presentation builds
+ * (`permissions/presentation.ts`), and the v1 form of their answers, which the
+ * shared decoding reads.
  */
 import type { RequestPermissionResponse } from "@agentclientprotocol/sdk/unstable";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
@@ -8,11 +9,11 @@ import type { AcpPermissionRequest } from "../permissions/presentation.js";
 import { v2ToolCallPatch } from "./tool-call.js";
 
 /**
- * The v2 form of a permission request of the agent.
+ * The v2 form of a permission request.
  *
  * v1 asks about a tool call, whose title the prompt shows. v2 gives the prompt
- * its own `title` and `description`, which the agent sets for a v2 client
- * (`AcpPermissionRequest`), and asks about a `subject`: here always the tool
+ * its own `title` and `description`, which the presentation sets for a v2
+ * client (`AcpPermissionRequest`), and asks about a `subject`: here always the tool
  * call, as the same patch that a `tool_call_update` carries.
  */
 export function v2PermissionRequest(request: AcpPermissionRequest): v2.RequestPermissionRequest {
@@ -34,10 +35,10 @@ export function v2PermissionRequest(request: AcpPermissionRequest): v2.RequestPe
  *
  * v2 adds outcomes that v1 does not know, which the draft says are no
  * approval. They become `cancelled`. In v2, `cancelled` also means that the
- * user dismissed the prompt or the client declined it by policy. So the agent
- * reads a `cancelled` outcome on v2 as the user refusing the tool, unless a
+ * user dismissed the prompt or the client declined it by policy. So the v2
+ * core reads a `cancelled` outcome as the user refusing the tool, unless a
  * `session/cancel` is stopping the session's work: then the tool use is
- * aborted, as on v1.
+ * aborted, as on v1 (`src/v2-native/permissions.ts`).
  */
 export function v1PermissionResponse(
   response: v2.RequestPermissionResponse,

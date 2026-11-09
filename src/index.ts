@@ -2,7 +2,7 @@
 
 import { claudeCliPath } from "./claude-cli.js";
 import { applyManagedPolicyEnv } from "./managed-policy.js";
-import { acpProtocolsFromEnv, serveAcp, v2CoreFromEnv } from "./serve.js";
+import { acpProtocolsFromEnv, serveAcp } from "./serve.js";
 import packageJson from "../package.json" with { type: "json" };
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -85,7 +85,6 @@ if (process.argv.includes("--cli")) {
 
   const acp = serveAcp(logger, {
     protocols: acpProtocolsFromEnv(process.env.CLAUDE_AGENT_ACP_PROTOCOL),
-    v2Core: v2CoreFromEnv(process.env.CLAUDE_AGENT_ACP_V2_CORE),
   });
 
   async function shutdown() {

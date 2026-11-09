@@ -1,7 +1,6 @@
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 import { v1AgentApp, type ClaudeAcpAgent, type Logger } from "./acp-agent.js";
 import { nodeToWebReadable, nodeToWebWritable } from "./utils.js";
-import { v2AgentApp } from "./v2/agent.js";
 import { nativeV2AgentApp, type AgentHandle } from "./v2-native/agent.js";
 
 /**
@@ -24,33 +23,10 @@ export function acpProtocolsFromEnv(value: string | undefined): AcpProtocols {
   );
 }
 
-/**
- * The implementation that serves ACP v2:
- *
- * - `native` (the default): `src/v2-native/`, which serves v2 straight from
- *   Claude Code, to every v2 client, JetBrains AIR too. See
- *   `docs/v2-native-core.md` for what it does not serve.
- * - `bridge`: `src/v2/`, which converts each v2 request to v1 and serves it
- *   with `ClaudeAcpAgent`. The fallback until the bridge is deleted.
- */
-export type V2Core = "bridge" | "native";
-
-/**
- * Reads `CLAUDE_AGENT_ACP_V2_CORE`: unset or empty is `native`. Throws on any
- * value other than `bridge` and `native`.
- */
-export function v2CoreFromEnv(value: string | undefined): V2Core {
-  if (value === undefined || value === "") return "native";
-  if (value === "bridge" || value === "native") return value;
-  throw new Error(
-    `CLAUDE_AGENT_ACP_V2_CORE must be "bridge" or "native", not ${JSON.stringify(value)}`,
-  );
-}
-
 /** Serves ACP on stdio through {@link acpProtocolRouter}. */
 export function serveAcp(
   logger: Logger | undefined,
-  options: { protocols: AcpProtocols; v2Core?: V2Core },
+  options: { protocols: AcpProtocols },
 ): { closed: Promise<void>; dispose(): Promise<void> } {
   const output = nodeToWebWritable(process.stdout);
   const input = nodeToWebReadable(process.stdin);
@@ -61,8 +37,7 @@ export function serveAcp(
     agent = created;
   };
   const { closed } = acpProtocolRouter(logger, onAgent, options.protocols, {
-    v2Core: options.v2Core,
-    onNativeAgent: onAgent,
+    onV2Agent: onAgent,
   }).connect(v2.ndJsonStream(output, input));
   return {
     closed,
@@ -78,26 +53,20 @@ export function serveAcp(
  * the draft ACP v2, and every other client gets ACP v1. With `v1`, a v2
  * client is negotiated down to v1. With `v2`, the router rejects the
  * `initialize` of a v1 client as an unsupported protocol version. `onAgent`
- * receives the v1 core's agent of the connection once the router has opened
- * it (a v1 connection, or a v2 one that the bridge serves), and
- * `onNativeAgent` the agent of a v2 connection that the native core serves
- * (`v2Core: "native"`, the default).
+ * receives the agent of a v1 connection (`ClaudeAcpAgent`) once the router
+ * has opened it, and `onV2Agent` the agent of a v2 connection, which the
+ * native v2 core (`src/v2-native/`) serves.
  */
 export function acpProtocolRouter(
   logger: Logger | undefined,
   onAgent: (agent: ClaudeAcpAgent) => void,
   protocols: AcpProtocols = "auto",
-  {
-    v2Core = "native",
-    onNativeAgent = () => {},
-  }: { v2Core?: V2Core; onNativeAgent?: (agent: AgentHandle) => void } = {},
+  { onV2Agent = () => {} }: { onV2Agent?: (agent: AgentHandle) => void } = {},
 ): v2.AgentProtocolRouter {
   const router = v2.agentProtocolRouter();
   if (protocols !== "v2") router.withV1(v1AgentApp(logger, onAgent));
   if (protocols !== "v1") {
-    router.withV2(
-      v2Core === "native" ? nativeV2AgentApp(logger, onNativeAgent) : v2AgentApp(logger, onAgent),
-    );
+    router.withV2(nativeV2AgentApp(logger, onV2Agent));
   }
   return router;
 }

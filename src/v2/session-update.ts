@@ -1,6 +1,6 @@
 /**
- * The v2 form of the session updates that `ClaudeAcpAgent` sends as v1
- * updates.
+ * The v2 form of the v1 session updates that the shared SDK-to-ACP mapping
+ * produces (`toAcpNotifications`).
  */
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { AcpSessionNotification } from "../acp-subagents.js";
@@ -60,9 +60,7 @@ export function v2SessionUpdate(
       // v1's draft plan operations have v2's shape.
       return update;
     case "subagent_update": {
-      // The subagents RFD gives it the same shape in v1 and v2. One that
-      // reports a state also has a copy on the child's stream (see
-      // `v2ChildStateUpdate`).
+      // The subagents RFD gives it the same shape in v1 and v2.
       const { state, ...association } = update;
       return { ...association, ...(state != null ? { state: v2SubagentState(state) } : {}) };
     }
@@ -80,26 +78,6 @@ export function v2SessionUpdate(
         `The ACP v2 surface does not translate ${update.sessionUpdate} session updates yet`,
       );
   }
-}
-
-/**
- * The child's own `state_update` for a v1 `subagent_update` that reports the
- * child's work state, or `undefined` when it reports none.
- *
- * v1 reports a child's work state only on its parent, as the `state` of the
- * `subagent_update`. v2 reports it on the child's own stream, as for any
- * session, and mirrors it on the parent (the subagents RFD). The child's copy
- * goes right after the parent's: never before the announcement, and both
- * copies of a state before any later state.
- */
-export function v2ChildStateUpdate(
-  update: AcpSessionNotification["update"],
-): v2.UpdateSessionNotification | undefined {
-  if (update.sessionUpdate !== "subagent_update" || update.state == null) return undefined;
-  return {
-    sessionId: update.sessionId,
-    update: { sessionUpdate: "state_update", ...v2SubagentState(update.state) },
-  };
 }
 
 type V1SubagentState = NonNullable<

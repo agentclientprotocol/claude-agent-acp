@@ -7,7 +7,7 @@ import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import { nodeToWebReadable, nodeToWebWritable } from "../utils.js";
 
 /**
- * The default ACP v2 core (`src/v2-native/`) against the bundled Claude Code
+ * The ACP v2 core (`src/v2-native/`) against the bundled Claude Code
  * CLI, in the adapter's own process as a client starts it. The doubles of
  * `v2-native.test.ts` send the frames the core builds its turn model on
  * (`command_lifecycle`, `session_state_changed`, `interrupt({ cancelQueued })`);
@@ -32,15 +32,9 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("native v2 core with Claude 
     await writeFile(path.join(cwd, "file.txt"), "one\n");
     updates.length = 0;
     permissionAnswer = "allow_once";
-    const env: Record<string, string | undefined> = {
-      ...process.env,
-      CLAUDE_AGENT_ACP_PROTOCOL: "v2",
-    };
-    // Unset, so the run takes the default v2 core.
-    delete env.CLAUDE_AGENT_ACP_V2_CORE;
     child = spawn("node", [path.resolve("dist/index.js")], {
       cwd,
-      env,
+      env: { ...process.env, CLAUDE_AGENT_ACP_PROTOCOL: "v2" },
       stdio: ["pipe", "pipe", "inherit"],
     });
     const connection = v2

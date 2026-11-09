@@ -18,23 +18,20 @@ import {
   type Options,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { ClaudeAcpAgent } from "../acp-agent.js";
 import type { AuthStatusUpdateNotification } from "../auth-status.js";
-import { clientSupportsCompactionUpdates } from "../context-compaction.js";
 import { clearContextWindowCache } from "../context-window.js";
 import { v2DiffContent } from "../diff.js";
 import { type AcpProtocols, acpProtocolRouter, acpProtocolsFromEnv } from "../serve.js";
-import { clientSupportsNotices } from "../session-notices.js";
 import { v1PermissionResponse, v2PermissionRequest } from "../v2/permission.js";
 import { v1PromptRequest } from "../v2/prompt.js";
 import { V2Terminals } from "../v2/terminal.js";
 import { V2ToolCallMeta } from "../v2/tool-call-meta.js";
 import { v2RestartedToolCall } from "../v2/tool-call.js";
-import { v2ChildStateUpdate, v2SessionUpdate } from "../v2/session-update.js";
+import { v2SessionUpdate } from "../v2/session-update.js";
+import type { AgentHandle } from "../v2-native/agent.js";
 import {
   v1ForkSessionRequest,
   v1NewSessionRequest,
-  v1RestoreSessionRequest,
   v1SetSessionConfigOptionRequest,
   v2ConfigOptions,
 } from "../v2/session.js";
@@ -179,7 +176,7 @@ const CLI_SUBSCRIPTION = JSON.stringify({
 
 const V2_CLIENT_INFO = { name: "v2-test-client", version: "1.0.0" };
 
-const agents: ClaudeAcpAgent[] = [];
+const agents: AgentHandle[] = [];
 /** An empty Claude config directory and a session cwd, so no test reads the real ones. */
 let tempDir: string;
 let cwd: string;
@@ -210,8 +207,7 @@ function connectRouter(protocols?: AcpProtocols): v2.Stream {
   const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
   const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
   acpProtocolRouter(undefined, (agent) => agents.push(agent), protocols, {
-    v2Core: process.env.V2_CORE_UNDER_TEST === "native" ? "native" : "bridge",
-    onNativeAgent: (agent) => agents.push(agent as unknown as ClaudeAcpAgent),
+    onV2Agent: (agent) => agents.push(agent),
   }).connect({
     readable: toAgent.readable,
     writable: toClient.writable,
@@ -219,29 +215,22 @@ function connectRouter(protocols?: AcpProtocols): v2.Stream {
   return { readable: toClient.readable, writable: toAgent.writable };
 }
 
-/** Whether the tests run against the native v2 core (`src/v2-native/`) instead of the bridge. */
-const NATIVE_CORE = process.env.V2_CORE_UNDER_TEST === "native";
-
 /** The native core's session `sessionId` (a `NativeSession`), for waits on its internals. */
 function nativeSession(sessionId: string): any {
   return (agents[0] as unknown as { sessions: Map<string, unknown> }).sessions.get(sessionId);
 }
 
 /**
- * Waits until Claude Code has the prompt queued behind the running turn. The
- * cores keep it differently, which no client sees: the bridge's turn queue
- * holds both turns, and the native core has pushed the prompt and waits for
- * its insertion.
+ * Waits until Claude Code has the prompt queued behind the running turn: the
+ * core has pushed the prompt and waits for its insertion.
  */
 async function waitForQueuedPrompt(sessionId: string): Promise<void> {
   await vi.waitFor(() =>
-    NATIVE_CORE
-      ? expect(
-          [...nativeSession(sessionId).pending.values()].filter(
-            (prompt: { pushed: boolean }) => prompt.pushed,
-          ),
-        ).toHaveLength(1)
-      : expect(agents[0].sessions[sessionId]?.turnQueue).toHaveLength(2),
+    expect(
+      [...nativeSession(sessionId).pending.values()].filter(
+        (prompt: { pushed: boolean }) => prompt.pushed,
+      ),
+    ).toHaveLength(1),
   );
 }
 
@@ -422,14 +411,10 @@ describe("ACP protocol routing", () => {
     });
 
     // The v2 app registers neither `_session/async_task/stop` nor `_session/goal`.
-    // The bridge keeps the other AIR extensions. The native core lists only
-    // those that v2 does not cover (see "AIR clients" in docs/v2-native-core.md).
+    // The core lists only the AIR extensions that v2 does not cover (see
+    // "AIR clients" in docs/v2-native-core.md).
     const air = (response._meta as any)?.jetbrains?.air;
-    if (NATIVE_CORE) {
-      expect(air.capabilities).toEqual(["agentFileChangeReport", "recommendedValue"]);
-    } else {
-      expect(air.capabilities).toContain("sessionFailure");
-    }
+    expect(air.capabilities).toEqual(["agentFileChangeReport", "recommendedValue"]);
     expect(air.capabilities).not.toContain("asyncTasks");
     expect(air).not.toHaveProperty("goal");
   });
@@ -786,14 +771,7 @@ describe("ACP v2 sessions", () => {
       await client.authUpdate(1);
     });
 
-    if (!NATIVE_CORE) {
-      // v2 asks that ongoing work continue. The bridge starts a new query,
-      // which cancels the turn (see "Intended differences" in
-      // docs/v2-native-core.md).
-      expect(sdk.queryOptions).toHaveLength(2);
-      expect(turnTrace(client.sessionUpdates)).toContain("idle cancelled");
-      return;
-    }
+    // v2 asks that ongoing work continue.
     expect(sdk.queryOptions).toHaveLength(1);
     expect(sdk.setMcpServers).toHaveBeenCalledExactlyOnceWith({
       github: expect.objectContaining({ type: "http", url: "https://github.dev/mcp" }),
@@ -1223,22 +1201,6 @@ describe("ACP v2 sessions", () => {
       });
     });
   });
-
-  // Bridge internals: the v1 capabilities that the bridge gives ClaudeAcpAgent.
-  // The native core has none, and sends notices and compaction updates to
-  // every v2 client (see "reports Claude Code's warnings as live notices").
-  it.skipIf(process.env.V2_CORE_UNDER_TEST === "native")(
-    "tells the agent that a v2 client takes notices and compaction updates",
-    async () => {
-      const { app, authUpdate } = v2Client();
-      await app.connectWith(connectRouter(), async (agent) => {
-        await initializeV2(agent);
-        await authUpdate(1);
-      });
-      expect(clientSupportsNotices(agents[0].clientCapabilities)).toBe(true);
-      expect(clientSupportsCompactionUpdates(agents[0].clientCapabilities)).toBe(true);
-    },
-  );
 
   it("forwards the URL elicitation of MCP OAuth to a v2 client", async () => {
     let statusCall = 0;
@@ -2246,12 +2208,11 @@ describe("ACP v2 prompts", () => {
         _meta: { jetbrains: { air: { version: 1, loadReplayEnd: true } } },
       },
     });
-    // The bridge gives an AIR client AIR's subagent form, which reports no
-    // `background` list. The native core serves AIR v2's own.
+    // An AIR client gets v2's `background` list too.
     expect(atResponse.at(-1)?.update).toEqual({
       sessionUpdate: "state_update",
       state: "idle",
-      ...(NATIVE_CORE ? { background: [] } : {}),
+      background: [],
     });
     expect(client.sessionUpdates.filter(isEnd)).toHaveLength(1);
   });
@@ -2838,21 +2799,13 @@ describe("ACP v2 prompts", () => {
     await client.app.connectWith(connectRouter(), async (agent) => {
       await initializeV2(agent);
       const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
-      // The prompt waits while the close runs: on the bridge in the
-      // subscription guard, on the native core, which has none, for the
-      // interrupt of an earlier cancel.
+      // The prompt waits while the close runs, for the interrupt of an
+      // earlier cancel.
       const guard = Promise.withResolvers<void>();
       const guarded = Promise.withResolvers<void>();
-      if (NATIVE_CORE) {
-        sdk.interrupt = () => guard.promise;
-        await agent.notify(v2.methods.agent.session.cancel, { sessionId });
-        guarded.resolve();
-      } else {
-        vi.spyOn(agents[0] as any, "runClaudeSubscriptionGuard").mockImplementation(() => {
-          guarded.resolve();
-          return guard.promise;
-        });
-      }
+      sdk.interrupt = () => guard.promise;
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+      guarded.resolve();
       const prompt = agent.request(v2.methods.agent.session.prompt, {
         sessionId,
         prompt: text("go"),
@@ -2884,8 +2837,7 @@ describe("ACP v2 prompts", () => {
       await vi.waitFor(() =>
         expect(turnTrace(client.sessionUpdates)).toContain("agent_message_chunk"),
       );
-      // The native core has no consumer to wake: its close ends the work itself.
-      if (!NATIVE_CORE) agents[0].sessions[sessionId]!.cancelController = new AbortController();
+      // The close ends the work itself: it waits for no consumer.
 
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
       try {
@@ -3392,9 +3344,8 @@ describe("ACP v2 prompts", () => {
       });
 
       const updates = client.sessionUpdates as unknown as Seen[];
-      // The command ends in the child's session. The bridge reports the
-      // child's idle first. The native core ends the command first: v2 asks
-      // for the updates after a cancel before the idle that reports it.
+      // The command ends in the child's session, before the child's idle: v2
+      // asks for the updates after a cancel before the idle that reports it.
       const childIdle = updates.findIndex(
         ({ sessionId, update }) =>
           sessionId === "agent-1" &&
@@ -3407,8 +3358,7 @@ describe("ACP v2 prompts", () => {
         sessionId: "agent-1",
         update: { status: "cancelled" },
       });
-      if (NATIVE_CORE) expect(lastStatusAt(updates, "toolu_child")).toBeLessThan(childIdle);
-      else expect(lastStatusAt(updates, "toolu_child")).toBeGreaterThan(childIdle);
+      expect(lastStatusAt(updates, "toolu_child")).toBeLessThan(childIdle);
       // Claude Code's result for the command was dropped, so only one report ended it.
       expect(
         updates.filter(
@@ -3760,9 +3710,8 @@ describe("ACP v2 prompts", () => {
       /**
        * Claude Code, as the bundled CLI answers each prompt: the client's
        * prompt plans and calls ExitPlanMode, `/clear` mounts a fresh
-       * conversation, and the plan's prompt carries it out. The bridge sends
-       * the plan's prompt to a fresh query instead of `/clear`. Each echo
-       * carries the prompt's `origin`, as the bundled CLI's does.
+       * conversation, and the plan's prompt carries it out. Each echo carries
+       * the prompt's `origin`, as the bundled CLI's does.
        */
       const prompts: string[] = [];
       sdk.run = async function* (input, options) {
@@ -4201,9 +4150,8 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
       const { root, updates } = await cancelCycle("toolu_child");
 
       // The parent does not show the Agent call: the child's idle reports the
-      // stop. The command ends in the child's session, before the cycle's
-      // idle. The bridge ends it after the child's idle; the native core
-      // before it, as v2 asks of the updates after a cancel.
+      // stop. The command ends in the child's session, before the child's
+      // idle, as v2 asks of the updates after a cancel.
       expect(statusesOf(updates, "toolu_agent")).toEqual([]);
       expect(updates[lastIdleAt(updates, "agent-1")]).toMatchObject({
         update: { stopReason: "cancelled" },
@@ -4214,8 +4162,7 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
         "pending",
         "cancelled",
       ]);
-      if (NATIVE_CORE) expect(end).toBeLessThan(lastIdleAt(updates, "agent-1"));
-      else expect(end).toBeGreaterThan(lastIdleAt(updates, "agent-1"));
+      expect(end).toBeLessThan(lastIdleAt(updates, "agent-1"));
       expect(updates[lastIdleAt(updates, root)]).toMatchObject({
         update: { stopReason: "cancelled" },
       });
@@ -5351,13 +5298,8 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
     });
     const client = await promptAndWait(2, async (agent, sessionId, client) => {
       await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toEqual(endedTurn));
-      // Each core records the request frame in its own state.
       await vi.waitFor(() =>
-        expect(
-          NATIVE_CORE
-            ? nativeSession(sessionId).stopped.modelRequestSinceResult
-            : agents[0].sessions[sessionId]?.modelRequestSinceResult,
-        ).toBe(true),
+        expect(nativeSession(sessionId).stopped.modelRequestSinceResult).toBe(true),
       );
       await agent.notify(v2.methods.agent.session.cancel, { sessionId });
     });
@@ -5795,19 +5737,9 @@ describe("ACP v2 requests that subagents make", () => {
         ).configOptions;
         return [`${option!.currentValue} ${option!.options[0]!.name}`];
       });
-      // The bridge replays while Claude Code starts, without the model list:
-      // the model goes as its id, then as the list's entry after the
-      // response. The native core replays after the start (see "Intended
-      // differences").
-      expect(models).toEqual(
-        NATIVE_CORE
-          ? ["claude-sonnet-4-6 Claude Sonnet 4.6", "response"]
-          : [
-              "claude-sonnet-4-6 claude-sonnet-4-6",
-              "response",
-              "claude-sonnet-4-6 Claude Sonnet 4.6",
-            ],
-      );
+      // The core replays after Claude Code started, so the model goes as the
+      // model list's entry at once.
+      expect(models).toEqual(["claude-sonnet-4-6 Claude Sonnet 4.6", "response"]);
     });
 
     it("drops a foreground child's consolidated messages after the root's cancel, except the results of its shown tool calls", async () => {
@@ -6002,11 +5934,10 @@ describe("ACP v2 requests that subagents make", () => {
         }
       });
       // The child's run ends with no stop reason: nothing says how. Its tool
-      // call ends first, as v2 asks; the bridge leaves it open (see
-      // "Intended differences").
+      // call ends first, as v2 asks.
       expect(trace).toEqual([
         "root running []",
-        ...(NATIVE_CORE ? ["agent-1 toolu_ls failed"] : []),
+        "agent-1 toolu_ls failed",
         "root subagent agent-1 idle",
         "agent-1 idle []",
         "root idle end_turn []",
@@ -6089,13 +6020,8 @@ describe("ACP v2 requests that subagents make", () => {
 
     it.each([
       // The client holds the call from the request: it keeps getting it, and
-      // the message goes to the child only. The bridge does not name the
-      // sender then (see "Intended differences").
-      [
-        "before",
-        1,
-        [`agent-1 toolu_send ${NATIVE_CORE ? "root" : "undefined"} -> agent-1 Look again`],
-      ],
+      // the message goes to the child only, and names its sender.
+      ["before", 1, ["agent-1 toolu_send root -> agent-1 Look again"]],
       [
         "after",
         0,
@@ -7306,14 +7232,7 @@ describe("ACP v2 requests that a cancel withdraws", () => {
         await wait(client);
         // The first is still open, so the answer changes nothing.
         answer.resolve(allowOnce);
-        // Each core counts the open requests in its own state.
-        await vi.waitFor(() =>
-          expect(
-            NATIVE_CORE
-              ? nativeSession(sessionId).requests.size
-              : agents[0].sessions[sessionId]?.openUserInputs?.size,
-          ).toBe(1),
-        );
+        await vi.waitFor(() => expect(nativeSession(sessionId).requests.size).toBe(1));
         await agent.notify(v2.methods.agent.session.cancel, { sessionId });
       });
 
@@ -8162,13 +8081,6 @@ describe("ACP v2 session translation", () => {
     expect(v1ForkSessionRequest({ sessionId: "s", cwd, systemPrompt }).systemPrompt).toEqual(
       v1SystemPrompt,
     );
-    expect(
-      v1RestoreSessionRequest({ sessionId: "s", cwd, systemPrompt }).request.systemPrompt,
-    ).toEqual(v1SystemPrompt);
-    expect(
-      v1RestoreSessionRequest({ sessionId: "s", cwd, systemPrompt, replayFrom: { type: "start" } })
-        .request.systemPrompt,
-    ).toEqual(v1SystemPrompt);
   });
 
   it("rejects a config option value type that v1 cannot express", () => {
@@ -8218,21 +8130,6 @@ describe("ACP v2 session translation", () => {
       content: text("Look")[0],
     };
     expect(v2SessionUpdate(chunk)).toEqual(chunk);
-  });
-
-  it("reports a subagent's work state on the child's stream as well", () => {
-    const failed = {
-      state: "idle" as const,
-      stopReason: "error" as const,
-      error: { code: -32603, message: "Overloaded" },
-    };
-    expect(
-      v2ChildStateUpdate({ sessionUpdate: "subagent_update", sessionId: "agent-1", state: failed }),
-    ).toEqual({ sessionId: "agent-1", update: { sessionUpdate: "state_update", ...failed } });
-    // An update of the association that reports no state has no copy.
-    expect(
-      v2ChildStateUpdate({ sessionUpdate: "subagent_update", sessionId: "agent-1", title: "X" }),
-    ).toBeUndefined();
   });
 
   it("fails on a subagent state that the subagents RFD does not define", () => {
@@ -9154,9 +9051,7 @@ describe("ACP v2 Remote Control", () => {
         prompt: text("/remote-control laptop"),
       });
       await vi.waitFor(() => expect(sdk.enableRemoteControl).toHaveBeenCalled());
-      if (NATIVE_CORE) {
-        await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
-      }
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
       await client.authUpdate(1);
       return response;
     });
@@ -9169,13 +9064,6 @@ describe("ACP v2 Remote Control", () => {
         content: text("/remote-control laptop"),
       },
     ]);
-    if (!NATIVE_CORE) {
-      // The bridge's reply has no messageId, which v2 requires of a chunk, so
-      // it never reaches the client, and no state goes around the command
-      // (see "Intended differences" in docs/v2-native-core.md).
-      expect(turnTrace(client.sessionUpdates)).toEqual(["user_message"]);
-      return;
-    }
     expect(client.updates("agent_message_chunk")[0].content).toMatchObject({
       text: expect.stringContaining(SESSION_URL),
     });
@@ -9188,53 +9076,48 @@ describe("ACP v2 Remote Control", () => {
     ]);
   });
 
-  // The bridge runs /remote-control before its subscription guard, so it
-  // inserts the command before a prompt received earlier that the guard still
-  // judges. v2 asks that held prompts be inserted in the order received.
-  it.skipIf(!NATIVE_CORE)(
-    "inserts a prompt that the subscription guard judges before a /remote-control sent after it",
-    async () => {
-      const argv = process.argv;
-      process.argv = [...argv, "--hide-claude-auth"];
-      const apiKey = { apiKeySource: "ANTHROPIC_API_KEY", apiProvider: "firstParty" };
-      sdk.initializationResult = async () => ({
-        ...(await sdkDefaults.initializationResult()),
-        account: apiKey,
-      });
-      const account = Promise.withResolvers<Record<string, unknown>>();
-      sdk.accountInfo = () => account.promise;
-      scriptTurns(async function* (options) {
-        yield result(options);
-      });
-      const client = v2Client();
-      try {
-        await client.app.connectWith(connectRouter(), async (agent) => {
-          await initializeV2(agent);
-          const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
-          const first = agent.request(v2.methods.agent.session.prompt, {
-            sessionId,
-            prompt: text("fix the bug"),
-          });
-          const command = agent.request(v2.methods.agent.session.prompt, {
-            sessionId,
-            prompt: text("/remote-control"),
-          });
-          await new Promise((resolve) => setTimeout(resolve, 20));
-          account.resolve(apiKey);
-          await Promise.all([first, command]);
-          await vi.waitFor(() => expect(sdk.enableRemoteControl).toHaveBeenCalled());
-          await client.authUpdate(1);
+  // v2 asks that held prompts be inserted in the order received.
+  it("inserts a prompt that the subscription guard judges before a /remote-control sent after it", async () => {
+    const argv = process.argv;
+    process.argv = [...argv, "--hide-claude-auth"];
+    const apiKey = { apiKeySource: "ANTHROPIC_API_KEY", apiProvider: "firstParty" };
+    sdk.initializationResult = async () => ({
+      ...(await sdkDefaults.initializationResult()),
+      account: apiKey,
+    });
+    const account = Promise.withResolvers<Record<string, unknown>>();
+    sdk.accountInfo = () => account.promise;
+    scriptTurns(async function* (options) {
+      yield result(options);
+    });
+    const client = v2Client();
+    try {
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        const first = agent.request(v2.methods.agent.session.prompt, {
+          sessionId,
+          prompt: text("fix the bug"),
         });
-      } finally {
-        process.argv = argv;
-      }
+        const command = agent.request(v2.methods.agent.session.prompt, {
+          sessionId,
+          prompt: text("/remote-control"),
+        });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        account.resolve(apiKey);
+        await Promise.all([first, command]);
+        await vi.waitFor(() => expect(sdk.enableRemoteControl).toHaveBeenCalled());
+        await client.authUpdate(1);
+      });
+    } finally {
+      process.argv = argv;
+    }
 
-      expect(client.updates("user_message").map((message) => message.content)).toEqual([
-        text("fix the bug"),
-        text("/remote-control"),
-      ]);
-    },
-  );
+    expect(client.updates("user_message").map((message) => message.content)).toEqual([
+      text("fix the bug"),
+      text("/remote-control"),
+    ]);
+  });
 
   it("runs /remote-control sent while Claude works once the turn ends", async () => {
     const release = Promise.withResolvers<void>();
@@ -9251,13 +9134,7 @@ describe("ACP v2 Remote Control", () => {
         sessionId,
         prompt: text("/remote-control"),
       });
-      if (!NATIVE_CORE) {
-        // v2 asks to hold a prompt rather than reject it while Claude works:
-        // the bridge rejects the command (see "Intended differences").
-        await expect(command).rejects.toMatchObject({ code: -32600 });
-        release.resolve();
-        return;
-      }
+      // v2 asks to hold a prompt rather than reject it while Claude works.
       await new Promise((resolve) => setTimeout(resolve, 20));
       expect(sdk.enableRemoteControl).not.toHaveBeenCalled();
       release.resolve();

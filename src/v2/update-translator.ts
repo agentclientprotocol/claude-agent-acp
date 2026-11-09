@@ -2,9 +2,8 @@
  * Turns the v1 session updates that the shared SDK-to-ACP mapping produces
  * (`toAcpNotifications`) into the v2 updates of one connection.
  *
- * Both v2 cores use it: the bridge (`agent.ts`), which translates every update
- * of `ClaudeAcpAgent`, and the native core (`src/v2-native/`), which maps the
- * SDK stream itself. It holds the per-connection state that the translation
+ * The v2 core (`src/v2-native/`) uses it for every update that it maps from
+ * the SDK stream. It holds the per-connection state that the translation
  * needs: the display terminals of commands and the `_meta` the client stores
  * for each tool call.
  */

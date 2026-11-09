@@ -1,18 +1,14 @@
 /**
- * The ACP v2 session lifecycle, expressed through the v1 session methods of
- * `ClaudeAcpAgent`: v2 requests become the v1 requests that the agent serves,
- * and its v1 responses become v2 responses.
+ * The v1 form of the v2 session setup and config requests, which the shared
+ * session modules take (`sdkMcpServers`, `forkSession`, `configOptionValue`),
+ * and the v2 form of the config options and commands that they build.
  */
 import {
   RequestError,
   type AvailableCommand,
   type ForkSessionRequest,
-  type LoadSessionRequest,
   type McpServer,
   type NewSessionRequest,
-  type NewSessionResponse,
-  type ResumeSessionRequest,
-  type ResumeSessionResponse,
   type SessionConfigOption,
   type SessionConfigSelectGroup,
   type SessionConfigSelectOptions,
@@ -33,45 +29,7 @@ export function v1NewSessionRequest(params: v2.NewSessionRequest): NewSessionReq
   };
 }
 
-/**
- * The v1 request that a v2 `session/resume` means.
- *
- * v2 restores a session with `session/resume` and replays its history only
- * when `replayFrom` asks for it. v1 has two methods: `session/resume`, which
- * never replays, and `session/load`, which replays the whole history before it
- * responds. `replayFrom: { type: "start" }` is the second; a cursor that
- * starts elsewhere is rejected.
- */
-export function v1RestoreSessionRequest(
-  params: v2.ResumeSessionRequest,
-):
-  | { method: "resume"; request: ResumeSessionRequest }
-  | { method: "load"; request: LoadSessionRequest } {
-  const { replayFrom, mcpServers, systemPrompt, ...rest } = params;
-  const request = { ...rest, ...v1SystemPromptField(systemPrompt) };
-  if (replayFrom == null) {
-    return {
-      method: "resume",
-      request: { ...request, ...(mcpServers ? { mcpServers: v1McpServers(mcpServers) } : {}) },
-    };
-  }
-  const servers = v1McpServers(mcpServers);
-  if (replayFrom.type !== "start") {
-    throw RequestError.invalidParams(
-      { replayFrom },
-      `Replaying from a ${replayFrom.type} cursor is not supported`,
-    );
-  }
-  return {
-    method: "load",
-    request: { ...request, mcpServers: servers ?? [] },
-  };
-}
-
-/**
- * The v1 request of a v2 `session/fork`. In both versions the agent's fork
- * returns a session that the client can prompt, with its config options.
- */
+/** The v1 request of a v2 `session/fork`. */
 export function v1ForkSessionRequest(params: v2.ForkSessionRequest): ForkSessionRequest {
   const { mcpServers, systemPrompt, ...request } = params;
   return {
@@ -90,18 +48,6 @@ function v1SystemPromptField(systemPrompt: v2.SystemPrompt | null | undefined): 
 } {
   if (systemPrompt == null) return {};
   return { systemPrompt: { ...systemPrompt, content: systemPrompt.content.map(v1ContentBlock) } };
-}
-
-/** v2 drops `modes`: the session mode is the `mode` config option, which the agent always lists. */
-export function v2NewSessionResponse(response: NewSessionResponse): v2.NewSessionResponse {
-  return { sessionId: response.sessionId, ...v2ResumeSessionResponse(response) };
-}
-
-export function v2ResumeSessionResponse(response: ResumeSessionResponse): v2.ResumeSessionResponse {
-  return {
-    ...v2ConfigOptionsField(response.configOptions),
-    ...(response._meta != null ? { _meta: response._meta } : {}),
-  };
 }
 
 /** v2 tags a select value with `type: "id"`; v1 leaves it untagged. */
@@ -157,19 +103,12 @@ export function v2AvailableCommands(commands: AvailableCommand[]): v2.AvailableC
   }));
 }
 
-/** v1 responses may send `null`; v2 omits the field instead. */
-function v2ConfigOptionsField(options: SessionConfigOption[] | null | undefined): {
-  configOptions?: v2.SessionConfigOption[];
-} {
-  return options != null ? { configOptions: v2ConfigOptions(options) } : {};
-}
-
 /**
  * The v1 list of the MCP servers of a v2 setup request, or undefined for no
  * list. A request with two servers of the same `name`, or with a transport
  * that the agent does not advertise in `session.mcp` (such as `acp` or a
- * custom `_` type), fails with invalid params (-32602): the v1 session setup
- * would otherwise drop the server without telling the client.
+ * custom `_` type), fails with invalid params (-32602): `sdkMcpServers` would
+ * otherwise drop the server without telling the client.
  */
 function v1McpServers(servers: v2.McpServer[] | null | undefined): McpServer[] | undefined {
   if (servers == null) return undefined;
@@ -179,8 +118,8 @@ function v1McpServers(servers: v2.McpServer[] | null | undefined): McpServer[] |
 
 /**
  * v2 requires a `type` on every transport and makes the empty lists optional.
- * The agent recognizes a v1 stdio server by its missing `type`, so the v2 tag
- * is dropped. {@link v1McpServers} has already rejected every other transport.
+ * `sdkMcpServers` recognizes a v1 stdio server by its missing `type`, so the
+ * v2 tag is dropped. {@link v1McpServers} has already rejected every other transport.
  */
 function v1McpServer(server: v2.McpServer): McpServer {
   if (v2.McpServer.isStdio(server)) {
