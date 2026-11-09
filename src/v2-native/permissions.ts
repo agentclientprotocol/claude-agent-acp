@@ -30,6 +30,15 @@ export interface PermissionHost {
   target(agentId: string | undefined): Promise<RequestTarget>;
   /** The user picked a mode in the answer, such as ExitPlanMode's "auto-accept edits". */
   modeChanged(mode: PermissionMode): void;
+  /**
+   * Whether the tool use is of work that a cancel stopped before the client
+   * saw it (see `StoppedWork`): it is denied without a request.
+   */
+  dropsToolUse(
+    toolUseId: string,
+    agentId: string | undefined,
+    signal: AbortSignal,
+  ): Promise<boolean>;
 }
 
 export function canUseTool(host: PermissionHost): CanUseTool {
@@ -51,6 +60,10 @@ export function canUseTool(host: PermissionHost): CanUseTool {
       agentID,
     },
   ) => {
+    // The client was told that this work never ran, so it sees no request for it.
+    if (await host.dropsToolUse(toolUseID, agentID, signal)) {
+      return { behavior: "deny", message: "The user cancelled this prompt." };
+    }
     const target = await host.target(agentID);
     // No persistent "always allow" when the user's own ask rule forced the
     // prompt, or when Claude Code says the rule it would write grants more

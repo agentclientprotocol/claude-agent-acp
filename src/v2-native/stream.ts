@@ -28,6 +28,7 @@ import {
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
+import { AcpToolCallRenderer } from "../tool-calls/renderer.js";
 import { replayClear, type V2UpdateTranslator } from "../v2/update-translator.js";
 
 /** Every v2 client gets the same tool call reports: v2 diffs and display terminals. */
@@ -50,6 +51,13 @@ export class SessionOutput {
   private agentText = false;
   /** During {@link replay}, the messages that it has cleared so far. */
   private replayCleared: Set<string> | undefined;
+  /** The open tool calls whose tool use reached a complete assistant message: Claude Code runs them. */
+  private readonly dispatched = new Set<string>();
+  /**
+   * Whether the tool results come from work that a `session/cancel` stopped:
+   * an error result then ends a run that the cancel aborted (`cancelled`).
+   */
+  cancelled = false;
 
   constructor(
     readonly sessionId: string,
@@ -105,6 +113,9 @@ export class SessionOutput {
    */
   assistant(message: SDKAssistantMessage): void {
     const messageId = messageIdForGrouping(message);
+    for (const block of message.message.content) {
+      if (block.type === "tool_use") this.dispatched.add(block.id);
+    }
     const streamed =
       message.message.id !== undefined && this.streamedMessages.delete(message.message.id);
     const dropText = streamed || message.parent_tool_use_id !== null;
@@ -136,6 +147,7 @@ export class SessionOutput {
       {
         toolUseResult: message.tool_use_result,
         toolResultMeta: (message as { tool_result_meta?: unknown }).tool_result_meta,
+        cancelled: this.cancelled,
       },
       transform,
     );
@@ -211,6 +223,7 @@ export class SessionOutput {
       messageId?: string;
       toolUseResult?: unknown;
       toolResultMeta?: unknown;
+      cancelled?: boolean;
       replay?: boolean;
     },
     transform: (notification: AcpSessionNotification) => AcpSessionNotification = (n) => n,
@@ -250,6 +263,31 @@ export class SessionOutput {
     }
   }
 
+  /**
+   * Ends the open tool calls that will get no result, for the end of the work
+   * (see `AcpToolCallRenderer.unfinished`), before its idle. After a cancel
+   * (`stopped`), every open call ends `cancelled`. Otherwise only the calls
+   * that Claude dropped before they ran end, `cancelled` too: a streamed
+   * tool_use that no complete message holds. A call that runs, such as one in
+   * the background, gets Claude Code's result. A command's report also ends
+   * its terminal. The call is forgotten, so a late result changes nothing.
+   */
+  closeUnfinished(stopped: boolean): void {
+    const renderer = new AcpToolCallRenderer(V2_TOOL_CALL_CAPABILITIES);
+    for (const toolCallId of [...this.unfinished]) {
+      const ran = this.dispatched.has(toolCallId);
+      if (ran && !stopped) continue;
+      const report = renderer.unfinished({ toolCallId, ran, cancelled: stopped });
+      const toolUse = this.toolUseCache[toolCallId];
+      const terminalExit = toolUse && renderer.terminalExit(toolUse);
+      if (terminalExit) report._meta = { ...report._meta, ...terminalExit };
+      this.emittedToolCalls.delete(toolCallId);
+      delete this.toolUseCache[toolCallId];
+      this.toolCallFields.delete(toolCallId);
+      this.emit([{ sessionId: this.sessionId, update: report }]);
+    }
+  }
+
   /** The tool calls that the client holds without a final status. */
   private readonly unfinished = new Set<string>();
 
@@ -263,8 +301,12 @@ export class SessionOutput {
         if (v2Update.sessionUpdate === "tool_call_update" && !replaying) {
           const { toolCallId, status } = v2Update as { toolCallId: string; status?: string | null };
           if (status != null) {
-            if (FINAL_STATUSES.has(status)) this.unfinished.delete(toolCallId);
-            else this.unfinished.add(toolCallId);
+            if (FINAL_STATUSES.has(status)) {
+              this.unfinished.delete(toolCallId);
+              this.dispatched.delete(toolCallId);
+            } else {
+              this.unfinished.add(toolCallId);
+            }
           }
         }
         this.send(v2Update);

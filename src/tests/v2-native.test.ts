@@ -229,9 +229,17 @@ function sessionState(state: "idle" | "running" | "requires_action") {
   return { type: "system", subtype: "session_state_changed", state, uuid: randomUUID() };
 }
 
-/** The `system/init` that starts each turn, also one that no prompt started. */
-function turnInit() {
-  return { type: "system", subtype: "init", uuid: randomUUID() };
+/**
+ * The first output of a turn: the `message_start` of its model's stream. It
+ * opens a turn that no prompt started, such as after a background task ends.
+ */
+function cycleStart() {
+  return {
+    type: "stream_event",
+    event: { type: "message_start", message: { id: `msg_${randomUUID()}`, content: [] } },
+    parent_tool_use_id: null,
+    uuid: randomUUID(),
+  };
 }
 
 function textDelta(id: string, text: string) {
@@ -427,6 +435,20 @@ describe("native ACP v2 core", () => {
         cachedWriteTokens: 0,
         totalTokens: 6,
       },
+      // As on the bridge: the turn's tokens, and its rows by model.
+      _meta: {
+        quota: {
+          token_count: {
+            totalTokens: 6,
+            inputTokens: 3,
+            cachedInputTokens: 1,
+            cachedWriteTokens: 0,
+            outputTokens: 2,
+            reasoningOutputTokens: 0,
+          },
+          model_usage: [],
+        },
+      },
     });
   });
 
@@ -478,14 +500,17 @@ describe("native ACP v2 core", () => {
       claude.send(sessionState("running"));
       claude.send(lifecycle(running, "started"));
       await first;
-      const queued = agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: PROMPT });
+      const queued = agent
+        .request(v2.methods.agent.session.prompt, { sessionId, prompt: PROMPT })
+        .catch((error: unknown) => error);
       const waiting = await claude.prompt(1);
 
       await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+      // The cancel answers the queued prompt at once.
+      expect(await queued).toMatchObject({ code: -32800 });
       await vi.waitFor(() => expect(claude.interrupt).toHaveBeenCalledWith({ cancelQueued: true }));
       // Claude Code ends the queued prompt, then the interrupted work.
       claude.send(lifecycle(waiting, "cancelled"));
-      await expect(queued).rejects.toMatchObject({ code: -32800 });
       claude.send(result({ subtype: "error_during_execution", is_error: true }));
       claude.send(sessionState("idle"));
       await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
@@ -502,7 +527,7 @@ describe("native ACP v2 core", () => {
     });
     const decision = await client.connect(async (agent) => {
       const { claude } = await openSession(agent);
-      claude.send(turnInit());
+      claude.send(cycleStart());
       await vi.waitFor(() => expect(client.states()).toEqual(["running"]));
       return claude.options.canUseTool!(
         "Bash",
@@ -594,7 +619,7 @@ describe("native ACP v2 core", () => {
     const client = nativeClient();
     const error = await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
-      claude.send(turnInit());
+      claude.send(cycleStart());
       claude.send(
         assistant("msg_1", [
           { type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "make" } },
@@ -650,12 +675,12 @@ describe("native ACP v2 core", () => {
       // subagent ends and the turn that Claude Code starts on its own ends.
       claude.send(sessionState("running"));
       claude.send(lifecycle(prompt, "started"));
-      claude.send(turnInit());
+      claude.send(cycleStart());
       await answer;
       claude.send(result({ result: "launched" }));
       claude.send(lifecycle(prompt, "completed"));
       await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
-      claude.send(turnInit());
+      claude.send(cycleStart());
       claude.send(result({ result: "The subagent finished." }));
       claude.send(sessionState("idle"));
       await vi.waitFor(() =>
@@ -669,12 +694,14 @@ describe("native ACP v2 core", () => {
     await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
       const sessionId = response.sessionId;
-      const first = agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: PROMPT });
+      const first = agent
+        .request(v2.methods.agent.session.prompt, { sessionId, prompt: PROMPT })
+        .catch((error: unknown) => error);
       const queued = await claude.prompt(0);
       await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+      expect(await first).toMatchObject({ code: -32800 });
       await vi.waitFor(() => expect(claude.interrupt).toHaveBeenCalled());
       claude.send(lifecycle(queued, "cancelled"));
-      await expect(first).rejects.toMatchObject({ code: -32800 });
 
       const second = agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: PROMPT });
       const prompt = await claude.prompt(1);
@@ -687,6 +714,106 @@ describe("native ACP v2 core", () => {
     expect(client.sessionUpdates.at(-1)).toMatchObject({ state: "idle", stopReason: "end_turn" });
   });
 
+  it("drops the run of a prompt that a cancel answered after Claude Code took it in, and denies its tools", async () => {
+    const client = nativeClient();
+    const decision = await client.connect(async (agent) => {
+      const { response, claude } = await openSession(agent);
+      const sessionId = response.sessionId;
+      const queued = agent
+        .request(v2.methods.agent.session.prompt, { sessionId, prompt: PROMPT })
+        .catch((error: unknown) => error);
+      const prompt = await claude.prompt(0);
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+      expect(await queued).toMatchObject({ code: -32800 });
+      // Claude Code had taken the prompt in before the interrupt arrived.
+      claude.send(lifecycle(prompt, "started"));
+      claude.send(
+        assistant("msg_late", [
+          { type: "tool_use", id: "toolu_late", name: "Bash", input: { command: "make" } },
+        ]),
+      );
+      const decision = await claude.options.canUseTool!(
+        "Bash",
+        { command: "make" },
+        {
+          signal: new AbortController().signal,
+          toolUseID: "toolu_late",
+          requestId: "r1",
+          suggestions: [],
+        },
+      );
+      claude.send(result());
+      claude.send(sessionState("idle"));
+      // A later cycle shows that the session goes on.
+      claude.send(cycleStart());
+      claude.send(result());
+      await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+      return decision;
+    });
+
+    expect(decision).toEqual({ behavior: "deny", message: "The user cancelled this prompt." });
+    expect(client.permissionRequests).toEqual([]);
+    expect(
+      client.sessionUpdates.filter(
+        (update) => update.sessionUpdate === "user_message" || "toolCallId" in update,
+      ),
+    ).toEqual([]);
+  });
+
+  it("ends a cycle at its own result, not at a placeholder or at the idle of the turn before", async () => {
+    const client = nativeClient();
+    await client.connect(async (agent) => {
+      const { claude } = await openSession(agent);
+      claude.send(cycleStart());
+      claude.send(result());
+      // The turn's idle comes after the next cycle started.
+      claude.send(cycleStart());
+      claude.send(sessionState("idle"));
+      const followup = { origin: { kind: "task-notification" } };
+      claude.send(result({ ...followup, num_turns: 0 }));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(client.states()).toEqual(["running", "idle", "running"]);
+      claude.send(result({ ...followup, num_turns: 1 }));
+      await vi.waitFor(() =>
+        expect(client.states()).toEqual(["running", "idle", "running", "idle"]),
+      );
+    });
+  });
+
+  it("reports a tool call that Claude dropped before it ran as cancelled at the turn's end", async () => {
+    const client = nativeClient();
+    await client.connect(async (agent) => {
+      const { claude } = await openSession(agent);
+      claude.send({
+        type: "stream_event",
+        event: {
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "tool_use", id: "toolu_dropped", name: "Bash", input: {} },
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+      });
+      claude.send(result());
+      await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+    });
+
+    expect(client.sessionUpdates.slice(-2)).toMatchObject([
+      {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "toolu_dropped",
+        status: "cancelled",
+        content: [
+          {
+            type: "content",
+            content: { type: "text", text: "Claude stopped this tool call before it ran." },
+          },
+        ],
+      },
+      { state: "idle", stopReason: "end_turn" },
+    ]);
+  });
+
   it("pushes a prompt sent after session/cancel only once the interrupt is done", async () => {
     const client = nativeClient();
     await client.connect(async (agent) => {
@@ -696,7 +823,7 @@ describe("native ACP v2 core", () => {
       claude.interrupt.mockImplementationOnce(
         () => new Promise<void>((resolve) => (finishInterrupt = resolve)),
       );
-      claude.send(turnInit());
+      claude.send(cycleStart());
       await vi.waitFor(() => expect(client.states()).toEqual(["running"]));
       await agent.notify(v2.methods.agent.session.cancel, { sessionId });
       await vi.waitFor(() => expect(claude.interrupt).toHaveBeenCalled());
@@ -715,7 +842,7 @@ describe("native ACP v2 core", () => {
     await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
       const sessionId = response.sessionId;
-      claude.send(turnInit());
+      claude.send(cycleStart());
       await vi.waitFor(() => expect(client.states()).toEqual(["running"]));
       claude.interrupt.mockImplementationOnce(async () => {
         claude.send(result({ subtype: "error_during_execution", is_error: true }));
@@ -831,7 +958,7 @@ describe("native ACP v2 core", () => {
       const sessionId = await client.connect(async (agent) => {
         const { response, claude } = await openSession(agent);
         const child = subagent(agentId, "toolu_launch");
-        claude.send(turnInit());
+        claude.send(cycleStart());
         claude.send(child.started());
         claude.send(child.prompt("Find why the test fails"));
         claude.send(child.says("It is a race."));
@@ -889,7 +1016,7 @@ describe("native ACP v2 core", () => {
       const sessionId = await client.connect(async (agent) => {
         const { response, claude } = await openSession(agent);
         const child = subagent(agentId, "toolu_bg_agent", { is_backgrounded: true });
-        claude.send(turnInit());
+        claude.send(cycleStart());
         claude.send({
           type: "system",
           subtype: "background_tasks_changed",
@@ -933,7 +1060,7 @@ describe("native ACP v2 core", () => {
       const client = nativeClient();
       await client.connect(async (agent) => {
         const { claude } = await openSession(agent);
-        claude.send(turnInit());
+        claude.send(cycleStart());
         claude.send(subagent("outer", "toolu_outer").started());
         claude.send(subagent("inner", "toolu_inner", { parent_task_id: "outer" }).started());
         await vi.waitFor(() =>
@@ -951,7 +1078,7 @@ describe("native ACP v2 core", () => {
       });
       await client.connect(async (agent) => {
         const { claude } = await openSession(agent);
-        claude.send(turnInit());
+        claude.send(cycleStart());
         claude.send(subagent("child", "toolu_launch").started());
         await vi.waitFor(() => expect(client.states()).toEqual(["running"]));
         const decision = claude.options.canUseTool!(
@@ -989,7 +1116,7 @@ describe("native ACP v2 core", () => {
       const client = nativeClient();
       await client.connect(async (agent) => {
         const { claude } = await openSession(agent);
-        claude.send(turnInit());
+        claude.send(cycleStart());
         claude.send(subagent("child", "toolu_launch", { is_backgrounded: true }).started());
         await vi.waitFor(() =>
           expect(updatesOf(client.notifications, "child")).toContainEqual(
@@ -1016,7 +1143,7 @@ describe("native ACP v2 core", () => {
       const client = nativeClient();
       const error = await client.connect(async (agent) => {
         const { claude } = await openSession(agent);
-        claude.send(turnInit());
+        claude.send(cycleStart());
         claude.send(subagent("child", "toolu_launch").started());
         await vi.waitFor(() =>
           expect(client.notifications.some((n) => n.sessionId === "child")).toBe(true),
@@ -1039,7 +1166,7 @@ describe("native ACP v2 core", () => {
       const client = nativeClient();
       const sessionId = await client.connect(async (agent) => {
         const { response, claude } = await openSession(agent);
-        claude.send(turnInit());
+        claude.send(cycleStart());
         claude.send(
           assistant("msg_bash", [
             {

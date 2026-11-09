@@ -393,6 +393,16 @@ import {
   type UltracodeOptionState,
 } from "./session-ultracode.js";
 import { STARTUP_FAILURE_RESULTS_ENV, startupFailureError } from "./startup-failure.js";
+import {
+  addModelUsage,
+  modelUsageIncrement,
+  normalizeModelUsage,
+  quotaMeta,
+  resumedFirstResultModelUsage,
+  tallyTotal,
+  type AccumulatedUsage,
+  type ModelTokenTally,
+} from "./usage-quota.js";
 
 export { EFFORT_CONFIG_ID, settingsEffortForModel } from "./session-effort.js";
 export {
@@ -430,17 +440,6 @@ export interface Logger {
   /** Optional: a caller that supplies no `warn` gets its warnings on `error`. */
   warn?: (...args: any[]) => void;
 }
-
-type AccumulatedUsage = {
-  inputTokens: number;
-  outputTokens: number;
-  cachedReadTokens: number;
-  cachedWriteTokens: number;
-};
-
-/** Per-model token tallies keyed by the model id the SDK reported them under
- *  (its resolved spelling, e.g. "claude-opus-5[1m]"). */
-type ModelTokenTally = Record<string, AccumulatedUsage>;
 
 type UsageSnapshot = {
   input_tokens: number;
@@ -1634,7 +1633,7 @@ export type Session = {
  *  Exception: a result from one of these origins that names a pending prompt
  *  in `user_message_uuids` consumed that folded prompt and takes the user
  *  lane (see the result handler). */
-const AUTONOMOUS_RESULT_ORIGINS: ReadonlySet<SDKMessageOrigin["kind"]> = new Set([
+export const AUTONOMOUS_RESULT_ORIGINS: ReadonlySet<SDKMessageOrigin["kind"]> = new Set([
   "task-notification",
   "peer",
   "coordinator",
@@ -12617,20 +12616,6 @@ function turnQuotaMeta(session: Session) {
   return quotaMeta(session.accumulatedUsage, session.accumulatedModelUsage);
 }
 
-/** `_meta.quota` for work that spent `usage` in its main agent loop and
- *  `modelUsage` by model (see {@link turnQuotaMeta}). */
-function quotaMeta(usage: AccumulatedUsage, modelUsage: ModelTokenTally | undefined) {
-  return {
-    quota: {
-      token_count: quotaTokenCount(usage),
-      model_usage: Object.entries(modelUsage ?? {}).map(([model, usage]) => ({
-        model,
-        token_count: quotaTokenCount(usage),
-      })),
-    },
-  };
-}
-
 /** Whether a request that awaits the user for the subagent `agentID` (absent
  *  for the main conversation) blocks the session's foreground work. The main
  *  conversation's requests do. So do those of a subagent that runs in the
@@ -12658,7 +12643,7 @@ function blocksForeground(session: Session, agentID: string | undefined): boolea
 
 /** Whether Claude Code ended the work of `result` because an interrupt
  *  stopped it, while the model streamed or while a tool ran. */
-function isAbortedResult(result: Extract<SDKMessage, { type: "result" }>): boolean {
+export function isAbortedResult(result: Extract<SDKMessage, { type: "result" }>): boolean {
   return (
     result.terminal_reason === "aborted_streaming" || result.terminal_reason === "aborted_tools"
   );
@@ -12703,124 +12688,6 @@ function autonomousCycleEnd(
       ? "end_turn"
       : "max_turn_requests",
   );
-}
-
-/** One `token_count` object. `cachedInputTokens` is cache reads, matching
- *  codex's field; Claude also reports cache writes, which codex has no slot
- *  for, so those ride along in an extra sibling (the same name the ACP `usage`
- *  field already uses) and are counted in `totalTokens`. `reasoningOutputTokens`
- *  is always 0: Claude bills thinking inside its output tokens and never breaks
- *  it out — the key is kept so the shape stays uniform across agents. */
-function quotaTokenCount(usage: AccumulatedUsage) {
-  return {
-    totalTokens: tallyTotal(usage),
-    inputTokens: usage.inputTokens,
-    cachedInputTokens: usage.cachedReadTokens,
-    cachedWriteTokens: usage.cachedWriteTokens,
-    outputTokens: usage.outputTokens,
-    reasoningOutputTokens: 0,
-  };
-}
-
-/** Sum a tally's four counters. Per the Anthropic API `inputTokens` excludes
- *  the cache counters, so this is not double-counting (see `totalTokens`). */
-function tallyTotal(usage: AccumulatedUsage): number {
-  return usage.inputTokens + usage.outputTokens + usage.cachedReadTokens + usage.cachedWriteTokens;
-}
-
-/** Project `result.modelUsage` into our tally shape. Counters are coerced the
- *  way `snapshotFromUsage` coerces the stream's: third-party backends have been
- *  observed omitting fields, and a missing or NaN counter must not reach the
- *  wire as NaN (which `JSON.stringify` writes as `null`). */
-function normalizeModelUsage(modelUsage: Record<string, ModelUsage> | undefined): ModelTokenTally {
-  const tally: ModelTokenTally = {};
-  for (const [model, usage] of Object.entries(modelUsage ?? {})) {
-    tally[model] = {
-      inputTokens: finiteCount(usage?.inputTokens),
-      outputTokens: finiteCount(usage?.outputTokens),
-      cachedReadTokens: finiteCount(usage?.cacheReadInputTokens),
-      cachedWriteTokens: finiteCount(usage?.cacheCreationInputTokens),
-    };
-  }
-  return tally;
-}
-
-function finiteCount(value: number | null | undefined): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
-}
-
-/** `current - previous` per model, dropping models with nothing to report so a
- *  turn only lists the models it actually ran on. A reading that fell BELOW the
- *  previous one means the running total restarted under us (a mid-session
- *  /clear, a zeroed crash result): there is no usable reference left to
- *  subtract, so the reading itself is the increment. */
-function modelUsageIncrement(current: ModelTokenTally, previous: ModelTokenTally): ModelTokenTally {
-  const increment: ModelTokenTally = {};
-  for (const [model, usage] of Object.entries(current)) {
-    const base = previous[model];
-    const subtracted: AccumulatedUsage = base
-      ? {
-          inputTokens: usage.inputTokens - base.inputTokens,
-          outputTokens: usage.outputTokens - base.outputTokens,
-          cachedReadTokens: usage.cachedReadTokens - base.cachedReadTokens,
-          cachedWriteTokens: usage.cachedWriteTokens - base.cachedWriteTokens,
-        }
-      : usage;
-    const rewound = Object.values(subtracted).some((count) => count < 0);
-    const resolved = rewound ? usage : subtracted;
-    if (tallyTotal(resolved) > 0) {
-      increment[model] = resolved;
-    }
-  }
-  return increment;
-}
-
-/** The per-model rows for the first result of a resumed session. Its
- *  `modelUsage` reading continues from the totals the transcript saved (SDK
- *  0.3.277+; older transcripts may hold none), so there is no earlier reading
- *  to subtract from, and taking the reading itself would charge the whole
- *  pre-resume history to this one turn. The result's own `usage` is per-turn
- *  (main agent loop only, like the response's `usage`), so it stands in under
- *  the turn's top-level model — `key` is that model's `modelUsage` spelling
- *  when the reading has one, else the assistant message's own. Any subagent
- *  spend on this one turn goes unlisted rather than over-listed. */
-function resumedFirstResultModelUsage(
-  usage: {
-    input_tokens?: number | null;
-    output_tokens?: number | null;
-    cache_read_input_tokens?: number | null;
-    cache_creation_input_tokens?: number | null;
-  },
-  key: string | null,
-): ModelTokenTally {
-  if (key === null) {
-    return {};
-  }
-  const row: AccumulatedUsage = {
-    inputTokens: finiteCount(usage.input_tokens),
-    outputTokens: finiteCount(usage.output_tokens),
-    cachedReadTokens: finiteCount(usage.cache_read_input_tokens),
-    cachedWriteTokens: finiteCount(usage.cache_creation_input_tokens),
-  };
-  return tallyTotal(row) > 0 ? { [key]: row } : {};
-}
-
-/** Fold `increment` into `base` per model — the per-model counterpart of the
- *  `+=` the turn's flat accumulator uses. */
-function addModelUsage(base: ModelTokenTally, increment: ModelTokenTally): ModelTokenTally {
-  const merged: ModelTokenTally = { ...base };
-  for (const [model, usage] of Object.entries(increment)) {
-    const existing = merged[model];
-    merged[model] = existing
-      ? {
-          inputTokens: existing.inputTokens + usage.inputTokens,
-          outputTokens: existing.outputTokens + usage.outputTokens,
-          cachedReadTokens: existing.cachedReadTokens + usage.cachedReadTokens,
-          cachedWriteTokens: existing.cachedWriteTokens + usage.cachedWriteTokens,
-        }
-      : usage;
-  }
-  return merged;
 }
 
 /** Sum all four fields as a proxy for post-turn context occupancy: the current
@@ -14450,7 +14317,10 @@ function parseModelConfig(
   return Object.keys(result).length > 0 ? result : undefined;
 }
 
-function getMatchingModelUsage(modelUsage: Record<string, ModelUsage>, currentModel: string) {
+export function getMatchingModelUsage(
+  modelUsage: Record<string, ModelUsage>,
+  currentModel: string,
+) {
   let bestKey: string | null = null;
   let bestLen = 0;
 

@@ -456,6 +456,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     session.start(
       q,
       new SessionConfig(q, { currentModeId: mode, availableModes }, models, currentModel),
+      resume !== undefined,
     );
     this.sessions.set(sessionId, session);
     return session;

@@ -177,6 +177,32 @@ function connectRouter(protocols?: AcpProtocols): v2.Stream {
   return { readable: toClient.readable, writable: toAgent.writable };
 }
 
+/** Whether the tests run against the native v2 core (`src/v2-native/`) instead of the bridge. */
+const NATIVE_CORE = process.env.V2_CORE_UNDER_TEST === "native";
+
+/** The native core's session `sessionId` (a `NativeSession`), for waits on its internals. */
+function nativeSession(sessionId: string): any {
+  return (agents[0] as unknown as { sessions: Map<string, unknown> }).sessions.get(sessionId);
+}
+
+/**
+ * Waits until Claude Code has the prompt queued behind the running turn. The
+ * cores keep it differently, which no client sees: the bridge's turn queue
+ * holds both turns, and the native core has pushed the prompt and waits for
+ * its insertion.
+ */
+async function waitForQueuedPrompt(sessionId: string): Promise<void> {
+  await vi.waitFor(() =>
+    NATIVE_CORE
+      ? expect(
+          [...nativeSession(sessionId).pending.values()].filter(
+            (prompt: { pushed: boolean }) => prompt.pushed,
+          ),
+        ).toHaveLength(1)
+      : expect(agents[0].sessions[sessionId]?.turnQueue).toHaveLength(2),
+  );
+}
+
 /**
  * A v2 client app that collects every `_auth/status_update`, session update,
  * elicitation, and permission request it receives, answers elicitations with
@@ -1827,7 +1853,7 @@ describe("ACP v2 prompts", () => {
       const queued = agent
         .request(v2.methods.agent.session.prompt, { sessionId, prompt: text("second") })
         .finally(() => (answered = true));
-      await vi.waitFor(() => expect(agents[0].sessions[sessionId]?.turnQueue).toHaveLength(2));
+      await waitForQueuedPrompt(sessionId);
       expect(answered).toBe(false);
 
       firstAnswer.resolve();
@@ -1886,7 +1912,7 @@ describe("ACP v2 prompts", () => {
         sessionId,
         prompt: text("second"),
       });
-      await vi.waitFor(() => expect(agents[0].sessions[sessionId]?.turnQueue).toHaveLength(2));
+      await waitForQueuedPrompt(sessionId);
 
       await agent.notify(v2.methods.agent.session.cancel, { sessionId });
 
@@ -1948,13 +1974,21 @@ describe("ACP v2 prompts", () => {
     await client.app.connectWith(connectRouter(), async (agent) => {
       await initializeV2(agent);
       const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
-      // The prompt waits in the subscription guard while the close runs.
+      // The prompt waits while the close runs: on the bridge in the
+      // subscription guard, on the native core, which has none, for the
+      // interrupt of an earlier cancel.
       const guard = Promise.withResolvers<void>();
       const guarded = Promise.withResolvers<void>();
-      vi.spyOn(agents[0] as any, "runClaudeSubscriptionGuard").mockImplementation(() => {
+      if (NATIVE_CORE) {
+        sdk.interrupt = () => guard.promise;
+        await agent.notify(v2.methods.agent.session.cancel, { sessionId });
         guarded.resolve();
-        return guard.promise;
-      });
+      } else {
+        vi.spyOn(agents[0] as any, "runClaudeSubscriptionGuard").mockImplementation(() => {
+          guarded.resolve();
+          return guard.promise;
+        });
+      }
       const prompt = agent.request(v2.methods.agent.session.prompt, {
         sessionId,
         prompt: text("go"),
@@ -1986,7 +2020,8 @@ describe("ACP v2 prompts", () => {
       await vi.waitFor(() =>
         expect(turnTrace(client.sessionUpdates)).toContain("agent_message_chunk"),
       );
-      agents[0].sessions[sessionId]!.cancelController = new AbortController();
+      // The native core has no consumer to wake: its close ends the work itself.
+      if (!NATIVE_CORE) agents[0].sessions[sessionId]!.cancelController = new AbortController();
 
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
       try {
@@ -3948,7 +3983,7 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
         sessionId,
         prompt: text("and test it"),
       });
-      await vi.waitFor(() => expect(agents[0].sessions[sessionId]?.turnQueue).toHaveLength(2));
+      await waitForQueuedPrompt(sessionId);
       await agent.notify(v2.methods.agent.session.cancel, { sessionId });
       await expect(queued).rejects.toMatchObject({ code: -32800 });
     });
@@ -4075,7 +4110,7 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
         sessionId,
         prompt: text("and write it down"),
       });
-      await vi.waitFor(() => expect(agents[0].sessions[sessionId]?.turnQueue).toHaveLength(2));
+      await waitForQueuedPrompt(sessionId);
       await agent.notify(v2.methods.agent.session.cancel, { sessionId });
       await expect(queued).rejects.toMatchObject({ code: -32800 });
       await vi.waitFor(() => expect(decision).toBeDefined());
@@ -4195,8 +4230,13 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
     });
     const client = await promptAndWait(2, async (agent, sessionId, client) => {
       await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toEqual(endedTurn));
+      // Each core records the request frame in its own state.
       await vi.waitFor(() =>
-        expect(agents[0].sessions[sessionId]?.modelRequestSinceResult).toBe(true),
+        expect(
+          NATIVE_CORE
+            ? nativeSession(sessionId).stopped.modelRequestSinceResult
+            : agents[0].sessions[sessionId]?.modelRequestSinceResult,
+        ).toBe(true),
       );
       await agent.notify(v2.methods.agent.session.cancel, { sessionId });
     });
@@ -5391,7 +5431,14 @@ describe("ACP v2 requests that a cancel withdraws", () => {
         await wait(client);
         // The first is still open, so the answer changes nothing.
         answer.resolve(allowOnce);
-        await vi.waitFor(() => expect(agents[0].sessions[sessionId]?.openUserInputs?.size).toBe(1));
+        // Each core counts the open requests in its own state.
+        await vi.waitFor(() =>
+          expect(
+            NATIVE_CORE
+              ? nativeSession(sessionId).requests.size
+              : agents[0].sessions[sessionId]?.openUserInputs?.size,
+          ).toBe(1),
+        );
         await agent.notify(v2.methods.agent.session.cancel, { sessionId });
       });
 
