@@ -49,7 +49,7 @@ import { STARTUP_FAILURE_RESULTS_ENV, startupFailureError } from "../startup-fai
 import { createPostToolUseHook } from "../tools.js";
 import { Pushable } from "../utils.js";
 import { V2_SESSION_CAPABILITIES } from "../v2/initialize.js";
-import { v1ForkSessionRequest, v1NewSessionRequest } from "../v2/session.js";
+import { v1ForkSessionRequest, v1NewSessionRequest } from "../v2/session-requests.js";
 import { V2UpdateTranslator } from "../v2/update-translator.js";
 import { airInitializeMeta, airSupport, NO_AIR, type AirSupport } from "./air.js";
 import { NativeAuth } from "./auth.js";

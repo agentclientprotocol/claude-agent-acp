@@ -87,7 +87,7 @@ import {
   ultracodeSupported,
   ultracodeWorkflowsEnabled,
 } from "../session-ultracode.js";
-import { v1SetSessionConfigOptionRequest, v2ConfigOptions } from "../v2/session.js";
+import { v1SetSessionConfigOptionRequest, v2ConfigOptions } from "../v2/session-requests.js";
 
 type ConfigQuery = Pick<
   Query,

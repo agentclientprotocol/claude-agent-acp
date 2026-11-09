@@ -34,7 +34,7 @@ import {
   v1NewSessionRequest,
   v1SetSessionConfigOptionRequest,
   v2ConfigOptions,
-} from "../v2/session.js";
+} from "../v2/session-requests.js";
 import { startupFailure } from "./helpers.js";
 import packageJson from "../../package.json" with { type: "json" };
 

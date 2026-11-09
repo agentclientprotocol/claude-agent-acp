@@ -18,7 +18,7 @@ import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { Query, SDKSystemMessage, SlashCommand } from "@anthropic-ai/claude-agent-sdk";
 import { getAvailableSlashCommands } from "../acp-agent.js";
 import { parseMcpCommand, runMcpCommand, type McpCommand } from "../mcp-command.js";
-import { v2AvailableCommands } from "../v2/session.js";
+import { v2AvailableCommands } from "../v2/session-requests.js";
 
 export class SessionCommands {
   /** Claude Code's terminal-bound commands, from the turn's `system/init`. */
