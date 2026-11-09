@@ -137,6 +137,27 @@ function bridgeSessionUpdateLines(scenario: string): string[] | undefined {
     );
 }
 
+/**
+ * With `DUMP_NATIVE_SCENARIOS=<dir>`, writes each scenario's session updates
+ * to `<dir>/<scenario>.jsonl`, in the lines of the bridge's golden file, to
+ * diff the two cores: `diff <dir>/read.jsonl <(grep session/update ...v2/read.jsonl)`.
+ */
+afterAll(() => {
+  const dir = process.env.DUMP_NATIVE_SCENARIOS;
+  if (!dir) return;
+  fs.mkdirSync(dir, { recursive: true });
+  for (const [scenario, recorded] of runs) {
+    fs.writeFileSync(
+      path.join(dir, `${scenario}.jsonl`),
+      sessionUpdateLines(recorded.normalized).join("\n") + "\n",
+    );
+    const bridge = bridgeSessionUpdateLines(scenario);
+    if (bridge) {
+      fs.writeFileSync(path.join(dir, `${scenario}.bridge.jsonl`), bridge.join("\n") + "\n");
+    }
+  }
+});
+
 describe("ACP v2 scenarios on the native core", () => {
   it("pass, or stop as the table says", () => {
     const table = (status: (scenario: string) => string) =>
