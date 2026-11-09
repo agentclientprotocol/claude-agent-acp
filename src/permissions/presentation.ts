@@ -120,20 +120,36 @@ export function buildClaudePermissionPresentation(
     }),
     // Only AIR gets the permission presentation.
     ...(title && capabilities.air.client
-      ? {
-          _meta: withAirMeta(undefined, AIR_PERMISSION_KEY, {
-            version: 1,
-            title,
-            ...(description ? { description } : {}),
-            // The CLI's own hint, forwarded so a client that can pre-select
-            // an option keeps the decline focused; the option order already
-            // leads with the reject options when this is set.
-            ...(value.defaultToNo === true ? { defaultToNo: true } : {}),
-          }),
-        }
+      ? { _meta: airPermissionMeta({ title, description, defaultToNo: value.defaultToNo }) }
       : {}),
     ...(capabilities.v2 ? { title, ...(description ? { description } : {}) } : {}),
   };
+}
+
+/**
+ * The `_meta.jetbrains.air.permission` of a permission request, from the
+ * heading and explanation that {@link buildClaudePermissionPresentation}
+ * built. The native v2 core adds it for an AIR client, whose tool calls it
+ * renders without the AIR tool call contract.
+ */
+export function airPermissionMeta({
+  title,
+  description,
+  defaultToNo,
+}: {
+  title: string;
+  description?: string;
+  defaultToNo?: boolean;
+}): Record<string, unknown> {
+  return withAirMeta(undefined, AIR_PERMISSION_KEY, {
+    version: 1,
+    title,
+    ...(description ? { description } : {}),
+    // The CLI's own hint, forwarded so a client that can pre-select an
+    // option keeps the decline focused; the option order already leads with
+    // the reject options when this is set.
+    ...(defaultToNo === true ? { defaultToNo: true } : {}),
+  });
 }
 
 /**
