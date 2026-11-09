@@ -50,22 +50,39 @@ export type IdleOutcome = Extract<
   }
 >;
 
+/** What a prompt's turn that ended without a result spent, as the bridge reports it. */
+const NOTHING_SPENT: AccumulatedUsage = {
+  inputTokens: 0,
+  outputTokens: 0,
+  cachedReadTokens: 0,
+  cachedWriteTokens: 0,
+};
+
 /**
  * The stop reason, usage and `_meta.quota` of an idle, from the result that
- * ended the turn, and what its assistant messages reported (`report`). Work
- * that ended without a result reports neither usage nor quota. A failed turn
- * reports its error instead, as the bridge does.
+ * ended the turn, and what its assistant messages reported (`report`).
+ * `prompted`: a prompt started the turn. Without a result, such as when an
+ * interrupt stopped the work before its result, a prompt's turn reports zero
+ * usage and a zero quota, and a cycle that Claude Code started on its own
+ * reports neither, as on the bridge (whose prompt turns report the turn's
+ * tally, which is zero then). A failed turn reports its error instead, as the
+ * bridge does.
  */
 export function idleOutcome(
   end: TurnEnd | undefined,
   cancelled: boolean,
   report?: TurnReport,
+  prompted = false,
 ): IdleOutcome {
-  const spent = end ? { usage: end.usage, _meta: end._meta } : {};
+  const spent = end
+    ? { usage: end.usage, _meta: end._meta }
+    : prompted
+      ? { usage: { ...NOTHING_SPENT, totalTokens: 0 }, _meta: quotaMeta(NOTHING_SPENT, {}) }
+      : {};
   if (cancelled) return { stopReason: "cancelled", ...spent };
   // The bridge fails the turn at Claude Code's sign-in message.
   if (report?.loginRequired) return failed(RequestError.authRequired());
-  if (!end) return { stopReason: "end_turn" };
+  if (!end) return { stopReason: "end_turn", ...spent };
   const { result } = end;
   const ended = resultEnd(result);
   if (!("error" in ended)) return { stopReason: ended.stopReason, ...spent };

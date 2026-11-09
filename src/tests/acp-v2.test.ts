@@ -1959,6 +1959,171 @@ describe("ACP v2 prompts", () => {
     ]);
   });
 
+  it("sends the tail of a text block whose stream was cut short from the consolidated message", async () => {
+    scriptTurns(async function* (options) {
+      yield stream(options, {
+        type: "message_start",
+        message: { id: "msg_answer", role: "assistant", content: [], usage: {} },
+      });
+      yield stream(options, {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "text", text: "" },
+      });
+      yield stream(options, {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "Here is" },
+      });
+      // The stream loses the rest of the block, and the consolidated message holds it.
+      yield assistantText(options, "Here is the answer.");
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      await client.authUpdate(1);
+    });
+
+    expect(
+      client.updates("agent_message_chunk").map((update) => ({
+        messageId: update.messageId,
+        text: (update.content as { text: string }).text,
+      })),
+    ).toEqual([
+      { messageId: "msg_answer", text: "Here is" },
+      { messageId: "msg_answer", text: " the answer." },
+    ]);
+  });
+
+  it("drops the consolidated messages of the work a cancel stops, except the results of its shown tool calls", async () => {
+    const interrupted = Promise.withResolvers<void>();
+    sdk.interrupt = async () => interrupted.resolve();
+    scriptTurns(async function* (options) {
+      yield stream(options, {
+        type: "message_start",
+        message: { id: "msg_working", role: "assistant", content: [], usage: {} },
+      });
+      yield stream(options, {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "text", text: "" },
+      });
+      yield stream(options, {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "Working on" },
+      });
+      yield stream(options, {
+        type: "content_block_start",
+        index: 1,
+        content_block: { type: "tool_use", id: "toolu_shown", name: "Bash", input: {} },
+      });
+      await interrupted.promise;
+      // What Claude Code had when the interrupt arrived: the consolidated
+      // message, with the text's tail and a tool use that never streamed.
+      yield {
+        ...assistantText(options, "Working on it", "msg_working"),
+        message: {
+          ...assistantText(options, "", "msg_working").message,
+          content: [
+            { type: "text", text: "Working on it" },
+            { type: "tool_use", id: "toolu_shown", name: "Bash", input: { command: "ls" } },
+            { type: "tool_use", id: "toolu_unseen", name: "Bash", input: { command: "pwd" } },
+          ],
+          stop_reason: "tool_use",
+        },
+      };
+      // The interrupt gives both tools an error result.
+      yield {
+        type: "user",
+        message: {
+          role: "user",
+          content: ["toolu_shown", "toolu_unseen"].map((id) => ({
+            type: "tool_result",
+            tool_use_id: id,
+            content: "[Request interrupted by user for tool use]",
+            is_error: true,
+          })),
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield result(options, ABORTED_TOOLS);
+      yield idleState(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("go") });
+      await vi.waitFor(() =>
+        expect(client.updates("tool_call_update").map((u) => u.toolCallId)).toContain(
+          "toolu_shown",
+        ),
+      );
+
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle cancelled"));
+      await client.authUpdate(1);
+    });
+
+    expect(
+      client.updates("agent_message_chunk").map((u) => (u.content as { text: string }).text),
+    ).toEqual(["Working on"]);
+    const toolCalls = client.updates("tool_call_update");
+    expect(toolCalls.some((update) => update.toolCallId === "toolu_unseen")).toBe(false);
+    expect(toolCalls.filter((update) => update.toolCallId === "toolu_shown").at(-1)).toMatchObject({
+      status: "cancelled",
+    });
+  });
+
+  it.each([
+    ["Claude Code goes idle", false],
+    ["the stream dies", true],
+  ])(
+    "reports zero usage on the idle of a prompt's turn that a cancel stops before its result, when %s",
+    async (_, dies) => {
+      const interrupted = Promise.withResolvers<void>();
+      sdk.interrupt = async () => interrupted.resolve();
+      scriptTurns(async function* (options) {
+        yield assistantText(options, "Working on it");
+        await interrupted.promise;
+        // The interrupt stops the turn before its result.
+        if (dies) throw new Error("Claude Code process terminated by signal SIGTERM");
+        yield idleState(options);
+      });
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("go") });
+        await vi.waitFor(() =>
+          expect(turnTrace(client.sessionUpdates)).toContain("agent_message_chunk"),
+        );
+
+        await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+
+        await vi.waitFor(() =>
+          expect(turnTrace(client.sessionUpdates)).toContain("idle cancelled"),
+        );
+        await client.authUpdate(1);
+      });
+
+      const zero = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+      expect(client.updates("state_update").at(-1)).toMatchObject({
+        stopReason: "cancelled",
+        usage: { ...zero, cachedReadTokens: 0, cachedWriteTokens: 0 },
+        _meta: { quota: { token_count: zero, model_usage: [] } },
+      });
+    },
+  );
+
   it("reports idle cancelled when the stream dies while a cancel stops the turn", async () => {
     const interrupted = Promise.withResolvers<void>();
     sdk.interrupt = async () => interrupted.resolve();

@@ -81,7 +81,9 @@ such as one that an interrupt stopped before it ran. The `idle` that follows a r
 result's, also when it comes after the next cycle's first output. A placeholder result
 (`num_turns: 0` of a task notification) ends nothing: Claude Code answers queued notifications
 with one model call. The idle's usage and `_meta.quota` are the result's (`outcome.ts`, with the
-quota helpers of `session-usage.ts` that v1 uses). The stop reason is read from the result by the v1
+quota helpers of `session-usage.ts` that v1 uses). Without a result, a prompt's turn reports zero
+usage and a zero quota, and a cycle that Claude Code started on its own reports neither, as on
+the bridge. The stop reason is read from the result by the v1
 core's rules (`resultEnd`, `result-end.ts`). A failed turn's idle carries its error instead, built
 as the bridge builds it: an authentication failure (the assistant message's `error`, or the
 "run /login" text) is `authRequired` (-32000), and any other failure has the assistant message's
@@ -96,6 +98,17 @@ output, its states, and its permission requests, which are denied (`stopped-work
 result after a cancel ends the work that the interrupt stopped as `cancelled`. Claude Code's
 interrupt withdraws the open permission requests. Their end reports no `running` before the
 idle, and one that the user answers after the cancel reports `running`, as on the bridge.
+
+The work that the client saw goes on until its idle, and v2 allows its updates until then. As on
+the bridge, its streamed deltas go out (text, thinking, tool use starts), and of its consolidated
+messages only the results of the tool calls that the client holds, which an error result ends
+`cancelled`. The rest is dropped: the consolidated assistant messages (the tail of a cut-short
+text block, a tool use that never streamed) and the results of tool calls that the client never
+saw.
+
+A consolidated assistant message adds only the text that did not stream, as on the bridge
+(`unstreamedRemainder`): the tail of a block whose stream was cut short, or the whole text of a
+message that never streamed.
 
 ## Subagents and background work
 
@@ -208,6 +221,8 @@ These pieces were extracted so that both cores use the same code:
 - the provider routing (`providers.ts`): `ProviderConfig`, the gateway login methods and their
   validation, the `providers/list` response, `providers/set` validation and model listing, and
   `createEnvForProvider`, taken from `ClaudeAcpAgent`
+- `recordStreamedDelta` and `unstreamedRemainder` (`streamed-text.ts`): the record of streamed
+  text and thinking, and what a consolidated message adds to it, taken from `acp-agent.ts`
 - the token usage helpers (`session-usage.ts`): usage snapshots, the `_meta.quota` shape, the
   `modelUsage` increments and the context window guess, taken from `acp-agent.ts`
 - `resultEnd` (`result-end.ts`): the stop reason of a result, taken from `autonomousCycleEnd`
@@ -219,6 +234,11 @@ These pieces were extracted so that both cores use the same code:
   `TitledSession` and `TitleOwner` interfaces, which `ClaudeAcpAgent` matches as it is
 
 ## How it is checked
+
+- `src/tests/acp-v2.test.ts`, the bridge's v2 tests, runs against both cores: the
+  `v2-native-core` project of `vitest.config.ts` runs it again with `V2_CORE_UNDER_TEST=native`,
+  so `npm run test:run` and CI cover both. Tests that check a core's internals, or a listed
+  difference, branch on `NATIVE_CORE`.
 
 - `src/tests/v2-native.test.ts` drives the core with a Claude Code double, message by message:
   insertion, folding, lifecycle failures, cancel, permission states, config, local commands,
@@ -238,12 +258,6 @@ These pieces were extracted so that both cores use the same code:
 
 ## Intended differences from the bridge
 
-- Output that comes after `session/cancel`, until the turn's `result`, is still sent: the work is
-  still stopping. The bridge drops the output of stopped work.
-- A text block that an interrupt cut short does not get its tail from the consolidated message.
-- The idle of a turn that ended without a `result`, such as one that an interrupt stopped
-  before it ran, has no `usage` and no `_meta.quota`. The bridge sends the turn's tally, which
-  is zero then.
 - An AIR client gets no AIR extensions: `initialize` advertises no `_meta.jetbrains.air`, and its
   state updates carry the v2 `background` list. The bridge gives it AIR's subagent form, which
   reports no list. AIR's `loadReplayEnd` event, which the client declares, is sent.
@@ -267,6 +281,9 @@ These pieces were extracted so that both cores use the same code:
     `model` is reported, from its responses
   - SendMessage and SubagentHandback as session messages: they stay tool calls
   - a child's tool progress
+  - after the root's `session/cancel`, the consolidated messages of a foreground child still go
+    to its session until it ends. The bridge drops them, apart from the results of the child's
+    tool calls that the client holds, as it does for the root
   - in a replay, SendMessage deliveries, hand-backs and a child's model changes after its first
     response
   - a subagent whose parent Claude Code no longer tracks, such as after a restart, stays

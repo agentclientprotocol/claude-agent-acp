@@ -306,7 +306,15 @@ function textDelta(id: string, text: string) {
   return [
     {
       type: "stream_event",
-      event: { type: "message_start", message: { id, content: [] } },
+      event: {
+        type: "message_start",
+        message: {
+          id,
+          role: "assistant",
+          content: [],
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      },
       parent_tool_use_id: null,
       uuid: randomUUID(),
     },
@@ -522,6 +530,8 @@ describe("native ACP v2 core", () => {
     expect(kinds).toEqual([
       "user_message",
       "state_update",
+      // The context window at the response's `message_start`, then at the result.
+      "usage_update",
       "agent_message_chunk",
       "usage_update",
       "state_update",
