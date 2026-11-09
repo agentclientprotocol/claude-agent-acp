@@ -225,6 +225,7 @@ import { buildClaudePermissionOptions } from "./permissions/options.js";
 import {
   type AcpPermissionRequest,
   buildClaudePermissionPresentation,
+  permissionToolCallMeta,
 } from "./permissions/presentation.js";
 import { decodeClaudePermissionResponse } from "./permissions/response.js";
 import { SettingsManager } from "./settings.js";
@@ -316,6 +317,7 @@ import {
   type ModelTokenTally,
   type UsageSnapshot,
 } from "./session-usage.js";
+import { resultEnd } from "./result-end.js";
 import { previewPatchContent } from "./diff.js";
 import {
   backgroundedBashToolCall,
@@ -360,7 +362,7 @@ import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "./u
 
 export { DEFAULT_AGENT_ID } from "./session-config-ids.js";
 import { MCP_AVAILABLE_COMMAND, parseMcpCommand, runMcpCommand } from "./mcp-command.js";
-import { parseModelConfig, resolveThinkingConfig } from "./session-env.js";
+import { configuredSettings, parseModelConfig, resolveThinkingConfig } from "./session-env.js";
 import {
   MODE_CONFIG_ID,
   resolveInitialPermissionMode,
@@ -10248,24 +10250,15 @@ export class ClaudeAcpAgent {
         defaultToNo,
       });
 
-      // `mcpServer` (SDK 0.3.274+): which MCP server serves an `mcp__*` tool
-      // and where its definition came from. Forwarded verbatim so a client
-      // can key trust on `source` (`sdk` = a host-registered in-process
-      // server; anything else is configuration) instead of parsing the
-      // tool-name prefix. The name is the config key as authored — untrusted
-      // text, so it rides `_meta` rather than the title.
       // AIR already holds the tool name and the parent tool call. Every
       // other client gets them again, like upstream.
-      const airClient = capabilities.air.client;
-      if (mcpServer || (parentToolUseId && !airClient)) {
-        presentation.toolCall._meta = {
-          claudeCode: {
-            ...(airClient ? {} : { toolName }),
-            ...(parentToolUseId && !airClient ? { parentToolUseId } : {}),
-            ...(mcpServer ? { mcpServer: { name: mcpServer.name, source: mcpServer.source } } : {}),
-          },
-        };
-      }
+      const toolCallMeta = permissionToolCallMeta({
+        toolName,
+        parentToolUseId,
+        mcpServer,
+        airClient: capabilities.air.client,
+      });
+      if (toolCallMeta) presentation.toolCall._meta = toolCallMeta;
 
       const permissionOptions = buildClaudePermissionOptions({
         toolName,
@@ -11353,16 +11346,11 @@ export class ClaudeAcpAgent {
     // into the query.
     const resolvedProvider = this.resolveProviderConfig();
     const providerEnv = createEnvForProvider(resolvedProvider);
-    const providedSettings = userProvidedOptions?.settings;
-    const providedSettingsObject =
-      typeof providedSettings === "string"
-        ? (JSON.parse(
-            await fs.readFile(path.resolve(params.cwd, providedSettings), "utf8"),
-          ) as Settings)
-        : providedSettings;
-    const configuredSettingsObject = modelConfig
-      ? { ...modelConfig, ...providedSettingsObject }
-      : providedSettingsObject;
+    const configuredSettingsObject = await configuredSettings(
+      userProvidedOptions?.settings,
+      params.cwd,
+      modelConfig,
+    );
     // Claude Code applies env from settings.json after the subprocess env. Put
     // an active ACP route in the programmatic settings tier too so user/project
     // settings cannot silently restore a different ANTHROPIC_BASE_URL.
@@ -12374,18 +12362,9 @@ function autonomousCycleEnd(
     },
   });
   if (cancelled) return ended("cancelled");
-  if (result.stop_reason === "refusal") return ended("refusal");
-  if (result.stop_reason === "max_tokens") return ended("max_tokens");
-  if (result.is_error) {
-    const text =
-      result.subtype === "success" ? result.result : result.errors.join(", ") || result.subtype;
-    return { error: RequestError.internalError(undefined, text) };
-  }
-  return ended(
-    result.subtype === "success" || result.subtype === "error_during_execution"
-      ? "end_turn"
-      : "max_turn_requests",
-  );
+  const end = resultEnd(result);
+  if ("error" in end) return { error: RequestError.internalError(undefined, end.error) };
+  return ended(end.stopReason);
 }
 
 /** Error kinds this adapter invents itself, alongside the SDK's categorical

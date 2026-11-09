@@ -2,7 +2,9 @@
  * Session options that come from the agent's environment, shared by the v1
  * core and the native v2 core.
  */
-import type { ThinkingConfig } from "@anthropic-ai/claude-agent-sdk";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import type { Options, Settings, ThinkingConfig } from "@anthropic-ai/claude-agent-sdk";
 
 /** Translate the legacy `MAX_THINKING_TOKENS` env var, plus the optional
  *  `CLAUDE_CODE_THINKING_DISPLAY` env var, into the SDK's `thinking` option.
@@ -57,4 +59,21 @@ export function parseModelConfig(
   if (parsed.modelOverrides !== undefined) result.modelOverrides = parsed.modelOverrides;
   if (parsed.availableModels !== undefined) result.availableModels = parsed.availableModels;
   return Object.keys(result).length > 0 ? result : undefined;
+}
+
+/**
+ * The programmatic settings of a session, before the provider routing: the
+ * models of `modelConfig` (`CLAUDE_MODEL_CONFIG`), then the client's
+ * `settings` option, an object or a file path relative to `cwd`.
+ */
+export async function configuredSettings(
+  provided: Options["settings"],
+  cwd: string,
+  modelConfig: ReturnType<typeof parseModelConfig>,
+): Promise<Settings | undefined> {
+  const object =
+    typeof provided === "string"
+      ? (JSON.parse(await fs.readFile(path.resolve(cwd, provided), "utf8")) as Settings)
+      : (provided as Settings | undefined);
+  return modelConfig ? { ...modelConfig, ...object } : object;
 }

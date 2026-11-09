@@ -17,12 +17,14 @@ import type {
   SDKAssistantMessage,
   SDKMemoryRecallMessage,
   SDKPartialAssistantMessage,
+  SDKPermissionDeniedMessage,
   SDKToolProgressMessage,
   SDKUserMessage,
   SessionMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
   isReplayHiddenMetaMessage,
+  isSyntheticLoginMessage,
   messageIdForGrouping,
   stripLocalCommandMetadata,
   streamEventToAcpNotifications,
@@ -37,7 +39,7 @@ import { isCompactSummaryMessage, replayCompactSummary } from "../context-compac
 import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
 import { AcpToolCallRenderer, V2_CANCELLED } from "../tool-calls/renderer.js";
-import { changedTaskPlanEntries, type TaskState } from "../tools.js";
+import { changedTaskPlanEntries, unregisterHookCallback, type TaskState } from "../tools.js";
 import { replayClear, type V2UpdateTranslator } from "../v2/update-translator.js";
 
 /** Every v2 client gets the same tool call reports: v2 diffs and display terminals. */
@@ -276,6 +278,46 @@ export class SessionOutput {
       this.emit([{ sessionId: this.sessionId, update: { sessionUpdate: "plan", entries } }]);
   }
 
+  /**
+   * The tool call of a permission request that the stream never shows, such
+   * as SandboxNetworkAccess's, before the request: the client holds it, and
+   * {@link toolCallStatus} ends it once the request is answered, as on the
+   * bridge (`ensureToolCallEmitted`).
+   */
+  permissionToolCall(toolName: string, toolCallId: string, input: unknown): void {
+    if (this.emittedToolCalls.has(toolCallId)) return;
+    this.emittedToolCalls.add(toolCallId);
+    const update = new AcpToolCallRenderer(V2_TOOL_CALL_CAPABILITIES).toolCall(
+      { id: toolCallId, name: toolName, input },
+      { cwd: this.cwd },
+    );
+    this.toolCallFields.apply(update);
+    this.emit([{ sessionId: this.sessionId, update }]);
+  }
+
+  /**
+   * Claude Code denied a tool use without asking (a rule, the classifier or
+   * the mode): its tool call fails with the reason, as on the bridge. A tool
+   * call that the client does not hold, such as dropped work's, is left out.
+   */
+  permissionDenied(message: SDKPermissionDeniedMessage, parentToolUseId?: string): void {
+    // Its PostToolUse hook never runs.
+    unregisterHookCallback(message.tool_use_id);
+    if (!this.emittedToolCalls.has(message.tool_use_id)) return;
+    const denied = new AcpToolCallRenderer(V2_TOOL_CALL_CAPABILITIES).permissionDenied({
+      toolCallId: message.tool_use_id,
+      toolName: message.tool_name,
+      ...(parentToolUseId !== undefined ? { parentToolUseId } : {}),
+      decisionReasonType: message.decision_reason_type,
+      decisionReason: message.decision_reason,
+      message: message.message,
+    });
+    // A denial is final, so it replaces a pinned approval patch.
+    if (this.toolCallFields.apply(denied, { replacePinnedContent: true })) {
+      this.emit([{ sessionId: this.sessionId, update: denied }]);
+    }
+  }
+
   /** Sets the status of a tool call, such as a background task's when it ends. */
   toolCallStatus(toolCallId: string, status: "in_progress" | "paused" | ToolCallFinalStatus): void {
     if (FINAL_STATUSES.has(status)) this.unfinished.delete(toolCallId);
@@ -295,6 +337,8 @@ export class SessionOutput {
     try {
       for (const message of messages) {
         if (message.parent_tool_use_id !== null || isReplayHiddenMetaMessage(message)) continue;
+        // Claude Code's sign-in message, which the live session did not show either.
+        if (message.type === "assistant" && isSyntheticLoginMessage(message.message)) continue;
         // A compaction's summary message replays as the completed compaction.
         // `emit` sends at once, before the call returns, so the update keeps
         // its place among the replayed messages.

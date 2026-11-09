@@ -98,6 +98,8 @@ export interface RequestTarget {
   readonly cwd: string;
   /** The output of the session, which holds its tool calls. */
   readonly output: SessionOutput;
+  /** For a subagent's request: the Agent or Task call that launched the subagent. */
+  readonly parentToolUseId?: string;
   /** Whether a cancel stops the work that the request belongs to. */
   cancelling(): boolean;
   requestPermission(
@@ -146,6 +148,11 @@ type Child = {
   /** What `task_started` said of it. */
   task: { description?: string; prompt?: string; subagentType?: string };
   announced: boolean;
+  /**
+   * The subagent that launched it, when that one is not announced yet and no
+   * launch call names the parent: it is announced right after that parent.
+   */
+  awaitedParent: string | undefined;
   /** Its messages that came before its announcement. */
   pending: SDKMessage[];
   title: string | undefined;
@@ -202,6 +209,10 @@ export class SessionTasks {
   private readonly agentRequests = new Map<string, Set<AbortController>>();
   /** The subagents whose runs a cancel stops, by agent id, until their runs end. */
   private readonly cancelledAgents = new Set<string>();
+  /** The subagents that the root's last cancel stopped (see {@link foregroundCancelFailed}). */
+  private readonly foregroundCancelled = new Set<string>();
+  /** Set when the root session closes: no request goes to the client after it. */
+  private closed = false;
   /** The session that made each SendMessage call: the sender of a resumed child's prompt. */
   private readonly senderByToolUse = new Map<string, string>();
   /** The other tasks that `task_started` reported, until they end. */
@@ -368,7 +379,7 @@ export class SessionTasks {
 
   /** Reads the subagents that the history `messages` launched, for its replay. */
   loadReplay(messages: SessionMessage[]): Promise<SubagentReplay | undefined> {
-    return SubagentReplay.load(this.host, messages);
+    return SubagentReplay.load(this.host, messages, (sessionId) => this.children.has(sessionId));
   }
 
   /** Whether `sessionId` is an announced child session of this root. */
@@ -390,9 +401,12 @@ export class SessionTasks {
       sessionId: announced?.sessionId ?? root.sessionId,
       cwd: announced ? this.cwdOf(announced.sessionId) : root.cwd,
       output: announced?.output ?? root.output,
+      ...(child?.launchToolUseId !== undefined ? { parentToolUseId: child.launchToolUseId } : {}),
       cancelling: () => this.cancelledAgents.has(agentId),
+      // The request counts on the session it goes to, also when the child is
+      // announced while the request is built.
       requestPermission: (request, toolSignal) =>
-        this.agentRequest(agentId, toolSignal, async (signal) => {
+        this.agentRequest(agentId, announced, toolSignal, async (signal) => {
           try {
             return await this.hostRequest(request, signal);
           } catch (error) {
@@ -400,18 +414,31 @@ export class SessionTasks {
             throw error;
           }
         }),
-      openRequest: (signal, send) => this.agentRequest(agentId, signal, send),
+      openRequest: (signal, send) => this.agentRequest(agentId, announced, signal, send),
     };
   }
 
   /**
-   * Whether the root's foreground work waits on a subagent that waits on the
-   * user: one it does not run in the background, or one that such a
-   * subagent waits on.
+   * Whether the root's foreground work, through the subagents that it waits
+   * on (those it does not run in the background), waits on the user: each of
+   * them is blocked. Undefined when it waits on no subagent. A subagent is
+   * blocked when each subagent that it waits on is, or, waiting on none, when
+   * a request of it is open. So one that still makes progress keeps the work
+   * `running`, as v2 asks.
    */
-  foregroundBlocked(): boolean {
-    return [...this.agentRequests].some(
-      ([agentId, requests]) => requests.size > 0 && this.waitsOn(agentId, undefined),
+  foregroundBlocked(): boolean | undefined {
+    return this.subagentsBlocked(undefined, new Set());
+  }
+
+  private subagentsBlocked(parent: string | undefined, seen: Set<string>): boolean | undefined {
+    const waited = [...this.agents].flatMap(([agentId, task]) =>
+      !task.background && task.parentTaskId === parent && !seen.has(agentId) ? [agentId] : [],
+    );
+    if (waited.length === 0) return undefined;
+    for (const agentId of waited) seen.add(agentId);
+    return waited.every(
+      (agentId) =>
+        this.subagentsBlocked(agentId, seen) ?? (this.agentRequests.get(agentId)?.size ?? 0) > 0,
     );
   }
 
@@ -421,13 +448,34 @@ export class SessionTasks {
    * interrupt stops their runs, which then end `cancelled`.
    */
   cancelForeground(): void {
+    this.foregroundCancelled.clear();
     for (const agentId of this.agents.keys()) {
-      if (this.waitsOn(agentId, undefined)) this.withdraw(agentId);
+      if (!this.waitsOn(agentId, undefined)) continue;
+      this.withdraw(agentId);
+      this.foregroundCancelled.add(agentId);
     }
   }
 
-  /** The root session closes: every subagent's open request is withdrawn. */
+  /**
+   * The interrupt of the root's cancel failed: the subagents that it stopped
+   * go on. Their requests were withdrawn, and their later ones are theirs
+   * again, not a stopped run's.
+   */
+  foregroundCancelFailed(): void {
+    for (const agentId of this.foregroundCancelled) {
+      this.cancelledAgents.delete(agentId);
+      const child = this.children.get(agentId);
+      if (child) this.reportChild(child);
+    }
+    this.foregroundCancelled.clear();
+  }
+
+  /**
+   * The root session closes: every subagent's open request is withdrawn, and
+   * a later one never reaches the client.
+   */
   withdrawAll(): void {
+    this.closed = true;
     for (const agentId of this.agentRequests.keys()) this.withdraw(agentId);
   }
 
@@ -445,10 +493,23 @@ export class SessionTasks {
     try {
       await this.host.stopTask(child.sessionId);
     } catch (error) {
-      // The run ended meanwhile, or Claude Code refused: it reports how it ends.
+      // The run ended meanwhile, or Claude Code refused: it reports how it
+      // ends. A run that goes on reports `running` again, which the
+      // withdrawn requests did not.
       this.cancelledAgents.delete(sessionId);
+      this.reportChild(child);
       this.host.logger.error(`Subagent ${sessionId}: stopping it failed`, error);
     }
+  }
+
+  /**
+   * Claude Code denied a tool use without asking: on the session of the agent
+   * `agent_id` names, where its tool call is.
+   */
+  permissionDenied(message: Extract<SDKMessage, { subtype: "permission_denied" }>): void {
+    const child = message.agent_id !== undefined ? this.children.get(message.agent_id) : undefined;
+    if (child?.announced) child.output!.permissionDenied(message, child.launchToolUseId);
+    else this.rootOutput.permissionDenied(message);
   }
 
   /** A `SubagentStart` hook: the child's working directory and type. */
@@ -485,47 +546,70 @@ export class SessionTasks {
   }
 
   /**
-   * The current state of the listed work, for a resume of the active
-   * session: each subagent that the root lists, with its labels and state
-   * (also on its own stream), each tool call that it lists as its tool use
-   * shows it now, and each listed item's `cancel` capability.
+   * The current state of the session's work, for a resume of the active
+   * session: each subagent that a session lists, or that works in its
+   * foreground, with its labels and state (also on its own stream), and the
+   * current update of each item that a session lists. Every item comes
+   * before the state that lists it, and a child's announcement before any
+   * update of its session, so a child whose list names items is announced
+   * first and gets its state after them.
    */
   currentState(): v2.UpdateSessionNotification[] {
     const updates: v2.UpdateSessionNotification[] = [];
-    const listed = this.lists().get(this.host.sessionId) ?? [];
-    for (const item of listed) {
-      if (item.type !== "subagent") continue;
-      const child = this.children.get(item.sessionId);
-      if (!child) continue;
-      const state = stateObject(this.childState(child), undefined);
-      updates.push(
-        this.host.background.stamp({
-          sessionId: child.parentSessionId,
-          update: { ...this.announcement(child), state },
-        }),
-        this.host.background.stamp({
-          sessionId: child.sessionId,
-          update: { sessionUpdate: "state_update", ...state } as v2.SessionUpdate,
-        }),
+    const lists = this.lists();
+    const visit = (sessionId: string) => {
+      const listed = lists.get(sessionId) ?? [];
+      const children = this.parentsFirst().filter(
+        (child) =>
+          child.parentSessionId === sessionId &&
+          (child.working ||
+            listed.some((item) => item.type === "subagent" && item.sessionId === child.sessionId)),
       );
-    }
-    for (const item of listed) {
-      if (item.type !== "tool_call") continue;
-      const toolCall = [...this.toolCalls.values()].find((t) => t.toolCallId === item.toolCallId);
-      if (!toolCall) continue;
-      const update = V2_RENDERER.toolCall(
-        { id: toolCall.toolCallId, ...toolCall.toolUse },
-        { cwd: this.host.cwd },
-      );
-      const status = toolCall.paused ? "paused" : "in_progress";
-      for (const v2Update of this.host.translator.updates(this.host.sessionId, {
-        ...update,
-        status,
-      } as AcpSessionNotification["update"])) {
-        updates.push({ sessionId: this.host.sessionId, update: v2Update });
+      for (const child of children) {
+        const state = stateObject(this.childState(child), undefined);
+        if ((lists.get(child.sessionId) ?? []).length === 0) {
+          updates.push(
+            this.host.background.stamp({
+              sessionId: child.parentSessionId,
+              update: { ...this.announcement(child), state },
+            }),
+          );
+        } else {
+          updates.push({ sessionId: child.parentSessionId, update: this.announcement(child) });
+          visit(child.sessionId);
+          updates.push(
+            this.host.background.stamp({
+              sessionId: child.parentSessionId,
+              update: { sessionUpdate: "subagent_update", sessionId: child.sessionId, state },
+            }),
+          );
+        }
+        updates.push(
+          this.host.background.stamp({
+            sessionId: child.sessionId,
+            update: { sessionUpdate: "state_update", ...state } as v2.SessionUpdate,
+          }),
+        );
       }
-    }
-    updates.push(...this.host.background.currentItems(this.host.sessionId));
+      for (const item of listed) {
+        if (item.type !== "tool_call") continue;
+        const toolCall = [...this.toolCalls.values()].find((t) => t.toolCallId === item.toolCallId);
+        if (!toolCall) continue;
+        const update = V2_RENDERER.toolCall(
+          { id: toolCall.toolCallId, ...toolCall.toolUse },
+          { cwd: this.cwdOf(sessionId) },
+        );
+        const status = toolCall.paused ? "paused" : "in_progress";
+        for (const v2Update of this.host.translator.updates(sessionId, {
+          ...update,
+          status,
+        } as AcpSessionNotification["update"])) {
+          updates.push({ sessionId, update: v2Update });
+        }
+      }
+      updates.push(...this.host.background.currentItems(sessionId));
+    };
+    visit(this.host.sessionId);
     return updates;
   }
 
@@ -551,10 +635,7 @@ export class SessionTasks {
     if (!error) return;
     for (const [taskId] of this.toolCalls) this.endToolCall(taskId, "stopped");
     for (const child of this.children.values()) {
-      if (child.announced && child.working) {
-        child.output!.finishUnfinished("failed");
-        this.endRun(child, { stopReason: "error", error });
-      }
+      if (child.announced && child.working) this.endRun(child, { stopReason: "error", error });
     }
     this.level = new Map();
     this.publish();
@@ -634,6 +715,7 @@ export class SessionTasks {
           ...(nonBlank(message.subagent_type) ? { subagentType: message.subagent_type } : {}),
         },
         announced: false,
+        awaitedParent: undefined,
         pending: toolUseId !== undefined ? (this.pendingByLaunch.get(toolUseId) ?? []) : [],
         title: undefined,
         description: undefined,
@@ -655,8 +737,13 @@ export class SessionTasks {
         const launch = this.launches.get(toolUseId);
         if (launch) this.announce(child, launch.output.sessionId);
       } else {
+        // No session update may carry a session id before its announcement.
         const parent = message.parent_task_id ?? this.host.sessionId;
-        this.announce(child, parent);
+        if (parent === this.host.sessionId || this.children.get(parent)?.announced) {
+          this.announce(child, parent);
+        } else {
+          child.awaitedParent = parent;
+        }
       }
     }
     this.host.foregroundRequestsChanged();
@@ -890,6 +977,12 @@ export class SessionTasks {
     const pending = child.pending;
     child.pending = [];
     for (const message of pending) this.deliver(child, message);
+    for (const waiting of [...this.children.values()]) {
+      if (!waiting.announced && waiting.awaitedParent === child.sessionId) {
+        waiting.awaitedParent = undefined;
+        this.announce(waiting, child.sessionId);
+      }
+    }
   }
 
   /**
@@ -1022,8 +1115,11 @@ export class SessionTasks {
   }
 
   /**
-   * A run of `child` ended: its idle goes out, then a stopped run's
-   * unfinished tool calls end `cancelled`, except its background work.
+   * A run of `child` ended: its unfinished tool calls get their final status,
+   * except its background work, then its idle goes out, as v2 asks. A stopped
+   * run's end `cancelled` and a failed run's `failed`. At any other end, a
+   * tool call that Claude dropped before it ran ends `cancelled`, as on the
+   * root (see `SessionOutput.closeUnfinished`).
    */
   private endRun(child: Child, outcome: IdleOutcome): void {
     if (!child.working) {
@@ -1039,15 +1135,27 @@ export class SessionTasks {
       }
       return;
     }
+    const keep = this.backgroundWork(child.sessionId);
+    if (outcome.stopReason === "end_turn") {
+      child.output!.closeUnfinished(false, keep);
+    } else {
+      const status = outcome.stopReason === "cancelled" ? "cancelled" : "failed";
+      const ended = child.output!.finishUnfinished(status, keep, { exitTerminals: true });
+      for (const toolCallId of ended) child.stopped.add(toolCallId);
+    }
     child.working = false;
     child.outcome = outcome;
     this.reportChild(child);
     this.cancelledAgents.delete(child.sessionId);
-    if (outcome.stopReason === "cancelled") {
-      const keep = this.backgroundCalls(child.sessionId);
-      const ended = child.output!.finishUnfinished("cancelled", keep, { exitTerminals: true });
-      for (const toolCallId of ended) child.stopped.add(toolCallId);
+  }
+
+  /** The tool calls and terminals of `sessionId` that go on in the background. */
+  private backgroundWork(sessionId: string): Set<string> {
+    const work = this.backgroundCalls(sessionId);
+    for (const terminal of this.terminals.values()) {
+      if (terminal.output.sessionId === sessionId) work.add(terminal.toolCallId);
     }
+    return work;
   }
 
   private childState(child: Child): ChildState {
@@ -1086,17 +1194,19 @@ export class SessionTasks {
 
   /**
    * Runs `send` as an open request of the agent `agentId` (see
-   * {@link RequestTarget.openRequest}). While it is open, an announced child
-   * is `requires_action`, and the work that waits on the agent is too.
+   * {@link RequestTarget.openRequest}). While it is open, `announced`, the
+   * child session it goes to, is `requires_action`, and the work that waits
+   * on the agent is too. After the root closed, its signal is aborted before
+   * `send` runs.
    */
   private async agentRequest<T>(
     agentId: string,
+    announced: Child | undefined,
     toolSignal: AbortSignal,
     send: (signal: AbortSignal) => Promise<T>,
   ): Promise<T> {
-    const child = this.children.get(agentId);
-    const announced = child?.announced ? child : undefined;
     const abort = new AbortController();
+    if (this.closed) abort.abort();
     const signal = AbortSignal.any([toolSignal, abort.signal]);
     const requests = this.agentRequests.get(agentId) ?? new Set();
     this.agentRequests.set(agentId, requests);

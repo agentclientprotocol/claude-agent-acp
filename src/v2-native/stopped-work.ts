@@ -33,6 +33,16 @@ export class StoppedWork {
   private readonly abandoned = new Set<string>();
   /** Whether Claude Code runs dropped work: its output goes nowhere. */
   private dropping = false;
+  /** The abandoned prompt whose run is dropped, when a prompt's run is. */
+  private droppingFor: string | undefined;
+  /** The prompts that Claude Code took in since the last result. */
+  private readonly startedSinceResult = new Set<string>();
+  /**
+   * Whether the late result of a dead turn may still come: Claude Code sent
+   * `cancelled` for a prompt that it had started, before any result. The v1
+   * core calls such a prompt a zombie.
+   */
+  private deadTurnResult = false;
   /**
    * The tool uses of the main conversation that the session read since the
    * last result, each with whether it was dropped work's.
@@ -67,7 +77,8 @@ export class StoppedWork {
   /** A `status: requesting` frame, with the prompts that the request serves. */
   requesting(prompts: readonly string[]): void {
     this.modelRequestSinceResult = true;
-    if (prompts.some((uuid) => this.abandoned.has(uuid))) this.dropping = true;
+    const abandoned = prompts.find((uuid) => this.abandoned.has(uuid));
+    if (abandoned !== undefined) this.drop(abandoned);
   }
 
   /**
@@ -78,19 +89,30 @@ export class StoppedWork {
    * is not dropped.
    */
   promptStarted(uuid: string, foreground: boolean): boolean {
+    this.startedSinceResult.add(uuid);
     if (!this.abandoned.has(uuid)) {
-      // Claude Code takes its prompts in order: the earlier ones ran or were dropped.
+      // Claude Code takes its prompts in order: the earlier ones ran or were
+      // dropped, and a dead turn's late result came before this prompt started.
       this.abandoned.clear();
       this.endDropping();
+      this.deadTurnResult = false;
       return false;
     }
-    if (!foreground) this.dropping = true;
+    if (!foreground) this.drop(uuid);
     return true;
   }
 
-  /** Claude Code ended the prompt `uuid` (`completed` or `cancelled`). */
-  promptEnded(uuid: string): void {
-    if (this.abandoned.delete(uuid)) this.endDropping();
+  /**
+   * Claude Code ended the prompt `uuid` (`completed`, or `cancelled` when
+   * `cancelled`). Only the end of the prompt whose run is dropped ends the
+   * drop: another abandoned prompt's `cancelled` frame, which the interrupt's
+   * `cancelQueued` sends, does not.
+   */
+  promptEnded(uuid: string, cancelled = false): void {
+    // `cancelled` after `started` and before a result: the turn died, and its
+    // result can still come after this frame. That result ends nothing.
+    if (cancelled && this.startedSinceResult.delete(uuid)) this.deadTurnResult = true;
+    if (this.abandoned.delete(uuid) && this.droppingFor === uuid) this.endDropping();
   }
 
   /**
@@ -132,6 +154,9 @@ export class StoppedWork {
         clearTimeout(timer);
         signal.removeEventListener("abort", done);
         waiters.delete(done);
+        if (waiters.size === 0 && this.toolUseWaiters.get(toolUseId) === waiters) {
+          this.toolUseWaiters.delete(toolUseId);
+        }
         resolve();
       };
       const timer = setTimeout(done, TOOL_USE_WAIT_MS);
@@ -143,18 +168,21 @@ export class StoppedWork {
 
   /**
    * A result that is not a placeholder. Returns whether it ends dropped work,
-   * and whether it ends work that the interrupt stopped (an aborted result
-   * after a cancel).
+   * or is the late result of a dead turn (see {@link promptEnded}), and
+   * whether it ends work that the interrupt stopped (an aborted result after
+   * a cancel).
    */
   result(result: SDKResultMessage): { dropped: boolean; interrupted: boolean } {
     this.modelRequestSinceResult = false;
+    this.startedSinceResult.clear();
     // Claude Code asks for a tool use before the result that ends its turn.
     this.toolUses.clear();
-    const interrupted = this.interruptPending && isAbortedResult(result);
-    if (interrupted) this.interruptPending = false;
-    const dropped = this.dropping;
+    const aborted = this.interruptPending && isAbortedResult(result);
+    if (aborted) this.interruptPending = false;
+    const dropped = this.dropping || this.deadTurnResult;
+    this.deadTurnResult = false;
     this.endDropping();
-    return { dropped, interrupted };
+    return { dropped, interrupted: aborted && !dropped };
   }
 
   /**
@@ -164,11 +192,21 @@ export class StoppedWork {
   idle(): void {
     this.interruptPending = false;
     this.modelRequestSinceResult = false;
+    // A dead turn's result comes before Claude Code goes idle, or never.
+    this.deadTurnResult = false;
+    this.startedSinceResult.clear();
     this.endDropping();
+  }
+
+  /** Drops the run of the abandoned prompt `uuid`. */
+  private drop(uuid: string): void {
+    this.dropping = true;
+    this.droppingFor = uuid;
   }
 
   private endDropping(): void {
     this.dropping = false;
+    this.droppingFor = undefined;
   }
 }
 

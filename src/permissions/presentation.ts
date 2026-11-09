@@ -135,3 +135,33 @@ export function buildClaudePermissionPresentation(
     ...(capabilities.v2 ? { title, ...(description ? { description } : {}) } : {}),
   };
 }
+
+/**
+ * The `_meta.claudeCode` of a permission request's tool call: which MCP
+ * server serves an `mcp__*` tool and where its definition came from
+ * (`mcpServer`, SDK 0.3.274+), so a client can key trust on `source`, and,
+ * for clients other than AIR, the tool name and the Agent or Task call of a
+ * subagent's request. Undefined when there is nothing to add.
+ */
+export function permissionToolCallMeta({
+  toolName,
+  parentToolUseId,
+  mcpServer,
+  airClient,
+}: {
+  toolName: string;
+  parentToolUseId: string | undefined;
+  mcpServer: { name: string; source: string } | undefined;
+  airClient: boolean;
+}): { claudeCode: Record<string, unknown> } | undefined {
+  if (!mcpServer && !(parentToolUseId && !airClient)) return undefined;
+  // The name is the config key as authored: untrusted text, so it rides
+  // `_meta` rather than the title.
+  return {
+    claudeCode: {
+      ...(airClient ? {} : { toolName }),
+      ...(parentToolUseId && !airClient ? { parentToolUseId } : {}),
+      ...(mcpServer ? { mcpServer: { name: mcpServer.name, source: mcpServer.source } } : {}),
+    },
+  };
+}

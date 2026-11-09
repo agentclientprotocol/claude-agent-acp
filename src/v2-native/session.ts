@@ -18,8 +18,8 @@
  *   which v2 lists as background work instead (`background`), so its `idle`
  *   only ends a turn that ended without a result.
  * - `requires_action` is this session's own: a turn is open, and a
- *   permission request or elicitation of this session is open, or of a
- *   subagent that the turn waits on.
+ *   permission request or elicitation of this session is open, or, while
+ *   the turn waits on subagents, each of them waits on one.
  * - Subagents are child sessions, and background work is listed on every
  *   state (see {@link SessionTasks}).
  * - `session/cancel` answers the prompts that are not inserted yet with
@@ -38,10 +38,12 @@ import {
   type CreateElicitationRequest,
   type CreateElicitationResponse,
   type PromptRequest,
+  type ToolCallUpdate,
 } from "@agentclientprotocol/sdk/unstable";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type {
   PermissionMode,
+  PermissionResult,
   Query,
   SDKMessage,
   SDKResultMessage,
@@ -57,7 +59,13 @@ import type { V2UpdateTranslator } from "../v2/update-translator.js";
 import { MODEL_CONFIG_ID } from "../session-model.js";
 import { SessionCommands } from "./commands.js";
 import type { SessionConfig } from "./config.js";
-import { idleOutcome, isPlaceholderResult, ResultUsage, type TurnEnd } from "./outcome.js";
+import {
+  idleOutcome,
+  isPlaceholderResult,
+  ResultUsage,
+  TurnReport,
+  type TurnEnd,
+} from "./outcome.js";
 import { StoppedWork } from "./stopped-work.js";
 import { SessionReports } from "./reports.js";
 import { SessionElicitations } from "./elicitation.js";
@@ -137,8 +145,8 @@ export class NativeSession implements RequestTarget {
   private idleOwed = false;
   /** Whether Claude Code sends `command_lifecycle` frames (`msg_lifecycle_v1`). */
   private lifecycleFrames = false;
-  /** The explanation of the open turn's refusal, from its refused assistant message. */
-  private refusalExplanation: string | undefined;
+  /** What the open turn's assistant messages reported about its end (see {@link TurnReport}). */
+  private readonly turnReport = new TurnReport();
   /** Set by `session/close`, or when the query ends: nothing more goes out. */
   private closed = false;
   private closing: Promise<void> | undefined;
@@ -220,12 +228,14 @@ export class NativeSession implements RequestTarget {
       },
       this.output,
     );
-    this.tasks.hostRequest = (request, signal) => connection.requestPermission(request, signal);
+    this.tasks.hostRequest = (request, signal) =>
+      unlessWithdrawn(signal, () => connection.requestPermission(request, signal));
     this.elicitations = new SessionElicitations({
       sessionId,
       logger: connection.logger,
       support: connection.elicitation,
-      createElicitation: (request, signal) => connection.createElicitation(request, signal),
+      createElicitation: (request, signal) =>
+        unlessWithdrawn(signal, () => connection.createElicitation(request, signal)),
       completeElicitation: (params) => connection.completeElicitation(params),
       target: (agentId) => this.target(agentId),
       query: () => this.query,
@@ -296,6 +306,8 @@ export class NativeSession implements RequestTarget {
     // Throws invalid params for content that Claude cannot take.
     const request: PromptRequest = v1PromptRequest(params);
     this.reports.promptSent(request.prompt);
+    // The notice of a mode fallback at the session's start, which sends it at once.
+    void this.config.promptSent();
     const uuid = randomUUID();
     const message = { ...promptToClaude(request), uuid };
     const localCommand = this.commands.localCommand(request.prompt);
@@ -368,6 +380,9 @@ export class NativeSession implements RequestTarget {
         this.cancelledWork = false;
         this.output.cancelled = false;
         this.stopped.interruptFailed();
+        this.tasks.foregroundCancelFailed();
+        // The withdrawn requests reported no `running`: the work goes on.
+        this.reportState();
       },
     );
     this.interrupting = done;
@@ -471,7 +486,9 @@ export class NativeSession implements RequestTarget {
       try {
         // The subject is an upsert of the tool call: the client may see the
         // request before the tool use streams.
-        return await this.connection.requestPermission(request, signal);
+        return await unlessWithdrawn(signal, () =>
+          this.connection.requestPermission(request, signal),
+        );
       } catch (error) {
         if (signal.aborted) return { outcome: { outcome: "cancelled" } };
         throw error;
@@ -485,6 +502,9 @@ export class NativeSession implements RequestTarget {
     send: (signal: AbortSignal) => Promise<T>,
   ): Promise<T> {
     const open: OpenRequest = { abort: new AbortController(), coveredByCancel: false };
+    // After `session/close` nothing of the session goes out: the request is
+    // withdrawn before it is sent.
+    if (this.closed) open.abort.abort();
     const signal = AbortSignal.any([toolSignal, open.abort.signal]);
     this.requests.add(open);
     this.reportState();
@@ -504,6 +524,35 @@ export class NativeSession implements RequestTarget {
     if (this.config.modeChanged(mode)) {
       this.send({ sessionUpdate: "config_option_update", configOptions: this.config.options() });
     }
+  }
+
+  prePlanMode(): string | undefined {
+    return this.config.prePlanMode();
+  }
+
+  permissionAllowed(result: PermissionResult): Promise<PermissionResult> {
+    return this.config.permissionAllowed(result);
+  }
+
+  toolCallSubject<T extends ToolCallUpdate>(sessionId: string, toolCall: T): T {
+    return this.connection.translator.toolCallMeta.subject(sessionId, toolCall);
+  }
+
+  /** Claude Code switched the model without the adapter (see `modelSwitchHook`). */
+  modelSwitched(model: string): void {
+    this.config.modelSwitched(model).then(
+      (changed) => {
+        if (!changed) return;
+        this.reports.disarmIdleCompaction("model change");
+        this.send({ sessionUpdate: "config_option_update", configOptions: this.config.options() });
+      },
+      (error: unknown) => {
+        this.connection.logger.error(
+          `Session ${this.sessionId}: failed to follow a model switch`,
+          error,
+        );
+      },
+    );
   }
 
   // --- The query's messages ----------------------------------------------
@@ -545,15 +594,11 @@ export class NativeSession implements RequestTarget {
         this.output.streamEvent(message);
         return;
       case "assistant":
-        if (message.parent_tool_use_id === null) {
-          this.usage.assistant(message.message.model);
-          if (message.message.stop_reason === "refusal") {
-            this.refusalExplanation =
-              message.message.stop_details?.explanation ?? this.refusalExplanation;
-          }
-        }
+        if (message.parent_tool_use_id === null) this.usage.assistant(message.message.model);
         if (this.stopped.drops(message)) return;
         if (message.parent_tool_use_id === null) {
+          // Claude Code's sign-in message is not shown (see `TurnReport`).
+          if (this.turnReport.assistant(message)) return;
           this.outputStarts();
           this.reports.assistant(message);
         }
@@ -600,6 +645,13 @@ export class NativeSession implements RequestTarget {
             return;
           case "elicitation_complete":
             this.elicitations.completed(message.elicitation_id);
+            return;
+          case "model_refusal_no_fallback":
+            this.turnReport.refusalWithoutFallback(message);
+            return;
+          case "permission_denied":
+            // A rule, the classifier or the mode denied a tool use before it ran.
+            this.tasks.permissionDenied(message);
             return;
           case "session_state_changed":
             if (message.state === "idle") {
@@ -651,7 +703,7 @@ export class NativeSession implements RequestTarget {
         return;
       case "cancelled":
         if (this.failPrompt(uuid, RequestError.requestCancelled())) return;
-        this.stopped.promptEnded(uuid);
+        this.stopped.promptEnded(uuid, true);
         // The prompt had started: the interrupt stopped its turn.
         if (uuid === this.turnCommand) this.closeTurn();
         return;
@@ -716,7 +768,10 @@ export class NativeSession implements RequestTarget {
     if (isPlaceholderResult(message)) return;
     this.idleOwed = true;
     const { dropped, interrupted } = this.stopped.result(message);
-    if (dropped) return;
+    if (dropped) {
+      this.turnReport.reset();
+      return;
+    }
     // The interrupt stopped work that Claude Code had started before the cancel arrived.
     if (interrupted) this.cancelledWork = true;
     // A result with no open turn: a turn that sent nothing before it.
@@ -726,9 +781,8 @@ export class NativeSession implements RequestTarget {
     const local = this.turnLocalCommand;
     if (message.stop_reason === "refusal") {
       // The refused message shows nothing: its explanation answers.
-      if (this.refusalExplanation) {
-        this.output.agentMessage(this.refusalExplanation, message.uuid);
-      }
+      const explanation = this.turnReport.refusalExplanation;
+      if (explanation) this.output.agentMessage(explanation, message.uuid);
     } else if (
       message.subtype === "success" &&
       !message.is_error &&
@@ -857,22 +911,29 @@ export class NativeSession implements RequestTarget {
       }
     }
     this.reports.turnEnded();
+    this.elicitations.turnEnded();
     this.foreground = false;
     this.reportState();
     this.cancelledWork = false;
     this.output.cancelled = false;
     this.lastEnd = undefined;
     this.turnCommand = undefined;
-    this.refusalExplanation = undefined;
+    this.turnReport.reset();
     const ownCommandDone = this.ownCommandDone;
     this.ownCommandDone = undefined;
     ownCommandDone?.();
     this.turnLocalCommand = undefined;
   }
 
+  /**
+   * While the turn waits on subagents, it is blocked when each of them is
+   * (see `SessionTasks.foregroundBlocked`). Otherwise by the session's own
+   * open requests.
+   */
   private foregroundState(): ForegroundState {
     if (!this.foreground) return "idle";
-    return this.requests.size > 0 || this.tasks.foregroundBlocked() ? "requires_action" : "running";
+    const blocked = this.tasks.foregroundBlocked() ?? this.requests.size > 0;
+    return blocked ? "requires_action" : "running";
   }
 
   /**
@@ -884,9 +945,11 @@ export class NativeSession implements RequestTarget {
     if (this.closed) return;
     const state = this.foregroundState();
     if (state === this.reportedState) return;
-    const silent = withdrawnByCancel && state === "running";
+    // The client keeps `requires_action`: the next report sends `running`
+    // if the work goes on after all, such as when the interrupt fails.
+    if (withdrawnByCancel && state === "running") return;
     this.reportedState = state;
-    if (!silent) this.send(this.stateUpdate(state));
+    this.send(this.stateUpdate(state));
   }
 
   private stateUpdate(state: ForegroundState): v2.SessionUpdate {
@@ -899,7 +962,7 @@ export class NativeSession implements RequestTarget {
         return {
           sessionUpdate: "state_update",
           state,
-          ...idleOutcome(this.lastEnd, this.cancelledWork),
+          ...idleOutcome(this.lastEnd, this.cancelledWork, this.turnReport),
         };
     }
   }
@@ -927,4 +990,13 @@ export class NativeSession implements RequestTarget {
   private failPending(error: unknown): void {
     for (const uuid of [...this.pending.keys()]) this.failPrompt(uuid, error);
   }
+}
+
+/**
+ * Sends a request to the client unless `signal` aborted already. The ACP SDK
+ * would send it anyway, then withdraw it with `$/cancel_request`.
+ */
+function unlessWithdrawn<T>(signal: AbortSignal, send: () => Promise<T>): Promise<T> {
+  if (signal.aborted) return Promise.reject(new Error("The request was withdrawn"));
+  return send();
 }

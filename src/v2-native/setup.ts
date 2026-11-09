@@ -4,8 +4,6 @@
  * the models a session offers, and the updates that a `session/resume`
  * sends before its response.
  */
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import {
   type HookCallbackMatcher,
@@ -22,7 +20,10 @@ import {
   clientSupportsAirCapability,
   withAirMeta,
 } from "../air-extension.js";
-import { parseModelConfig } from "../session-env.js";
+import {
+  configuredSettings as sharedConfiguredSettings,
+  parseModelConfig,
+} from "../session-env.js";
 import {
   applyAvailableModelsAllowlist,
   getAvailableModels,
@@ -40,16 +41,15 @@ export function clientOptions(meta: unknown): Options | undefined {
  * models of `CLAUDE_MODEL_CONFIG`, then the client's `settings` option, an
  * object or a file path relative to `cwd`.
  */
-export async function configuredSettings(
+export function configuredSettings(
   client: Options | undefined,
   cwd: string,
 ): Promise<Settings | undefined> {
-  const modelConfig = parseModelConfig(process.env.CLAUDE_MODEL_CONFIG);
-  const provided =
-    typeof client?.settings === "string"
-      ? (JSON.parse(await fs.readFile(path.resolve(cwd, client.settings), "utf8")) as Settings)
-      : (client?.settings as Settings | undefined);
-  return modelConfig ? { ...modelConfig, ...provided } : provided;
+  return sharedConfiguredSettings(
+    client?.settings,
+    cwd,
+    parseModelConfig(process.env.CLAUDE_MODEL_CONFIG),
+  );
 }
 
 /** The core's hooks, after the client's own hooks of the same event. */

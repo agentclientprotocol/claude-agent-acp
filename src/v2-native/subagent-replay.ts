@@ -15,6 +15,9 @@
  * on the child's own stream: v2 forbids replaying a child's past `running` as
  * current activity. These states are history to the client, so each child's
  * current state goes out again after the response ({@link afterResponse}).
+ * A child that the live session still tracks, on a resume of the active
+ * session, gets its current state from the resume snapshot instead
+ * (`SessionTasks.currentState`).
  *
  * Not replayed: SendMessage deliveries and hand-backs, which stay tool calls
  * and user text, and a model change after a child's first response. A launch
@@ -84,6 +87,8 @@ export class SubagentReplay {
     private readonly history: SubagentHistory,
     /** The transcript of each child, by agent id. */
     private readonly transcripts: Map<string, SessionMessage[]>,
+    /** Whether the live session tracks the child session `sessionId`. */
+    private readonly live: (sessionId: string) => boolean,
   ) {}
 
   /**
@@ -93,6 +98,7 @@ export class SubagentReplay {
   static async load(
     host: ReplayHost,
     messages: SessionMessage[],
+    live: (sessionId: string) => boolean = () => false,
   ): Promise<SubagentReplay | undefined> {
     if (!messages.some((message) => launchIdsOf(message).length > 0)) return undefined;
     const history = await subagentHistory(host.sessionId);
@@ -107,7 +113,7 @@ export class SubagentReplay {
       transcripts.set(record.agentId, transcript);
       queue.push(...transcript.flatMap(launchIdsOf));
     }
-    return new SubagentReplay(host, history, transcripts);
+    return new SubagentReplay(host, history, transcripts, live);
   }
 
   /** The hooks of the replay of the root session's history (`messages`). */
@@ -139,13 +145,14 @@ export class SubagentReplay {
   }
 
   /**
-   * The current state of each replayed child, after the response: its
-   * process is gone, so its replayed end. A `cwd` that is gone, such as a
-   * worktree that Claude Code removed, is cleared.
+   * The current state of each replayed child that the live session does not
+   * track, after the response: its process is gone, so its replayed end. A
+   * `cwd` that is gone, such as a worktree that Claude Code removed, is
+   * cleared.
    */
   afterResponse(): void {
     for (const child of this.children.values()) {
-      if (!child.announced) continue;
+      if (!child.announced || this.live(child.sessionId)) continue;
       const state = endState(child);
       this.host.send({
         sessionId: child.parentSessionId,

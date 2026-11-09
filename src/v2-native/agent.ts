@@ -41,7 +41,7 @@ import { sdkMcpServers } from "../mcp-servers.js";
 import { ALLOW_BYPASS, autoModeDisabled } from "../permissions/modes.js";
 import { readResumedTail, resumedModelFromTranscript } from "../resumed-session.js";
 import { resolveThinkingConfig } from "../session-env.js";
-import { buildAvailableModes, resolveInitialPermissionMode } from "../session-mode.js";
+import { resolveInitialPermissionMode } from "../session-mode.js";
 import { sanitizeTitle } from "../session-titles.js";
 import { SettingsManager } from "../settings.js";
 import { STARTUP_FAILURE_RESULTS_ENV, startupFailureError } from "../startup-failure.js";
@@ -51,9 +51,9 @@ import { V2_SESSION_CAPABILITIES } from "../v2/initialize.js";
 import { v1ForkSessionRequest, v1NewSessionRequest } from "../v2/session.js";
 import { V2UpdateTranslator } from "../v2/update-translator.js";
 import { NativeAuth } from "./auth.js";
-import { SessionConfig } from "./config.js";
+import { modelSwitchHook, SessionConfig } from "./config.js";
 import { fileChangePreviewHook } from "./file-preview.js";
-import { canUseTool } from "./permissions.js";
+import { canUseTool, denyingStoppedWork } from "./permissions.js";
 import { reportHooks } from "./reports.js";
 import { NativeSession, type SessionConnection } from "./session.js";
 import {
@@ -235,7 +235,9 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       messageIdForGrouping,
     });
     const session = await this.startSession(sessionId, params, sessionId);
-    return { sessionId, ...(await this.setupFields(session)) };
+    const response = { sessionId, ...(await this.setupFields(session)) };
+    afterSetupResponse(session, params);
+    return response;
   }
 
   /**
@@ -473,6 +475,9 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
               model: await history.then(resumedModelFromTranscript, () => undefined),
             }
           : await readResumedTail(resume, this.logger);
+    // Read before the settings watchers open: only a failed query start disposes them.
+    const configured = await configuredSettings(client, request.cwd);
+    const pathToClaudeCodeExecutable = await claudeCliPath();
     const settings = new SettingsManager(request.cwd, { logger: this.logger });
     await settings.initialize();
     // A client can remove bypass from the session with `false`.
@@ -481,7 +486,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       settings.getSettings().permissions?.disableBypassPermissionsMode !== "disable" &&
       client?.allowDangerouslySkipPermissions !== false;
     const allowAuto = !autoModeDisabled(settings.getSettings());
-    const { mode } = resolveInitialPermissionMode(
+    const { mode, builtInDefault } = resolveInitialPermissionMode(
       {
         resumed: resumed?.permissionMode,
         defaultMode: settings.getSettings().permissions?.defaultMode,
@@ -493,7 +498,6 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     // ends. They keep the values they read: their cwd and key helper.
     const authStarted = this.auth.sessionStarting(settings);
     const routing = this.auth.routing();
-    const configured = await configuredSettings(client, request.cwd);
     const thinking = resolveThinkingConfig(
       process.env.MAX_THINKING_TOKENS,
       process.env.CLAUDE_CODE_THINKING_DISPLAY,
@@ -547,11 +551,11 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       mcpServers,
       permissionMode: mode,
       allowDangerouslySkipPermissions: allowBypass,
-      canUseTool: session.elicitations.canUseTool(canUseTool(session)),
+      canUseTool: denyingStoppedWork(session, session.elicitations.canUseTool(canUseTool(session))),
       // MCP elicitations and the refusal fallback, for the modes the client
       // renders. Without forms, AskUserQuestion is disallowed (below).
       ...elicitationOptions,
-      pathToClaudeCodeExecutable: await claudeCliPath(),
+      pathToClaudeCodeExecutable,
       // Echoes each prompt that Claude Code takes in (see `NativeSession`).
       extraArgs: { ...client?.extraArgs, "replay-user-messages": "" },
       disallowedTools: [
@@ -586,6 +590,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
             ],
           },
         ],
+        PostModelSwitch: [modelSwitchHook((model) => session.modelSwitched(model))],
         ...reportHooks(session),
       }),
       env: {
@@ -634,23 +639,22 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       settings.dispose();
       throw error;
     }
-    const availableModes = buildAvailableModes({ allowBypass, allowAuto });
+    // Does not throw: a failed sync of the mode is logged (`SessionModeManager.initialize`).
+    const config = await SessionConfig.start(
+      sessionId,
+      q,
+      { mode, builtInDefault, allowBypass, allowAuto },
+      models.models,
+      models.modelInfos,
+      (notification) => session.output.emitV1([notification]),
+      this.logger,
+    );
     session.reports.configure({
       settings,
       env: options.env ?? {},
       mcpServers: request.mcpServers.map((server) => server.name),
     });
-    session.start(
-      q,
-      new SessionConfig(
-        q,
-        { currentModeId: mode, availableModes },
-        models.models,
-        models.modelInfos,
-      ),
-      mcpServers,
-      resume !== undefined,
-    );
+    session.start(q, config, mcpServers, resume !== undefined);
     this.sessions.set(sessionId, session);
     return session;
   }
@@ -692,7 +696,7 @@ async function validatedSetup(
  */
 function afterSetupResponse(
   session: NativeSession,
-  params: v2.NewSessionRequest | v2.ResumeSessionRequest,
+  params: v2.NewSessionRequest | v2.ResumeSessionRequest | v2.ForkSessionRequest,
 ): void {
   // The setup already rejected servers of an unknown transport.
   const names = (params.mcpServers ?? []).flatMap((server) =>

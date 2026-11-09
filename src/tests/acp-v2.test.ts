@@ -2557,7 +2557,9 @@ describe("ACP v2 prompts", () => {
       });
 
       const updates = client.sessionUpdates as unknown as Seen[];
-      // The child reported idle first, and then its command ended in its session.
+      // The command ends in the child's session. The bridge reports the
+      // child's idle first. The native core ends the command first: v2 asks
+      // for the updates after a cancel before the idle that reports it.
       const childIdle = updates.findIndex(
         ({ sessionId, update }) =>
           sessionId === "agent-1" &&
@@ -2570,7 +2572,8 @@ describe("ACP v2 prompts", () => {
         sessionId: "agent-1",
         update: { status: "cancelled" },
       });
-      expect(lastStatusAt(updates, "toolu_child")).toBeGreaterThan(childIdle);
+      if (NATIVE_CORE) expect(lastStatusAt(updates, "toolu_child")).toBeLessThan(childIdle);
+      else expect(lastStatusAt(updates, "toolu_child")).toBeGreaterThan(childIdle);
       // Claude Code's result for the command was dropped, so only one report ended it.
       expect(
         updates.filter(
@@ -3111,8 +3114,9 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
       const { root, updates } = await cancelCycle("toolu_child");
 
       // The parent does not show the Agent call: the child's idle reports the
-      // stop. The command ends in the child's session, after the child's idle
-      // and before the cycle's.
+      // stop. The command ends in the child's session, before the cycle's
+      // idle. The bridge ends it after the child's idle; the native core
+      // before it, as v2 asks of the updates after a cancel.
       expect(statusesOf(updates, "toolu_agent")).toEqual([]);
       expect(updates[lastIdleAt(updates, "agent-1")]).toMatchObject({
         update: { stopReason: "cancelled" },
@@ -3123,7 +3127,8 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
         "pending",
         "cancelled",
       ]);
-      expect(end).toBeGreaterThan(lastIdleAt(updates, "agent-1"));
+      if (NATIVE_CORE) expect(end).toBeLessThan(lastIdleAt(updates, "agent-1"));
+      else expect(end).toBeGreaterThan(lastIdleAt(updates, "agent-1"));
       expect(updates[lastIdleAt(updates, root)]).toMatchObject({
         update: { stopReason: "cancelled" },
       });

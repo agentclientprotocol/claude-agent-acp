@@ -31,7 +31,7 @@ both, so a v2 core can follow Claude Code's own events instead of rebuilding a t
 | `session/prompt` fails             | `session/cancel` or `cancelled` (-32800), `discarded` or `refused` (-32603)            |
 | `state_update` `running`           | a turn starts: a prompt's `started` or echo, or the main conversation's output         |
 | `state_update` `idle`              | the turn's `result`, with its stop reason, usage, `_meta.quota` and error              |
-| `state_update` `requires_action`   | a turn is open and a permission request or elicitation of the session is open          |
+| `state_update` `requires_action`   | a turn is open and it waits on the user (see the end of this page)                     |
 | `session/cancel`                   | `interrupt({ cancelQueued: true })`, also while idle, as on the bridge                 |
 | `session/resume` with `replayFrom` | `getSessionMessages`, mapped like live output                                          |
 | `session/fork`                     | `forkSession` (`fork-session.ts`), then a resume of the copy                           |
@@ -81,7 +81,13 @@ such as one that an interrupt stopped before it ran. The `idle` that follows a r
 result's, also when it comes after the next cycle's first output. A placeholder result
 (`num_turns: 0` of a task notification) ends nothing: Claude Code answers queued notifications
 with one model call. The idle's usage and `_meta.quota` are the result's (`outcome.ts`, with the
-quota helpers of `session-usage.ts` that v1 uses). A failed turn's idle carries its error instead.
+quota helpers of `session-usage.ts` that v1 uses). The stop reason is read from the result by the v1
+core's rules (`resultEnd`, `result-end.ts`). A failed turn's idle carries its error instead, built
+as the bridge builds it: an authentication failure (the assistant message's `error`, or the
+"run /login" text) is `authRequired` (-32000), and any other failure has the assistant message's
+error kind in `data.errorKind`. Claude Code's sign-in message ("Not logged in · Please run /login")
+is not shown, live or in a replay, and fails the turn with `authRequired`. A turn whose prompt got
+`cancelled` after `started` and before a result is dead: its late result ends nothing.
 
 `session/cancel` answers every prompt not inserted yet with -32800, as the bridge does. Claude
 Code can still run one that it had taken in before the interrupt arrived, or a cycle that it
@@ -117,8 +123,11 @@ These are the bridge's rules. A child's messages before its announcement wait fo
 child that ends before it is announced stays unexposed: its Agent call is then shown with its
 final status. A child that its parent waits on (`is_backgrounded` not `true`) is part of the
 parent's foreground work, also before its announcement: its requests block the parent too
-(`requires_action`), and cancelling the parent stops it. A stopped child's unfinished tool
-calls end `cancelled` after its idle, and Claude Code's later results for them are dropped. A
+(`requires_action`), and cancelling the parent stops it. A child's unfinished tool calls get
+their final status before its idle (unlike the bridge, see "Intended differences"): `cancelled` when it was stopped, `failed` when it failed, and
+otherwise a tool call that Claude dropped before it ran ends `cancelled`. Claude Code's later
+results for a stopped or failed run's calls are dropped. A child that a task names as its parent
+without a launch call is announced only after that parent. A
 background child is listed in its parent's `background` while it works, and cancelling the
 parent leaves it running. The client can only watch a child and cancel its run: prompt, close,
 resume, delete and config changes on it fail with -32602. A session started with
@@ -145,7 +154,10 @@ resume, delete and config changes on it fail with -32602. A session started with
   Without form elicitation, AskUserQuestion is disallowed and the refusal fallback is not
   declared. An MCP server's request in a mode the client did not advertise, or that the client
   answers with an error, is answered `cancel`.
-- `src/v2-native/config.ts`: the mode and model config options.
+- `src/v2-native/config.ts`: the mode and model config options, on the v1 core's mode rules
+  (`SessionModeManager`): `auto` runs as `acceptEdits`, with a notice, for a model that does not
+  support it. A model switch that the adapter did not make (`PostModelSwitch`, such as a typed
+  `/model`) updates the `model` option.
 - `src/v2-native/setup.ts`: what session setup adds on the bridge's rules: the client's
   `_meta.claudeCode.options`, `CLAUDE_MODEL_CONFIG`, the models (the `availableModels`
   allowlist, `ANTHROPIC_MODEL` and the settings' `model`, the resumed transcript's model), the
@@ -198,6 +210,9 @@ These pieces were extracted so that both cores use the same code:
   `createEnvForProvider`, taken from `ClaudeAcpAgent`
 - the token usage helpers (`session-usage.ts`): usage snapshots, the `_meta.quota` shape, the
   `modelUsage` increments and the context window guess, taken from `acp-agent.ts`
+- `resultEnd` (`result-end.ts`): the stop reason of a result, taken from `autonomousCycleEnd`
+- `permissionToolCallMeta` (`permissions/presentation.ts`): the `_meta.claudeCode` of a
+  permission request's tool call (`mcpServer`, the parent tool use), taken from `canUseTool`
 - `informationalNotice` and `mcpServerStartupNotice` (`session-notices.ts`), and
   `replayCompactSummary` (`context-compaction.ts`), taken from `ClaudeAcpAgent`
 - `SessionTitles` (`session-titles.ts`) now reads its session and agent through the
@@ -233,6 +248,14 @@ These pieces were extracted so that both cores use the same code:
   state updates carry the v2 `background` list. The bridge gives it AIR's subagent form, which
   reports no list. AIR's `loadReplayEnd` event, which the client declares, is sent.
 - `/remote-control` is not listed: this core does not serve it.
+- A stopped child's unfinished tool calls end before the idle that reports its cancel, as v2 asks
+  of the updates after `session/cancel`. The bridge ends them after the idle.
+- While the root's turn waits on foreground subagents, it reports `requires_action` only when each
+  of them waits on the user. One that still makes progress keeps the turn `running`, as v2 asks.
+  The bridge reports `requires_action` as soon as one of them asks.
+- An MCP server's URL elicitation that the user accepts keeps the work `requires_action` until
+  Claude Code reports it complete (`elicitation_complete`), the tool use ends, or the turn ends:
+  `accept` only consents to open the URL. The bridge reports `running` at the answer.
 
 ## Not served yet
 
@@ -305,5 +328,6 @@ Beyond the scenarios, `v2-native.test.ts` covers these requirements of the draft
   logins are advertised only with `auth.terminal`.
 
 `requires_action` comes from the session's own open requests, not Claude Code's: it covers
-exactly this session's permission requests and elicitations. MCP OAuth is not one: it does not
-block a turn.
+exactly this session's permission requests and elicitations, and, while the turn waits on
+foreground subagents, theirs, once each of them waits on one. MCP OAuth is not one: it does not
+block a turn. After `session/close` answered, no request of the session goes to the client.

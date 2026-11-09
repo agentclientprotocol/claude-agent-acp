@@ -11,8 +11,11 @@
  *
  * The first three are open requests of their session while they wait
  * (`requires_action`), and a cancel or close withdraws them with
- * `$/cancel_request`, as it does a permission request. Building the
- * elicitations and reading the answers is shared with v1 (`elicitation.ts`).
+ * `$/cancel_request`, as it does a permission request. An MCP server's URL
+ * request that the user accepts stays open until Claude Code reports it
+ * complete: `accept` only consents to open the URL, and the work waits for
+ * the user to finish there. Building the elicitations and reading the
+ * answers is shared with v1 (`elicitation.ts`).
  */
 import type {
   CompleteElicitationNotification,
@@ -58,6 +61,10 @@ export class SessionElicitations {
    * on its own fails their next `mcpServerStatus`, which ends them too.
    */
   private readonly closed = new AbortController();
+  /** The accepted URL requests that wait for their `elicitation_complete`, by elicitation id. */
+  private readonly awaitingCompletion = new Map<string, Set<() => void>>();
+  /** The elicitation ids that Claude Code reported complete in the open turn. */
+  private readonly completedIds = new Set<string>();
 
   constructor(private readonly host: ElicitationHost) {}
 
@@ -80,7 +87,7 @@ export class SessionElicitations {
                 sessionId,
                 support,
                 logger,
-                elicit: this.elicit(await this.host.target(undefined), signal),
+                elicit: this.elicit(await this.host.target(undefined), signal, true),
               }),
           }
         : {}),
@@ -122,6 +129,8 @@ export class SessionElicitations {
 
   /** Claude Code's `elicitation_complete`: a URL elicitation of an MCP server finished. */
   completed(elicitationId: string): void {
+    this.completedIds.add(elicitationId);
+    for (const release of this.awaitingCompletion.get(elicitationId) ?? []) release();
     if (!this.host.support.url || this.closed.signal.aborted) return;
     this.host.completeElicitation({ elicitationId }).catch((error) => {
       this.host.logger.error(`Failed to complete elicitation: ${error}`);
@@ -156,11 +165,65 @@ export class SessionElicitations {
     this.closed.abort();
   }
 
-  /** Sends an elicitation as an open request of `target`. */
-  private elicit(target: RequestTarget, signal: AbortSignal): Elicit {
+  /**
+   * The open turn ended: its accepted URL requests no longer hold it. A
+   * server that never reports its completion holds only its turn.
+   */
+  turnEnded(): void {
+    for (const releases of [...this.awaitingCompletion.values()]) {
+      for (const release of [...releases]) release();
+    }
+    this.completedIds.clear();
+  }
+
+  /**
+   * Sends an elicitation as an open request of `target`. With
+   * `holdAcceptedUrl`, an accepted URL request then stays open (see the
+   * module doc).
+   */
+  private elicit(target: RequestTarget, toolSignal: AbortSignal, holdAcceptedUrl = false): Elicit {
     return (request) =>
-      target.openRequest(signal, (signal) =>
-        elicitUnlessWithdrawn(signal, (signal) => this.host.createElicitation(request, signal)),
-      );
+      target.openRequest(toolSignal, async (signal) => {
+        const outcome = await elicitUnlessWithdrawn(signal, (signal) =>
+          this.host.createElicitation(request, signal),
+        );
+        const elicitationId = (request as { elicitationId?: unknown }).elicitationId;
+        if (
+          holdAcceptedUrl &&
+          request.mode === "url" &&
+          typeof elicitationId === "string" &&
+          "response" in outcome &&
+          outcome.response.action === "accept"
+        ) {
+          // Opened before this request settles, so the state stays
+          // `requires_action`. Claude Code gets the answer at once: the MCP
+          // server waits for the user's interaction itself.
+          void target.openRequest(toolSignal, (signal) =>
+            this.untilCompleted(elicitationId, signal),
+          );
+        }
+        return outcome;
+      });
+  }
+
+  /**
+   * Resolves once Claude Code reports the elicitation `elicitationId`
+   * complete, `signal` aborts (the tool use ended, or a cancel or close
+   * withdrew it), or the turn ends.
+   */
+  private untilCompleted(elicitationId: string, signal: AbortSignal): Promise<void> {
+    if (this.completedIds.has(elicitationId) || signal.aborted) return Promise.resolve();
+    return new Promise((resolve) => {
+      const releases = this.awaitingCompletion.get(elicitationId) ?? new Set<() => void>();
+      this.awaitingCompletion.set(elicitationId, releases);
+      const release = () => {
+        signal.removeEventListener("abort", release);
+        releases.delete(release);
+        if (releases.size === 0) this.awaitingCompletion.delete(elicitationId);
+        resolve();
+      };
+      signal.addEventListener("abort", release, { once: true });
+      releases.add(release);
+    });
   }
 }
