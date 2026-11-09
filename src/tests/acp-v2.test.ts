@@ -2000,6 +2000,34 @@ describe("ACP v2 prompts", () => {
     expect(atClose).toEqual(["user_message", "running", "agent_message_chunk", "idle cancelled"]);
   });
 
+  it.each([
+    ["Edit", "workflow-agent"],
+    ["Write", undefined],
+  ] as const)("does not publish a preview for a hook-only %s", async (name, agentId) => {
+    const file = path.join(cwd, "app.ts");
+    await writeFile(file, "const value = 1;\n");
+    const input =
+      name === "Edit"
+        ? { file_path: file, old_string: "const value = 1;", new_string: "const value = 2;" }
+        : { file_path: file, content: "const value = 2;\n" };
+    scriptTurns(async function* (options) {
+      // Workflow agents run these hooks without streaming their tool uses
+      // or results to the root query.
+      await previewToolUse(options, { id: "workflow-edit", name, input, agentId });
+      await writeFile(file, "const value = 2;\n");
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+    });
+
+    expect(client.updates("tool_call_update")).toEqual([]);
+  });
+
   // Hook callbacks bypass the SDK's message queue, so the hook can also come
   // before the agent has seen the streamed tool_use.
   it.each([
@@ -2034,27 +2062,19 @@ describe("ACP v2 prompts", () => {
         };
         // Claude Code runs the PreToolUse hooks and waits for them; no
         // permission request comes for an auto-approved Edit.
-        const preToolUse = async () => {
-          for (const matcher of options.hooks?.PreToolUse ?? []) {
-            for (const hook of matcher.hooks) {
-              await hook(
-                {
-                  hook_event_name: "PreToolUse",
-                  session_id: options.sessionId!,
-                  cwd,
-                  tool_name: "Edit",
-                  tool_input: input,
-                  tool_use_id: "toolu_edit",
-                } as never,
-                "toolu_edit",
-                { signal: new AbortController().signal },
-              );
-            }
-          }
-        };
+        const preToolUse = () => previewToolUse(options, { id: "toolu_edit", name: "Edit", input });
         if (hookFirst) await preToolUse();
-        yield toolUse;
+        yield stream(options, {
+          type: "message_start",
+          message: { id: "msg_edit", role: "assistant", content: [], usage: {} },
+        });
+        yield stream(options, {
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "tool_use", id: "toolu_edit", name: "Edit", input: {} },
+        });
         if (!hookFirst) await preToolUse();
+        yield toolUse;
         // The Edit runs.
         await writeFile(file, "line 1\nconst value = 2;\nline 3\n");
         yield {
@@ -4018,22 +4038,7 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
         session_id: options.sessionId,
       };
       // Claude Code runs the PreToolUse hooks, then asks for the permission.
-      for (const matcher of options.hooks?.PreToolUse ?? []) {
-        for (const hook of matcher.hooks) {
-          await hook(
-            {
-              hook_event_name: "PreToolUse",
-              session_id: options.sessionId!,
-              cwd,
-              tool_name: "Write",
-              tool_input: input,
-              tool_use_id: "toolu_late",
-            } as never,
-            "toolu_late",
-            { signal: new AbortController().signal },
-          );
-        }
-      }
+      await previewToolUse(options, { id: "toolu_late", name: "Write", input });
       decision = await options.canUseTool!("Write", input, {
         signal: new AbortController().signal,
         suggestions: [],
@@ -6049,6 +6054,120 @@ describe("ACP v2 terminal of a command in the background", () => {
         ).toEqual(["pending", "in_progress"]);
       });
 
+      it("updates a workflow card from SDK progress before launch and while idle, and keeps it on resume", async () => {
+        const finish = Promise.withResolvers<void>();
+        const progress = (options: Options, fields: Record<string, unknown> = {}) =>
+          taskEvent(options, "task_progress", {
+            task_id: "wf1",
+            tool_use_id: "toolu_wf",
+            description: "Probe: probe",
+            summary: "Run a probe",
+            last_tool_name: "probe",
+            usage: { total_tokens: 0, tool_uses: 0, duration_ms: 29 },
+            ...fields,
+          });
+        scriptTurns(async function* (options) {
+          yield progress(options, { task_id: "unknown" });
+          yield toolUseMessage(options, "toolu_wf", "Workflow", { script: "probe" });
+          yield level(options, [workflow]);
+          yield taskEvent(options, "task_started", { ...workflow, tool_use_id: "toolu_wf" });
+          // Observed on CLI 2.1.319: workflow progress can precede the launch
+          // result. last_tool_name is the active agent's label, not a tool.
+          yield progress(options);
+          yield {
+            ...toolResultMessage(options, "toolu_wf", { content: "Workflow launched." }),
+            tool_use_result: {
+              status: "async_launched",
+              taskId: "wf1",
+              taskType: "local_workflow",
+            },
+          };
+          yield result(options);
+          yield idleState(options);
+          yield taskEvent(options, "task_updated", { task_id: "wf1", patch: { status: "paused" } });
+          yield progress(options, {
+            summary: undefined,
+            last_tool_name: undefined,
+            usage: { total_tokens: 4003, tool_uses: 2, duration_ms: 1494 },
+          });
+          yield level(options, [workflow]);
+          yield progress(options, {
+            usage: { total_tokens: 4003, tool_uses: 2, duration_ms: 1494 },
+          });
+          await finish.promise;
+          yield taskEvent(options, "task_updated", {
+            task_id: "wf1",
+            patch: { status: "completed" },
+          });
+          yield progress(options, { description: "Late progress" });
+          yield level(options, []);
+        });
+        const body = (tokens: string, tools: number, seconds: number) => [
+          {
+            type: "content",
+            content: {
+              type: "text",
+              text: `Run a probe\n\nLast activity: probe\n\n${tokens} tokens · ${tools} tool calls · ${seconds}s`,
+            },
+          },
+        ];
+        let resumed: v2.SessionUpdate[] = [];
+        let live: v2.SessionUpdate[] = [];
+        const client = await promptUntil(
+          "idle end_turn [toolu_wf]",
+          async (agent, sessionId, client) => {
+            await vi.waitFor(() =>
+              expect(client.updates("tool_call_update")).toContainEqual(
+                expect.objectContaining({ content: body("4,003", 2, 1) }),
+              ),
+            );
+            live = client.updates("tool_call_update");
+            const before = client.sessionUpdates.length;
+            await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+            resumed = client.sessionUpdates.slice(before).map(({ update }) => update);
+            finish.resolve();
+            await vi.waitFor(() => expect(backgroundTrace(client)).toContain("idle []"));
+          },
+        );
+
+        expect(
+          live.filter(
+            (update) =>
+              update.sessionUpdate === "tool_call_update" &&
+              update.title === "Workflow: Probe: probe",
+          ),
+        ).toEqual([
+          {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "toolu_wf",
+            title: "Workflow: Probe: probe",
+            content: body("0", 0, 0),
+          },
+          {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "toolu_wf",
+            title: "Workflow: Probe: probe",
+            content: body("4,003", 2, 1),
+          },
+        ]);
+        expect(resumed[0]).toMatchObject({
+          toolCallId: "toolu_wf",
+          title: "Workflow: Probe: probe",
+          content: body("4,003", 2, 1),
+          status: "paused",
+        });
+        expect(
+          client
+            .updates("tool_call_update")
+            .flatMap((update) => (update.status ? [update.status] : [])),
+        ).toEqual(["pending", "in_progress", "paused", "paused", "completed"]);
+        const calls = client.updates("tool_call_update");
+        const completed = calls.findIndex((update) => update.status === "completed");
+        expect(
+          calls.slice(completed + 1).filter((update) => update.title || update.content),
+        ).toEqual([]);
+      });
+
       it("sends each listed call's current state before the state snapshot of session/resume", async () => {
         scriptTurns(async function* (options) {
           yield* monitorStarts(options);
@@ -6888,3 +7007,27 @@ describe("ACP v2 auth", () => {
     });
   });
 });
+
+async function previewToolUse(
+  options: Options,
+  tool: { id: string; name: string; input: unknown; agentId?: string },
+): Promise<void> {
+  for (const matcher of options.hooks?.PreToolUse ?? []) {
+    for (const hook of matcher.hooks) {
+      await hook(
+        {
+          hook_event_name: "PreToolUse",
+          session_id: options.sessionId!,
+          transcript_path: path.join(cwd, "session.jsonl"),
+          cwd,
+          tool_name: tool.name,
+          tool_input: tool.input,
+          tool_use_id: tool.id,
+          ...(tool.agentId ? { agent_id: tool.agentId } : {}),
+        },
+        tool.id,
+        { signal: new AbortController().signal },
+      );
+    }
+  }
+}

@@ -105,6 +105,28 @@ type TaskProgress = TaskIdentity & {
   output_file?: unknown;
 };
 
+/** The display fields of a task progress report, shared by AIR and v2 cards. */
+export type TaskProgressFields = {
+  description?: string;
+  summary?: string;
+  lastToolName?: string;
+  usage?: { totalTokens: number; toolUses: number; durationMs: number };
+};
+
+/** Reads the display fields supplied by a task progress report. */
+export function taskProgressFields(message: TaskProgress): TaskProgressFields {
+  const usage = taskUsage(message.usage);
+  const description = nonBlankString(message.description);
+  const summary = nonBlankString(message.summary);
+  const lastToolName = nonBlankString(field(message, "lastToolName", "last_tool_name"));
+  return {
+    ...(description ? { description } : {}),
+    ...(summary ? { summary } : {}),
+    ...(lastToolName ? { lastToolName } : {}),
+    ...(usage ? { usage } : {}),
+  };
+}
+
 type BackgroundTaskLevel = TaskIdentity & {
   taskType?: unknown;
   task_type?: unknown;
@@ -267,15 +289,8 @@ export class AsyncTaskRuntime {
       return;
     }
 
-    const usage = taskUsage(message.usage);
-    const description = nonBlankString(message.description);
-    const summary = nonBlankString(message.summary);
-    const lastToolName = nonBlankString(field(message, "lastToolName", "last_tool_name"));
     const progress = {
-      ...(description ? { description } : {}),
-      ...(summary ? { summary } : {}),
-      ...(lastToolName ? { lastToolName } : {}),
-      ...(usage ? { usage } : {}),
+      ...taskProgressFields(message),
       ...(outputChanged && task.outputFilePath ? { outputFilePath: task.outputFilePath } : {}),
       ...(task.toolCallId !== previousToolCallId && task.toolCallId
         ? { toolCallId: task.toolCallId }
