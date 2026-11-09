@@ -10,13 +10,18 @@
  * - The route: `providers/set`, `providers/disable`, and an `auth/logout`
  *   that drops a provider or a gateway login. Each live session restarts at
  *   its next turn boundary: no turn is open, no prompt of the session waits
- *   to go to Claude Code or in its queue, and no subagent runs. Prompts that
- *   come meanwhile wait, and go to the new query. The request that changed
- *   the route answers once every live session restarted.
+ *   to go to Claude Code or in its queue, and no subagent runs, background
+ *   ones included. A session at a turn boundary restarts right away, and the
+ *   request that changed the route answers once it did. A busy session's
+ *   restart is due at its next turn boundary, which the request does not
+ *   wait for: until then the session keeps its query, and its prompts go to
+ *   that query under the old route (the provider RFD lets an Agent leave
+ *   running sessions on it). That restart starts under the route in force
+ *   when it runs.
  *   A session that cannot start again stops: its requests then fail with
  *   what happened, until a resume starts it again.
  * - The additional directories: a resume of the active session with other
- *   ones restarts it at its next turn boundary, as for a new route. Claude
+ *   ones restarts it as for a new route, and does not wait for it. Claude
  *   Code reads them once, when its process starts, and the SDK has no call
  *   that changes them on a running query.
  * - The account, under `--hide-claude-auth` (see `subscription-guard.ts`):
@@ -33,11 +38,13 @@
  * the effort of the setup's `_meta`, and the client's choices are set again
  * on it (`SessionConfig.restoreFrom`), which then reports its options in a
  * `config_option_update`. One restart of a session runs at
- * a time: a route restart waits for an account restart that runs.
+ * a time: a route restart waits for an account restart that runs, as for a
+ * busy session.
  *
- * A `session/cancel` or `session/close` answers the prompts that wait for a
- * restart with -32800, and stops the work that runs on the old query while
- * the restart waits for it.
+ * Prompts wait only for a restart that runs, from the new query's start to
+ * the old one's end, and go to the new query. A `session/cancel` or
+ * `session/close` answers them with -32800, and stops the work that runs on
+ * the old query while the restart waits for it.
  */
 import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
@@ -63,7 +70,7 @@ export interface RestartHost {
   send(notification: v2.UpdateSessionNotification): void;
 }
 
-/** A route restart of one session: waiting for its turn boundary, then running. */
+/** A route restart of a busy session: waiting for its turn boundary, then running. */
 type Reroute = { done: Promise<void>; started: boolean };
 
 export class SessionRestarts {
@@ -71,6 +78,7 @@ export class SessionRestarts {
   private readonly setups = new Map<string, SetupParams>();
   /** The sessions whose account may have changed: their next prompt at a turn boundary restarts them. */
   private readonly accountChanged = new Set<string>();
+  /** The route restarts that wait for the session's turn boundary. Prompts do not wait for them. */
   private readonly reroutes = new Map<string, Reroute>();
   /** The restarts that run: from the new query's start to the old one's end. */
   private readonly swaps = new Map<string, Promise<void>>();
@@ -91,8 +99,8 @@ export class SessionRestarts {
 
   /**
    * A resume of the active session brought other additional directories:
-   * the session restarts with `params` at its next turn boundary (see the
-   * module doc). Does not wait for it.
+   * the session restarts with `params`, as for a new route (see the module
+   * doc). Does not wait for it.
    */
   rootsChanged(sessionId: string, params: SetupParams): void {
     this.track(sessionId, params);
@@ -101,8 +109,7 @@ export class SessionRestarts {
 
   /**
    * The session is no longer active, such as when its query ended. A route
-   * restart that waits is dropped, and the prompts that wait for it then
-   * find no active session (-32002).
+   * restart that is due does not run.
    */
   forget(sessionId: string): void {
     this.setups.delete(sessionId);
@@ -111,7 +118,11 @@ export class SessionRestarts {
 
   /**
    * The route changed: restarts every live session at its next turn
-   * boundary. Resolves once each one restarted, or was closed or lost.
+   * boundary. Resolves once each session that is at one now restarted, or
+   * was closed or lost. Their restarts start in this call, so a prompt that
+   * comes after it waits for them (`beforePrompt`). The busy sessions'
+   * restarts are only due: a failure of one stops its session later
+   * (`RestartHost.lost`).
    */
   async reroute(): Promise<void> {
     await Promise.all([...this.setups.keys()].map((sessionId) => this.rerouteSession(sessionId)));
@@ -124,11 +135,13 @@ export class SessionRestarts {
 
   /**
    * What a prompt of `sessionId` waits for before it goes to the session: a
-   * restart that is due. `undefined` when none is: the prompt goes on in the
-   * same call, so prompts keep their order.
+   * restart that runs, or an account restart that is due. `undefined` when
+   * none is: the prompt goes on in the same call, so prompts keep their
+   * order. A route restart that waits for a turn boundary does not hold it:
+   * the prompt goes to the current query.
    */
   beforePrompt(sessionId: string): Promise<void> | undefined {
-    const running = this.reroutes.get(sessionId)?.done ?? this.swaps.get(sessionId);
+    const running = this.swaps.get(sessionId);
     if (running) return this.hold(sessionId, running);
     const session = this.host.active(sessionId);
     if (this.accountChanged.has(sessionId) && session?.atTurnBoundary(true)) {
@@ -186,12 +199,30 @@ export class SessionRestarts {
     await Promise.all([...this.swaps.values()].map((swap) => swap.catch(() => {})));
   }
 
-  private rerouteSession(sessionId: string): Promise<void> {
+  /**
+   * Restarts the session for a new route. At a turn boundary, with no restart
+   * that runs, the restart starts in this call, and the result resolves once
+   * it is done. Otherwise it is due at the next turn boundary, and the result
+   * resolves at once.
+   */
+  private async rerouteSession(sessionId: string): Promise<void> {
+    const failed = (error: unknown) => {
+      this.host.logger.error(`Session ${sessionId}: could not restart for the new route`, error);
+    };
+    const session = this.host.active(sessionId);
+    if (session && !this.swaps.has(sessionId) && session.atTurnBoundary(true)) {
+      // A restart due at the boundary that came has not resumed yet: this
+      // one runs in its place.
+      this.reroutes.delete(sessionId);
+      await this.swap(sessionId, session, { keepOnFailure: false }).catch(failed);
+      return;
+    }
     const waiting = this.reroutes.get(sessionId);
     // One that waits starts under the route in force when it runs. One that
     // started may have read the route before this change: it runs again.
-    if (waiting && !waiting.started) return waiting.done;
+    if (waiting && !waiting.started) return;
     const reroute: Reroute = { done: Promise.resolve(), started: false };
+    const current = () => this.reroutes.get(sessionId) === reroute;
     reroute.done = (async () => {
       await waiting?.done;
       let session: V2Session | undefined;
@@ -199,23 +230,28 @@ export class SessionRestarts {
         // After an account restart that runs, on the session it started.
         await this.swaps.get(sessionId)?.catch(() => {});
         session = this.host.active(sessionId);
+        if (!current() || !session) return;
         // `false` once the session closed.
-        if (!session || !(await session.turnBoundary(true))) return;
-        // An account restart can start at the boundary too: wait for it.
-        if (!this.swaps.has(sessionId)) break;
+        if (!(await session.turnBoundary(true)) || !current()) return;
+        // A restart can start at the boundary too, and a prompt that it held
+        // can end the boundary again before this resumes: wait again then.
+        if (
+          !this.swaps.has(sessionId) &&
+          this.host.active(sessionId) === session &&
+          session.atTurnBoundary(true)
+        ) {
+          break;
+        }
       }
-      if (this.host.active(sessionId) !== session || !this.setups.has(sessionId)) return;
+      if (!this.setups.has(sessionId)) return;
       reroute.started = true;
       await this.swap(sessionId, session, { keepOnFailure: false });
     })()
-      .catch((error: unknown) => {
-        this.host.logger.error(`Session ${sessionId}: could not restart for the new route`, error);
-      })
+      .catch(failed)
       .finally(() => {
-        if (this.reroutes.get(sessionId) === reroute) this.reroutes.delete(sessionId);
+        if (current()) this.reroutes.delete(sessionId);
       });
     this.reroutes.set(sessionId, reroute);
-    return reroute.done;
   }
 
   /**

@@ -11,8 +11,8 @@
  * A gateway login routes the sessions started after it.
  * `providers/set`, `providers/disable`, and a logout that drops a provider or
  * a gateway login also route the live sessions: each one's query restarts at
- * its next turn boundary (see `restarts.ts`), and the request answers once
- * they did.
+ * its next turn boundary (see `restarts.ts`). The request answers once the
+ * sessions at a turn boundary restarted, and does not wait for the busy ones.
  */
 import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
@@ -63,7 +63,10 @@ export interface SessionRouting {
 
 /** What the auth state tells the rest of the core. */
 export interface AuthEvents {
-  /** The route of live sessions changed: resolves once each one follows it. */
+  /**
+   * The route of live sessions changed: resolves once the sessions at a turn
+   * boundary restarted (see `SessionRestarts.reroute`).
+   */
   routeChanged(): Promise<void>;
   /** An auth status probe read the identity `kind`. */
   probed(kind: AuthStatusKind): void;

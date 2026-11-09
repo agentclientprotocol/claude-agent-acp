@@ -304,12 +304,15 @@ exit codes), which the shared renderer gives only with `air.client`, and the `ki
   `restoreSessionChoices` sets them (model, mode and pre-plan mode, ultracode, Fast mode, the
   effort pin, the agent the client picked) and sent in a `config_option_update`. For a new route,
   each live session restarts at its next turn boundary (no turn open, no prompt of the session
-  waiting to go to Claude Code or in its queue, no subagent running), prompts sent meanwhile wait
-  and go to the new query, and the request answers once every session restarted. A route restart
-  waits for an account restart of the session that runs. A resume of the active session with
-  other additional directories restarts it the same way: Claude Code reads them only when its
-  process starts. A session whose query does not start again stops (see "Differences from the
-  old v2 bridge").
+  waiting to go to Claude Code or in its queue, no subagent running, background ones included).
+  A session at a turn boundary restarts before the request answers. A busy session keeps its
+  query until its next turn boundary, which the request does not wait for, and its prompts go to
+  that query meanwhile (the provider RFD lets an Agent leave running sessions on the old route).
+  A route restart waits for an account restart of the session that runs, as for a busy session.
+  Prompts wait only for a restart that runs, and go to the new query. A resume of the active
+  session with other additional directories restarts it the same way, without waiting for it:
+  Claude Code reads them only when its process starts. A session whose query does not start
+  again stops (see "Differences from the old v2 bridge").
   A `session/cancel` or `session/close` answers the waiting prompts with -32800. The old query's
   background commands end with it: their terminals exit before the list drops them.
 - `src/v2/subscription-guard.ts`: the `--hide-claude-auth` subscription guard, on the

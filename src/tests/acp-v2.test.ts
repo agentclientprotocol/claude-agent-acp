@@ -8694,7 +8694,7 @@ describe("ACP v2 providers", () => {
     return answered;
   }
 
-  it("routes a live session through a provider set while it works, once its turn ends", async () => {
+  it("answers a provider set while a session works, and routes the session at its turn boundary", async () => {
     const release = Promise.withResolvers<void>();
     const answered = answerEachPrompt(release.promise);
     const client = v2Client();
@@ -8708,25 +8708,24 @@ describe("ACP v2 providers", () => {
         value: "acceptEdits",
       });
       await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("first") });
-      let switched = false;
-      const set = setGateway(agent).then(() => (switched = true));
-      // A prompt sent meanwhile waits for the switch.
+      await setGateway(agent);
+      // The running turn keeps its query, and so does a prompt sent meanwhile.
+      expect(sdk.queryOptions).toHaveLength(1);
       const second = agent.request(v2.methods.agent.session.prompt, {
         sessionId,
         prompt: text("second"),
       });
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      // The running turn keeps its query.
-      expect(switched).toBe(false);
-      expect(sdk.queryOptions).toHaveLength(1);
-
+      // The second prompt reaches the session before the first turn ends.
+      await new Promise((resolve) => setTimeout(resolve, 20));
       release.resolve();
-      await set;
-      expect(sdk.queryOptions).toHaveLength(2);
+      await second;
+      await vi.waitFor(() => expect(sdk.queryOptions).toHaveLength(2));
       expect(sdk.queryOptions[1]).toMatchObject({
         resume: sessionId,
         env: { ANTHROPIC_BASE_URL: GATEWAY },
       });
+      // A prompt during the restart goes to the new query.
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("third") });
       // The new query keeps the mode the client chose.
       expect(
         client
@@ -8734,14 +8733,14 @@ describe("ACP v2 providers", () => {
           .at(-1)
           ?.configOptions.find((option) => option.configId === "mode"),
       ).toMatchObject({ currentValue: "acceptEdits" });
-      await second;
-      await vi.waitFor(() => expect(answered).toHaveLength(2));
+      await vi.waitFor(() => expect(answered).toHaveLength(3));
       await client.authUpdate(1);
     });
 
     expect(answered).toEqual([
       { text: "first", routed: false },
-      { text: "second", routed: true },
+      { text: "second", routed: false },
+      { text: "third", routed: true },
     ]);
   });
 
@@ -9005,17 +9004,16 @@ describe("ACP v2 subscription guard (--hide-claude-auth)", () => {
         prompt: text("again"),
       });
       await vi.waitFor(() => expect(sdk.queryOptions).toHaveLength(2));
-      const set = agent.request(v2.methods.agent.providers.set, {
+      // The session's account restart runs: the route restart is due after it.
+      await agent.request(v2.methods.agent.providers.set, {
         providerId: "main",
         apiType: "anthropic",
         baseUrl: "https://gateway.example.com",
       });
-      await new Promise((resolve) => setTimeout(resolve, 20));
       started.resolve();
-      await set;
       await again;
       // One query of the session is left: none of the others was left running.
-      expect(inputOpen).toHaveLength(3);
+      await vi.waitFor(() => expect(inputOpen).toHaveLength(3));
       await vi.waitFor(() => expect(inputOpen.filter((open) => open)).toHaveLength(1));
       await client.authUpdate(1);
     });

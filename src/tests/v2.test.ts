@@ -521,32 +521,50 @@ describe("ACP v2 core", () => {
         baseUrl: "https://gateway.example.com",
       });
 
-    it("restarts the query only once the background subagents ended", async () => {
+    it("answers at once while a background subagent runs, and restarts the session once it ends", async () => {
       const client = v2Client();
       await client.connect(async (agent) => {
         const { response, claude } = await openSession(agent);
-        void agent.request(v2.methods.agent.session.prompt, {
-          sessionId: response.sessionId,
-          prompt: PROMPT,
-        });
-        const prompt = await claude.prompt(0);
-        claude.send(lifecycle(prompt, "started"));
+        const sessionId = response.sessionId;
+        void agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: PROMPT });
+        claude.send(lifecycle(await claude.prompt(0), "started"));
         const helper = subagent("agent-1", "toolu_agent", { is_backgrounded: true });
         claude.send(helper.launch());
         claude.send(helper.started());
         claude.send(result());
         await vi.waitFor(() => expect(client.states().at(-1)).toBe("idle"));
-        let switched = false;
-        const set = setProvider(agent).then(() => (switched = true));
-        await new Promise((resolve) => setTimeout(resolve, 20));
-        expect(switched).toBe(false);
+        await setProvider(agent);
+        expect(sdk.processes).toHaveLength(1);
+
+        // A prompt meanwhile goes to the current query.
+        void agent.request(v2.methods.agent.session.prompt, {
+          sessionId,
+          prompt: [{ type: "text", text: "next" }],
+        });
+        claude.send(lifecycle(await claude.prompt(1), "started"));
+        claude.send(result());
+        await vi.waitFor(() => expect(client.states().at(-1)).toBe("idle"));
         expect(sdk.processes).toHaveLength(1);
 
         claude.send(helper.ended());
-        await set;
+        await vi.waitFor(() => expect(claude.close).toHaveBeenCalled());
         expect(sdk.processes).toHaveLength(2);
-        expect(claude.close).toHaveBeenCalled();
-        expect(sdk.processes[1].options).toMatchObject({ resume: response.sessionId });
+        expect(sdk.processes[1].options).toMatchObject({ resume: sessionId });
+      });
+    });
+
+    it("sends a prompt of an idle session right after the response to the new query", async () => {
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        await setProvider(agent);
+        const answer = agent.request(v2.methods.agent.session.prompt, {
+          sessionId: response.sessionId,
+          prompt: PROMPT,
+        });
+        sdk.processes[1].send(lifecycle(await sdk.processes[1].prompt(0), "started"));
+        await answer;
+        expect(claude.prompts).toHaveLength(0);
       });
     });
 
@@ -555,9 +573,10 @@ describe("ACP v2 core", () => {
       await client.connect(async (agent) => {
         const { response, claude } = await openSession(agent);
         const sessionId = response.sessionId;
-        void agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: PROMPT });
-        claude.send(lifecycle(await claude.prompt(0), "started"));
+        const started = Promise.withResolvers<void>();
+        sdk.startGate = started.promise;
         const set = setProvider(agent);
+        await vi.waitFor(() => expect(sdk.processes).toHaveLength(2));
         const waiting = agent.request(v2.methods.agent.session.prompt, {
           sessionId,
           prompt: [{ type: "text", text: "next" }],
@@ -566,10 +585,10 @@ describe("ACP v2 core", () => {
         await agent.notify(v2.methods.agent.session.cancel, { sessionId });
         await expect(waiting).rejects.toMatchObject({ code: -32800 });
 
-        claude.send(result({ subtype: "error_during_execution", is_error: true }));
+        started.resolve();
         await set;
         // The cancelled prompt never reached either query.
-        expect(claude.prompts).toHaveLength(1);
+        expect(claude.prompts).toHaveLength(0);
         expect(sdk.processes[1].prompts).toHaveLength(0);
       });
     });
