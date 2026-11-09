@@ -63,7 +63,7 @@ export interface TaskHost {
   stopTask(taskId: string): Promise<void>;
 }
 
-/** Where a permission request goes: the root session or a child. */
+/** Where a permission request or elicitation goes: the root session or a child. */
 export interface RequestTarget {
   readonly sessionId: string;
   readonly cwd: string;
@@ -75,6 +75,12 @@ export interface RequestTarget {
     request: v2.RequestPermissionRequest,
     signal: AbortSignal,
   ): Promise<v2.RequestPermissionResponse>;
+  /**
+   * Runs `send` as an open request of the target (`requires_action`) until it
+   * settles. Its signal aborts with `signal`, or when a cancel or close
+   * withdraws the target's requests.
+   */
+  openRequest<T>(signal: AbortSignal, send: (signal: AbortSignal) => Promise<T>): Promise<T>;
 }
 
 type ChildState = "idle" | "running" | "requires_action";
@@ -307,7 +313,16 @@ export class SessionTasks {
       cwd: child.cwd ?? this.host.cwd,
       output: child.output,
       cancelling: () => child.cancelled,
-      requestPermission: (request, signal) => this.childRequest(child, request, signal),
+      requestPermission: (request, toolSignal) =>
+        this.childRequest(child, toolSignal, async (signal) => {
+          try {
+            return await this.hostRequest(request, signal);
+          } catch (error) {
+            if (signal.aborted) return { outcome: { outcome: "cancelled" } };
+            throw error;
+          }
+        }),
+      openRequest: (signal, send) => this.childRequest(child, signal, send),
     };
   }
 
@@ -709,11 +724,12 @@ export class SessionTasks {
     });
   }
 
-  private async childRequest(
+  /** Runs `send` as an open request of `child` (see {@link RequestTarget.openRequest}). */
+  private async childRequest<T>(
     child: Child,
-    request: v2.RequestPermissionRequest,
     toolSignal: AbortSignal,
-  ): Promise<v2.RequestPermissionResponse> {
+    send: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
     const abort = new AbortController();
     const signal = AbortSignal.any([toolSignal, abort.signal]);
     child.requestAborts.add(abort);
@@ -721,10 +737,7 @@ export class SessionTasks {
     this.reportChild(child);
     this.host.foregroundRequestsChanged();
     try {
-      return await this.hostRequest(request, signal);
-    } catch (error) {
-      if (signal.aborted) return { outcome: { outcome: "cancelled" } };
-      throw error;
+      return await send(signal);
     } finally {
       child.requestAborts.delete(abort);
       child.openRequests--;

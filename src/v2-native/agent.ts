@@ -15,7 +15,12 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { RequestError } from "@agentclientprotocol/sdk/unstable";
+import {
+  RequestError,
+  type CompleteElicitationNotification,
+  type CreateElicitationRequest,
+  type CreateElicitationResponse,
+} from "@agentclientprotocol/sdk/unstable";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import {
   deleteSession,
@@ -30,6 +35,7 @@ import packageJson from "../../package.json" with { type: "json" };
 import { messageIdForGrouping, type Logger } from "../acp-agent.js";
 import { claudeCliPath } from "../claude-cli.js";
 import { clientSystemPrompt, sessionSystemPrompt } from "../client-system-prompt.js";
+import type { ElicitationSupport } from "../elicitation.js";
 import { forkSession } from "../fork-session.js";
 import { sdkMcpServers } from "../mcp-servers.js";
 import { ALLOW_BYPASS, autoModeDisabled } from "../permissions/modes.js";
@@ -118,6 +124,8 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
   readonly auth: NativeAuth;
   /** What the client declared in `initialize`. */
   private clientCapabilities: v2.ClientCapabilities | null | undefined;
+  /** The elicitation modes that the client advertised in `initialize`. */
+  elicitation: ElicitationSupport = { form: false, url: false };
 
   constructor(
     private readonly ctx: v2.AgentContext,
@@ -145,6 +153,24 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     });
   }
 
+  createElicitation(
+    request: CreateElicitationRequest,
+    signal: AbortSignal,
+  ): Promise<CreateElicitationResponse> {
+    // The v1 types accept a property schema with any tag; the v2 types accept
+    // one only in a received value. An MCP server's schema is relayed
+    // unchanged, as on the bridge, so this cast does not check it.
+    return this.ctx.request(
+      v2.methods.client.elicitation.create,
+      request as v2.CreateElicitationRequest,
+      { cancellationSignal: signal, stopWaitingOnCancel: true },
+    );
+  }
+
+  completeElicitation(params: CompleteElicitationNotification): Promise<void> {
+    return this.ctx.notify(v2.methods.client.elicitation.complete, params);
+  }
+
   ended(sessionId: string): void {
     // A later `session/resume` starts the session again from its transcript.
     this.sessions.delete(sessionId);
@@ -160,6 +186,10 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
    */
   initialize(request: v2.InitializeRequest): v2.InitializeResponse {
     this.clientCapabilities = request.capabilities;
+    this.elicitation = {
+      form: request.capabilities?.elicitation?.form != null,
+      url: request.capabilities?.elicitation?.url != null,
+    };
     const { authMethods, _meta } = this.auth.initialize(request.capabilities);
     return {
       protocolVersion: v2.PROTOCOL_VERSION,
@@ -185,7 +215,9 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
   async newSession(params: v2.NewSessionRequest): Promise<v2.NewSessionResponse> {
     const sessionId = randomUUID();
     const session = await this.startSession(sessionId, params, undefined);
-    return { sessionId, ...(await this.setupFields(session)) };
+    const response = { sessionId, ...(await this.setupFields(session)) };
+    afterSetupResponse(session, params);
+    return response;
   }
 
   /**
@@ -256,7 +288,9 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     // The current title, after the replay and before the state, as on the bridge.
     await session.reports.publishTitle();
     for (const notification of session.resumeSnapshot()) this.send(notification);
-    return this.setupFields(session);
+    const response = await this.setupFields(session);
+    afterSetupResponse(session, params);
+    return response;
   }
 
   async listSessions(params: v2.ListSessionsRequest): Promise<v2.ListSessionsResponse> {
@@ -465,6 +499,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       this,
       input,
     );
+    const elicitationOptions = session.elicitations.queryOptions();
     const options: Options = {
       systemPrompt: sessionSystemPrompt(clientPrompt, params._meta?.systemPrompt),
       settingSources: ["user", "project", "local"],
@@ -496,12 +531,17 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       mcpServers,
       permissionMode: mode,
       allowDangerouslySkipPermissions: allowBypass,
-      canUseTool: canUseTool(session),
+      canUseTool: session.elicitations.canUseTool(canUseTool(session)),
+      // MCP elicitations and the refusal fallback, for the modes the client
+      // renders. Without forms, AskUserQuestion is disallowed (below).
+      ...elicitationOptions,
       pathToClaudeCodeExecutable: await claudeCliPath(),
       // Echoes each prompt that Claude Code takes in (see `NativeSession`).
       extraArgs: { ...client?.extraArgs, "replay-user-messages": "" },
-      // AskUserQuestion needs a form elicitation, which this core does not send.
-      disallowedTools: [...(client?.disallowedTools ?? []), "AskUserQuestion"],
+      disallowedTools: [
+        ...(client?.disallowedTools ?? []),
+        ...(elicitationOptions.disallowedTools ?? []),
+      ],
       tools:
         client?.tools ??
         (params._meta?.disableBuiltInTools === true
@@ -626,6 +666,24 @@ async function validatedSetup(
     }
   }
   return request;
+}
+
+/**
+ * Starts OAuth for the setup request's MCP servers that need it, once the
+ * setup response is sent: v2 asks for no elicitation before it. The handler
+ * returns the response right after this call, and the SDK writes it before a
+ * timer runs. Nothing else orders the two.
+ */
+function afterSetupResponse(
+  session: NativeSession,
+  params: v2.NewSessionRequest | v2.ResumeSessionRequest,
+): void {
+  // The setup already rejected servers of an unknown transport.
+  const names = (params.mcpServers ?? []).flatMap((server) =>
+    typeof server.name === "string" ? [server.name] : [],
+  );
+  if (names.length === 0) return;
+  setTimeout(() => session.elicitations.authenticateMcpServers(names), 0);
 }
 
 function sameDirectories(left: readonly string[], right: readonly string[]): boolean {

@@ -63,7 +63,6 @@ import {
   getSessionMessages,
   HookCallback,
   listSessions,
-  McpServerStatus,
   ModelInfo,
   OnElicitation,
   OnUserDialog,
@@ -184,17 +183,17 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import packageJson from "../package.json" with { type: "json" };
 import {
-  applyAskElicitationResponse,
-  askUserQuestionsToCreateRequest,
-  createElicitationResponseToElicitResult,
+  answerAskUserQuestion,
+  answerMcpElicitation,
+  answerUserDialog,
   ElicitationSupport,
-  extractAskUserQuestions,
-  extractRefusalFallbackPrompt,
-  mcpElicitationToCreateRequest,
+  elicitUnlessWithdrawn,
   REFUSAL_FALLBACK_DIALOG_KIND,
-  refusalFallbackResultFromResponse,
-  refusalFallbackToCreateRequest,
 } from "./elicitation.js";
+import {
+  startMcpServerAuthentication as startSharedMcpServerAuthentication,
+  supportsMcpOAuth,
+} from "./mcp-oauth.js";
 import { forkSession } from "./fork-session.js";
 import {
   clientSystemPrompt,
@@ -564,34 +563,6 @@ async function structuredUsageMarkdown(
   }
 }
 
-/** Claude Code keeps the OAuth callback listener open in the background after
- *  `mcpAuthenticate` returns the authorization URL. The SDK does not expose
- *  that listener's completion promise, so watch the server status while the
- *  ACP client has the URL elicitation open. */
-const MCP_OAUTH_STATUS_POLL_MS = 1_000;
-const MCP_OAUTH_TIMEOUT_MS = 10 * 60_000;
-
-/** Runtime MCP OAuth control exposed by the pinned Agent SDK. It is not yet in
- *  the public `Query` declaration, even though the method is present on the
- *  SDK query object and backed by Claude Code's `mcp_authenticate` control. */
-type McpOAuthQuery = Query & {
-  mcpAuthenticate(
-    serverName: string,
-    redirectUri?: string,
-  ): Promise<{
-    authUrl?: string;
-    requiresUserAction: boolean;
-    callbackExpected: boolean;
-    redirectScheme?: "localhost" | "custom";
-    callbackPort?: number;
-    state?: string;
-  }>;
-};
-
-function supportsMcpOAuth(query: Query): query is McpOAuthQuery {
-  return typeof (query as Partial<McpOAuthQuery>).mcpAuthenticate === "function";
-}
-
 /** Runtime Remote Control control exposed by the pinned Agent SDK. Like
  *  `mcpAuthenticate`, it is not in the public `Query` declaration yet. The CLI's
  *  own `/remote-control` is terminal-bound and not offered to SDK hosts, so the
@@ -650,22 +621,6 @@ function claudeCodeOffersCommand(
   return commands.some(
     (command) => command.name === name && !terminalCommands?.includes(command.name),
   );
-}
-
-/** Wait for a polling interval, resolving false when the session is aborted. */
-function waitUnlessAborted(milliseconds: number, signal: AbortSignal): Promise<boolean> {
-  if (signal.aborted) return Promise.resolve(false);
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      signal.removeEventListener("abort", onAbort);
-      resolve(true);
-    }, milliseconds);
-    const onAbort = () => {
-      clearTimeout(timer);
-      resolve(false);
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-  });
 }
 
 /** Error surfaced when the SDK declares a turn over (`session_state_changed:
@@ -2483,10 +2438,6 @@ type McpAuthenticationHost = {
   logger: Logger;
 };
 
-/** Background OAuth work is implementation state, not part of the public
- *  `Session` shape exposed through `ClaudeAcpAgent.sessions`. */
-const mcpAuthentications = new WeakMap<Session, Promise<void>>();
-
 /** Start OAuth for ACP-provided MCP servers that Claude reported as needing
  *  authentication. This runs after session creation has returned so an
  *  interactive browser flow never delays `session/new`. */
@@ -2500,147 +2451,30 @@ function startMcpAuthentication(
 }
 
 /** Start OAuth in the background for the servers in `requestedServers` that
- *  Claude reports as needing authentication. Startup and `/mcp` use it. It
- *  does nothing while another OAuth run of the session is in progress. */
+ *  Claude reports as needing authentication (see `mcp-oauth.ts`). Startup and
+ *  `/mcp` use it. */
 function startMcpServerAuthentication(
   host: McpAuthenticationHost,
   sessionId: string,
   requestedServers: Set<string>,
 ): void {
-  if (!host.clientCapabilities?.elicitation?.url) return;
-
-  const session = host.sessions[sessionId];
-  if (!session || mcpAuthentications.has(session)) return;
-
-  const authentication = authenticateMcpServers(host, sessionId, session.query, requestedServers)
-    .catch((error) => {
-      if (!session.abortController.signal.aborted) {
-        host.logger.error(`Failed to inspect MCP servers for OAuth: ${error}`);
-      }
-    })
-    .finally(() => {
-      if (mcpAuthentications.get(session) === authentication) {
-        mcpAuthentications.delete(session);
-      }
-    });
-  mcpAuthentications.set(session, authentication);
-}
-
-async function authenticateMcpServers(
-  host: McpAuthenticationHost,
-  sessionId: string,
-  query: Query,
-  requestedServers: Set<string>,
-): Promise<void> {
-  if (!supportsMcpOAuth(query)) {
-    host.logger.error("The Claude Agent SDK does not expose MCP OAuth authentication.");
-    return;
-  }
-
-  const statuses = await query.mcpServerStatus();
-  for (const status of statuses) {
-    if (status.status !== "needs-auth" || !requestedServers.has(status.name)) continue;
-    try {
-      await authenticateMcpServer(host, sessionId, query, status.name);
-    } catch (error) {
-      const session = host.sessions[sessionId];
-      if (session && !session.abortController.signal.aborted) {
-        host.logger.error(`Failed to authenticate MCP server ${status.name}: ${error}`);
-      }
-    }
-  }
-}
-
-/** Bridge Claude Code's startup MCP OAuth control to ACP URL elicitation.
- *  Claude opens and owns the localhost callback listener; the ACP client only
- *  needs to present the returned authorization URL. */
-async function authenticateMcpServer(
-  host: McpAuthenticationHost,
-  sessionId: string,
-  query: McpOAuthQuery,
-  serverName: string,
-): Promise<void> {
   const session = host.sessions[sessionId];
   if (!session) return;
-
-  const login = await query.mcpAuthenticate(serverName);
-  if (!login.requiresUserAction) return;
-  if (!login.authUrl) {
-    throw new Error("Claude Code requested user action without returning an authorization URL");
-  }
-
-  const elicitationId = `mcp-oauth-${randomUUID()}`;
-  const flowAbort = new AbortController();
-  const abortFlow = () => flowAbort.abort(session.abortController.signal.reason);
-  session.abortController.signal.addEventListener("abort", abortFlow, { once: true });
-  if (session.abortController.signal.aborted) abortFlow();
-
-  try {
-    const completed = waitForMcpAuthentication(
-      host.sessions,
+  startSharedMcpServerAuthentication(
+    {
+      urlElicitation: !!host.clientCapabilities?.elicitation?.url,
+      createElicitation: (params, signal) => host.client.createElicitation(params, signal),
+      completeElicitation: (params) => host.client.completeElicitation(params),
+      logger: host.logger,
+    },
+    {
+      key: session,
       sessionId,
-      query,
-      serverName,
-      flowAbort.signal,
-    );
-    const elicitation = host.client.createElicitation(
-      {
-        mode: "url",
-        sessionId,
-        message: `Authenticate with MCP server ${serverName}`,
-        url: login.authUrl,
-        elicitationId,
-      },
-      flowAbort.signal,
-    );
-    const first = await Promise.race([
-      completed.then((authenticated) => ({ type: "completed" as const, authenticated })),
-      elicitation.then((response) => ({ type: "elicitation" as const, response })),
-    ]);
-
-    // A url-mode accept carries no content to check. The guard
-    // `CreateElicitationResponse.isAccept` would also reject an accept whose
-    // `content` holds a v2-only value, such as an object.
-    if (first.type === "elicitation" && first.response.action !== "accept") {
-      return;
-    }
-
-    if (first.type === "elicitation") {
-      await completed;
-    }
-    try {
-      await host.client.completeElicitation({ elicitationId });
-    } catch (error) {
-      if (!flowAbort.signal.aborted) {
-        host.logger.error(`Failed to complete MCP OAuth elicitation: ${error}`);
-      }
-    }
-  } finally {
-    flowAbort.abort();
-    session.abortController.signal.removeEventListener("abort", abortFlow);
-  }
-}
-
-async function waitForMcpAuthentication(
-  sessions: Record<string, Session>,
-  sessionId: string,
-  query: Query,
-  serverName: string,
-  signal: AbortSignal,
-): Promise<boolean> {
-  const deadline = Date.now() + MCP_OAUTH_TIMEOUT_MS;
-  while (!signal.aborted && Date.now() < deadline) {
-    const session = sessions[sessionId];
-    if (!session || session.query !== query) return false;
-
-    const status: McpServerStatus | undefined = (await query.mcpServerStatus()).find(
-      (server) => server.name === serverName,
-    );
-    if (!status || status.status === "failed" || status.status === "disabled") return false;
-    if (status.status === "connected") return true;
-    if (!(await waitUnlessAborted(MCP_OAUTH_STATUS_POLL_MS, signal))) return false;
-  }
-  return false;
+      currentQuery: () => host.sessions[sessionId]?.query,
+      closed: session.abortController.signal,
+    },
+    requestedServers,
+  );
 }
 
 export class ClaudeAcpAgent {
@@ -10562,53 +10396,32 @@ export class ClaudeAcpAgent {
 
   /**
    * Handle elicitation requests that originate from MCP servers by forwarding
-   * them to the client over ACP. Only the user's own decline reaches the MCP
-   * server as `decline`. A request the user never saw, because the client did
-   * not advertise its mode, we can't represent it, or the client answered with
-   * an error, is a `cancel`.
+   * them to the client over ACP (see {@link answerMcpElicitation}).
    */
   private handleMcpElicitation(sessionId: string, support: ElicitationSupport): OnElicitation {
     return async (request, { signal: callbackSignal }) => {
       const signal = this.untilSessionClosed(sessionId, callbackSignal);
-      const isUrl = request.mode === "url";
-      if ((isUrl && !support.url) || (!isUrl && !support.form)) {
-        return { action: "cancel" };
-      }
-
-      const createRequest = mcpElicitationToCreateRequest(request, sessionId);
-      if (!createRequest) {
-        return { action: "cancel" };
-      }
-
-      try {
-        const response = await this.withPendingUserInput(sessionId, signal, () =>
-          this.elicitFromClient(createRequest, signal),
-        );
-        if (signal.aborted) {
-          return { action: "cancel" };
-        }
-        return createElicitationResponseToElicitResult(response);
-      } catch (error) {
-        // A cancellation we requested (signal aborted) settles as a cancel, not
-        // a hard decline — the elicitation was abandoned, not refused.
-        if (signal.aborted) {
-          return { action: "cancel" };
-        }
-        // The client answered with an error, e.g. -32602 for a form it cannot
-        // render, so the user never saw the request. MCP's `decline` means the
-        // user refused; `cancel` means they made no explicit choice.
-        this.logger.error(`Failed to forward MCP elicitation: ${error}`);
-        return { action: "cancel" };
-      }
+      return answerMcpElicitation(request, {
+        sessionId,
+        support,
+        logger: this.logger,
+        elicit: (createRequest) =>
+          elicitUnlessWithdrawn(signal, (signal) =>
+            this.withPendingUserInput(sessionId, signal, () =>
+              this.elicitFromClient(createRequest, signal),
+            ),
+          ),
+      });
     };
   }
 
   /**
    * Present the built-in AskUserQuestion tool's questions as an ACP form
-   * elicitation and return the answers as the tool's `updatedInput`. Called from
-   * `canUseTool` since that is where the SDK routes the tool's permission check.
-   * The elicitation goes to `requestSessionId`, a subagent's child session for
-   * a question it asks, and blocks the turn of `sessionId`.
+   * elicitation and return the answers as the tool's `updatedInput` (see
+   * {@link answerAskUserQuestion}). Called from `canUseTool` since that is
+   * where the SDK routes the tool's permission check. The elicitation goes to
+   * `requestSessionId`, a subagent's child session for a question it asks,
+   * and blocks the turn of `sessionId`.
    */
   private async handleAskUserQuestion(
     sessionId: string,
@@ -10619,89 +10432,43 @@ export class ClaudeAcpAgent {
     agentID: string | undefined,
   ): Promise<PermissionResult> {
     const signal = this.untilSessionClosed(sessionId, toolSignal);
-    const questions = extractAskUserQuestions(toolInput);
-    if (!questions) {
-      return { behavior: "deny", message: "AskUserQuestion called with no valid questions." };
-    }
-
-    const createRequest = askUserQuestionsToCreateRequest(
-      questions,
-      requestSessionId,
+    return answerAskUserQuestion(toolInput, {
+      sessionId: requestSessionId,
       toolUseID,
-      this.toolCallCapabilities.air.client,
-    );
-    let response;
-    try {
-      response = await this.withChildAwaitingUser(sessionId, requestSessionId, signal, () =>
-        this.withPendingUserInput(
-          sessionId,
-          signal,
-          () => this.elicitFromClient(createRequest, signal),
-          agentID,
+      airClient: this.toolCallCapabilities.air.client,
+      reportUnanswered: () => this.sessions[sessionId]?.askUserQuestionUnansweredV1 === true,
+      logger: this.logger,
+      elicit: (createRequest) =>
+        elicitUnlessWithdrawn(signal, (signal) =>
+          this.withChildAwaitingUser(sessionId, requestSessionId, signal, () =>
+            this.withPendingUserInput(
+              sessionId,
+              signal,
+              () => this.elicitFromClient(createRequest, signal),
+              agentID,
+            ),
+          ),
         ),
-      );
-    } catch (error) {
-      // A cancellation we requested (signal aborted) settles as an aborted tool
-      // use, matching the post-response check below.
-      if (signal.aborted) {
-        throw new Error("Tool use aborted", { cause: error });
-      }
-      this.logger.error(`Failed to present AskUserQuestion elicitation: ${error}`);
-      return { behavior: "deny", message: "Could not present the question to the user." };
-    }
-    if (signal.aborted) {
-      throw new Error("Tool use aborted");
-    }
-
-    const outcome = applyAskElicitationResponse(response, toolInput, questions, {
-      reportUnanswered: this.sessions[sessionId]?.askUserQuestionUnansweredV1 === true,
     });
-    if (outcome.action === "cancel") {
-      throw new Error("Tool use aborted");
-    }
-    return { behavior: "allow", updatedInput: outcome.updatedInput };
   }
 
   /**
    * Handle `request_user_dialog` control requests — blocking dialogs the CLI
-   * asks the host to render. Only kinds declared in `supportedDialogKinds`
-   * are ever emitted; everything unexpected is answered `cancelled` (the
-   * required answer for unrecognized kinds), which applies the dialog's
-   * default behavior CLI-side. Today the only declared kind is the
-   * refusal-fallback consent prompt, rendered as an ACP form elicitation.
+   * asks the host to render (see {@link answerUserDialog}).
    */
   private handleUserDialog(sessionId: string): OnUserDialog {
     return async (request, { signal: callbackSignal }) => {
       const signal = this.untilSessionClosed(sessionId, callbackSignal);
-      if (request.dialogKind !== REFUSAL_FALLBACK_DIALOG_KIND) {
-        return { behavior: "cancelled" };
-      }
-      const prompt = extractRefusalFallbackPrompt(request.payload);
-      if (!prompt) {
-        this.logger.error(
-          `refusal_fallback_prompt payload had an unexpected shape; cancelling the dialog: ${JSON.stringify(request.payload)}`,
-        );
-        return { behavior: "cancelled" };
-      }
-      let response: CreateElicitationResponse;
-      try {
-        response = await this.withPendingUserInput(sessionId, signal, () =>
-          this.elicitFromClient(refusalFallbackToCreateRequest(prompt, sessionId), signal),
-        );
-      } catch (error) {
-        // A cancellation we requested (signal aborted) is expected teardown;
-        // anything else is a client failure. Either way the safe answer is
-        // `cancelled` — the CLI applies the dialog's default (keep the
-        // refusal) rather than switching models without consent.
-        if (!signal.aborted) {
-          this.logger.error(`Failed to present refusal fallback elicitation: ${error}`);
-        }
-        return { behavior: "cancelled" };
-      }
-      if (signal.aborted) {
-        return { behavior: "cancelled" };
-      }
-      return { behavior: "completed", result: refusalFallbackResultFromResponse(response) };
+      return answerUserDialog(request, {
+        sessionId,
+        logger: this.logger,
+        elicit: (createRequest) =>
+          elicitUnlessWithdrawn(signal, (signal) =>
+            this.withPendingUserInput(sessionId, signal, () =>
+              this.elicitFromClient(createRequest, signal),
+            ),
+          ),
+      });
     };
   }
 

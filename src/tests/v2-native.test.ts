@@ -47,6 +47,8 @@ const sdk = vi.hoisted(() => ({
     { value: "default", displayName: "Default", description: "Recommended" },
     { value: "opus", displayName: "Opus", description: "Most capable" },
   ],
+  /** What `mcpServerStatus` reports. */
+  mcpServers: [] as Array<{ name: string; status: string }>,
 }));
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
@@ -111,12 +113,18 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         supportedCommands: async () => [
           { name: "review", description: "Review a change", argumentHint: "<pull request>" },
         ],
-        mcpServerStatus: async () => [{ name: "linear", status: "connected" }],
         interrupt: fake.interrupt,
         setPermissionMode: fake.setPermissionMode,
         setModel: fake.setModel,
         stopTask: fake.stopTask,
         close: fake.close,
+        mcpServerStatus: async () => sdk.mcpServers,
+        // A server that needs OAuth: Claude Code returns its authorization URL.
+        mcpAuthenticate: async () => ({
+          authUrl: "https://mcp.example.com/authorize",
+          requiresUserAction: true,
+          callbackExpected: true,
+        }),
       });
     },
     getSessionMessages: vi.fn(async () => []),
@@ -147,6 +155,7 @@ beforeEach(async () => {
   cwd = await mkdtemp(path.join(tempDir, "project-"));
   vi.stubEnv("CLAUDE_CONFIG_DIR", path.join(tempDir, "claude"));
   sdk.processes = [];
+  sdk.mcpServers = [];
 });
 
 afterEach(async () => {
@@ -158,14 +167,23 @@ afterEach(async () => {
 /** A v2 client of the native core that records the session updates it receives. */
 function nativeClient({
   answerPermission = () => ({ outcome: { outcome: "cancelled" } }),
+  answerElicitation = () => ({ action: "cancel" }),
 }: {
   answerPermission?: (
     request: v2.RequestPermissionRequest,
   ) => v2.RequestPermissionResponse | Promise<v2.RequestPermissionResponse>;
+  /** `signal` aborts when the agent cancels the request. */
+  answerElicitation?: (
+    request: v2.CreateElicitationRequest,
+    signal: AbortSignal,
+  ) => v2.CreateElicitationResponse | Promise<v2.CreateElicitationResponse>;
 } = {}) {
   const sessionUpdates: v2.SessionUpdate[] = [];
   const notifications: v2.UpdateSessionNotification[] = [];
   const permissionRequests: v2.RequestPermissionRequest[] = [];
+  const elicitations: v2.CreateElicitationRequest[] = [];
+  /** The ids of the `elicitation/complete` notifications. */
+  const completedElicitations: string[] = [];
   const app = v2
     .client({ name: "native-test-client" })
     .onNotification(v2.methods.client.session.update, ({ params }) => {
@@ -175,6 +193,13 @@ function nativeClient({
     .onRequest(v2.methods.client.session.requestPermission, ({ params }) => {
       permissionRequests.push(params);
       return answerPermission(params);
+    })
+    .onRequest(v2.methods.client.elicitation.create, ({ params, signal }) => {
+      elicitations.push(params);
+      return answerElicitation(params, signal);
+    })
+    .onNotification(v2.methods.client.elicitation.complete, ({ params }) => {
+      completedElicitations.push(params.elicitationId);
     });
   const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
   const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
@@ -197,6 +222,8 @@ function nativeClient({
     sessionUpdates,
     notifications,
     permissionRequests,
+    elicitations,
+    completedElicitations,
     states,
     connect: <T>(run: (agent: v2.ClientContext) => Promise<T>) =>
       app.connectWith({ readable: toClient.readable, writable: toAgent.writable }, run),
@@ -700,6 +727,7 @@ describe("native ACP v2 core", () => {
 
   it("replaces Claude Code's text of /mcp with the server list, before the turn's idle", async () => {
     const client = nativeClient();
+    sdk.mcpServers = [{ name: "linear", status: "connected" }];
     await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
       const answer = agent.request(v2.methods.agent.session.prompt, {
@@ -1408,6 +1436,126 @@ describe("native ACP v2 core", () => {
         "exit",
         "idle []",
       ]);
+    });
+  });
+
+  describe("elicitations", () => {
+    it.each([
+      ["no elicitation", {}, { ask: false, mcp: false, dialog: false }],
+      ["forms", { form: {} }, { ask: true, mcp: true, dialog: true }],
+      ["URLs only", { url: {} }, { ask: false, mcp: true, dialog: false }],
+    ])(
+      "asks Claude Code for the requests that a client with %s renders",
+      async (_, elicitation, expected) => {
+        const client = nativeClient();
+        const { claude } = await client.connect((agent) => openSession(agent, { elicitation }));
+
+        const { options } = claude;
+        expect(!(options.disallowedTools ?? []).includes("AskUserQuestion")).toBe(expected.ask);
+        expect(options.onElicitation !== undefined).toBe(expected.mcp);
+        expect(options.onUserDialog !== undefined).toBe(expected.dialog);
+        expect(options.supportedDialogKinds).toEqual(
+          expected.dialog ? ["refusal_fallback_prompt"] : undefined,
+        );
+      },
+    );
+
+    it.each([
+      [
+        "lists",
+        ["ask_user_question_unanswered_v1"],
+        { "Which package?": { unanswered: "skipped" } },
+      ],
+      ["does not list", [], undefined],
+    ])(
+      "marks a skipped question as unanswered only when the turn's system/init %s the capability",
+      async (_, capabilities, annotations) => {
+        const client = nativeClient({
+          answerElicitation: () => ({ action: "accept", content: {} }),
+        });
+        const decision = await client.connect(async (agent) => {
+          const { claude } = await openSession(agent, { elicitation: { form: {} } });
+          claude.send({ type: "system", subtype: "init", uuid: randomUUID(), capabilities });
+          claude.send(cycleStart());
+          await vi.waitFor(() => expect(client.states()).toEqual(["running"]));
+          return claude.options.canUseTool!(
+            "AskUserQuestion",
+            {
+              questions: [
+                {
+                  question: "Which package?",
+                  header: "Package",
+                  options: [{ label: "core" }, { label: "cli" }],
+                  multiSelect: false,
+                },
+              ],
+            },
+            {
+              signal: new AbortController().signal,
+              toolUseID: "toolu_ask",
+              requestId: "r1",
+              suggestions: [],
+            },
+          );
+        });
+
+        expect(client.elicitations[0]).toMatchObject({ mode: "form", toolCallId: "toolu_ask" });
+        expect(decision).toMatchObject({ behavior: "allow", updatedInput: { answers: {} } });
+        expect(
+          (decision as { updatedInput?: { annotations?: unknown } }).updatedInput?.annotations,
+        ).toEqual(annotations);
+      },
+    );
+
+    it("completes an MCP server's URL elicitation when Claude Code reports it complete", async () => {
+      const client = nativeClient();
+      await client.connect(async (agent) => {
+        const { claude } = await openSession(agent, { elicitation: { url: {} } });
+        claude.send({
+          type: "system",
+          subtype: "elicitation_complete",
+          mcp_server_name: "linear",
+          elicitation_id: "e1",
+          uuid: randomUUID(),
+          session_id: "session",
+        });
+        await vi.waitFor(() => expect(client.completedElicitations).toEqual(["e1"]));
+      });
+    });
+
+    it("cancels an open MCP OAuth elicitation before it answers session/close", async () => {
+      // The server stays `needs-auth`: the user has not signed in yet.
+      sdk.mcpServers = [{ name: "linear", status: "needs-auth" }];
+      let cancelled = false;
+      const client = nativeClient({
+        answerElicitation: (_, signal) =>
+          new Promise((resolve) =>
+            signal.addEventListener("abort", () => {
+              cancelled = true;
+              resolve({ action: "cancel" });
+            }),
+          ),
+      });
+      const cancelledAtClose = await client.connect(async (agent) => {
+        await agent.request(v2.methods.agent.initialize, {
+          protocolVersion: v2.PROTOCOL_VERSION,
+          info: { name: "native-test-client", version: "1.0.0" },
+          capabilities: { elicitation: { url: {} } },
+        });
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, {
+          cwd,
+          mcpServers: [{ type: "http", name: "linear", url: "https://mcp.example.com/mcp" }],
+        });
+        await vi.waitFor(() => expect(client.elicitations).toHaveLength(1));
+        await agent.request(v2.methods.agent.session.close, { sessionId });
+        return cancelled;
+      });
+
+      expect(client.elicitations[0]).toMatchObject({
+        mode: "url",
+        url: "https://mcp.example.com/authorize",
+      });
+      expect(cancelledAtClose).toBe(true);
     });
   });
 

@@ -18,8 +18,8 @@
  *   which v2 lists as background work instead (`background`), so its `idle`
  *   only ends a turn that ended without a result.
  * - `requires_action` is this session's own: a turn is open, and a
- *   permission request of this session is open, or of a subagent that the
- *   turn waits on.
+ *   permission request or elicitation of this session is open, or of a
+ *   subagent that the turn waits on.
  * - Subagents are child sessions, and background work is listed on every
  *   state (see {@link SessionTasks}).
  * - `session/cancel` answers the prompts that are not inserted yet with
@@ -32,7 +32,13 @@
  * {@link SessionOutput}).
  */
 import { randomUUID } from "node:crypto";
-import { RequestError, type PromptRequest } from "@agentclientprotocol/sdk/unstable";
+import {
+  RequestError,
+  type CompleteElicitationNotification,
+  type CreateElicitationRequest,
+  type CreateElicitationResponse,
+  type PromptRequest,
+} from "@agentclientprotocol/sdk/unstable";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type {
   PermissionMode,
@@ -43,6 +49,7 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 import { promptToClaude, type Logger } from "../acp-agent.js";
 import type { McpCommand } from "../mcp-command.js";
+import type { ElicitationSupport } from "../elicitation.js";
 import { Pushable } from "../utils.js";
 import { v1PromptRequest } from "../v2/prompt.js";
 import { V2Background } from "../v2/background.js";
@@ -53,6 +60,7 @@ import type { SessionConfig } from "./config.js";
 import { idleOutcome, isPlaceholderResult, ResultUsage, type TurnEnd } from "./outcome.js";
 import { StoppedWork } from "./stopped-work.js";
 import { SessionReports } from "./reports.js";
+import { SessionElicitations } from "./elicitation.js";
 import { SessionOutput } from "./stream.js";
 import { SessionTasks, type RequestTarget } from "./tasks.js";
 
@@ -66,6 +74,13 @@ export interface SessionConnection {
     request: v2.RequestPermissionRequest,
     signal: AbortSignal,
   ): Promise<v2.RequestPermissionResponse>;
+  /** The elicitation modes that the client advertised. */
+  readonly elicitation: ElicitationSupport;
+  createElicitation(
+    request: CreateElicitationRequest,
+    signal: AbortSignal,
+  ): Promise<CreateElicitationResponse>;
+  completeElicitation(params: CompleteElicitationNotification): Promise<void>;
   /** The session's query ended on its own: the session is no longer active. */
   ended(sessionId: string): void;
 }
@@ -102,7 +117,7 @@ export class NativeSession implements RequestTarget {
   private turnCommand: string | undefined;
   /** The state the client was told last. */
   private reportedState: ForegroundState = "idle";
-  /** The open permission requests of the session. */
+  /** The open permission requests and elicitations of the session. */
   private readonly requests = new Set<OpenRequest>();
   /** Whether `session/cancel` stops the open turn: its idle reports `cancelled`. */
   private cancelledWork = false;
@@ -136,6 +151,7 @@ export class NativeSession implements RequestTarget {
   /** The `background` lists of the session and its children, stamped on each state. */
   private readonly background: V2Background;
   readonly tasks: SessionTasks;
+  readonly elicitations: SessionElicitations;
   config!: SessionConfig;
   commands!: SessionCommands;
   /** The `/mcp` prompts not inserted yet, by uuid, and the open turn's (see `SessionCommands`). */
@@ -201,6 +217,15 @@ export class NativeSession implements RequestTarget {
       this.output,
     );
     this.tasks.hostRequest = (request, signal) => connection.requestPermission(request, signal);
+    this.elicitations = new SessionElicitations({
+      sessionId,
+      logger: connection.logger,
+      support: connection.elicitation,
+      createElicitation: (request, signal) => connection.createElicitation(request, signal),
+      completeElicitation: (params) => connection.completeElicitation(params),
+      target: (agentId) => this.target(agentId),
+      query: () => this.query,
+    });
     // The session reports its background work: every state carries a list.
     this.background.changed({ sessionId, items: [], state: undefined });
   }
@@ -398,8 +423,9 @@ export class NativeSession implements RequestTarget {
     this.closing ??= (async () => {
       if (!this.closed) this.stopForeground();
       // v2 asks to withdraw every request of the session before the close
-      // response, also its background subagents'.
+      // response, also its background subagents' and the MCP OAuth runs'.
       this.tasks.withdrawAll();
+      this.elicitations.close();
       for (const request of this.requests) {
         request.coveredByCancel = true;
         request.abort.abort();
@@ -437,21 +463,33 @@ export class NativeSession implements RequestTarget {
     return this.tasks.target(agentId, this);
   }
 
-  async requestPermission(
+  requestPermission(
     request: v2.RequestPermissionRequest,
     toolSignal: AbortSignal,
   ): Promise<v2.RequestPermissionResponse> {
+    return this.openRequest(toolSignal, async (signal) => {
+      try {
+        // The subject is an upsert of the tool call: the client may see the
+        // request before the tool use streams.
+        return await this.connection.requestPermission(request, signal);
+      } catch (error) {
+        if (signal.aborted) return { outcome: { outcome: "cancelled" } };
+        throw error;
+      }
+    });
+  }
+
+  /** Runs `send` as an open request of this session (see {@link RequestTarget.openRequest}). */
+  async openRequest<T>(
+    toolSignal: AbortSignal,
+    send: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
     const open: OpenRequest = { abort: new AbortController(), coveredByCancel: false };
     const signal = AbortSignal.any([toolSignal, open.abort.signal]);
     this.requests.add(open);
     this.reportState();
     try {
-      // The subject is an upsert of the tool call: the client may see the
-      // request before the tool use streams.
-      return await this.connection.requestPermission(request, signal);
-    } catch (error) {
-      if (signal.aborted) return { outcome: { outcome: "cancelled" } };
-      throw error;
+      return await send(signal);
     } finally {
       this.requests.delete(open);
       // A request withdrawn after a cancel (Claude Code's interrupt aborts
@@ -539,6 +577,7 @@ export class NativeSession implements RequestTarget {
         switch (message.subtype) {
           case "init":
             if (message.capabilities?.includes("msg_lifecycle_v1")) this.lifecycleFrames = true;
+            this.elicitations.init(message.capabilities);
             this.reports.handle(message);
             // Its terminal-bound commands leave the list.
             if (this.commands.init(message)) this.resendCommands();
@@ -558,6 +597,9 @@ export class NativeSession implements RequestTarget {
             return;
           case "commands_changed":
             this.send(this.commands.changed(message.commands));
+            return;
+          case "elicitation_complete":
+            this.elicitations.completed(message.elicitation_id);
             return;
           case "session_state_changed":
             if (message.state === "idle") {

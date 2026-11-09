@@ -31,11 +31,13 @@ both, so a v2 core can follow Claude Code's own events instead of rebuilding a t
 | `session/prompt` fails             | `session/cancel` or `cancelled` (-32800), `discarded` or `refused` (-32603)            |
 | `state_update` `running`           | a turn starts: a prompt's `started` or echo, or the main conversation's output         |
 | `state_update` `idle`              | the turn's `result`, with its stop reason, usage, `_meta.quota` and error              |
-| `state_update` `requires_action`   | a turn is open and a permission request of the session is open                         |
+| `state_update` `requires_action`   | a turn is open and a permission request or elicitation of the session is open          |
 | `session/cancel`                   | `interrupt({ cancelQueued: true })`, also while idle, as on the bridge                 |
 | `session/resume` with `replayFrom` | `getSessionMessages`, mapped like live output                                          |
 | `session/fork`                     | `forkSession` (`fork-session.ts`), then a resume of the copy                           |
 | `availableCommands`                | `supportedCommands`, filtered by `getAvailableSlashCommands`, and the adapter's `/mcp` |
+| `elicitation/create`               | AskUserQuestion, `onElicitation`, `onUserDialog`, and MCP OAuth (see below)            |
+| `elicitation/complete`             | `system/elicitation_complete`, and an MCP OAuth sign-in that finished                  |
 | output updates                     | the shared SDK mapping (`toAcpNotifications`), translated by `V2UpdateTranslator`      |
 
 The reports that are not Claude's output come from `src/v2-native/reports.ts`, built as on v1:
@@ -55,7 +57,7 @@ The reports that are not Claude's output come from `src/v2-native/reports.ts`, b
 | `running`, then `idle`, no user_message | the adapter's idle `/compact` (`IdleCompaction`)                                |
 
 The session keeps little of its own: a map of prompts that are not inserted yet, whether a turn
-is open, and its count of open permission requests (`src/v2-native/session.ts`).
+is open, and its count of open permission requests and elicitations (`src/v2-native/session.ts`).
 
 Claude Code's `session_state_changed` is not the foreground state. It stays `running` while
 background subagents work: across the turn's `result`, the next prompts' turns, and the turn
@@ -103,7 +105,7 @@ Code's task events (with `forwardSubagentText` and `perTaskStopAffordance`):
 | incoming `session_message` in the child                | the first user text of each run: the delegation                                    |
 | `cwd` of the child                                     | the `SubagentStart` hook's `cwd`, when it is not the parent's (such as a worktree) |
 | child `running` / `idle`, mirrored on the parent       | `task_started` (or a `running` patch) to `task_notification`                       |
-| child `requires_action`                                | a permission request whose `agentID` is the child                                  |
+| child `requires_action`                                | a permission request or question whose `agentID` is the child                      |
 | `session/cancel` of a child                            | `stopTask(agentId)`                                                                |
 | `background` of a session                              | its background subagents, commands (terminals), task tool calls and other tasks    |
 | `terminal/cancel`, `tool_call/cancel`                  | `stopTask` of the listed item's task                                               |
@@ -124,6 +126,14 @@ close, resume, delete and config changes on it fail with -32602.
   `background` list of each session (see below).
 - `src/v2-native/permissions.ts`: `canUseTool` as v2 permission requests, on the session of the
   agent that asks.
+- `src/v2-native/elicitation.ts`: elicitations, for the modes the client advertised. A form
+  for AskUserQuestion (on the session of the agent that asks), for an MCP server's form, and for
+  the refusal fallback's consent prompt. A URL for an MCP server's URL request and for MCP OAuth.
+  All but MCP OAuth are open requests of their session, like permission requests: a cancel or a
+  close withdraws them. MCP OAuth starts after the setup response, and a close withdraws it.
+  Without form elicitation, AskUserQuestion is disallowed and the refusal fallback is not
+  declared. An MCP server's request in a mode the client did not advertise, or that the client
+  answers with an error, is answered `cancel`.
 - `src/v2-native/config.ts`: the mode and model config options.
 - `src/v2-native/setup.ts`: what session setup adds on the bridge's rules: the client's
   `_meta.claudeCode.options`, `CLAUDE_MODEL_CONFIG`, the models (the `availableModels`
@@ -164,6 +174,10 @@ These pieces were extracted so that both cores use the same code:
 - `getAvailableSlashCommands`, exported from `acp-agent.ts`
 - `AuthStatusReporter` and `cliLogout` (`auth-status-reporter.ts`): the `authStatus` state, the
   `claude auth status` probe and the `_auth/status_update` pushes, taken from `ClaudeAcpAgent`
+- the elicitation answers (`elicitation.ts`): `answerAskUserQuestion`, `answerMcpElicitation`,
+  `answerUserDialog` and `elicitUnlessWithdrawn`, taken from `ClaudeAcpAgent`'s handlers
+- MCP OAuth (`mcp-oauth.ts`): `startMcpServerAuthentication` and its status polling, taken from
+  `acp-agent.ts`
 - the provider routing (`providers.ts`): `ProviderConfig`, the gateway login methods and their
   validation, the `providers/list` response, `providers/set` validation and model listing, and
   `createEnvForProvider`, taken from `ClaudeAcpAgent`
@@ -180,10 +194,9 @@ These pieces were extracted so that both cores use the same code:
   insertion, folding, lifecycle failures, cancel, permission states, config, local commands,
   a crashed query, and replay.
 - `src/tests/acp-scenarios-v2-native.test.ts` runs every scenario of the shared suite on the
-  native core. All 40 send only schema-valid v2. 39 pass. `ask-user-question` stops, because
-  the native core sends no form elicitations. `SAME_AS_BRIDGE` lists the scenarios whose session
-  updates equal the bridge's golden file: 25 of them. The others differ in what is listed under
-  "Not served yet" (an Edit's patch, subagent details, the resume snapshot).
+  native core. All 40 send only schema-valid v2, and all pass. `SAME_AS_BRIDGE` lists the
+  scenarios whose session updates equal the bridge's golden file. The others differ in what is
+  listed under "Not served yet" (subagent details, the resume snapshot).
 - The scenario double now sends `session_state_changed` when the query asks for it, as the real
   CLI does. The bridge and v1 scenario golden files did not change.
 - A manual run against the bundled Claude Code CLI checked the following:
@@ -211,11 +224,6 @@ These pieces were extracted so that both cores use the same code:
 - A gateway login, `providers/set`, `providers/disable` or `auth/logout` routes only the sessions
   started after it. The bridge recreates the queries of live sessions between turns; on the
   native core they keep their route until they are closed and resumed.
-- Elicitation (and so `requires_action` for a question):
-  - AskUserQuestion (the tool is disallowed)
-  - MCP elicitation (the SDK declines)
-  - the refusal-fallback dialog
-  - MCP OAuth
 - Subagents:
   - the child's configuration (`config_option_update` from the `SubagentStart` hook)
   - the incoming view of a SendMessage, which the child's transcript does not show
@@ -279,4 +287,5 @@ Beyond the scenarios, `v2-native.test.ts` covers these requirements of the draft
   logins are advertised only with `auth.terminal`.
 
 `requires_action` comes from the session's own open requests, not Claude Code's: it covers
-exactly this session's permission requests, and will cover its elicitations.
+exactly this session's permission requests and elicitations. MCP OAuth is not one: it does not
+block a turn.
