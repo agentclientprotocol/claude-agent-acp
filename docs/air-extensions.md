@@ -630,6 +630,7 @@ The client already has the rest of the tool call, because the adapter sends the 
 
 A client that is not AIR gets the upstream request `toolCall`: `toolCallId`, `name`, `status: pending`, the whole `rawInput`, `title`, `kind`, `content`, and `locations`.
 Its `_meta.claudeCode` carries `toolName`, and `parentToolUseId` for a subagent tool call, next to `mcpServer`.
+Such a v1 client gets the SDK `decisionReason`, without the `Reason: ` prefix, in the request's own `_meta.claudeCode.decisionReason`.
 A Sandbox Network or Computer Use request without content shows its input as a JSON code block.
 
 Compact text removes control characters, collapses whitespace where it is safe, and enforces length limits.

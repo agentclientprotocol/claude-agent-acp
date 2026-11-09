@@ -7,7 +7,8 @@ import { AcpToolCallRenderer } from "../tool-calls/renderer.js";
  * A permission request as the agent builds it. For a v2 client it also
  * carries the heading and the explanation of the prompt, which ACP v2 sends as
  * the request's `title` and `description`. v1 has no field for them; AIR gets
- * them in `_meta`.
+ * them in `_meta`, and any other v1 client gets the reason in
+ * `_meta.claudeCode.decisionReason`.
  */
 export type AcpPermissionRequest = RequestPermissionRequest & {
   /** The heading of the prompt. It is not the title of the tool call. */
@@ -65,7 +66,9 @@ function compactText(value: unknown): string | undefined {
  * patch, and the blocked path when the tool call has no such location.
  *
  * The heading and the explanation of the prompt go to AIR in `_meta`, and to a
- * v2 client as `title` and `description`.
+ * v2 client as `title` and `description`. Any other v1 client gets the SDK
+ * `decisionReason` in `_meta.claudeCode.decisionReason`, without the `Reason: `
+ * prefix, so it can show why Claude asked.
  */
 export function buildClaudePermissionPresentation(
   value: ClaudePermissionPresentationInput,
@@ -133,5 +136,11 @@ export function buildClaudePermissionPresentation(
         }
       : {}),
     ...(capabilities.v2 ? { title, ...(description ? { description } : {}) } : {}),
+    // A v1 client that is not AIR has no field for the reason. Without it, the
+    // client cannot say why Claude asked, e.g. "Claude requested permissions to
+    // edit .env, which is a sensitive file".
+    ...(decisionReason && !capabilities.air.client && !capabilities.v2
+      ? { _meta: { claudeCode: { decisionReason } } }
+      : {}),
   };
 }
