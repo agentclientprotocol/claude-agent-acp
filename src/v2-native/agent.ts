@@ -55,6 +55,7 @@ import { modelSwitchHook, SessionConfig } from "./config.js";
 import { fileChangePreviewHook } from "./file-preview.js";
 import { canUseTool, denyingStoppedWork } from "./permissions.js";
 import { reportHooks } from "./reports.js";
+import { SessionRestarts, type SetupParams } from "./restarts.js";
 import { NativeSession, type SessionConnection } from "./session.js";
 import {
   clientOptions,
@@ -64,6 +65,7 @@ import {
   withClientHooks,
 } from "./setup.js";
 import type { SubagentReplay } from "./subagent-replay.js";
+import { SubscriptionGuard } from "./subscription-guard.js";
 import { restrictedChild } from "./tasks.js";
 
 /** The sessions per `session/list` page. */
@@ -123,6 +125,10 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
   readonly sessions = new Map<string, NativeSession>();
   readonly translator = new V2UpdateTranslator();
   readonly auth: NativeAuth;
+  /** The `--hide-claude-auth` subscription guard (see `subscription-guard.ts`). */
+  private readonly guard: SubscriptionGuard;
+  /** The restarts of the sessions' queries, for a new route or account (see `restarts.ts`). */
+  private readonly restarts: SessionRestarts;
   /** What the client declared in `initialize`. */
   private clientCapabilities: v2.ClientCapabilities | null | undefined;
   /** The elicitation modes that the client advertised in `initialize`. */
@@ -132,7 +138,23 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     private readonly ctx: v2.AgentContext,
     readonly logger: Logger,
   ) {
-    this.auth = new NativeAuth(ctx, logger);
+    this.auth = new NativeAuth(ctx, logger, {
+      routeChanged: () => this.restarts.reroute(),
+      probed: (kind) => this.guard.probed(kind),
+    });
+    this.guard = new SubscriptionGuard(this.auth, logger, (sessionId) =>
+      this.restarts.accountMayHaveChanged(sessionId),
+    );
+    this.restarts = new SessionRestarts({
+      logger,
+      active: (sessionId) => this.sessions.get(sessionId),
+      start: (sessionId, params) => this.restartSession(sessionId, params),
+      lost: async (sessionId, previous) => {
+        await previous.retire();
+        if (this.sessions.get(sessionId) === previous) this.ended(sessionId);
+      },
+      send: (notification) => this.send(notification),
+    });
   }
 
   // --- SessionConnection ---------------------------------------------------
@@ -177,6 +199,12 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     this.sessions.delete(sessionId);
     this.translator.forget(sessionId);
     this.auth.sessionEnded(sessionId);
+    this.guard.sessionEnded(sessionId);
+    this.restarts.forget(sessionId);
+  }
+
+  signedOut(sessionId: string): void {
+    this.guard.signedOut(sessionId);
   }
 
   // --- Requests --------------------------------------------------------------
@@ -206,10 +234,25 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     };
   }
 
-  /** `session/prompt`. Each prompt reads the auth identity again, as on v1. */
-  prompt(params: v2.PromptRequest): Promise<v2.PromptResponse> {
-    const session = this.session(params.sessionId, "prompt");
+  /**
+   * `session/prompt`. Each prompt reads the auth identity again, as on v1. A
+   * restart of the session's query that is due runs first (see
+   * `restarts.ts`), then the subscription guard judges the account, except
+   * for the adapter's `/remote-control`, which the bridge runs before its
+   * guard. Each await happens only when there is something to wait for, so
+   * the prompts of a session keep their order.
+   */
+  async prompt(params: v2.PromptRequest): Promise<v2.PromptResponse> {
+    this.session(params.sessionId, "prompt");
     this.auth.promptStarted(params.sessionId);
+    const restart = this.restarts.beforePrompt(params.sessionId);
+    if (restart) await restart;
+    const session = this.session(params.sessionId, "prompt");
+    const query = session.claudeQuery();
+    if (query && !session.mayRunRemoteControl(params.prompt)) {
+      const refusal = this.guard.beforePrompt(params.sessionId, query);
+      if (refusal) await refusal;
+    }
     return session.prompt(params);
   }
 
@@ -254,6 +297,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       );
     }
     if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "resume");
+    await this.restarts.settled(sessionId);
     let session = this.sessions.get(sessionId);
     let history: Promise<SessionMessage[]> | undefined;
     if (session) {
@@ -276,6 +320,8 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
         ...clientOptions(params._meta)?.mcpServers,
         ...sdkMcpServers(request.mcpServers),
       });
+      // A restart of its query starts with these servers.
+      this.restarts.track(sessionId, params);
     } else {
       // One read of the transcript serves the replay and the resumed model.
       history = replayFrom != null ? getSessionMessages(sessionId, { dir: params.cwd }) : undefined;
@@ -338,12 +384,15 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
   /** Closing is idempotent: a session that is not active closes at once. */
   async closeSession({ sessionId }: v2.CloseSessionRequest): Promise<v2.CloseSessionResponse> {
     if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "close");
+    // A restart that runs ends first, so the close ends the session it started.
+    await this.restarts.closing(sessionId);
     const session = this.sessions.get(sessionId);
     if (!session) return {};
     await session.close();
     if (this.sessions.get(sessionId) === session) this.sessions.delete(sessionId);
     this.translator.forget(sessionId);
     this.auth.sessionEnded(sessionId);
+    this.guard.sessionEnded(sessionId);
     return {};
   }
 
@@ -365,6 +414,8 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
   async setConfigOption(
     params: v2.SetSessionConfigOptionRequest,
   ): Promise<v2.SetSessionConfigOptionResponse> {
+    // On the new query, when a restart runs.
+    await this.restarts.settled(params.sessionId);
     const configOptions = await this.session(params.sessionId, "configure").setConfigOption(
       params.configId,
       (params as { type?: string }).type,
@@ -386,6 +437,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
   }
 
   async cancel(sessionId: string): Promise<void> {
+    this.restarts.cancelled(sessionId);
     const session = this.sessions.get(sessionId);
     if (session) return session.cancel();
     await this.ownerOfChild(sessionId)?.tasks.cancelChild(sessionId);
@@ -418,12 +470,32 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
   }
 
   async dispose(): Promise<void> {
+    await this.restarts.dispose();
     const sessions = [...this.sessions.values()];
     this.sessions.clear();
     await Promise.all(sessions.map((session) => session.close()));
   }
 
   // --- Session setup -----------------------------------------------------------
+
+  /**
+   * Starts the query of the live session `sessionId` again, resuming its
+   * conversation (see `restarts.ts`). Claude Code writes the conversation at
+   * the first prompt, so a session never prompted has none to resume: it
+   * starts afresh under the same id, as on the bridge.
+   */
+  private async restartSession(sessionId: string, params: SetupParams): Promise<NativeSession> {
+    try {
+      return await this.startSession(sessionId, params, sessionId);
+    } catch (error) {
+      if (!(
+        error instanceof RequestError && error.code === RequestError.sessionNotFound(sessionId).code
+      )) {
+        throw error;
+      }
+      return this.startSession(sessionId, params, undefined);
+    }
+  }
 
   /**
    * The config options and commands of a setup response. When reading the
@@ -465,6 +537,8 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
   ): Promise<NativeSession> {
     const request = await validatedSetup(params);
     const client = clientOptions(params._meta);
+    // After a provider change that is still listing its models, as on the bridge.
+    await this.auth.routeSettled();
     // The resumed transcript's last model and mode, as on the bridge.
     const resumed =
       resume === undefined
@@ -621,6 +695,13 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
       throw startupFailureError(error) ?? error;
     }
     authStarted(sessionId, initialization.account);
+    try {
+      this.guard.sessionStarted(sessionId, initialization.account, settings.getApiKeyHelper());
+    } catch (error) {
+      q.close();
+      settings.dispose();
+      throw error;
+    }
     let models;
     try {
       models = await sessionModels(
@@ -656,6 +737,7 @@ class NativeV2Agent implements AgentHandle, SessionConnection {
     });
     session.start(q, config, mcpServers, resume !== undefined);
     this.sessions.set(sessionId, session);
+    this.restarts.track(sessionId, params);
     return session;
   }
 }

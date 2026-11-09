@@ -378,6 +378,16 @@ export class SessionOutput {
     this.content(text, "assistant", null, { messageId });
   }
 
+  /**
+   * A user message that this session did not send, such as one typed in
+   * another client over Remote Control: rendered as a replayed one is,
+   * without its command metadata.
+   */
+  userMessage(content: unknown, messageId: string): void {
+    const shown = stripLocalCommandMetadata(content);
+    if (shown !== null) this.content(shown as UserContent, "user", null, { messageId });
+  }
+
   /** Whether agent text went out since the last {@link resetAgentText}. */
   hasAgentText(): boolean {
     return this.agentText;

@@ -382,6 +382,11 @@ export class SessionTasks {
     return SubagentReplay.load(this.host, messages, (sessionId) => this.children.has(sessionId));
   }
 
+  /** Whether a subagent task runs, announced or not, in the foreground or the background. */
+  hasLiveSubagents(): boolean {
+    return this.agents.size > 0;
+  }
+
   /** Whether `sessionId` is an announced child session of this root. */
   hasChild(sessionId: string): boolean {
     return this.children.get(sessionId)?.announced === true;

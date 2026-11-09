@@ -57,6 +57,8 @@ const sdk = vi.hoisted(() => ({
   subagents: new Map<string, Record<string, unknown>>(),
   /** When set, a permission request's patch preview waits for it. */
   previewGate: undefined as Promise<void> | undefined,
+  /** When set, Claude Code fails to start with it. */
+  startFailure: undefined as Error | undefined,
 }));
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
@@ -117,7 +119,10 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         async [Symbol.asyncDispose]() {},
       };
       return Object.assign(messages, {
-        initializationResult: async () => ({ models: sdk.models }),
+        initializationResult: async () => {
+          if (sdk.startFailure) throw sdk.startFailure;
+          return { models: sdk.models };
+        },
         supportedCommands: async () => [
           { name: "review", description: "Review a change", argumentHint: "<pull request>" },
         ],
@@ -186,6 +191,7 @@ beforeEach(async () => {
   sdk.models = DEFAULT_MODELS;
   sdk.subagents = new Map();
   sdk.previewGate = undefined;
+  sdk.startFailure = undefined;
 });
 
 afterEach(async () => {
@@ -473,6 +479,83 @@ describe("native ACP v2 core", () => {
     });
     // In the settings tier too, so a settings.json env cannot restore another route.
     expect(settings).toMatchObject({ apiKeyHelper: "", env: { ANTHROPIC_BASE_URL: baseUrl } });
+  });
+
+  describe("a provider change of live sessions", () => {
+    const setProvider = (agent: v2.ClientContext) =>
+      agent.request(v2.methods.agent.providers.set, {
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gateway.example.com",
+      });
+
+    it("restarts the query only once the background subagents ended", async () => {
+      const client = nativeClient();
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        void agent.request(v2.methods.agent.session.prompt, {
+          sessionId: response.sessionId,
+          prompt: PROMPT,
+        });
+        const prompt = await claude.prompt(0);
+        claude.send(lifecycle(prompt, "started"));
+        const helper = subagent("agent-1", "toolu_agent", { is_backgrounded: true });
+        claude.send(helper.launch());
+        claude.send(helper.started());
+        claude.send(result());
+        await vi.waitFor(() => expect(client.states().at(-1)).toBe("idle"));
+        let switched = false;
+        const set = setProvider(agent).then(() => (switched = true));
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(switched).toBe(false);
+        expect(sdk.processes).toHaveLength(1);
+
+        claude.send(helper.ended());
+        await set;
+        expect(sdk.processes).toHaveLength(2);
+        expect(claude.close).toHaveBeenCalled();
+        expect(sdk.processes[1].options).toMatchObject({ resume: response.sessionId });
+      });
+    });
+
+    it("answers a prompt that waits for the restart with -32800 on session/cancel", async () => {
+      const client = nativeClient();
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const sessionId = response.sessionId;
+        void agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: PROMPT });
+        claude.send(lifecycle(await claude.prompt(0), "started"));
+        const set = setProvider(agent);
+        const waiting = agent.request(v2.methods.agent.session.prompt, {
+          sessionId,
+          prompt: [{ type: "text", text: "next" }],
+        });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+        await expect(waiting).rejects.toMatchObject({ code: -32800 });
+
+        claude.send(result({ subtype: "error_during_execution", is_error: true }));
+        await set;
+        // The cancelled prompt never reached either query.
+        expect(claude.prompts).toHaveLength(1);
+        expect(sdk.processes[1].prompts).toHaveLength(0);
+      });
+    });
+
+    it("ends a session whose query does not start again under the new route", async () => {
+      const client = nativeClient();
+      await client.connect(async (agent) => {
+        const { response } = await openSession(agent);
+        sdk.startFailure = new Error("Claude Code could not start");
+        await setProvider(agent);
+        await expect(
+          agent.request(v2.methods.agent.session.prompt, {
+            sessionId: response.sessionId,
+            prompt: PROMPT,
+          }),
+        ).rejects.toMatchObject({ code: -32002 });
+      });
+    });
   });
 
   it("answers session/new with the mode and model options and the commands", async () => {

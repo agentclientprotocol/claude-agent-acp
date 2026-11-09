@@ -89,6 +89,17 @@ const sdk = vi.hoisted(() => ({
     requiresUserAction: false,
     callbackExpected: false,
   }),
+  /** The query replaces its MCP servers, as a resume of the active session asks. */
+  setMcpServers: async (_servers: Record<string, unknown>): Promise<Record<string, unknown>> => ({
+    added: [],
+    removed: [],
+    errors: {},
+  }),
+  /** The account that the query cached at its start, which `accountInfo()` reads. */
+  accountInfo: async (): Promise<Record<string, unknown>> => ({}),
+  /** Set to serve Remote Control, as a query of a CLI that supports it does. */
+  enableRemoteControl: undefined as
+    ((enabled: boolean, name?: string) => Promise<{ session_url?: string }>) | undefined,
 }));
 const sdkDefaults = { ...sdk };
 
@@ -112,6 +123,9 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         interrupt: () => sdk.interrupt(),
         stopTask: (taskId: string) => sdk.stopTask(taskId),
         close: () => sdk.close(),
+        accountInfo: () => sdk.accountInfo(),
+        setMcpServers: (servers: Record<string, unknown>) => sdk.setMcpServers(servers),
+        ...(sdk.enableRemoteControl ? { enableRemoteControl: sdk.enableRemoteControl } : {}),
       });
       return Object.assign(messages, controls);
     },
@@ -656,6 +670,51 @@ describe("ACP v2 sessions", () => {
       await agent.request(v2.methods.agent.session.delete, { sessionId });
       await authUpdate(1);
     });
+  });
+
+  it("keeps the running turn of the active session that a resume gives other MCP servers", async () => {
+    const release = Promise.withResolvers<void>();
+    scriptTurns(async function* (options) {
+      await release.promise;
+      yield result(options);
+    });
+    sdk.setMcpServers = vi.fn(sdkDefaults.setMcpServers);
+    const server = (name: string) => ({
+      type: "http" as const,
+      name,
+      url: `https://${name}.dev/mcp`,
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, {
+        cwd,
+        mcpServers: [server("linear")],
+      });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("work") });
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        mcpServers: [server("github")],
+      });
+      release.resolve();
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates).at(-1)).toMatch(/^idle/));
+      await client.authUpdate(1);
+    });
+
+    if (!NATIVE_CORE) {
+      // v2 asks that ongoing work continue. The bridge starts a new query,
+      // which cancels the turn (see "Intended differences" in
+      // docs/v2-native-core.md).
+      expect(sdk.queryOptions).toHaveLength(2);
+      expect(turnTrace(client.sessionUpdates)).toContain("idle cancelled");
+      return;
+    }
+    expect(sdk.queryOptions).toHaveLength(1);
+    expect(sdk.setMcpServers).toHaveBeenCalledExactlyOnceWith({
+      github: expect.objectContaining({ type: "http", url: "https://github.dev/mcp" }),
+    });
+    expect(turnTrace(client.sessionUpdates).at(-1)).toBe("idle end_turn");
   });
 
   it("resumes an unavailable mode using the configured mode in the v2 response", async () => {
@@ -6917,6 +6976,138 @@ describe("ACP v2 providers", () => {
       await authUpdate(1);
     });
   });
+
+  const GATEWAY = "https://gateway.example.com";
+  const setGateway = (agent: v2.ClientContext) =>
+    agent.request(v2.methods.agent.providers.set, {
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: GATEWAY,
+    });
+
+  /**
+   * Claude Code echoes each prompt and answers it. A turn of a query without
+   * the gateway's route waits for `release` first.
+   */
+  function answerEachPrompt(release: Promise<void>): Array<{ text: string; routed: boolean }> {
+    const answered: Array<{ text: string; routed: boolean }> = [];
+    sdk.run = async function* (prompts, options) {
+      const routed = options.env?.ANTHROPIC_BASE_URL === GATEWAY;
+      for await (const prompt of prompts) {
+        yield {
+          type: "user",
+          message: prompt.message,
+          parent_tool_use_id: null,
+          uuid: prompt.uuid,
+          session_id: options.sessionId,
+          isReplay: true,
+        };
+        if (!routed) await release;
+        const content = prompt.message.content;
+        answered.push({
+          text: typeof content === "string" ? content : (content[0] as { text: string }).text,
+          routed,
+        });
+        yield assistantText(options, "done");
+        yield result(options);
+      }
+    };
+    return answered;
+  }
+
+  it("routes a live session through a provider set while it works, once its turn ends", async () => {
+    const release = Promise.withResolvers<void>();
+    const answered = answerEachPrompt(release.promise);
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.setConfigOption, {
+        sessionId,
+        configId: "mode",
+        type: "id",
+        value: "acceptEdits",
+      });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("first") });
+      let switched = false;
+      const set = setGateway(agent).then(() => (switched = true));
+      // A prompt sent meanwhile waits for the switch.
+      const second = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("second"),
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      // The running turn keeps its query.
+      expect(switched).toBe(false);
+      expect(sdk.queryOptions).toHaveLength(1);
+
+      release.resolve();
+      await set;
+      expect(sdk.queryOptions).toHaveLength(2);
+      expect(sdk.queryOptions[1]).toMatchObject({
+        resume: sessionId,
+        env: { ANTHROPIC_BASE_URL: GATEWAY },
+      });
+      // The new query keeps the mode the client chose.
+      expect(
+        client
+          .updates("config_option_update")
+          .at(-1)
+          ?.configOptions.find((option) => option.configId === "mode"),
+      ).toMatchObject({ currentValue: "acceptEdits" });
+      await second;
+      await vi.waitFor(() => expect(answered).toHaveLength(2));
+      await client.authUpdate(1);
+    });
+
+    expect(answered).toEqual([
+      { text: "first", routed: false },
+      { text: "second", routed: true },
+    ]);
+  });
+
+  it.each([
+    [
+      "providers/disable",
+      (agent: v2.ClientContext) =>
+        agent.request(v2.methods.agent.providers.disable, { providerId: "main" }),
+    ],
+    ["auth/logout", (agent: v2.ClientContext) => agent.request(v2.methods.agent.auth.logout, {})],
+  ])("routes a live session off the provider after %s", async (_method, leave) => {
+    answerEachPrompt(Promise.resolve());
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      await setGateway(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await leave(agent);
+      expect(sdk.queryOptions.map((options) => options.env?.ANTHROPIC_BASE_URL)).toEqual([
+        GATEWAY,
+        undefined,
+      ]);
+      expect(sdk.queryOptions[1]).toMatchObject({ resume: sessionId });
+      await client.authUpdate(1);
+    });
+  });
+
+  it("routes only the sessions started after a gateway login", async () => {
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent, { auth: { _meta: { gateway: true } } });
+      await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.auth.login, {
+        methodId: "gateway",
+        _meta: { gateway: { baseUrl: GATEWAY, headers: {} } },
+      });
+      await agent.request(v2.methods.agent.session.new, { cwd });
+      await client.authUpdate(2);
+    });
+
+    expect(sdk.queryOptions.map((options) => options.env?.ANTHROPIC_BASE_URL)).toEqual([
+      undefined,
+      GATEWAY,
+    ]);
+  });
 });
 
 describe("ACP v2 auth", () => {
@@ -6970,5 +7161,237 @@ describe("ACP v2 auth", () => {
       );
       expect((await authUpdate(3)).authStatus).toMatchObject({ kind: "account" });
     });
+  });
+});
+
+describe("ACP v2 subscription guard (--hide-claude-auth)", () => {
+  const SUBSCRIPTION = {
+    email: "user@example.com",
+    subscriptionType: "max",
+    apiProvider: "firstParty",
+  };
+  const API_KEY = { apiKeySource: "ANTHROPIC_API_KEY", apiProvider: "firstParty" };
+  const NOT_SUPPORTED = { code: -32000, data: { reason: "claude_subscription_not_supported" } };
+
+  beforeEach(() => {
+    const argv = process.argv;
+    process.argv = [...argv, "--hide-claude-auth"];
+    return () => {
+      process.argv = argv;
+    };
+  });
+
+  /** Each query caches the next of `accounts` at its start, and the last one after them. */
+  function accountsAtStart(...accounts: Array<Record<string, unknown>>) {
+    let started = 0;
+    sdk.initializationResult = async () => ({
+      ...(await sdkDefaults.initializationResult()),
+      account: accounts[Math.min(started++, accounts.length - 1)],
+    });
+  }
+
+  it.each([
+    ["a subscription would pay", SUBSCRIPTION, NOT_SUPPORTED],
+    ["the account holds no credential", {}, { code: -32000, data: undefined }],
+  ])("refuses session/new when %s", async (_case, account, refusal) => {
+    accountsAtStart(account);
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      await expect(agent.request(v2.methods.agent.session.new, { cwd })).rejects.toMatchObject(
+        refusal,
+      );
+    });
+  });
+
+  it("refuses a prompt before insertion when the cached account bills a subscription", async () => {
+    accountsAtStart(API_KEY);
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      sdk.accountInfo = async () => SUBSCRIPTION;
+      await expect(
+        agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") }),
+      ).rejects.toMatchObject(NOT_SUPPORTED);
+      await client.authUpdate(1);
+    });
+
+    expect(client.updates("user_message")).toEqual([]);
+  });
+
+  it("starts the query again after a sign-out, and refuses the next prompt on the account it finds", async () => {
+    accountsAtStart(API_KEY, SUBSCRIPTION);
+    sdk.accountInfo = async () => API_KEY;
+    scriptTurns(async function* (options) {
+      yield result(options, { is_error: true, result: "Not logged in · Please run /login" });
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle error"));
+      await expect(
+        agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("again") }),
+      ).rejects.toMatchObject(NOT_SUPPORTED);
+      expect(sdk.queryOptions).toHaveLength(2);
+      expect(sdk.queryOptions[1]).toMatchObject({ resume: sessionId });
+      await client.authUpdate(1);
+    });
+
+    expect(client.updates("user_message")).toHaveLength(1);
+  });
+});
+
+describe("ACP v2 Remote Control", () => {
+  const SESSION_URL = "https://claude.ai/code/session_123";
+
+  beforeEach(() => {
+    sdk.enableRemoteControl = vi.fn(async () => ({ session_url: SESSION_URL }));
+  });
+
+  it("lists /remote-control when the query serves Remote Control", async () => {
+    const client = v2Client();
+    const response = await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      return agent.request(v2.methods.agent.session.new, { cwd });
+    });
+
+    expect(response.availableCommands).toContainEqual(
+      expect.objectContaining({ type: "command", name: "remote-control" }),
+    );
+  });
+
+  it("connects with /remote-control and answers with the session URL", async () => {
+    const client = v2Client();
+    const response = await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const response = await agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("/remote-control laptop"),
+      });
+      await vi.waitFor(() => expect(sdk.enableRemoteControl).toHaveBeenCalled());
+      if (NATIVE_CORE) {
+        await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      }
+      await client.authUpdate(1);
+      return response;
+    });
+
+    expect(sdk.enableRemoteControl).toHaveBeenCalledExactlyOnceWith(true, "laptop");
+    expect(client.updates("user_message")).toEqual([
+      {
+        sessionUpdate: "user_message",
+        messageId: response.messageId,
+        content: text("/remote-control laptop"),
+      },
+    ]);
+    if (!NATIVE_CORE) {
+      // The bridge's reply has no messageId, which v2 requires of a chunk, so
+      // it never reaches the client, and no state goes around the command
+      // (see "Intended differences" in docs/v2-native-core.md).
+      expect(turnTrace(client.sessionUpdates)).toEqual(["user_message"]);
+      return;
+    }
+    expect(client.updates("agent_message_chunk")[0].content).toMatchObject({
+      text: expect.stringContaining(SESSION_URL),
+    });
+    // v2 asks a local command to report `running`, then `idle`.
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      "user_message",
+      "running",
+      "agent_message_chunk",
+      "idle end_turn",
+    ]);
+  });
+
+  it("runs /remote-control sent while Claude works once the turn ends", async () => {
+    const release = Promise.withResolvers<void>();
+    scriptTurns(async function* (options) {
+      await release.promise;
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("work") });
+      const command = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("/remote-control"),
+      });
+      if (!NATIVE_CORE) {
+        // v2 asks to hold a prompt rather than reject it while Claude works:
+        // the bridge rejects the command (see "Intended differences").
+        await expect(command).rejects.toMatchObject({ code: -32600 });
+        release.resolve();
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(sdk.enableRemoteControl).not.toHaveBeenCalled();
+      release.resolve();
+      await command;
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates)).toEqual([
+          "user_message",
+          "running",
+          "idle end_turn",
+          "user_message",
+          "running",
+          "agent_message_chunk",
+          "idle end_turn",
+        ]),
+      );
+      await client.authUpdate(1);
+    });
+  });
+
+  it("shows a message typed in another client of the session as a user message", async () => {
+    sdk.run = async function* (prompts, options) {
+      const input = prompts[Symbol.asyncIterator]();
+      const { value } = await input.next();
+      yield {
+        type: "user",
+        message: value.message,
+        parent_tool_use_id: null,
+        uuid: value.uuid,
+        session_id: options.sessionId,
+        isReplay: true,
+        origin: { kind: "human" },
+      };
+      yield result(options);
+      // Claude Code echoes a prompt that a person typed in claude.ai, and runs it.
+      yield {
+        type: "user",
+        message: { role: "user", content: [{ type: "text", text: "typed on my phone" }] },
+        parent_tool_use_id: null,
+        uuid: "remote-message",
+        session_id: options.sessionId,
+        isReplay: true,
+        origin: { kind: "human" },
+      };
+      yield assistantText(options, "On it.", "msg_remote");
+      yield result(options);
+      while (!(await input.next()).done);
+    };
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(client.updates("agent_message_chunk")).toHaveLength(1));
+      await client.authUpdate(1);
+    });
+
+    // Only the other client's message: the echo of the session's own prompt is its user_message.
+    expect(client.updates("user_message_chunk")).toEqual([
+      {
+        sessionUpdate: "user_message_chunk",
+        messageId: "remote-message",
+        content: { type: "text", text: "typed on my phone" },
+      },
+    ]);
   });
 });

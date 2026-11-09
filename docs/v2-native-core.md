@@ -163,13 +163,36 @@ resume, delete and config changes on it fail with -32602. A session started with
   allowlist, `ANTHROPIC_MODEL` and the settings' `model`, the resumed transcript's model), the
   current title on resume, and AIR's `loadReplayEnd` event.
 - `src/v2-native/commands.ts`: the command list, and the adapter's `/mcp`, whose server list
-  replaces Claude Code's text before the turn's idle.
+  replaces Claude Code's text before the turn's idle. The list has the adapter's `/remote-control`
+  when the query serves Remote Control.
 - `src/v2-native/file-preview.ts`: the PreToolUse hook that shows an Edit's or Write's exact
   patch before it runs.
 - `src/v2-native/auth.ts`: `_auth/status_update`, gateway `auth/login`, `auth/logout`, and
   `providers/*`, on the v1 core's state rules (`AuthStatusReporter`, `providers.ts`). The
   identity is read after `initialize`, from each session's account, after a login or logout, and
-  at the start of each prompt, as on the bridge.
+  at the start of each prompt, as on the bridge. A gateway login routes the sessions started
+  after it, as on the bridge. `providers/set`, `providers/disable`, and an `auth/logout` that
+  drops a provider or a gateway login route the live sessions too (see `restarts.ts`).
+- `src/v2-native/restarts.ts`: restarts of a session's query, as the bridge's: a new query
+  resumes the same Claude session, then the old one ends, and the model and mode the client chose
+  are set again and sent in a `config_option_update`. For a new route, each live session restarts
+  at its next turn boundary (no turn open, no prompt in Claude Code's queue, no subagent running),
+  prompts sent meanwhile wait and go to the new query, and the request answers once every session
+  restarted. A session whose query does not start again is no longer active. A `session/cancel`
+  or `session/close` answers the waiting prompts with -32800. The old query's background commands
+  end with it: their terminals exit before the list drops them.
+- `src/v2-native/subscription-guard.ts`: the `--hide-claude-auth` subscription guard, on the
+  rules of `hide-claude-auth.ts`, which the bridge applies to v2 sessions. While no provider or
+  gateway login routes the traffic, a session does not start, and a prompt is refused before
+  insertion, on an account that a claude.ai subscription would pay for (`authRequired` with the
+  `claude_subscription_not_supported` reason) or that holds no accepted credential. A turn that
+  fails for a missing login, or a probe that finds another kind of identity, restarts the query at
+  the next prompt that finds the session idle, so its start judges the current account. A failed
+  restart fails that prompt and keeps the session, for a retry after a sign-in.
+- `src/v2-native/remote-control.ts`: the adapter's `/remote-control`, listed and run on the v1
+  core's rules (`remote-control.ts`), as a local command of its own turn (see "Intended
+  differences"), and the messages typed in another client of the session (a human-origin prompt
+  echo that this session did not send), shown as user messages, as on the bridge.
 - `src/v2-native/reports.ts`: usage, notices, compactions, titles, and the idle
   compaction (see the table above), and the hooks that feed them (PostCompact, TaskCreated,
   TaskCompleted).
@@ -199,6 +222,9 @@ These pieces were extracted so that both cores use the same code:
 - `resolveThinkingConfig` and `parseModelConfig` (`session-env.ts`), and `sessionSystemPrompt`
   (`client-system-prompt.ts`), taken from `ClaudeAcpAgent.createSession`
 - `getAvailableSlashCommands`, exported from `acp-agent.ts`
+- `/remote-control` (`remote-control.ts`): its parsing, the check that Claude Code does not offer
+  a command of the name, the call and its reply text, and `isRemoteHumanMessage`, taken from
+  `acp-agent.ts`
 - `AuthStatusReporter` and `cliLogout` (`auth-status-reporter.ts`): the `authStatus` state, the
   `claude auth status` probe and the `_auth/status_update` pushes, taken from `ClaudeAcpAgent`
 - the elicitation answers (`elicitation.ts`): `answerAskUserQuestion`, `answerMcpElicitation`,
@@ -246,8 +272,18 @@ These pieces were extracted so that both cores use the same code:
   is zero then.
 - An AIR client gets no AIR extensions: `initialize` advertises no `_meta.jetbrains.air`, and its
   state updates carry the v2 `background` list. The bridge gives it AIR's subagent form, which
-  reports no list. AIR's `loadReplayEnd` event, which the client declares, is sent.
-- `/remote-control` is not listed: this core does not serve it.
+  reports no list, and the AIR extensions that it reads from the client's `_meta`, such as file
+  change reports (`agentFileChangeReport`). AIR's `loadReplayEnd` event, which the client
+  declares, is sent.
+- `/remote-control` runs as a local command of its own turn, as v2 asks: `running`, the reply,
+  then `idle` with `end_turn`. Sent while Claude works, it waits for the work to end, and the
+  prompts after it wait for it: v2 asks to hold a prompt, not to reject it, while foreground work
+  runs. The bridge rejects it then (-32600), and otherwise reports no state around it. Its reply
+  has no `messageId`, which v2 requires of a chunk, so a v2 client never gets it.
+- Resuming the active session with other MCP servers keeps its work going and replaces the
+  servers on the running query (`setMcpServers`), as v2 asks ("Ongoing work continues, and the
+  request's MCP servers and workspace roots replace the previous ones"). The bridge tears the
+  session down and starts a new query, which cancels its running work.
 - A stopped child's unfinished tool calls end before the idle that reports its cancel, as v2 asks
   of the updates after `session/cancel`. The bridge ends them after the idle.
 - While the root's turn waits on foreground subagents, it reports `requires_action` only when each
@@ -259,9 +295,6 @@ These pieces were extracted so that both cores use the same code:
 
 ## Not served yet
 
-- A gateway login, `providers/set`, `providers/disable` or `auth/logout` routes only the sessions
-  started after it. The bridge recreates the queries of live sessions between turns; on the
-  native core they keep their route until they are closed and resumed.
 - Subagents:
   - the child's configuration from its hooks (mode, effort, agent, `PostModelSwitch`): only its
     `model` is reported, from its responses
@@ -280,14 +313,13 @@ These pieces were extracted so that both cores use the same code:
 - Session options:
   - effort, fast mode, ultracode and agent options (the bridge's `buildConfigOptions` and their
     set paths)
-  - a resume of the active session with other MCP servers calls `setMcpServers`; the bridge
-    recreates the query
 - Resume:
   - `replayFrom` other than `start`
   - the notice for subagent history that a replay cannot restore
 - ExitPlanMode's "clear context" option.
-- The v1-only features: AIR extensions, steering, Remote Control, the Claude subscription guard,
-  and file change reports.
+- The v1-only features, which the bridge does not serve to v2 clients either: steering
+  (`_session/steering`, whose `steering` marker `v2InitializeResponse` drops), and AIR's async
+  task stop and goal extensions.
 
 ## Replacing the bridge
 
