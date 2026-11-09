@@ -362,6 +362,7 @@ import {
   SessionModeManager,
 } from "./session-mode.js";
 import {
+  aliasResumedModelRow,
   applyAvailableModelsAllowlist,
   buildModelConfigOption,
   getAvailableModels,
@@ -12519,14 +12520,21 @@ export class ClaudeAcpAgent {
       // configured. Managed `deniedModels` drops entries the CLI would refuse.
       const settingsAvailableModels = settingsManager.getSettings().availableModels;
       const settingsModelOverrides = settingsManager.getSettings().modelOverrides;
+      const resumedModel = await resumedModelHint;
+      // A resumed Fable 5.1 session lists Fable 5.1 as `fable`, as a new
+      // session does (see `aliasResumedModelRow`).
+      const sdkModels = aliasResumedModelRow(
+        initializationResult.models,
+        creationOpts.resume !== undefined ? resumedModel : undefined,
+      );
       const settingsAllowedModels = Array.isArray(settingsAvailableModels)
         ? applyAvailableModelsAllowlist(
-            initializationResult.models,
+            sdkModels,
             settingsAvailableModels,
             settingsModelOverrides,
             settingsManager.getManagedDeniedModels(),
           )
-        : initializationResult.models;
+        : sdkModels;
       // Then keep only the models the `providers/set` gateway listed.
       const allowedModels = resolvedProvider?.listedModels
         ? narrowToGatewayModels(
@@ -12544,7 +12552,7 @@ export class ClaudeAcpAgent {
         this.logger,
         creationOpts.resume !== undefined,
         sessionId,
-        await resumedModelHint,
+        resumedModel,
         resolvedProvider?.listedModels !== undefined,
       );
       timing.phase("models");
@@ -12560,7 +12568,7 @@ export class ClaudeAcpAgent {
       const allowlistedModelInfo = allowedModels.find((m) => m.value === models.currentModelId);
       const fallbackModelInfo = allowlistedModelInfo
         ? undefined
-        : (resolveModelPreference(initializationResult.models, models.currentModelId) ?? undefined);
+        : (resolveModelPreference(sdkModels, models.currentModelId) ?? undefined);
       const currentModelInfo = allowlistedModelInfo ?? fallbackModelInfo;
       // Register the fallback-resolved capabilities under the verbatim live id
       // so every modelInfos consumer (buildConfigOptions' effort lookup, later
