@@ -68,12 +68,36 @@ const NATIVE_STOPS: Record<string, string> = {
 
 /**
  * The scenarios whose session updates equal the bridge's v2 golden file.
- * The others differ in what the native core does not report yet
- * (`usage_update`, the `background` list and quota `_meta` of a state, an
- * Edit's patch before it runs, ...), and in that Claude Code's `running`
- * comes before the prompt's `user_message`.
+ * The others differ in what the native core does not serve yet (an Edit's
+ * patch before it runs, subagent details, ...; see `docs/v2-native-core.md`).
  */
-const SAME_AS_BRIDGE: string[] = ["session-setup"];
+const SAME_AS_BRIDGE: string[] = [
+  "session-setup",
+  "text-and-thinking",
+  "bash-foreground",
+  "bash-error",
+  "bash-background",
+  "async-task-held-until-tool-id",
+  "async-task-ends-before-tool-id",
+  "async-task-released-at-turn-end",
+  "read",
+  "notebook-edit",
+  "grep-and-glob",
+  "web-fetch-and-search",
+  "todo-write",
+  "task-create-update",
+  "goal",
+  "exit-plan-reject",
+  "skill",
+  "mcp-tool",
+  "task-output-and-stop",
+  "memory-recall",
+  "tool-progress",
+  "rate-limit-and-origin",
+  "compaction-legacy",
+  "compaction-update",
+  "compaction-failed-legacy",
+];
 
 const runs = new Map<string, ScenarioRunV2>();
 let configDir: string;

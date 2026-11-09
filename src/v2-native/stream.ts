@@ -8,9 +8,12 @@
  * prompts or turns: the session decides what the output belongs to.
  */
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
+import type { ContentBlock } from "@agentclientprotocol/sdk/unstable";
 import type {
   SDKAssistantMessage,
+  SDKMemoryRecallMessage,
   SDKPartialAssistantMessage,
+  SDKToolProgressMessage,
   SDKUserMessage,
   SessionMessage,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -26,8 +29,11 @@ import {
   type ToolUseCache,
 } from "../acp-agent.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
+import { isCompactSummaryMessage, replayCompactSummary } from "../context-compaction.js";
 import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
+import { AcpToolCallRenderer } from "../tool-calls/renderer.js";
+import { changedTaskPlanEntries, type TaskState } from "../tools.js";
 import { replayClear, type V2UpdateTranslator } from "../v2/update-translator.js";
 
 /** Every v2 client gets the same tool call reports: v2 diffs and display terminals. */
@@ -42,6 +48,8 @@ export class SessionOutput {
   /** What the client holds of each open tool call: an update carries only what changed. */
   private readonly toolCallFields = new ToolCallFieldTracker();
   private readonly streamedToolInputs: StreamedToolInputCache = new Map();
+  /** The session's Task* list (TaskCreate, TaskUpdate, TaskList), sent as plan updates. */
+  readonly taskState: TaskState = new Map();
   /** The API ids of the assistant messages whose text streamed as deltas. */
   private readonly streamedMessages = new Set<string>();
   /** The id of the assistant message that is streaming. */
@@ -151,6 +159,44 @@ export class SessionOutput {
     this.emit(notifications);
   }
 
+  /**
+   * A tool's progress beat, on its tool call: the beat's own `tool_use_id`
+   * when the client holds that call, else the call it runs in
+   * (`parent_tool_use_id`), such as the Agent call of a subagent's tool or
+   * a heartbeat's derived id. A beat for a call that returned is dropped.
+   */
+  toolProgress(message: SDKToolProgressMessage): void {
+    const toolCallId = this.emittedToolCalls.has(message.tool_use_id)
+      ? message.tool_use_id
+      : message.parent_tool_use_id;
+    if (toolCallId === null || !this.emittedToolCalls.has(toolCallId)) return;
+    const beat = new AcpToolCallRenderer(V2_TOOL_CALL_CAPABILITIES).progress({
+      toolCallId,
+      toolName: message.tool_name,
+      elapsedTimeSeconds: message.elapsed_time_seconds,
+      subagentType: message.subagent_type,
+      subagentRetry: message.subagent_retry,
+    });
+    if (this.toolCallFields.apply(beat)) this.emit([{ sessionId: this.sessionId, update: beat }]);
+  }
+
+  /** Claude Code recalled memories: a completed read tool call. */
+  memoryRecall(message: SDKMemoryRecallMessage): void {
+    this.emit([
+      {
+        sessionId: this.sessionId,
+        update: new AcpToolCallRenderer(V2_TOOL_CALL_CAPABILITIES).memoryRecall(message),
+      },
+    ]);
+  }
+
+  /** The Task* list changed outside a tool result (the TaskCreated and TaskCompleted hooks). */
+  taskPlanChanged(): void {
+    const entries = changedTaskPlanEntries(this.taskState, false);
+    if (entries)
+      this.emit([{ sessionId: this.sessionId, update: { sessionUpdate: "plan", entries } }]);
+  }
+
   /** Sets the status of a tool call, such as a background task's when it ends. */
   toolCallStatus(toolCallId: string, status: "in_progress" | "paused" | ToolCallFinalStatus): void {
     if (FINAL_STATUSES.has(status)) this.unfinished.delete(toolCallId);
@@ -168,6 +214,15 @@ export class SessionOutput {
     try {
       for (const message of messages) {
         if (message.parent_tool_use_id !== null || isReplayHiddenMetaMessage(message)) continue;
+        // A compaction's summary message replays as the completed compaction.
+        // `emit` sends at once, before the call returns, so the update keeps
+        // its place among the replayed messages.
+        if (isCompactSummaryMessage(message) && message.uuid) {
+          void replayCompactSummary(message, async (n) => this.emit([n]), {
+            sessionId: this.sessionId,
+          });
+          continue;
+        }
         const inner = message.message as { id?: string; content?: unknown };
         if (message.type === "assistant" && Array.isArray(inner.content)) {
           this.content(inner.content as AssistantContent, "assistant", null, {
@@ -228,6 +283,7 @@ export class SessionOutput {
           cwd: this.cwd,
           emittedToolCalls: this.emittedToolCalls,
           toolCallFields: this.toolCallFields,
+          taskState: this.taskState,
           parentToolUseId,
           // A replayed tool use runs no hook that could report its result.
           registerHooks: !options.replay,
@@ -253,10 +309,16 @@ export class SessionOutput {
   /** The tool calls that the client holds without a final status. */
   private readonly unfinished = new Set<string>();
 
+  /** Called with each live agent text chunk, for the session's title. */
+  onAgentText: ((content: ContentBlock) => void) | undefined;
+
   private emit(notifications: AcpSessionNotification[]): void {
     for (const { update } of notifications) {
-      if (update.sessionUpdate === "agent_message_chunk") this.agentText = true;
       const replaying = this.replayCleared !== undefined;
+      if (update.sessionUpdate === "agent_message_chunk") {
+        this.agentText = true;
+        if (!replaying) this.onAgentText?.(update.content);
+      }
       for (const v2Update of this.translator.updates(this.sessionId, update, replaying)) {
         const clear = this.replayCleared && replayClear(this.replayCleared, v2Update);
         if (clear) this.send(clear);

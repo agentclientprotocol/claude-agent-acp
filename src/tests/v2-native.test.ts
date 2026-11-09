@@ -15,6 +15,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import {
+  getSessionInfo,
   getSessionMessages,
   type Options,
   type SDKUserMessage,
@@ -118,6 +119,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
       });
     },
     getSessionMessages: vi.fn(async () => []),
+    getSessionInfo: vi.fn(async () => undefined),
   };
 });
 
@@ -274,6 +276,8 @@ function result(overrides: Record<string, unknown> = {}) {
       cache_read_input_tokens: 1,
       cache_creation_input_tokens: 0,
     },
+    total_cost_usd: 0,
+    modelUsage: {},
     uuid: randomUUID(),
     ...overrides,
   };
@@ -413,7 +417,13 @@ describe("native ACP v2 core", () => {
     const kinds = client.sessionUpdates
       .map((update) => update.sessionUpdate)
       .filter((kind) => kind !== "available_commands_update");
-    expect(kinds).toEqual(["user_message", "state_update", "agent_message_chunk", "state_update"]);
+    expect(kinds).toEqual([
+      "user_message",
+      "state_update",
+      "agent_message_chunk",
+      "usage_update",
+      "state_update",
+    ]);
     expect(client.sessionUpdates.at(-1)).toEqual({
       sessionUpdate: "state_update",
       state: "idle",
@@ -426,6 +436,20 @@ describe("native ACP v2 core", () => {
         cachedReadTokens: 1,
         cachedWriteTokens: 0,
         totalTokens: 6,
+      },
+      // The same usage in the bridge's `_meta.quota` shape.
+      _meta: {
+        quota: {
+          token_count: {
+            totalTokens: 6,
+            inputTokens: 3,
+            cachedInputTokens: 1,
+            cachedWriteTokens: 0,
+            outputTokens: 2,
+            reasoningOutputTokens: 0,
+          },
+          model_usage: [],
+        },
       },
     });
   });
@@ -588,6 +612,74 @@ describe("native ACP v2 core", () => {
         content: { type: "text", text: "Context: 12k tokens" },
       }),
     );
+  });
+
+  it("sends the title that Claude Code stored, once its session state is idle", async () => {
+    const client = nativeClient();
+    await client.connect(async (agent) => {
+      const { response, claude } = await openSession(agent);
+      vi.mocked(getSessionInfo).mockResolvedValueOnce({
+        sessionId: response.sessionId,
+        summary: "Hi",
+        customTitle: "Greet the user",
+        lastModified: Date.UTC(2026, 9, 2),
+      });
+      const answer = agent.request(v2.methods.agent.session.prompt, {
+        sessionId: response.sessionId,
+        prompt: PROMPT,
+      });
+      const prompt = await claude.prompt(0);
+      claude.send(lifecycle(prompt, "started"));
+      await answer;
+      claude.send(result());
+      claude.send(sessionState("idle"));
+      await vi.waitFor(() =>
+        expect(client.sessionUpdates.at(-1)).toEqual({
+          sessionUpdate: "session_info_update",
+          title: "Greet the user",
+          updatedAt: "2026-10-02T00:00:00.000Z",
+        }),
+      );
+    });
+  });
+
+  it("reports a client MCP server that failed to start as a notice, once", async () => {
+    const client = nativeClient();
+    await client.connect(async (agent) => {
+      await agent.request(v2.methods.agent.initialize, {
+        protocolVersion: v2.PROTOCOL_VERSION,
+        info: { name: "native-test-client", version: "1.0.0" },
+        capabilities: {},
+      });
+      await agent.request(v2.methods.agent.session.new, {
+        cwd,
+        mcpServers: [{ type: "stdio", name: "files", command: "/usr/local/bin/mcp-files" }],
+      });
+      const claude = sdk.processes.at(-1)!;
+      // Each turn's init lists the servers; one that is not the client's is not reported.
+      for (let turn = 0; turn < 2; turn++) {
+        claude.send({
+          ...turnInit(),
+          mcp_servers: [
+            { name: "files", status: "failed" },
+            { name: "plugin", status: "failed" },
+          ],
+        });
+        claude.send(result());
+      }
+      await vi.waitFor(() =>
+        expect(client.states()).toEqual(["running", "idle", "running", "idle"]),
+      );
+    });
+
+    expect(client.sessionUpdates.filter((update) => update.sessionUpdate === "notice")).toEqual([
+      {
+        sessionUpdate: "notice",
+        severity: "warning",
+        title: 'MCP server "files" failed to start',
+        description: "Its tools are unavailable in this session. Run /mcp for the error.",
+      },
+    ]);
   });
 
   it("fails the pending prompts and ends the work when Claude Code exits", async () => {
@@ -821,6 +913,62 @@ describe("native ACP v2 core", () => {
         content: { type: "text", text: "Done" },
       },
       { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn", background: [] },
+    ]);
+  });
+
+  it("replays a compaction's summary message as the completed compaction, at its place", async () => {
+    const entry = (uuid: string, message: unknown, fields: Record<string, unknown> = {}) => ({
+      type: "user",
+      uuid,
+      session_id: "s",
+      parent_tool_use_id: null,
+      parent_agent_id: null,
+      message,
+      ...fields,
+    });
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      entry("u1", { role: "user", content: "Count" }),
+      // Claude Code's framing of the summary that it keeps.
+      entry(
+        "summary",
+        {
+          role: "user",
+          content:
+            "This session is being continued from a previous conversation that ran out of context.\n\n" +
+            "Summary:\nCount upward.\n\n" +
+            "Continue the conversation from where it left off without asking the user any further questions.",
+        },
+        { isCompactSummary: true },
+      ),
+      entry("u2", { role: "user", content: "Go on" }),
+    ] as never);
+    const client = nativeClient();
+    await client.connect(async (agent) => {
+      await agent.request(v2.methods.agent.initialize, {
+        protocolVersion: v2.PROTOCOL_VERSION,
+        info: { name: "native-test-client", version: "1.0.0" },
+        capabilities: {},
+      });
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId: randomUUID(),
+        cwd,
+        replayFrom: { type: "start" },
+      });
+    });
+
+    expect(
+      client.sessionUpdates
+        .filter((update) => !update.sessionUpdate.endsWith("_chunk"))
+        .slice(0, 3),
+    ).toEqual([
+      { sessionUpdate: "user_message", messageId: "u1", content: [] },
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "summary",
+        status: "completed",
+        summary: [{ type: "text", text: "Count upward." }],
+      },
+      { sessionUpdate: "user_message", messageId: "u2", content: [] },
     ]);
   });
 

@@ -65,7 +65,6 @@ import {
   listSessions,
   McpServerStatus,
   ModelInfo,
-  ModelUsage,
   OnElicitation,
   OnUserDialog,
   Options,
@@ -269,18 +268,18 @@ import {
   ContextCompactionLifecycle,
   clientSupportsCompactionUpdates,
   contextCompactionMetadataFromBoundary,
-  isCompactSummaryMessage,
+  replayCompactSummary,
 } from "./context-compaction.js";
 import { IdleCompaction } from "./idle-compaction.js";
 import {
   clientSupportsNotices,
   collapseHookSpeaker,
+  informationalNotice,
   MAX_NOTICE_TITLE_LENGTH,
+  mcpServerStartupNotice,
   normalizeNoticeText,
   noticeOrTranscriptUpdate,
   sentenceCase,
-  type SessionNotice,
-  splitNoticeText,
 } from "./session-notices.js";
 import {
   applyTaskCreate,
@@ -302,6 +301,23 @@ import {
   TaskState,
   unregisterHookCallback,
 } from "./tools.js";
+import {
+  addModelUsage,
+  DEFAULT_CONTEXT_WINDOW,
+  getMatchingModelUsage,
+  inferContextWindowFromModel,
+  modelUsageIncrement,
+  normalizeModelUsage,
+  quotaMeta,
+  resumedFirstResultModelUsage,
+  snapshotFromUsage,
+  tallyTotal,
+  totalTokens,
+  ZERO_USAGE,
+  type AccumulatedUsage,
+  type ModelTokenTally,
+  type UsageSnapshot,
+} from "./session-usage.js";
 import { previewPatchContent } from "./diff.js";
 import {
   backgroundedBashToolCall,
@@ -430,33 +446,6 @@ export interface Logger {
   /** Optional: a caller that supplies no `warn` gets its warnings on `error`. */
   warn?: (...args: any[]) => void;
 }
-
-type AccumulatedUsage = {
-  inputTokens: number;
-  outputTokens: number;
-  cachedReadTokens: number;
-  cachedWriteTokens: number;
-};
-
-/** Per-model token tallies keyed by the model id the SDK reported them under
- *  (its resolved spelling, e.g. "claude-opus-5[1m]"). */
-type ModelTokenTally = Record<string, AccumulatedUsage>;
-
-type UsageSnapshot = {
-  input_tokens: number;
-  output_tokens: number;
-  cache_read_input_tokens: number;
-  cache_creation_input_tokens: number;
-};
-
-const ZERO_USAGE = Object.freeze({
-  input_tokens: 0,
-  output_tokens: 0,
-  cache_read_input_tokens: 0,
-  cache_creation_input_tokens: 0,
-});
-
-const DEFAULT_CONTEXT_WINDOW = 200000;
 
 /** Floor after `session/cancel` before the adapter forces the active prompt
  *  loop to return "cancelled". `query.interrupt()` normally makes the SDK
@@ -3770,22 +3759,8 @@ export class ClaudeAcpAgent {
       if (!clientServers.has(server.name) || session.reportedMcpServers?.has(server.name)) {
         continue;
       }
-      let notice: SessionNotice;
-      if (server.status === "failed") {
-        notice = {
-          severity: "warning",
-          title: `MCP server "${server.name}" failed to start`,
-          description: "Its tools are unavailable in this session. Run /mcp for the error.",
-        };
-      } else if (server.status === "needs-auth" && !oauthAvailable) {
-        notice = {
-          severity: "info",
-          title: `MCP server "${server.name}" needs authentication`,
-          description: "Its tools are unavailable until the server is authenticated.",
-        };
-      } else {
-        continue;
-      }
+      const notice = mcpServerStartupNotice(server, oauthAvailable);
+      if (!notice) continue;
       (session.reportedMcpServers ??= new Set()).add(server.name);
       await sendUpdate({
         sessionId,
@@ -6210,7 +6185,6 @@ export class ClaudeAcpAgent {
                     noticedToolUses.add(message.tool_use_id);
                   }
                 }
-                const severity = message.level === "warning" ? "warning" : "info";
                 const transcriptContent = collapseHookSpeaker(message.content);
                 const transcriptText =
                   message.level === "info"
@@ -6219,15 +6193,7 @@ export class ClaudeAcpAgent {
                 await sendUpdate({
                   sessionId: params.sessionId,
                   update: noticeOrTranscriptUpdate(
-                    {
-                      severity,
-                      ...splitNoticeText(
-                        message.content,
-                        severity === "warning"
-                          ? "Claude reported a warning"
-                          : "Claude reported a notice",
-                      ),
-                    },
+                    informationalNotice(message),
                     supportsNotices,
                     transcriptText,
                     { claudeCode: { kind: "informational", level: message.level } },
@@ -9538,33 +9504,17 @@ export class ClaudeAcpAgent {
       // Claude persists the retained summary as a user message framed with
       // continuation instructions for the model. Clients on the compaction
       // contract get it materialized as the completed compaction entity at
-      // this transcript position (the boundary's own system record comes back
-      // from getSessionMessages without its metadata, so the summary message
-      // is the one durable marker); other clients keep the transcript text.
-      // The entity is keyed by the summary message's uuid, which differs from
-      // the live id (the `compacting` status uuid) — replay is terminal-first
-      // by the RFD, and no client merges a replay into a live entity store.
-      // A subagent's own compaction summary is not the root session's. A summary
-      // whose framing is unrecognized is still this compaction, without summary
-      // text: isCompactSummary says what it is, and the framing is Claude Code's
-      // to change.
+      // this transcript position; other clients keep the transcript text.
+      // A subagent's own compaction summary is not the root session's.
       if (
         replayCompactionUpdates &&
-        isCompactSummaryMessage(message) &&
         parentToolUseId === null &&
-        typeof message.uuid === "string" &&
-        message.uuid.length > 0
-      ) {
-        const replayCompaction = new ContextCompactionLifecycle(
+        (await replayCompactSummary(
+          message,
           (notification) => this.client.sessionUpdate(notification),
-          {
-            sessionId,
-            presentation: "compaction_update",
-            airClient: this.toolCallCapabilities.air.client,
-          },
-        );
-        replayCompaction.recordSummary(assistantMessageText(message.message));
-        await replayCompaction.finish(message.uuid, "completed");
+          { sessionId, airClient: this.toolCallCapabilities.air.client },
+        ))
+      ) {
         return;
       }
 
@@ -12617,20 +12567,6 @@ function turnQuotaMeta(session: Session) {
   return quotaMeta(session.accumulatedUsage, session.accumulatedModelUsage);
 }
 
-/** `_meta.quota` for work that spent `usage` in its main agent loop and
- *  `modelUsage` by model (see {@link turnQuotaMeta}). */
-function quotaMeta(usage: AccumulatedUsage, modelUsage: ModelTokenTally | undefined) {
-  return {
-    quota: {
-      token_count: quotaTokenCount(usage),
-      model_usage: Object.entries(modelUsage ?? {}).map(([model, usage]) => ({
-        model,
-        token_count: quotaTokenCount(usage),
-      })),
-    },
-  };
-}
-
 /** Whether a request that awaits the user for the subagent `agentID` (absent
  *  for the main conversation) blocks the session's foreground work. The main
  *  conversation's requests do. So do those of a subagent that runs in the
@@ -12705,137 +12641,6 @@ function autonomousCycleEnd(
   );
 }
 
-/** One `token_count` object. `cachedInputTokens` is cache reads, matching
- *  codex's field; Claude also reports cache writes, which codex has no slot
- *  for, so those ride along in an extra sibling (the same name the ACP `usage`
- *  field already uses) and are counted in `totalTokens`. `reasoningOutputTokens`
- *  is always 0: Claude bills thinking inside its output tokens and never breaks
- *  it out — the key is kept so the shape stays uniform across agents. */
-function quotaTokenCount(usage: AccumulatedUsage) {
-  return {
-    totalTokens: tallyTotal(usage),
-    inputTokens: usage.inputTokens,
-    cachedInputTokens: usage.cachedReadTokens,
-    cachedWriteTokens: usage.cachedWriteTokens,
-    outputTokens: usage.outputTokens,
-    reasoningOutputTokens: 0,
-  };
-}
-
-/** Sum a tally's four counters. Per the Anthropic API `inputTokens` excludes
- *  the cache counters, so this is not double-counting (see `totalTokens`). */
-function tallyTotal(usage: AccumulatedUsage): number {
-  return usage.inputTokens + usage.outputTokens + usage.cachedReadTokens + usage.cachedWriteTokens;
-}
-
-/** Project `result.modelUsage` into our tally shape. Counters are coerced the
- *  way `snapshotFromUsage` coerces the stream's: third-party backends have been
- *  observed omitting fields, and a missing or NaN counter must not reach the
- *  wire as NaN (which `JSON.stringify` writes as `null`). */
-function normalizeModelUsage(modelUsage: Record<string, ModelUsage> | undefined): ModelTokenTally {
-  const tally: ModelTokenTally = {};
-  for (const [model, usage] of Object.entries(modelUsage ?? {})) {
-    tally[model] = {
-      inputTokens: finiteCount(usage?.inputTokens),
-      outputTokens: finiteCount(usage?.outputTokens),
-      cachedReadTokens: finiteCount(usage?.cacheReadInputTokens),
-      cachedWriteTokens: finiteCount(usage?.cacheCreationInputTokens),
-    };
-  }
-  return tally;
-}
-
-function finiteCount(value: number | null | undefined): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
-}
-
-/** `current - previous` per model, dropping models with nothing to report so a
- *  turn only lists the models it actually ran on. A reading that fell BELOW the
- *  previous one means the running total restarted under us (a mid-session
- *  /clear, a zeroed crash result): there is no usable reference left to
- *  subtract, so the reading itself is the increment. */
-function modelUsageIncrement(current: ModelTokenTally, previous: ModelTokenTally): ModelTokenTally {
-  const increment: ModelTokenTally = {};
-  for (const [model, usage] of Object.entries(current)) {
-    const base = previous[model];
-    const subtracted: AccumulatedUsage = base
-      ? {
-          inputTokens: usage.inputTokens - base.inputTokens,
-          outputTokens: usage.outputTokens - base.outputTokens,
-          cachedReadTokens: usage.cachedReadTokens - base.cachedReadTokens,
-          cachedWriteTokens: usage.cachedWriteTokens - base.cachedWriteTokens,
-        }
-      : usage;
-    const rewound = Object.values(subtracted).some((count) => count < 0);
-    const resolved = rewound ? usage : subtracted;
-    if (tallyTotal(resolved) > 0) {
-      increment[model] = resolved;
-    }
-  }
-  return increment;
-}
-
-/** The per-model rows for the first result of a resumed session. Its
- *  `modelUsage` reading continues from the totals the transcript saved (SDK
- *  0.3.277+; older transcripts may hold none), so there is no earlier reading
- *  to subtract from, and taking the reading itself would charge the whole
- *  pre-resume history to this one turn. The result's own `usage` is per-turn
- *  (main agent loop only, like the response's `usage`), so it stands in under
- *  the turn's top-level model — `key` is that model's `modelUsage` spelling
- *  when the reading has one, else the assistant message's own. Any subagent
- *  spend on this one turn goes unlisted rather than over-listed. */
-function resumedFirstResultModelUsage(
-  usage: {
-    input_tokens?: number | null;
-    output_tokens?: number | null;
-    cache_read_input_tokens?: number | null;
-    cache_creation_input_tokens?: number | null;
-  },
-  key: string | null,
-): ModelTokenTally {
-  if (key === null) {
-    return {};
-  }
-  const row: AccumulatedUsage = {
-    inputTokens: finiteCount(usage.input_tokens),
-    outputTokens: finiteCount(usage.output_tokens),
-    cachedReadTokens: finiteCount(usage.cache_read_input_tokens),
-    cachedWriteTokens: finiteCount(usage.cache_creation_input_tokens),
-  };
-  return tallyTotal(row) > 0 ? { [key]: row } : {};
-}
-
-/** Fold `increment` into `base` per model — the per-model counterpart of the
- *  `+=` the turn's flat accumulator uses. */
-function addModelUsage(base: ModelTokenTally, increment: ModelTokenTally): ModelTokenTally {
-  const merged: ModelTokenTally = { ...base };
-  for (const [model, usage] of Object.entries(increment)) {
-    const existing = merged[model];
-    merged[model] = existing
-      ? {
-          inputTokens: existing.inputTokens + usage.inputTokens,
-          outputTokens: existing.outputTokens + usage.outputTokens,
-          cachedReadTokens: existing.cachedReadTokens + usage.cachedReadTokens,
-          cachedWriteTokens: existing.cachedWriteTokens + usage.cachedWriteTokens,
-        }
-      : usage;
-  }
-  return merged;
-}
-
-/** Sum all four fields as a proxy for post-turn context occupancy: the current
- *  turn's output becomes next turn's input. Per the Anthropic API, input_tokens
- *  excludes cache tokens — cache_read and cache_creation are reported
- *  separately — so summing all four is not double-counting. */
-function totalTokens(usage: UsageSnapshot): number {
-  return (
-    usage.input_tokens +
-    usage.output_tokens +
-    usage.cache_read_input_tokens +
-    usage.cache_creation_input_tokens
-  );
-}
-
 /** Error kinds this adapter invents itself, alongside the SDK's categorical
  *  `SDKAssistantMessageError` kinds: `no_result` marks a turn the SDK declared
  *  over without ever emitting its result (issue #825). */
@@ -12855,28 +12660,6 @@ function errorKindData(
   errorKind: AgentErrorKind | undefined,
 ): { errorKind: AgentErrorKind } | undefined {
   return errorKind ? { errorKind } : undefined;
-}
-
-/** Project a nullable API usage object into our non-null snapshot shape.
- *  Both SDK message_start and assistant message `usage` have `number | null`
- *  cache fields; we coerce absent values to 0 so `totalTokens` never hits
- *  NaN. `input_tokens`/`output_tokens` are typed `number` by the SDK but
- *  synthetic or third-party-backend stream events have been observed emitting
- *  them as null/undefined — coerce those too so a malformed upstream event
- *  can't leak NaN into the wire `used` field. Delta events have different
- *  semantics (cumulative + prev fallback) and are handled inline. */
-function snapshotFromUsage(usage: {
-  input_tokens?: number | null;
-  output_tokens?: number | null;
-  cache_read_input_tokens?: number | null;
-  cache_creation_input_tokens?: number | null;
-}): UsageSnapshot {
-  return {
-    input_tokens: usage.input_tokens ?? 0,
-    output_tokens: usage.output_tokens ?? 0,
-    cache_read_input_tokens: usage.cache_read_input_tokens ?? 0,
-    cache_creation_input_tokens: usage.cache_creation_input_tokens ?? 0,
-  };
 }
 
 // `supportedAgents()` always returns Claude Code's built-in subagents — the
@@ -14264,34 +14047,6 @@ export function runAcp(logger?: Logger) {
   return { connection, agent };
 }
 
-function commonPrefixLength(a: string, b: string) {
-  let i = 0;
-  while (i < a.length && i < b.length && a[i] === b[i]) {
-    i++;
-  }
-  return i;
-}
-
-/** Best-effort first guess of a model's context window, used to seed the
- *  window synchronously (via `immediateContextWindow`) until a `result` message
- *  arrives with the authoritative `modelUsage` value.
- *
- *  Anthropic 1M-context variants encode "1m" as a distinct token in the SDK
- *  model ID (e.g., "claude-opus-4-6-1m"), which `\b1m\b` catches without also
- *  matching things like "10m" or embedded substrings. Semantic aliases like
- *  `default` carry no such token in the ID, but their `resolvedModel` and the
- *  SDK's human-facing `displayName`/`description` can (e.g.
- *  "claude-opus-4-8[1m]", "Opus 4.7 (1M context)"), so callers pass those too.
- *  This text scan can't catch every model — some resolve to extended-context
- *  models with no "1m" anywhere (e.g. `sonnet` → claude-sonnet-5, natively
- *  ~1M). Such a miss falls back to the default window, is refined by the
- *  background `getContextUsage` (`refreshContextWindowInBackground`), and is
- *  corrected by `result.modelUsage` (and cached) within one turn. */
-function inferContextWindowFromModel(...texts: Array<string | undefined>): number | null {
-  if (texts.some((text) => text != null && /\b1m\b/i.test(text))) return 1_000_000;
-  return null;
-}
-
 /** Cross-session cache of authoritative context windows, keyed by
  *  `${providerCacheKey}\0${modelId}` (see {@link contextWindowCacheKey}).
  *  The window is a property of (model id, backend): the same resolved model id
@@ -14448,29 +14203,6 @@ function parseModelConfig(
   if (parsed.modelOverrides !== undefined) result.modelOverrides = parsed.modelOverrides;
   if (parsed.availableModels !== undefined) result.availableModels = parsed.availableModels;
   return Object.keys(result).length > 0 ? result : undefined;
-}
-
-function getMatchingModelUsage(modelUsage: Record<string, ModelUsage>, currentModel: string) {
-  let bestKey: string | null = null;
-  let bestLen = 0;
-
-  for (const key of Object.keys(modelUsage)) {
-    const len = commonPrefixLength(key, currentModel);
-    if (len > bestLen) {
-      bestLen = len;
-      bestKey = key;
-    }
-  }
-
-  if (bestKey) {
-    // `bestKey` is the SDK's resolved model id (e.g. "claude-sonnet-5[1m]"),
-    // the same spelling as ModelInfo.resolvedModel — the primary key the
-    // window is cached under. `currentModel` (the assistant message's
-    // `.model`) can be the bare form (e.g. "claude-sonnet-5"); the result
-    // handler caches under that spelling too, for seed-time reads that fall
-    // back to a bare id (rows without `resolvedModel`).
-    return { key: bestKey, usage: modelUsage[bestKey] };
-  }
 }
 
 /**

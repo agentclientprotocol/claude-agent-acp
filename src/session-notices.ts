@@ -118,3 +118,40 @@ export function splitNoticeText(
   }
   return rest ? { title: firstLine, description: rest } : { title: firstLine };
 }
+
+/** The notice of Claude Code's `informational` message (e.g. why a Stop hook
+ *  blocked continuation): a warning at level `warning`, else info. */
+export function informationalNotice(message: { level: string; content: string }): SessionNotice {
+  const severity = message.level === "warning" ? "warning" : "info";
+  return {
+    severity,
+    ...splitNoticeText(
+      message.content,
+      severity === "warning" ? "Claude reported a warning" : "Claude reported a notice",
+    ),
+  };
+}
+
+/** The notice of a client MCP server that the `system/init` lists as not
+ *  started: `failed`, or `needs-auth` when the client cannot run the OAuth
+ *  flow (`oauthAvailable`). Undefined for any other status. */
+export function mcpServerStartupNotice(
+  server: { name: string; status: string },
+  oauthAvailable: boolean,
+): SessionNotice | undefined {
+  if (server.status === "failed") {
+    return {
+      severity: "warning",
+      title: `MCP server "${server.name}" failed to start`,
+      description: "Its tools are unavailable in this session. Run /mcp for the error.",
+    };
+  }
+  if (server.status === "needs-auth" && !oauthAvailable) {
+    return {
+      severity: "info",
+      title: `MCP server "${server.name}" needs authentication`,
+      description: "Its tools are unavailable until the server is authenticated.",
+    };
+  }
+  return undefined;
+}
