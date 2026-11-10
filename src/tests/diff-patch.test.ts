@@ -15,8 +15,8 @@ import {
 } from "../diff.js";
 import { AcpToolCallRenderer } from "../tool-calls/renderer.js";
 import { buildClaudePermissionPresentation } from "../permissions/presentation.js";
-import { toolInfoFromToolUse } from "../tools.js";
 import { WriteReporter } from "../tool-calls/reporters/file-edit.js";
+import { toolInfoFromToolUse } from "./tool-render.js";
 
 const tempDirectories: string[] = [];
 

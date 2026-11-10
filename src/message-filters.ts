@@ -139,10 +139,6 @@ export function stripLocalCommandMetadata(content: unknown): unknown | null {
   return kept;
 }
 
-export function isLocalCommandMetadata(content: unknown): boolean {
-  return stripLocalCommandMetadata(content) === null;
-}
-
 /**
  * True for the synthetic assistant message the CLI injects into the transcript
  * when a turn fails authentication (e.g. "Not logged in · Please run /login",

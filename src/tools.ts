@@ -1,9 +1,4 @@
-import type {
-  PlanEntry,
-  ToolCallContent,
-  ToolCallLocation,
-  ToolKind,
-} from "@agentclientprotocol/sdk/unstable";
+import type { PlanEntry } from "@agentclientprotocol/sdk/unstable";
 import { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import type {
   TaskCreateInput,
@@ -12,55 +7,8 @@ import type {
   TaskUpdateInput,
   TaskUpdateOutput,
 } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
-import { ClientCapabilities } from "./tool-calls/client-capabilities.js";
-import type { ToolResultBlock } from "./tool-calls/content.js";
-import { AcpToolCallRenderer, type RenderedResult } from "./tool-calls/renderer.js";
 
 export { markdownEscape, toDisplayPath } from "./tool-calls/content.js";
-
-/**
- * The title, kind, content, and locations of a tool use, for a client with the
- * given terminal and patch capabilities. The {@link AcpToolCallRenderer} builds
- * them from the facts of the tool reporter.
- */
-export function toolInfoFromToolUse(
-  toolUse: any,
-  supportsTerminalOutput: boolean = false,
-  cwd?: string,
-  supportsDiffPatch: boolean = false,
-): {
-  title: string;
-  kind: ToolKind;
-  content: ToolCallContent[];
-  locations?: ToolCallLocation[];
-} {
-  const renderer = new AcpToolCallRenderer(
-    new ClientCapabilities(supportsTerminalOutput, false, supportsDiffPatch),
-  );
-  return renderer.toolInfo({ id: toolUse?.id, name: toolUse?.name, input: toolUse?.input }, cwd);
-}
-
-/**
- * The result fields of a tool result, for a client with the given terminal
- * capabilities. The {@link AcpToolCallRenderer} builds them from the facts of
- * the tool reporter.
- */
-export function toolUpdateFromToolResult(
-  toolResult: ToolResultBlock,
-  toolUse: any | undefined,
-  supportsTerminalOutput: boolean = false,
-  toolUseResult?: unknown,
-  preferTerminalOutputDelta: boolean = false,
-): RenderedResult {
-  const renderer = new AcpToolCallRenderer(
-    new ClientCapabilities(supportsTerminalOutput, preferTerminalOutputDelta),
-  );
-  return renderer.resultFields(
-    { id: toolUse?.id, name: toolUse?.name ?? "", input: toolUse?.input },
-    toolResult as Parameters<AcpToolCallRenderer["resultFields"]>[1],
-    toolUseResult,
-  );
-}
 
 export type ClaudePlanEntry = {
   content: string;
