@@ -58,11 +58,14 @@ opening a PR.
 - If a result is meant to match another request's output, reuse that request's
   logic.
 - The adapter serves ACP v1 and v2. A change that is not meant for one protocol
-  version only must work correctly in both. `src/v2/` converts v2 requests to v1
-  and reuses the v1 logic; keep v2-only differences in the conversion.
-- A session runs one turn at a time. "Claude is working" means `startTurn`'s
-  check (an unsettled turn in `turnQueue`, or `foregroundWork` for the session);
-  don't write a narrower one. Anything that sends `session/update` must go
+  version only must work correctly in both. `ClaudeAcpAgent` serves v1, and
+  `src/v2/` serves v2; they share modules (the SDK mapping, tool call
+  rendering, permissions, config options). Put a change meant for both versions
+  in the shared module, or make it in both cores.
+- A session runs one turn at a time. On v1, "Claude is working" means
+  `startTurn`'s check (an unsettled turn in `turnQueue`, or `foregroundWork` for
+  the session); on v2, an open turn of the v2 session. Don't write a
+  narrower one. Anything that sends `session/update` must go
   through the turn queue or be refused while the session is busy, or its output
   lands inside another turn. Keep the session marked busy across awaited network
   calls.

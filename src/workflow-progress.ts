@@ -9,6 +9,9 @@
  * some progress reports and none on others. Entries that don't match it are
  * skipped, so a change in the CLI drops the list instead of the card.
  */
+import type { ToolCallContent } from "@agentclientprotocol/sdk/unstable";
+import type { TaskProgressFields } from "./async-tasks.js";
+import { textContent } from "./tool-calls/content.js";
 
 export type WorkflowPhase = { index: number; title: string };
 
@@ -26,6 +29,44 @@ export type WorkflowAgent = {
 };
 
 export type WorkflowSnapshot = { phases: WorkflowPhase[]; agents: WorkflowAgent[] };
+
+/** What a workflow card shows: the task's progress fields and its latest phase and agent list. */
+export type WorkflowCardProgress = TaskProgressFields & { workflow?: WorkflowSnapshot };
+
+/**
+ * The latest workflow activity, as the title and the one replaceable body of
+ * the workflow's tool call. Undefined when no progress came. For example, the
+ * title `Workflow: Probe: probe` and the body:
+ *
+ * ```
+ * Run a probe
+ *
+ * Last activity: probe
+ *
+ * 4,003 tokens · 2 tool calls · 1s
+ * ```
+ */
+export function workflowCard(
+  progress: WorkflowCardProgress | undefined,
+): { title: string; content: ToolCallContent[] } | undefined {
+  if (!progress || Object.keys(progress).length === 0) return undefined;
+  const activity = progress.description ?? progress.summary;
+  const usage = progress.usage;
+  const text = [
+    progress.summary ?? progress.description,
+    progress.lastToolName ? `Last activity: ${progress.lastToolName}` : undefined,
+    usage
+      ? `${usage.totalTokens.toLocaleString("en-US")} tokens · ${usage.toolUses.toLocaleString("en-US")} tool calls · ${Math.floor(usage.durationMs / 1000)}s`
+      : undefined,
+    progress.workflow ? workflowSnapshotText(progress.workflow) : undefined,
+  ]
+    .filter((part) => part !== undefined)
+    .join("\n\n");
+  return {
+    title: activity ? `Workflow: ${activity}` : "Workflow",
+    content: [textContent(text)],
+  };
+}
 
 /** Reads a `workflow_progress` value. Undefined when it holds no phase or agent. */
 export function workflowSnapshot(value: unknown): WorkflowSnapshot | undefined {

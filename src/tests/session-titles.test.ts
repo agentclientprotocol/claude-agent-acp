@@ -115,6 +115,12 @@ describe("session titles", () => {
     return new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
   }
 
+  /** Sends the current title of `test-session` (see `SessionTitles.publishCurrent`). */
+  async function publishCurrentSessionInfo(agent: ClaudeAcpAgent) {
+    const session = agent.sessions["test-session"]!;
+    await session.titles.publishCurrent(session);
+  }
+
   const LONG_PROMPT = "Explain what the add function in hello.py does, in one sentence";
 
   it("pushes a session_info_update when the SDK generates a title at turn-end", async () => {
@@ -198,8 +204,8 @@ describe("session titles", () => {
       agent,
     );
 
-    await agent.publishCurrentSessionInfo("test-session");
-    await agent.publishCurrentSessionInfo("test-session");
+    await publishCurrentSessionInfo(agent);
+    await publishCurrentSessionInfo(agent);
 
     const current = {
       sessionUpdate: "session_info_update",
@@ -221,11 +227,11 @@ describe("session titles", () => {
 
     // No file and no title yet: nothing to send.
     vi.mocked(getSessionInfo).mockResolvedValue(undefined);
-    await agent.publishCurrentSessionInfo("test-session");
+    await publishCurrentSessionInfo(agent);
     expect(titles()).toEqual([]);
 
     await agent.sessions["test-session"]!.titles.setExplicitTitle("Renamed", async () => undefined);
-    await agent.publishCurrentSessionInfo("test-session");
+    await publishCurrentSessionInfo(agent);
     expect(titles()).toEqual(["Renamed", "Renamed"]);
   });
 
@@ -245,7 +251,7 @@ describe("session titles", () => {
       summary: "please fix the build",
       lastModified: 1_700_000_000_000,
     } as any);
-    await agent.publishCurrentSessionInfo("test-session");
+    await publishCurrentSessionInfo(agent);
 
     expect(titles()).toEqual(["Renamed", "Renamed"]);
   });

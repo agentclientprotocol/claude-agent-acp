@@ -74,9 +74,71 @@ describe("resolveModelPreference - resolvedModel matching", () => {
     expect(resolveModelPreference(LIVE_SHAPED_MODELS, "claude-opus-4-8")?.value).toBe("opus[1m]");
   });
 
-  it("returns null for a preference that matches nothing", () => {
-    expect(resolveModelPreference(LIVE_SHAPED_MODELS, "claude-gpt-99")).toBeNull();
+  // Words match whole: "a" is inside "Default", "son" inside "sonnet".
+  it.each(["claude-gpt-99", "not-a-model", "a", "son", "foo-sonnet", "not-default-model"])(
+    "returns null for %s, which names no model",
+    (preference) => {
+      expect(resolveModelPreference(LIVE_SHAPED_MODELS, preference)).toBeNull();
+    },
+  );
+
+  it.each([
+    ["us.anthropic.claude-sonnet-5-v1:0", "sonnet"],
+    ["global.anthropic.claude-haiku-4-5-20251001-v1:0", "haiku"],
+    ["anthropic/claude-sonnet-5:batch", "sonnet"],
+    ["claude-opus-4-8@20260101", "opus[1m]"],
+    ["claude-sonnet-5-fast", "sonnet"],
+    ["claude-haiku-4-5", "haiku"],
+    ["opusplan", "opus[1m]"],
+    ["opus", "opus[1m]"],
+    ["Sonnet 5", "sonnet"],
+    // The CLI's `best` alias runs Opus and ignores a `[1m]` hint.
+    ["best", "opus[1m]"],
+    ["BEST", "opus[1m]"],
+    ["best[1m]", "opus[1m]"],
+  ])("resolves the spelling %s to %s", (preference, value) => {
+    expect(resolveModelPreference(LIVE_SHAPED_MODELS, preference)?.value).toBe(value);
   });
+
+  it("resolves best to the Opus entry rather than the default when the default runs Sonnet", () => {
+    const models: ModelInfo[] = [
+      {
+        value: "default",
+        resolvedModel: "claude-sonnet-5",
+        displayName: "Default (recommended)",
+        description: "Use the default model (currently Sonnet 5)",
+      },
+      { value: "opus", resolvedModel: "claude-opus-4-8", displayName: "Opus", description: "" },
+      { value: "sonnet", resolvedModel: "claude-sonnet-5", displayName: "Sonnet", description: "" },
+    ];
+    expect(resolveModelPreference(models, "best")?.value).toBe("opus");
+  });
+
+  // A gateway listing of dated ids, as `ANTHROPIC_MODEL`, `settings.model` or
+  // `set_config_option` may spell them.
+  const DATED_MODELS: ModelInfo[] = [
+    { value: "claude-3-7-sonnet-20250219", displayName: "Claude 3.7 Sonnet", description: "" },
+    { value: "claude-3-5-haiku-20241022", displayName: "Claude 3.5 Haiku", description: "" },
+    { value: "claude-sonnet-4-5-20250929", displayName: "Claude Sonnet 4.5", description: "" },
+  ];
+
+  it.each([
+    ["claude-3-7-sonnet-latest", "claude-3-7-sonnet-20250219"],
+    ["claude-3-5-haiku-latest", "claude-3-5-haiku-20241022"],
+    ["openrouter/anthropic/claude-sonnet-4.5", "claude-sonnet-4-5-20250929"],
+    ["vertex_ai/claude-sonnet-4-5@20250929", "claude-sonnet-4-5-20250929"],
+    ["litellm/claude-sonnet-4-5", "claude-sonnet-4-5-20250929"],
+    ["publishers/anthropic/models/claude-sonnet-4-5", "claude-sonnet-4-5-20250929"],
+  ])("resolves the gateway spelling %s to %s", (preference, value) => {
+    expect(resolveModelPreference(DATED_MODELS, preference)?.value).toBe(value);
+  });
+
+  it.each(["openai/gpt-5", "openrouter/foo-sonnet", "claude-3-5-opus-latest"])(
+    "returns null for the gateway spelling %s, which names no listed model",
+    (preference) => {
+      expect(resolveModelPreference(DATED_MODELS, preference)).toBeNull();
+    },
+  );
 
   it("matches a '-1m' id-suffix preference against a '[1m]'-spelled resolvedModel", () => {
     // Without hint canonicalization the exact tier misses and the substring

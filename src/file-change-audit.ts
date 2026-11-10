@@ -104,11 +104,12 @@ const FILE_EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
  * Adds to `turn.editedPaths` the `file_path` (`notebook_path` for NotebookEdit)
  * of each successful file-tool edit among the tool results of a subagent
  * message. Root-agent messages (`parentToolUseId === null`) are skipped: the
- * checkpoint already tracks their files. Must run before `toAcpNotifications`
- * drops the tool use cache entries.
+ * checkpoint already tracks their files. A turn that v1 marked `settled`
+ * records nothing. Must run before `toAcpNotifications` drops the tool use
+ * cache entries.
  */
 export function recordSubagentFileEdits(
-  turn: (NativeFileChangeReportTurn & { settled: boolean }) | null | undefined,
+  turn: (NativeFileChangeReportTurn & { settled?: boolean }) | null | undefined,
   parentToolUseId: string | null,
   content: unknown,
   toolUses: Record<string, { name: string; input: unknown } | undefined>,

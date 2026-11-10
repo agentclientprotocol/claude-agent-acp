@@ -121,13 +121,11 @@ export class SessionIndexConnection {
 
   constructor(private readonly host: SessionIndexHost) {}
 
-  /** Sets the index up for the client of `initialize`. ACP v2 does not route
-   *  the session index methods yet. */
-  negotiate(request: InitializeRequest, options: { v2: boolean }): void {
+  /** Sets the index up for the client of `initialize`. */
+  negotiate(request: InitializeRequest): void {
     this.service?.dispose();
     this.service = undefined;
     if (
-      !options.v2 &&
       this.host.isAirClient() &&
       clientSupportsAirCapability(request.clientCapabilities, AIR_SESSION_INDEX_CAPABILITY)
     ) {

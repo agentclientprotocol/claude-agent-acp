@@ -8,6 +8,7 @@
 import { vi } from "vitest";
 import { randomUUID } from "crypto";
 import { SessionBackgroundWork } from "../background-work.js";
+import { PromptSuggestions } from "../prompt-suggestions.js";
 import { SessionTitles } from "../session-titles.js";
 
 /** Stand-in agent for a `SessionTitles` whose test doesn't care about titles:
@@ -93,11 +94,15 @@ export function mockSessionState(
     toolUseCache: {},
     emittedToolCalls: new Set(),
     liveBackgroundTasks: new Map(),
-    background: new SessionBackgroundWork(sessionId, false),
+    background: new SessionBackgroundWork(sessionId),
     emittedAssistantText: false,
     owedTrailingIdles: 0,
     messageIdToUuid: new Map(),
     sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
+    // As `createSession` gives it to the session of an AIR client.
+    ...(agent?.toolCallCapabilities?.air?.client
+      ? { promptSuggestions: new PromptSuggestions() }
+      : {}),
     ...overrides,
   } as any;
 }

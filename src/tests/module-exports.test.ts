@@ -32,6 +32,7 @@ describe("module runtime exports", () => {
   it("acp-agent.ts exports the expected names", async () => {
     expect(Object.keys(await import("../acp-agent.js")).sort()).toEqual([
       "AGENT_CONFIG_ID",
+      "AUTONOMOUS_RESULT_ORIGINS",
       "BUILTIN_AGENT_NAMES",
       "ClaudeAcpAgent",
       "DEFAULT_AGENT_ID",
@@ -49,6 +50,8 @@ describe("module runtime exports", () => {
       "createFastModeConfigOption",
       "discoverCustomAgents",
       "fastModeStateEnabled",
+      "getAvailableSlashCommands",
+      "isAbortedResult",
       "isLocalCommandMetadata",
       "isLoginRequiredText",
       "isReplayHiddenMetaMessage",

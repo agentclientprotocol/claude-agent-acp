@@ -67,7 +67,6 @@ import {
   getSessionInfo,
   getSessionMessages,
   getSubagentMessages,
-  type HookCallback,
   importSessionToStore,
   listSessions,
   type ModelInfo,
@@ -5297,7 +5296,7 @@ describe("permission request cancellation", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
-      background: new SessionBackgroundWork(sessionId, false),
+      background: new SessionBackgroundWork(sessionId),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
@@ -5367,14 +5366,14 @@ describe("permission request cancellation", () => {
   });
 
   describe("a cancelled outcome", () => {
-    function setup(options: { v2?: boolean } = {}) {
+    function setup() {
       const mockClient = {
         sessionUpdate: async () => {},
         requestPermission: async (): Promise<RequestPermissionResponse> => ({
           outcome: { outcome: "cancelled" },
         }),
       } as unknown as AcpClient;
-      const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} }, options);
+      const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
       const session = injectSession(agent, "session-1");
       session.emittedToolCalls.add("tool-1");
       const ask = (agentID?: string) =>
@@ -5394,29 +5393,6 @@ describe("permission request cancellation", () => {
 
       await expect(ask()).rejects.toThrow("Tool use aborted");
       await expect(ask("agent-fg")).rejects.toThrow("Tool use aborted");
-    });
-
-    it("denies the tool use of foreground work on v2 without a session/cancel", async () => {
-      // On v2 the client also answers `cancelled` when the user dismissed the
-      // prompt or its policy declined it. The turn goes on without the tool.
-      const { session, ask } = setup({ v2: true });
-      session.liveBackgroundTasks.set("agent-fg", { isSubagent: true });
-
-      for (const agentID of [undefined, "agent-fg"]) {
-        await expect(ask(agentID)).resolves.toEqual({
-          behavior: "deny",
-          message: "User refused permission to run tool",
-          toolUseID: "tool-1",
-          decisionClassification: "user_reject",
-        });
-      }
-    });
-
-    it("aborts the tool use of foreground work on v2 during a session/cancel", async () => {
-      const { session, ask } = setup({ v2: true });
-      session.cancelled = true;
-
-      await expect(ask()).rejects.toThrow("Tool use aborted");
     });
 
     it("denies the tool use of a background subagent", async () => {
@@ -7609,76 +7585,6 @@ describe("subagent permission attribution (issue #851)", () => {
       yield { type: "system", subtype: "session_state_changed", state: "idle" };
     };
   }
-
-  it("releases a tool call that ends cancelled on v2, as one that ends failed", async () => {
-    const updates: AcpSessionNotification[] = [];
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async (update: AcpSessionNotification) => {
-          updates.push(update);
-        },
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-      { v2: true },
-    );
-    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
-    injectGeneratorSession(
-      agent,
-      makeGenerator([
-        {
-          type: "assistant",
-          uuid: randomUUID(),
-          session_id: "test-session",
-          parent_tool_use_id: null,
-          message: {
-            id: "msg-bash",
-            model: "claude-sonnet-4-5",
-            role: "assistant",
-            type: "message",
-            stop_reason: "tool_use",
-            content: [
-              { type: "tool_use", id: "toolu_bash", name: "Bash", input: { command: "make" } },
-            ],
-            usage: { input_tokens: 0, output_tokens: 0 },
-          },
-        },
-        {
-          type: "user",
-          uuid: randomUUID(),
-          session_id: "test-session",
-          parent_tool_use_id: null,
-          // The user interrupted the turn while the command ran.
-          tool_result_meta: [{ id: "toolu_bash", non_execution_kind: "interrupted" }],
-          message: {
-            role: "user",
-            content: [
-              {
-                type: "tool_result",
-                tool_use_id: "toolu_bash",
-                content: "[Request interrupted by user for tool use]",
-                is_error: true,
-              },
-            ],
-          },
-        },
-        successResult(),
-      ]),
-    );
-
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
-
-    expect(
-      updates
-        .map(({ update }) => update)
-        .filter(
-          (update) =>
-            update.sessionUpdate === "tool_call_update" && "status" in update && update.status,
-        )
-        .at(-1),
-    ).toMatchObject({ toolCallId: "toolu_bash", status: "cancelled" });
-    // The agent stops tracking the call once it ends, whichever way.
-    expect(agent.sessions["test-session"]?.dispatchedToolCalls?.has("toolu_bash")).toBe(false);
-  });
 
   it("records task_started's task_id → tool_use_id mapping while consuming the stream", async () => {
     const agent = new ClaudeAcpAgent(
@@ -15096,7 +15002,7 @@ describe("session/close", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
-      background: new SessionBackgroundWork(sessionId, false),
+      background: new SessionBackgroundWork(sessionId),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
@@ -15220,7 +15126,7 @@ describe("session/delete", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
-      background: new SessionBackgroundWork(sessionId, false),
+      background: new SessionBackgroundWork(sessionId),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
@@ -15385,7 +15291,7 @@ describe("getOrCreateSession param change detection", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
-      background: new SessionBackgroundWork(sessionId, false),
+      background: new SessionBackgroundWork(sessionId),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
@@ -19923,7 +19829,7 @@ describe("post-error recovery", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
-      background: new SessionBackgroundWork("test-session", false),
+      background: new SessionBackgroundWork("test-session"),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
@@ -21919,23 +21825,6 @@ describe("output after a cancel", () => {
       toolUseID: id,
     } as any);
   /** The v2 PreToolUse preview hook for the Write call `id`, as Claude Code calls it. */
-  const previewWrite = (agent: ClaudeAcpAgent, id: string) =>
-    (
-      agent as unknown as { fileChangePreviewHook(sessionId: string): HookCallback }
-    ).fileChangePreviewHook("test-session")(
-      {
-        hook_event_name: "PreToolUse",
-        tool_name: "Write",
-        tool_input: writeInput,
-        tool_use_id: id,
-        session_id: "test-session",
-        transcript_path: "",
-        cwd: "/workspace/proj",
-      } as any,
-      id,
-      { signal: new AbortController().signal },
-    );
-
   /** Sends the prompt `text` and waits until its turn is active. Returns the
    *  prompt and the session's consumer, which ends with the scripted stream. */
   async function promptActive(agent: ClaudeAcpAgent, text: string) {
@@ -22084,7 +21973,6 @@ describe("output after a cancel", () => {
     async (_when, order, streamed) => {
       const cancelled = Promise.withResolvers<void>();
       let asked: Promise<unknown> | undefined;
-      let previewed: Promise<unknown> | undefined;
       const { agent, texts, updates, permissionRequests } = setup((input) =>
         (async function* () {
           const iter = input[Symbol.asyncIterator]();
@@ -22097,14 +21985,12 @@ describe("output after a cancel", () => {
           yield abortedResult(first.uuid);
           yield lifecycleFrame(first.uuid, "cancelled");
           // Claude Code had already taken the second prompt, so it still runs
-          // it, and its answer writes a file. It calls the preview hook and
-          // asks for the permission on its control channel, which can run
-          // ahead of the consumer.
+          // it, and its answer writes a file. It asks for the permission on
+          // its control channel, which can run ahead of the consumer.
           yield lifecycleFrame(second.uuid, "started");
           yield requesting(second.uuid);
           yield userEcho(second);
           const ask = () => {
-            previewed = previewWrite(agent, "toolu_late");
             asked = askToWrite(agent, "toolu_late");
           };
           if (order === "before") ask();
@@ -22113,13 +21999,13 @@ describe("output after a cancel", () => {
             // Claude Code can run a tool whose input is complete before it
             // sends the whole message.
             ask();
-            await Promise.all([previewed, asked]);
+            await asked;
           }
           yield* streamed
             ? toolUseMessage("toolu_late", "Write", writeInput)
             : [toolUseMessage("toolu_late", "Write", writeInput)[0]];
           if (order === "after") ask();
-          await Promise.all([previewed, asked]);
+          await asked;
           yield toolResult("toolu_late", "The user cancelled this prompt.", true);
           yield stampedResult(second.uuid);
           yield lifecycleFrame(second.uuid, "completed");
@@ -23184,67 +23070,6 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     await agent.sessions["test-session"]?.consumer;
   });
 
-  it("resumes a held turn's foreground work for a steer, and ends it again at the steered result", async () => {
-    const foreground: string[] = [];
-    const agent = new ClaudeAcpAgent(
-      { sessionUpdate: async () => {} } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-      {
-        foreground: () => ({
-          running: () => foreground.push("running"),
-          awaitingUser: () => foreground.push("awaitingUser"),
-          ended: (outcome) =>
-            foreground.push(`ended ${outcome.stopReason} ${outcome.usage?.totalTokens}`),
-          failed: () => foreground.push("failed"),
-        }),
-      },
-    );
-    injectGeneratorSession(agent, (input) => {
-      async function* messageGenerator() {
-        const iter = input[Symbol.asyncIterator]();
-        yield userEcho((await iter.next()).value);
-        yield running();
-        yield subagentStarted("agent-1");
-        yield resultMessage(); // held for agent-1
-        yield idle();
-        // The steer runs as a cycle of the held turn.
-        yield userEcho((await iter.next()).value);
-        yield assistantText("Steered answer");
-        yield resultMessage();
-        // The steered turn settles at an idle, held again for agent-1.
-        yield idle();
-        yield taskNotification("agent-1");
-        yield assistantText("promised summary");
-        yield resultMessage({ origin: { kind: "task-notification" } });
-        yield idle();
-      }
-      return messageGenerator();
-    });
-
-    const turn = agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "explore" }],
-    });
-    await vi.waitFor(() =>
-      expect(agent.sessions["test-session"]?.activeTurn?.deferredSettle).toBeDefined(),
-    );
-    await agent.steer({ sessionId: "test-session", prompt: [{ type: "text", text: "also X" }] });
-
-    expect((await turn).stopReason).toBe("end_turn");
-    await agent.sessions["test-session"]?.consumer;
-    expect(foreground).toEqual([
-      "running",
-      "ended end_turn 15",
-      // The steer resumes the turn's work, which ends at the steered result
-      // with the turn's usage, both of its cycles.
-      "running",
-      "ended end_turn 30",
-      // The follow-up after the subagent finished is a cycle of its own.
-      "running",
-      "ended end_turn 15",
-    ]);
-  });
-
   describe("ExitPlanMode answered inside a held turn's followup (issue #1167)", () => {
     // Plan mode + a background Explore agent: the user turn's result holds,
     // the subagent finishes, and the model writes the plan and calls
@@ -23445,98 +23270,6 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       ]);
     });
 
-    it("keeps the turn as the session's foreground work across the clear-context restart", async () => {
-      const foreground: string[] = [];
-      const agent = new ClaudeAcpAgent(
-        {
-          sessionUpdate: async () => {},
-          requestPermission: async (request: any) => ({
-            outcome: {
-              outcome: "selected",
-              optionId: request.options.find((option: any) => option.kind === "allow_once")
-                .optionId,
-            },
-          }),
-        } as unknown as AcpClient,
-        { log: () => {}, error: () => {} },
-        {
-          foreground: () => ({
-            running: () => foreground.push("running"),
-            awaitingUser: () => foreground.push("awaitingUser"),
-            ended: (outcome) =>
-              foreground.push(`ended ${outcome.stopReason} ${outcome.usage?.totalTokens}`),
-            failed: () => foreground.push("failed"),
-          }),
-        },
-      );
-      vi.spyOn(agent as any, "createSession").mockImplementation(
-        async (_params: any, options: any) => {
-          const input = new Pushable<any>();
-          async function* freshGenerator() {
-            const next = await input[Symbol.asyncIterator]().next();
-            yield userEcho(next.value);
-            yield running();
-            // The continuation asks for permission in the fresh query.
-            await agent.canUseTool("test-session")(
-              "Bash",
-              { command: "ls" },
-              {
-                signal: new AbortController().signal,
-                suggestions: [],
-                toolUseID: "toolu_ls",
-                requestId: "request-ls",
-              },
-            );
-            yield assistantText("Implemented");
-            yield resultMessage({ stop_reason: "max_tokens" });
-            yield idle();
-          }
-          agent.sessions["test-session"] = mockSessionState({
-            query: wrapQuery(freshGenerator()),
-            input,
-            modes: { currentModeId: options.permissionMode, availableModes: [] },
-            fastModeEnabled: false,
-          });
-          return { sessionId: "test-session" };
-        },
-      );
-      injectGeneratorSession(
-        agent,
-        (input) => {
-          async function* messageGenerator() {
-            const { value: first } = await input[Symbol.asyncIterator]().next();
-            yield* heldTurnPlanningFollowup(first);
-            yield idle();
-          }
-          return messageGenerator();
-        },
-        {
-          creationParams: { cwd: "/test", mcpServers: [] },
-          pendingExitPlanContextReset: {
-            toolUseId: "tool-plan",
-            plan: "Implement it",
-            mode: "default",
-          },
-        },
-      );
-
-      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "plan" }] });
-
-      // The turn's work ends at its result, though v1's answer is held. The
-      // follow-up that plans is a cycle, which the continuation takes over
-      // without a new `running`. The restart replaces the session behind the
-      // id; the work stays with the id.
-      expect(foreground).toEqual([
-        "running",
-        "ended end_turn 15",
-        "running",
-        "awaitingUser",
-        "running",
-        // The turn's usage: the carried 15 and the continuation's.
-        "ended max_tokens 30",
-      ]);
-    });
-
     it("cancels the held turn when the user keeps planning", async () => {
       const agent = createMockAgent();
       const createSession = vi.spyOn(agent as any, "createSession");
@@ -23559,40 +23292,6 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       expect(response.usage?.totalTokens).toBe(15);
       expect(createSession).not.toHaveBeenCalled();
       expect(agent.sessions["test-session"].pendingExitPlanModeInterruption).toBeUndefined();
-    });
-
-    it("ends the follow-up cycle cancelled, not failed, when the user keeps planning", async () => {
-      const foreground: string[] = [];
-      const agent = new ClaudeAcpAgent(
-        { sessionUpdate: async () => {} } as unknown as AcpClient,
-        { log: () => {}, error: () => {} },
-        {
-          foreground: () => ({
-            running: () => foreground.push("running"),
-            awaitingUser: () => foreground.push("awaitingUser"),
-            ended: (outcome) => foreground.push(`ended ${outcome.stopReason}`),
-            failed: () => foreground.push("failed"),
-          }),
-        },
-      );
-      injectGeneratorSession(agent, (input) => {
-        async function* messageGenerator() {
-          const { value: first } = await input[Symbol.asyncIterator]().next();
-          yield* heldTurnPlanningFollowup(first);
-          yield idle();
-        }
-        return messageGenerator();
-      });
-
-      const response = await agent.prompt({
-        sessionId: "test-session",
-        prompt: [{ type: "text", text: "plan" }],
-      });
-
-      expect(response.stopReason).toBe("cancelled");
-      // The turn's work ended at its result; the follow-up that planned is a
-      // cycle, which the error-shaped diagnostic of the answer ends cancelled.
-      expect(foreground).toEqual(["running", "ended end_turn", "running", "ended cancelled"]);
     });
 
     describe("with backgroundSubagents", () => {
@@ -28436,7 +28135,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
-      background: new SessionBackgroundWork("test-session", false),
+      background: new SessionBackgroundWork("test-session"),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
@@ -30346,7 +30045,7 @@ describe("agent selection config option", () => {
         toolUseCache: {},
         emittedToolCalls: new Set(),
         liveBackgroundTasks: new Map(),
-        background: new SessionBackgroundWork(sessionId, false),
+        background: new SessionBackgroundWork(sessionId),
         emittedAssistantText: false,
         owedTrailingIdles: 0,
         messageIdToUuid: new Map(),

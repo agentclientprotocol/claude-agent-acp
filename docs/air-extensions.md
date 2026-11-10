@@ -145,6 +145,15 @@ The agent list does not depend on the capabilities that AIR declares, except `se
 An extension is active only when the client declared its capability. The client does not declare `sessionBatchGet`, `sessionArchive`, `sessionRename`, `sessionListSubscribe` and `sessionWorktrees`.
 The response to a client that is not AIR has no `_meta.jetbrains` key.
 
+### ACP v2
+
+The v2 core (`src/v2/`) serves an AIR client only the extensions that ACP v2 does not cover.
+Its `initialize` response lists `agentFileChangeReport` and `recommendedValue`.
+It also serves the [permission presentation](#permission-presentation), the [question custom answers](#question-custom-answers), the [predicted follow-up prompt](#predicted-follow-up-prompt), and [load replay end](#load-replay-end).
+The [agent file-change report](#agent-file-change-report) goes out at the end of the turn that serves the prompt, before the turn's idle `state_update`, because a v2 `session/prompt` is answered when Claude Code takes the prompt in.
+ACP v2 covers subagents, background work, file plans, patches, compaction, the system prompt, and turn failures itself, so the v2 core serves no `nativeSubagentSessions`, `backgroundSubagents`, `asyncTasks`, `planFile`, `diffPatch`, `contextCompaction`, `customInstructions`, or `sessionFailure`.
+It does not serve the [tool call contract](#tool-call-contract) yet.
+
 ### Capabilities
 
 | Capability               | Advertised          | What the adapter does when the client declares it                                                               | Section                                                 |
@@ -1062,7 +1071,8 @@ The adapter ignores a malformed request and a repeated request id.
 
 ### Report
 
-The adapter sends one `session_info_update` before the `PromptResponse`:
+The adapter sends one `session_info_update` before the `PromptResponse`.
+On ACP v2 it comes before the idle `state_update` of the turn that serves the prompt (see [ACP v2](#acp-v2)):
 
 ```json
 {
@@ -1638,7 +1648,8 @@ The hold protects a client that stops listening at the prompt response.
 ### Behavior with the capability
 
 AIR declares `backgroundSubagents` in `initialize.clientCapabilities._meta.jetbrains.air.capabilities`.
-The capability applies to ACP v1 only. ACP v2 keeps the hold, and the agent does not advertise the capability to ACP v2.
+The capability applies to ACP v1 only, and the agent does not advertise it to ACP v2.
+ACP v2 has no hold: the v2 agent answers `session/prompt` when Claude Code takes the prompt in, lists a background subagent in its parent session's `background` while it works, and reports each subagent's work in the state of its child session (see [ACP v2](#acp-v2)).
 
 - The turn ends at its result with the stop reason of the result, usually `end_turn`.
 - The subagent updates, permission requests and elicitations go out after the prompt response.

@@ -1,7 +1,7 @@
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 import { v1AgentApp, type ClaudeAcpAgent, type Logger } from "./acp-agent.js";
 import { nodeToWebReadable, nodeToWebWritable } from "./utils.js";
-import { v2AgentApp } from "./v2/agent.js";
+import { v2AgentApp, type AgentHandle } from "./v2/agent.js";
 
 /**
  * The ACP versions that the adapter serves: `v1` or `v2` alone, or both with
@@ -32,13 +32,13 @@ export function serveAcp(
   const input = nodeToWebReadable(process.stdin);
   // The router opens the connection of the negotiated version only when it
   // reads `initialize`, so a client that leaves before then leaves no agent.
-  let agent: ClaudeAcpAgent | undefined;
-  const onAgent = (created: ClaudeAcpAgent) => {
+  let agent: AgentHandle | undefined;
+  const onAgent = (created: AgentHandle) => {
     agent = created;
   };
-  const { closed } = acpProtocolRouter(logger, onAgent, options.protocols).connect(
-    v2.ndJsonStream(output, input),
-  );
+  const { closed } = acpProtocolRouter(logger, onAgent, options.protocols, {
+    onV2Agent: onAgent,
+  }).connect(v2.ndJsonStream(output, input));
   return {
     closed,
     dispose: async () => {
@@ -53,15 +53,20 @@ export function serveAcp(
  * the draft ACP v2, and every other client gets ACP v1. With `v1`, a v2
  * client is negotiated down to v1. With `v2`, the router rejects the
  * `initialize` of a v1 client as an unsupported protocol version. `onAgent`
- * receives the agent of the connection once the router has opened it.
+ * receives the agent of a v1 connection (`ClaudeAcpAgent`) once the router
+ * has opened it, and `onV2Agent` the agent of a v2 connection, which the
+ * v2 core (`src/v2/`) serves.
  */
 export function acpProtocolRouter(
   logger: Logger | undefined,
   onAgent: (agent: ClaudeAcpAgent) => void,
   protocols: AcpProtocols = "auto",
+  { onV2Agent = () => {} }: { onV2Agent?: (agent: AgentHandle) => void } = {},
 ): v2.AgentProtocolRouter {
   const router = v2.agentProtocolRouter();
   if (protocols !== "v2") router.withV1(v1AgentApp(logger, onAgent));
-  if (protocols !== "v1") router.withV2(v2AgentApp(logger, onAgent));
+  if (protocols !== "v1") {
+    router.withV2(v2AgentApp(logger, onV2Agent));
+  }
   return router;
 }

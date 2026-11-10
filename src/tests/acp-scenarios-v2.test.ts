@@ -1,6 +1,7 @@
 /**
  * Every scenario of `acp-scenarios/scenarios.ts` on the experimental ACP v2
- * surface: through the protocol router, with the SDK's v2 client.
+ * core (`src/v2/`): through the protocol router, with the SDK's v2
+ * client.
  *
  * - Status: each scenario passes, every prompt turn ending with a stop reason,
  *   unless {@link V2_STOPS} names why it stops. Every scenario passes today;
@@ -11,15 +12,15 @@
  *   `tool_call`, so a report of a tool call that the client has not seen
  *   creates it, where v1 drops it.
  * - Golden files: `acp-scenarios/__snapshots__/v2/<scenario>.jsonl` for each
- *   passing scenario. Run `npx vitest run src/tests/acp-scenarios-v2.test.ts -u`
- *   to update them.
+ *   passing scenario, every message of the run. Run
+ *   `npx vitest run src/tests/acp-scenarios-v2.test.ts -u` to update them.
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ClaudeAcpAgent } from "../acp-agent.js";
+import type { AgentHandle } from "../v2/agent.js";
 import {
   resetIds,
   runScenarioV2,
@@ -61,8 +62,8 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const PASSES = "passes";
 
 /**
- * The scenarios that stop on the v2 surface, each with the reason, which names
- * the step of `docs/acp-v2.md` that removes it. Every other scenario passes.
+ * The scenarios that stop on the v2 surface, each with the reason. Every
+ * other scenario passes.
  */
 const V2_STOPS: Record<string, string> = {};
 
@@ -86,12 +87,15 @@ beforeAll(async () => {
   const { acpProtocolRouter } = await import("../serve.js");
   for (const scenario of SCENARIOS) {
     resetIds();
-    const agents: ClaudeAcpAgent[] = [];
+    const agents: { dispose(): Promise<void> }[] = [];
     const quiet = { log: () => {}, error: () => {} };
     runs.set(
       scenario.name,
       await runScenarioV2(
-        (stream) => acpProtocolRouter(quiet, (agent) => agents.push(agent)).connect(stream),
+        (stream) =>
+          acpProtocolRouter(quiet, (agent) => agents.push(agent), "auto", {
+            onV2Agent: (agent: AgentHandle) => agents.push(agent),
+          }).connect(stream),
         scenario,
       ),
     );
@@ -163,10 +167,10 @@ describe("ACP v2 scenarios", () => {
     const passing = SCENARIOS.map((scenario) => scenario.name).filter(
       (scenario) => statusOf(scenario) === PASSES,
     );
+    const golden = (scenario: string) =>
+      path.join(here, "acp-scenarios", "__snapshots__", "v2", `${scenario}.jsonl`);
     it.each(passing)("%s", async (scenario) => {
-      await expect(toJsonLines(run(scenario).normalized)).toMatchFileSnapshot(
-        path.join(here, "acp-scenarios", "__snapshots__", "v2", `${scenario}.jsonl`),
-      );
+      await expect(toJsonLines(run(scenario).normalized)).toMatchFileSnapshot(golden(scenario));
     });
   });
 });

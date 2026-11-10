@@ -164,7 +164,7 @@ async function writeTranscript(options: TranscriptOptions): Promise<{ id: string
   return { id, file };
 }
 
-function createAgent(options: { v2?: boolean } = {}) {
+function createAgent() {
   const notifications: { method: string; params: Record<string, unknown> }[] = [];
   const updates: unknown[] = [];
   const client = {
@@ -175,7 +175,7 @@ function createAgent(options: { v2?: boolean } = {}) {
       notifications.push({ method, params });
     },
   } as unknown as AcpClient;
-  const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} }, options);
+  const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
   return { agent, notifications, updates };
 }
 
@@ -315,16 +315,6 @@ describe("sessionIndex negotiation", () => {
       clientCapabilities: {},
     });
     expect(nonAir._meta).toEqual({ steering: { supported: true } });
-  });
-
-  it("is not advertised under ACP v2", async () => {
-    const response = await createAgent({ v2: true }).agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: air("sessionIndex"),
-    });
-    for (const capability of indexCapabilities) {
-      expect(airCapabilities(response)).not.toContain(capability);
-    }
   });
 
   it("answers method-not-found to the new methods without the capability", async () => {
@@ -745,15 +735,6 @@ describe("_session/batch_get", () => {
       }
     },
   );
-
-  it("rejects under ACP v2 even when sessionIndex was declared", async () => {
-    const { agent } = createAgent({ v2: true });
-    await initializeClient(agent, air("sessionIndex"));
-    await expect(agent.batchGetSessions({ sessionIds: [] })).rejects.toMatchObject({
-      code: -32601,
-    });
-    await agent.dispose();
-  });
 });
 
 describe("session/list of a sessionIndex client", () => {
