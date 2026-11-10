@@ -405,7 +405,7 @@ export class SessionModeManager<S extends SessionMode> {
   }
 }
 
-function buildAvailableModes(
+export function buildAvailableModes(
   { allowBypass, allowAuto }: ModeAvailability,
   air = false,
 ): SessionModeState["availableModes"] {

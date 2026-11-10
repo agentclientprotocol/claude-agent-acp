@@ -19,6 +19,9 @@ const REPLACED_FIELDS = [
 
 type ReplacedField = (typeof REPLACED_FIELDS)[number];
 
+/** Hooks also report workflow tools that never appear in the SDK stream. */
+const MAX_STAGED_PREVIEWS = 64;
+
 interface SentToolCall {
   /** The JSON of each replaced field that the client holds now. */
   fields: Map<ReplacedField, string>;
@@ -46,10 +49,12 @@ interface SentToolCall {
  */
 export class ToolCallFieldTracker {
   private readonly calls = new Map<string, SentToolCall>();
+  private readonly previews = new Map<string, ToolCallContent[]>();
 
   /**
    * Records a `tool_call`, or removes the unchanged fields of a
-   * `tool_call_update` and records the rest.
+   * `tool_call_update` and records the rest. A new call without content takes
+   * its staged preview, pinned until a final result replaces it.
    *
    * Returns false when the update carries nothing new: no replaced field
    * remains, `_meta` has no key besides `claudeCode` and `jetbrains`, and
@@ -62,10 +67,13 @@ export class ToolCallFieldTracker {
    */
   apply(update: SessionUpdate, options?: { replacePinnedContent?: boolean }): boolean {
     if (update.sessionUpdate === "tool_call") {
+      const preview = update.content?.length ? undefined : this.previews.get(update.toolCallId);
+      this.previews.delete(update.toolCallId);
+      if (preview) update.content = preview;
       const entry: SentToolCall = {
         fields: new Map(),
         mergedMeta: new Map(),
-        contentPinned: false,
+        contentPinned: preview !== undefined,
         resultSeen: false,
       };
       this.calls.set(update.toolCallId, entry);
@@ -107,6 +115,21 @@ export class ToolCallFieldTracker {
   }
 
   /**
+   * Keeps a pre-execution patch until the tool call is first published.
+   *
+   * A hook can beat the streamed tool use. Workflow tools can also run hooks
+   * without ever streaming their use or result, so staging a preview must not
+   * create a client-visible call. At most 64 previews wait; the oldest is
+   * discarded when the limit is exceeded.
+   */
+  stagePreview(toolCallId: string, content: ToolCallContent[]): void {
+    this.previews.set(toolCallId, content);
+    if (this.previews.size > MAX_STAGED_PREVIEWS) {
+      this.previews.delete(this.previews.keys().next().value!);
+    }
+  }
+
+  /**
    * Records the exact approval patch that the client shows for a tool call.
    *
    * The streamed tool input later refines the call with a standard diff of
@@ -142,11 +165,13 @@ export class ToolCallFieldTracker {
   /** Forgets one tool call. */
   delete(toolCallId: string): void {
     this.calls.delete(toolCallId);
+    this.previews.delete(toolCallId);
   }
 
   /** Forgets every tool call, when the session is torn down. */
   clear(): void {
     this.calls.clear();
+    this.previews.clear();
   }
 }
 

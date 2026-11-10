@@ -3,13 +3,13 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { AcpClient } from "../acp-client.js";
 import {
-  AcpClient,
   StreamedToolInputCache,
   streamEventToAcpNotifications,
   toAcpNotifications,
   ToolUseCache,
-} from "../acp-agent.js";
+} from "../sdk-to-acp.js";
 import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
 import { createPostToolUseHook } from "../tools.js";
 
@@ -149,6 +149,36 @@ describe("ToolCallFieldTracker", () => {
     const final: any = { sessionUpdate: "tool_call_update", toolCallId: "t", content: snippet };
     expect(tracker.apply(final, { replacePinnedContent: true })).toBe(true);
     expect(final.content).toEqual(snippet);
+  });
+
+  it("prefers a call's own content to an earlier staged preview", () => {
+    const tracker = new ToolCallFieldTracker();
+    tracker.stagePreview("t", [{ type: "diff", path: "/a.ts", oldText: "a", newText: "b" }]);
+    const content = [{ type: "diff" as const, path: "/a.ts", oldText: "a", newText: "c" }];
+    const update = { sessionUpdate: "tool_call" as const, toolCallId: "t", title: "Edit", content };
+    tracker.apply(update);
+
+    expect(update.content).toEqual(content);
+  });
+
+  it("bounds unclaimed previews and releases them when a call or session is forgotten", () => {
+    const tracker = new ToolCallFieldTracker();
+    const patch = [{ type: "diff" as const, path: "/a.ts", oldText: "a", newText: "b" }];
+    for (let index = 0; index < 65; index++) tracker.stagePreview(`${index}`, patch);
+    const start = (id: string) => {
+      const update = { sessionUpdate: "tool_call" as const, toolCallId: id, title: "Edit" };
+      tracker.apply(update);
+      return update;
+    };
+
+    expect(start("0")).not.toHaveProperty("content");
+    expect(start("1")).toHaveProperty("content", patch);
+    // A preview belongs only to the initial publication, not a later restart.
+    expect(start("1")).not.toHaveProperty("content");
+    tracker.delete("2");
+    expect(start("2")).not.toHaveProperty("content");
+    tracker.clear();
+    expect(start("3")).not.toHaveProperty("content");
   });
 
   it("ends an entry after both the tool_result and the hook", () => {

@@ -1,5 +1,79 @@
 # Changelog
 
+## [0.104.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.104.0...v0.104.1) (2026-11-10)
+
+
+### Bug Fixes
+
+* carry the auth detail in the ACP account label ([#1573](https://github.com/agentclientprotocol/claude-agent-acp/issues/1573)) ([3d6eb7b](https://github.com/agentclientprotocol/claude-agent-acp/commit/3d6eb7b5b650a1f9e5d2e869e92e313c32dbdc86))
+* distinguish Ultra from Max in auth status ([#1574](https://github.com/agentclientprotocol/claude-agent-acp/issues/1574)) ([7d95d30](https://github.com/agentclientprotocol/claude-agent-acp/commit/7d95d30ec3a4813d580b3bfdedb08f03d93a3571))
+* update to @anthropic-ai/claude-agent-sdk 0.3.322 ([#1577](https://github.com/agentclientprotocol/claude-agent-acp/issues/1577)) ([b89e449](https://github.com/agentclientprotocol/claude-agent-acp/commit/b89e4497da9184072e7f3c4bb28de79801659222))
+
+## [0.104.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.103.0...v0.104.0) (2026-11-10)
+
+
+### Features
+
+* implement the ACP auth/status RFD next to _auth/status_update ([#1570](https://github.com/agentclientprotocol/claude-agent-acp/issues/1570)) ([d202748](https://github.com/agentclientprotocol/claude-agent-acp/commit/d20274897684e8813477389b83a268f2b4f4ad11))
+
+
+### Bug Fixes
+
+* offer Anthropic Console login in remote environments ([#1572](https://github.com/agentclientprotocol/claude-agent-acp/issues/1572)) ([c09543d](https://github.com/agentclientprotocol/claude-agent-acp/commit/c09543d85ae1067e8df315f1cd3179527701ea16))
+
+## [0.103.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.102.0...v0.103.0) (2026-11-10)
+
+
+### ⚠ BREAKING CHANGES
+
+* deep imports of `dist/` files fail with `ERR_PACKAGE_PATH_NOT_EXPORTED`, and `lib.ts` exports only `serveAcp`, `AUTH_STATUS_UPDATE_METHOD` and their types.
+
+### Features
+
+* serve ACP v2 with a direct v2 agent and remove the v1 bridge ([#1560](https://github.com/agentclientprotocol/claude-agent-acp/issues/1560)) ([cb285cd](https://github.com/agentclientprotocol/claude-agent-acp/commit/cb285cd2857924c07038c129cc836da007e2737f))
+
+
+### Bug Fixes
+
+* give subagent checklists their own plan ID ([#1558](https://github.com/agentclientprotocol/claude-agent-acp/issues/1558)) ([2f7e386](https://github.com/agentclientprotocol/claude-agent-acp/commit/2f7e386f3600658d905906f3b37301120b07605f))
+
+
+### Code Refactoring
+
+* export only lib.ts, with serveAcp and the authStatus wire names ([#1566](https://github.com/agentclientprotocol/claude-agent-acp/issues/1566)) ([566e265](https://github.com/agentclientprotocol/claude-agent-acp/commit/566e2652a9da5a31dab57a23ea1b06e9fff2ead8))
+
+## [0.102.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.101.1...v0.102.0) (2026-11-09)
+
+
+### Features
+
+* list workflow phases and agents on the workflow card ([#1552](https://github.com/agentclientprotocol/claude-agent-acp/issues/1552)) ([176ae06](https://github.com/agentclientprotocol/claude-agent-acp/commit/176ae0634c2ef7cb0549339f4b9824884574b2f0))
+* send the checklist as a plan operation and remove plans on reset ([#1554](https://github.com/agentclientprotocol/claude-agent-acp/issues/1554)) ([766fd14](https://github.com/agentclientprotocol/claude-agent-acp/commit/766fd142f60bda2f434d55baaa8e72939f215800))
+
+
+### Bug Fixes
+
+* report v2 background tasks without a tool call as their own tool call ([#1556](https://github.com/agentclientprotocol/claude-agent-acp/issues/1556)) ([d098fb0](https://github.com/agentclientprotocol/claude-agent-acp/commit/d098fb08d54f521d5056d920ebcc5a2656334083))
+* update to @anthropic-ai/claude-agent-sdk 0.3.321 ([#1557](https://github.com/agentclientprotocol/claude-agent-acp/issues/1557)) ([855447c](https://github.com/agentclientprotocol/claude-agent-acp/commit/855447c7cd41aa566bdf361d6d59e6a5b038fe6e))
+
+## [0.101.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.101.0...v0.101.1) (2026-11-09)
+
+
+### Bug Fixes
+
+* keep autonomous turn tasks open across owed trailing idles ([#1455](https://github.com/agentclientprotocol/claude-agent-acp/issues/1455)) ([1ee2422](https://github.com/agentclientprotocol/claude-agent-acp/commit/1ee242293401372aa71ea5765e8dfd0679146dc9))
+* list a resumed Fable 5.1 session's model as `fable` ([#1548](https://github.com/agentclientprotocol/claude-agent-acp/issues/1548)) ([4cceb06](https://github.com/agentclientprotocol/claude-agent-acp/commit/4cceb06b31525ccaaecfd999ff9b21d401b2659a))
+* list a subagent's background Bash commands ([#1540](https://github.com/agentclientprotocol/claude-agent-acp/issues/1540)) ([6597626](https://github.com/agentclientprotocol/claude-agent-acp/commit/6597626d86ddb8c10ea9f1091d921806752d045a))
+* list Monitor calls in the session's background work ([#1538](https://github.com/agentclientprotocol/claude-agent-acp/issues/1538)) ([ba16234](https://github.com/agentclientprotocol/claude-agent-acp/commit/ba162346c9ccb4be51f13a3271198351d7822e78))
+* relay a rate_limit_event that arrives before the turn's first assistant frame ([#1534](https://github.com/agentclientprotocol/claude-agent-acp/issues/1534)) ([54392e1](https://github.com/agentclientprotocol/claude-agent-acp/commit/54392e144d307d5dd5b7732ae14634d4b2678bd5))
+* render workflow tool cards and progress correctly in ACP v2 ([#1550](https://github.com/agentclientprotocol/claude-agent-acp/issues/1550)) ([30600ba](https://github.com/agentclientprotocol/claude-agent-acp/commit/30600ba348e5f5c3755a50f5797fd24645e0ff48))
+* replay a compaction summary by its flag, not its framing ([#1536](https://github.com/agentclientprotocol/claude-agent-acp/issues/1536)) ([aa0c123](https://github.com/agentclientprotocol/claude-agent-acp/commit/aa0c1234b5c52a63d96c46c9826631bd0f428062))
+* report setup-token logins as logged in ([#1376](https://github.com/agentclientprotocol/claude-agent-acp/issues/1376)) ([7d1ef76](https://github.com/agentclientprotocol/claude-agent-acp/commit/7d1ef76c1d32e390f8ff8824087df3003825a170))
+* start transcript notices on their own line for clients without session.notices ([#1362](https://github.com/agentclientprotocol/claude-agent-acp/issues/1362)) ([47b64c0](https://github.com/agentclientprotocol/claude-agent-acp/commit/47b64c04de83145c4d42033c4408c811736c9c40))
+* **test:** assert the blockquoted MCP startup transcript line ([#1543](https://github.com/agentclientprotocol/claude-agent-acp/issues/1543)) ([3b22586](https://github.com/agentclientprotocol/claude-agent-acp/commit/3b22586cf63cef06f1029a8418a9abb3b2cc3236))
+* update to @agentclientprotocol/sdk 2.5.0 ([#1549](https://github.com/agentclientprotocol/claude-agent-acp/issues/1549)) ([ef65ab3](https://github.com/agentclientprotocol/claude-agent-acp/commit/ef65ab31b405a5d339133c980eb606a70a2d3624))
+* update to @anthropic-ai/claude-agent-sdk 0.3.319 ([#1545](https://github.com/agentclientprotocol/claude-agent-acp/issues/1545)) ([a58293f](https://github.com/agentclientprotocol/claude-agent-acp/commit/a58293f4c9aa559a500d61834ef97d2a23b3722b))
+
 ## [0.101.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.100.0...v0.101.0) (2026-11-05)
 
 

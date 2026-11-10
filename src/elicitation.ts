@@ -6,7 +6,13 @@ import type {
   ElicitationSchema,
   EnumOption,
 } from "@agentclientprotocol/sdk/unstable";
-import type { ElicitationRequest, ElicitationResult } from "@anthropic-ai/claude-agent-sdk";
+import type {
+  ElicitationRequest,
+  ElicitationResult,
+  PermissionResult,
+  UserDialogRequest,
+  UserDialogResult,
+} from "@anthropic-ai/claude-agent-sdk";
 import type {
   AskUserQuestionInput,
   AskUserQuestionOutput,
@@ -303,7 +309,7 @@ export function applyAskElicitationResponse(
   questions: AskUserQuestion[],
   options: { reportUnanswered?: boolean } = {},
 ): AskUserQuestionOutcome {
-  // Typed against the output schema: as of SDK 0.3.318 only it lists
+  // Typed against the output schema: as of SDK 0.3.319 only it lists
   // `unanswered`, though the tool reads the same annotations from its input.
   const annotations: NonNullable<AskUserQuestionOutput["annotations"]> = {};
   const withAnnotations = (answers: AskUserQuestionOutput["answers"]) => ({
@@ -511,4 +517,157 @@ export function refusalFallbackToCreateRequest(
 export function refusalFallbackResultFromResponse(response: CreateElicitationResponse): string {
   const choice = acceptedElicitationContent(response)[REFUSAL_FALLBACK_CHOICE_KEY];
   return choice === RETRY_FALLBACK_RESULT ? RETRY_FALLBACK_RESULT : KEEP_REFUSAL_RESULT;
+}
+
+/**
+ * What became of an elicitation: the client's response, or `withdrawn` when
+ * its signal aborted first (Claude Code withdrew the request, or a cancel or
+ * close of the session did). A response that comes after the abort counts as
+ * withdrawn too.
+ */
+export type ElicitationOutcome = { response: CreateElicitationResponse } | { withdrawn: true };
+
+/**
+ * Sends an elicitation with `send` and reads what became of it. A rejection
+ * while `signal` is not aborted, such as the client's -32602 for a form it
+ * cannot render, is rethrown.
+ */
+export async function elicitUnlessWithdrawn(
+  signal: AbortSignal,
+  send: (signal: AbortSignal) => Promise<CreateElicitationResponse>,
+): Promise<ElicitationOutcome> {
+  try {
+    const response = await send(signal);
+    return signal.aborted ? { withdrawn: true } : { response };
+  } catch (error) {
+    if (signal.aborted) return { withdrawn: true };
+    throw error;
+  }
+}
+
+/** Sends a built elicitation to the client (see {@link elicitUnlessWithdrawn}). */
+export type Elicit = (request: CreateElicitationRequest) => Promise<ElicitationOutcome>;
+
+type ElicitationLogger = { error: (...args: unknown[]) => void };
+
+/**
+ * Answers an MCP server's elicitation (the SDK's `onElicitation`) through
+ * `elicit`. Only the user's own decline reaches the MCP server as `decline`.
+ * A request the user never saw, because the client did not advertise its
+ * mode, it cannot be represented, the client answered with an error, or it
+ * was withdrawn, is a `cancel`.
+ */
+export async function answerMcpElicitation(
+  request: ElicitationRequest,
+  {
+    sessionId,
+    support,
+    elicit,
+    logger,
+  }: { sessionId: string; support: ElicitationSupport; elicit: Elicit; logger: ElicitationLogger },
+): Promise<ElicitationResult> {
+  const isUrl = request.mode === "url";
+  if ((isUrl && !support.url) || (!isUrl && !support.form)) {
+    return { action: "cancel" };
+  }
+  const createRequest = mcpElicitationToCreateRequest(request, sessionId);
+  if (!createRequest) {
+    return { action: "cancel" };
+  }
+  try {
+    const outcome = await elicit(createRequest);
+    if ("withdrawn" in outcome) return { action: "cancel" };
+    return createElicitationResponseToElicitResult(outcome.response);
+  } catch (error) {
+    // The client answered with an error, e.g. -32602 for a form it cannot
+    // render, so the user never saw the request. MCP's `decline` means the
+    // user refused; `cancel` means they made no explicit choice.
+    logger.error(`Failed to forward MCP elicitation: ${error}`);
+    return { action: "cancel" };
+  }
+}
+
+/**
+ * Presents the AskUserQuestion tool's questions as a form elicitation of
+ * `sessionId` through `elicit`, and returns the answers as the tool's
+ * `updatedInput`. A withdrawn question, or one the user cancelled, aborts the
+ * tool use. `reportUnanswered` is read once the answer is in (see
+ * {@link applyAskElicitationResponse}).
+ */
+export async function answerAskUserQuestion(
+  toolInput: Record<string, unknown>,
+  {
+    sessionId,
+    toolUseID,
+    airClient = false,
+    reportUnanswered,
+    elicit,
+    logger,
+  }: {
+    sessionId: string;
+    toolUseID: string;
+    airClient?: boolean;
+    reportUnanswered: () => boolean;
+    elicit: Elicit;
+    logger: ElicitationLogger;
+  },
+): Promise<PermissionResult> {
+  const questions = extractAskUserQuestions(toolInput);
+  if (!questions) {
+    return { behavior: "deny", message: "AskUserQuestion called with no valid questions." };
+  }
+  const createRequest = askUserQuestionsToCreateRequest(questions, sessionId, toolUseID, airClient);
+  let outcome: ElicitationOutcome;
+  try {
+    outcome = await elicit(createRequest);
+  } catch (error) {
+    logger.error(`Failed to present AskUserQuestion elicitation: ${error}`);
+    return { behavior: "deny", message: "Could not present the question to the user." };
+  }
+  if ("withdrawn" in outcome) {
+    throw new Error("Tool use aborted");
+  }
+  const answer = applyAskElicitationResponse(outcome.response, toolInput, questions, {
+    reportUnanswered: reportUnanswered(),
+  });
+  if (answer.action === "cancel") {
+    throw new Error("Tool use aborted");
+  }
+  return { behavior: "allow", updatedInput: answer.updatedInput };
+}
+
+/**
+ * Answers a `request_user_dialog` of Claude Code (the SDK's `onUserDialog`).
+ * Only kinds declared in `supportedDialogKinds` are ever emitted; everything
+ * unexpected is answered `cancelled` (the required answer for unrecognized
+ * kinds), which applies the dialog's default behavior CLI-side. The only
+ * declared kind is the refusal-fallback consent prompt, rendered as a form
+ * elicitation. A failed or withdrawn elicitation is `cancelled` too: the CLI
+ * then keeps the refusal rather than switching models without consent.
+ */
+export async function answerUserDialog(
+  request: UserDialogRequest,
+  { sessionId, elicit, logger }: { sessionId: string; elicit: Elicit; logger: ElicitationLogger },
+): Promise<UserDialogResult> {
+  if (request.dialogKind !== REFUSAL_FALLBACK_DIALOG_KIND) {
+    return { behavior: "cancelled" };
+  }
+  const prompt = extractRefusalFallbackPrompt(request.payload);
+  if (!prompt) {
+    logger.error(
+      `refusal_fallback_prompt payload had an unexpected shape; cancelling the dialog: ${JSON.stringify(request.payload)}`,
+    );
+    return { behavior: "cancelled" };
+  }
+  let outcome: ElicitationOutcome;
+  try {
+    outcome = await elicit(refusalFallbackToCreateRequest(prompt, sessionId));
+  } catch (error) {
+    logger.error(`Failed to present refusal fallback elicitation: ${error}`);
+    return { behavior: "cancelled" };
+  }
+  if ("withdrawn" in outcome) {
+    return { behavior: "cancelled" };
+  }
+  return { behavior: "completed", result: refusalFallbackResultFromResponse(outcome.response) };
 }

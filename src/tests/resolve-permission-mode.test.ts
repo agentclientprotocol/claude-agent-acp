@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import type { Logger } from "../acp-agent.js";
+import type { Logger } from "../logger.js";
 import { resolvePermissionMode } from "../permissions/modes.js";
 
 function mockLogger() {

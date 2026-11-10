@@ -120,18 +120,64 @@ export function buildClaudePermissionPresentation(
     }),
     // Only AIR gets the permission presentation.
     ...(title && capabilities.air.client
-      ? {
-          _meta: withAirMeta(undefined, AIR_PERMISSION_KEY, {
-            version: 1,
-            title,
-            ...(description ? { description } : {}),
-            // The CLI's own hint, forwarded so a client that can pre-select
-            // an option keeps the decline focused; the option order already
-            // leads with the reject options when this is set.
-            ...(value.defaultToNo === true ? { defaultToNo: true } : {}),
-          }),
-        }
+      ? { _meta: airPermissionMeta({ title, description, defaultToNo: value.defaultToNo }) }
       : {}),
     ...(capabilities.v2 ? { title, ...(description ? { description } : {}) } : {}),
+  };
+}
+
+/**
+ * The `_meta.jetbrains.air.permission` of a permission request, from the
+ * heading and explanation that {@link buildClaudePermissionPresentation}
+ * built. The v2 core adds it for an AIR client, whose tool calls it
+ * renders without the AIR tool call contract.
+ */
+export function airPermissionMeta({
+  title,
+  description,
+  defaultToNo,
+}: {
+  title: string;
+  description?: string;
+  defaultToNo?: boolean;
+}): Record<string, unknown> {
+  return withAirMeta(undefined, AIR_PERMISSION_KEY, {
+    version: 1,
+    title,
+    ...(description ? { description } : {}),
+    // The CLI's own hint, forwarded so a client that can pre-select an
+    // option keeps the decline focused; the option order already leads with
+    // the reject options when this is set.
+    ...(defaultToNo === true ? { defaultToNo: true } : {}),
+  });
+}
+
+/**
+ * The `_meta.claudeCode` of a permission request's tool call: which MCP
+ * server serves an `mcp__*` tool and where its definition came from
+ * (`mcpServer`, SDK 0.3.274+), so a client can key trust on `source`, and,
+ * for clients other than AIR, the tool name and the Agent or Task call of a
+ * subagent's request. Undefined when there is nothing to add.
+ */
+export function permissionToolCallMeta({
+  toolName,
+  parentToolUseId,
+  mcpServer,
+  airClient,
+}: {
+  toolName: string;
+  parentToolUseId: string | undefined;
+  mcpServer: { name: string; source: string } | undefined;
+  airClient: boolean;
+}): { claudeCode: Record<string, unknown> } | undefined {
+  if (!mcpServer && !(parentToolUseId && !airClient)) return undefined;
+  // The name is the config key as authored: untrusted text, so it rides
+  // `_meta` rather than the title.
+  return {
+    claudeCode: {
+      ...(airClient ? {} : { toolName }),
+      ...(parentToolUseId && !airClient ? { parentToolUseId } : {}),
+      ...(mcpServer ? { mcpServer: { name: mcpServer.name, source: mcpServer.source } } : {}),
+    },
   };
 }

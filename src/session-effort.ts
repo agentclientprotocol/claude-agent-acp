@@ -25,6 +25,22 @@ export function effortFlagSettings(
   return ultracode ? { effortLevel, ultracode: true } : { effortLevel };
 }
 
+/**
+ * `params` without `_meta.claudeCode.options.effort`, for a restart of the
+ * session's query: the restart restores the current effort pin instead of
+ * the one the session was created with.
+ */
+export function withoutEffort<T extends { _meta?: unknown }>(params: T): T {
+  const meta = params._meta as
+    { claudeCode?: { options?: { effort?: unknown } } } | null | undefined;
+  if (meta?.claudeCode?.options?.effort === undefined) {
+    return params;
+  }
+  const options = { ...meta.claudeCode.options };
+  delete options.effort;
+  return { ...params, _meta: { ...meta, claudeCode: { ...meta.claudeCode, options } } };
+}
+
 function canonicalizeModelSettingsKey(value: string): string {
   return value
     .trim()
@@ -132,4 +148,131 @@ export function buildEffortConfigOption(
         }
       : {}),
   };
+}
+
+/** A session's effort bookkeeping: the level the user pinned through the
+ *  picker, and the level last applied to the SDK's flag layer. */
+export type EffortState = {
+  pinned: string | undefined;
+  applied: string | undefined;
+};
+
+/** The effort after a switch to `newModelInfo`, before the option is rebuilt
+ *  (see {@link settleEffortAfterModelSwitch}). */
+export type EffortSwitch = {
+  /** The effort to build the new model's option with. */
+  seed: string | undefined;
+  /** Whether the user's pin is one of the new model's levels. */
+  pinnedForNewModel: boolean;
+  before: EffortState;
+  /** The level applied before the switch, restored if the sync fails. */
+  appliedBeforeSwitch: string | undefined;
+};
+
+/** The effort seed of a model switch. It depends on who owns the choice: a
+ *  user pin made through the ACP picker this session lives at the SDK's flag
+ *  layer and follows the session across switches, so it carries forward.
+ *  Otherwise the CLI resolves effort itself from the persisted settings — the
+ *  NEW model's `modelSettings` entry first (the CLI persists /effort per
+ *  model), then the legacy top-level value — so the option shows what it
+ *  will actually run instead of dragging the old model's value along. */
+export function effortForModelSwitch(input: {
+  state: EffortState;
+  /** The current value of the effort option, if it is shown. */
+  displayed: string | undefined;
+  newModelInfo: ModelInfo | undefined;
+  modelId: string;
+  /** The merged effort settings (see {@link mergeEffortSettings}). */
+  settings: Settings;
+  useRecommendedValue: boolean;
+}): EffortSwitch {
+  const { state, displayed, newModelInfo, useRecommendedValue } = input;
+  const pinned = state.pinned;
+  const pinnedForNewModel =
+    pinned !== undefined &&
+    newModelInfo?.supportsEffort === true &&
+    newModelInfo.supportedEffortLevels?.some((level) => level === pinned) === true;
+  return {
+    seed: pinnedForNewModel
+      ? pinned
+      : settingsEffortForModel(input.settings, newModelInfo, input.modelId),
+    pinnedForNewModel,
+    before: state,
+    appliedBeforeSwitch:
+      state.applied ??
+      (useRecommendedValue && typeof displayed === "string" && displayed !== "default"
+        ? displayed
+        : pinned),
+  };
+}
+
+/**
+ * Applies the effort of a model switch to the SDK's flag layer, once the new
+ * model's effort `option` is built from `change.seed`. Returns the new state
+ * and the option to show (undefined to hide it).
+ *
+ * Opted-in clients (`useRecommendedValue`) apply the concrete displayed effort
+ * on every switch, including settings-derived values, so a previous automatic
+ * flag cannot shadow the new model's settings. This does not create a user
+ * pin. For other clients, the flag is synced only when a user pin is lost
+ * across the switch — the new model clamped it away, where the flag must be
+ * cleared too or the SDK would keep running the old pin invisibly.
+ * Settings-derived seeds are display-only: the CLI resolves persisted effort
+ * itself, and pinning it at the flag layer would shadow the per-model values
+ * on every later switch.
+ *
+ * The model switch already succeeded, so a failed sync is returned as
+ * `error`, not thrown. The old bookkeeping stays, and the unapplied value is
+ * never shown: the option shows the last applied value when the new model can
+ * select it, else it is hidden until a later switch rebuilds it.
+ */
+export async function settleEffortAfterModelSwitch(
+  change: EffortSwitch,
+  option: SessionConfigOption | undefined,
+  ultracode: boolean,
+  useRecommendedValue: boolean,
+  applyFlagSettings: (settings: ReturnType<typeof effortFlagSettings>) => Promise<void>,
+): Promise<{ state: EffortState; option: SessionConfigOption | undefined; error?: unknown }> {
+  const { pinnedForNewModel, before } = change;
+  const sync = useRecommendedValue || (before.pinned !== undefined && !pinnedForNewModel);
+  if (!sync) {
+    return {
+      state: pinnedForNewModel ? { pinned: before.pinned, applied: before.pinned } : before,
+      option,
+    };
+  }
+  const newEffort = typeof option?.currentValue === "string" ? option.currentValue : undefined;
+  try {
+    // A legacy client's unpinned effort is display-only: the CLI resolves the
+    // persisted value for the new model. When an old user pin is no longer
+    // supported, clear the flag layer instead of replacing it with that
+    // displayed value. Opted-in clients deliberately apply their concrete
+    // displayed effort.
+    await applyFlagSettings(
+      effortFlagSettings(useRecommendedValue ? newEffort : undefined, ultracode),
+    );
+    return {
+      state: {
+        pinned: pinnedForNewModel ? before.pinned : undefined,
+        applied: useRecommendedValue && newEffort !== "default" ? newEffort : undefined,
+      },
+      option,
+    };
+  } catch (error) {
+    const applied = change.appliedBeforeSwitch;
+    const selectable =
+      applied !== undefined &&
+      option?.type === "select" &&
+      option.options.some((entry) =>
+        "value" in entry
+          ? entry.value === applied
+          : entry.options.some((nested) => nested.value === applied),
+      );
+    return {
+      state: { pinned: before.pinned, applied },
+      option:
+        selectable && option?.type === "select" ? { ...option, currentValue: applied } : undefined,
+      error,
+    };
+  }
 }

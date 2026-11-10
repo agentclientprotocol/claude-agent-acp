@@ -84,39 +84,73 @@ function versionedModelDisplayName(model: ModelInfo): string {
   return `${withoutContext} ${version}${contextSuffix[0]}`;
 }
 
-function tokenizeModelPreference(model: string): { tokens: string[]; contextHint?: string } {
-  const lower = model.trim().toLowerCase();
-  const contextHint = lower.match(MODEL_CONTEXT_HINT_PATTERN)?.[1]?.toLowerCase();
-  const tokens = lower
-    .replace(MODEL_CONTEXT_HINT_PATTERN, " $1 ")
+function modelWords(value: string): string[] {
+  return value
+    .toLowerCase()
     .split(/[^a-z0-9]+/)
-    .filter(Boolean)
-    .map((token) => {
-      if (token === "opusplan") return "opus";
-      if (token === "best" || token === "default") return "";
-      return token;
-    })
-    .filter((token) => token && token !== "claude")
-    .filter((token) => /[a-z]/.test(token) || token.endsWith("m"));
-  return { tokens, contextHint };
+    .filter(Boolean);
 }
 
-function scoreModelMatch(model: ModelInfo, tokens: string[], contextHint?: string): number {
-  const haystack = `${model.value} ${model.displayName}`.toLowerCase();
-  let score = 0;
-  let nonHintMatched = false;
-  for (const token of tokens) {
-    if (!haystack.includes(token)) continue;
-    if (token !== contextHint) nonHintMatched = true;
-    score += token === contextHint ? 3 : 1;
+/** Whether `needle`'s words appear in `haystack`'s words, adjacent and in
+ *  order: "opus" in "claude-opus-4-5", but not "son" in "sonnet" or "a" in
+ *  "Default (recommended)". */
+function containsWords(haystack: string, needle: string): boolean {
+  const words = modelWords(haystack);
+  const wanted = modelWords(needle);
+  if (wanted.length === 0) return false;
+  for (let start = 0; start + wanted.length <= words.length; start++) {
+    if (wanted.every((word, offset) => words[start + offset] === word)) return true;
   }
-  return contextHint && !nonHintMatched ? 0 : score;
+  return false;
 }
 
+/** `id` without the gateway spellings that `normalizeModelId` keeps for
+ *  `deniedModels` and gateway listings: path segments before `claude-`
+ *  (`vertex_ai/`, `openrouter/anthropic/`, `publishers/anthropic/models/`)
+ *  and the Anthropic API's `-latest` suffix (`claude-3-5-haiku-latest`). */
+function withoutGatewaySpelling(id: string): string {
+  return id.replace(/^(?:[^/]+\/)+(?=claude-)/, "").replace(/-latest$/, "");
+}
+
+/** The words of `preference` that name a model: without what
+ *  `normalizeModelId` drops (provider prefixes, dates, `-v1:0`, `-fast`,
+ *  context hints), version numbers, "claude", and "best"/"default".
+ *  "us.anthropic.claude-sonnet-4-5-v1:0" gives ["sonnet"], "opusplan" gives
+ *  ["opus"]. */
+function modelPreferenceTokens(preference: string): string[] {
+  return modelWords(withoutGatewaySpelling(normalizeModelId(preference)))
+    .map((token) => (token === "opusplan" ? "opus" : token))
+    .filter((token) => /[a-z]/.test(token) && !["claude", "best", "default"].includes(token));
+}
+
+/** Whether every one of `tokens` is a word of `model`'s value or display name. */
+function modelCoversTokens(model: ModelInfo, tokens: string[]): boolean {
+  const words = new Set(modelWords(`${model.value} ${model.displayName}`));
+  return tokens.length > 0 && tokens.every((token) => words.has(token));
+}
+
+/**
+ * The entry of `models` that `preference` names, or null when it names none.
+ * `best` names the entry `opus` resolves to, unless an entry's value is `best`.
+ * In order: an entry whose value, display name or `resolvedModel` equals it
+ * (in either context-hint spelling); an entry whose value or display name
+ * contains its words ("opus" for "claude-opus-4-5"), or whose value it
+ * contains while every model word of the preference is the entry's
+ * ("sonnet" for "us.anthropic.claude-sonnet-5-v1:0"); then any entry with all
+ * of its model words, preferring one with the same context hint ("sonnet[1m]"
+ * for "claude-sonnet-5-1m"). The fuzzy tiers need a compatible version, and
+ * words match whole: "not-a-model", "son" and "foo-sonnet" name no entry.
+ */
 export function resolveModelPreference(models: ModelInfo[], preference: string): ModelInfo | null {
   const trimmed = preference.trim();
   if (!trimmed) return null;
   const lower = trimmed.toLowerCase();
+  // The CLI resolves `best` to its flagship: Opus, unless a server-side flag
+  // names another family that this adapter cannot read. The CLI ignores a
+  // `[1m]` hint on `best`. A listed entry named `best` still matches directly.
+  if (stripContextHints(lower) === "best" && !models.some((model) => model.value === trimmed)) {
+    return resolveModelPreference(models, "opus");
+  }
   const canonicalPreference = canonicalizeModelId(trimmed);
   const directMatch = models.find(
     (model) =>
@@ -134,28 +168,26 @@ export function resolveModelPreference(models: ModelInfo[], preference: string):
   if (resolvedMatch) return resolvedMatch;
 
   const preferenceHint = contextHintOf(trimmed);
+  const tokens = modelPreferenceTokens(trimmed);
   const includesMatch = models.find((model) => {
     if (!modelVersionsCompatible(trimmed, model)) return false;
     if (contextHintOf(model.value) !== preferenceHint) return false;
-    const value = model.value.toLowerCase();
-    const display = model.displayName.toLowerCase();
-    return value.includes(lower) || display.includes(lower) || lower.includes(value);
+    return (
+      containsWords(model.value, trimmed) ||
+      containsWords(model.displayName, trimmed) ||
+      (containsWords(trimmed, model.value) && modelCoversTokens(model, tokens))
+    );
   });
   if (includesMatch) return includesMatch;
 
-  const { tokens, contextHint } = tokenizeModelPreference(trimmed);
-  if (tokens.length === 0) return null;
-  let bestMatch: ModelInfo | null = null;
-  let bestScore = 0;
-  for (const model of models) {
-    if (!modelVersionsCompatible(trimmed, model)) continue;
-    const score = scoreModelMatch(model, tokens, contextHint);
-    if (score > 0 && (!bestMatch || score > bestScore)) {
-      bestMatch = model;
-      bestScore = score;
-    }
-  }
-  return bestMatch;
+  const candidates = models.filter(
+    (model) => modelVersionsCompatible(trimmed, model) && modelCoversTokens(model, tokens),
+  );
+  return (
+    candidates.find((model) => contextHintOf(model.value) === preferenceHint) ??
+    candidates[0] ??
+    null
+  );
 }
 
 export function matchResumedModel(models: ModelInfo[], liveModel: string): ModelInfo {
@@ -280,6 +312,67 @@ function resolveSettingsModel(
 }
 
 const MODEL_FAMILY_ALIASES = new Set(["opus", "sonnet", "haiku", "fable"]);
+
+/** The family and version of a `claude-<family>-<major>[-<minor>]` id:
+ *  `claude-fable-5-1` is fable 5.1, `claude-haiku-4-5-20251001` haiku 4.5. */
+function familyVersionOf(id: string): { family: string; major: number; minor: number } | null {
+  const match = id.toLowerCase().match(/^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?![\d.])/);
+  if (!match) return null;
+  return { family: match[1], major: Number(match[2]), minor: Number(match[3] ?? 0) };
+}
+
+/**
+ * Give back the family alias value to the row the CLI lists under a resumed
+ * session's model id.
+ *
+ * The CLI lists Fable 5.2 as `fable`, but when it resumes a session that ran
+ * Fable 5.2 it lists the same row as `claude-fable-5-2` and has no `fable`
+ * row. Clients store the option value as the session's choice, so a value
+ * from a new session would not be offered by a resumed one, and the reverse.
+ *
+ * A row gets its family's alias as its value when its `value` is
+ * `resumedModel`, equals its own `resolvedModel` and has no context hint, no
+ * row has that alias, and no row of the family has a newer version (an alias
+ * runs its family's newest model). Every other row is returned as it is.
+ *
+ * The CLI lists a row the same way when `ANTHROPIC_MODEL` or `settings.model`
+ * pins `claude-fable-5-2`. Those rows keep the pinned id, so a client's choice
+ * stays on that version after a newer Fable becomes `fable`. A resumed Fable
+ * 5.1 session keeps `claude-fable-5-1` too, because Fable 5.2 is newer.
+ */
+export function aliasResumedModelRow(
+  models: ModelInfo[],
+  resumedModel: string | undefined,
+): ModelInfo[] {
+  if (resumedModel === undefined) return models;
+  const resumed = canonicalizeModelId(resumedModel);
+  const values = new Set(models.map((model) => model.value));
+  const versions = models.flatMap((model) => {
+    const version = familyVersionOf(model.resolvedModel ?? model.value);
+    return version ? [version] : [];
+  });
+  return models.map((model) => {
+    const version = familyVersionOf(model.value);
+    if (
+      version === null ||
+      !MODEL_FAMILY_ALIASES.has(version.family) ||
+      values.has(version.family) ||
+      model.resolvedModel !== model.value ||
+      contextHintOf(model.value) !== null ||
+      canonicalizeModelId(model.value) !== resumed ||
+      versions.some(
+        (other) =>
+          other.family === version.family &&
+          (other.major > version.major ||
+            (other.major === version.major && other.minor > version.minor)),
+      )
+    ) {
+      return model;
+    }
+    values.add(version.family);
+    return { ...model, value: version.family };
+  });
+}
 
 /** A model id without the spellings that name the same model: provider
  *  prefixes, dates, version suffixes, `:variant` suffixes, dotted versions,
@@ -454,6 +547,61 @@ export function narrowToGatewayModels(
   return narrowed.some((model) => listed.has(normalizeModelId(model.resolvedModel ?? model.value)))
     ? narrowed
     : [];
+}
+
+/**
+ * The capabilities of the session's current model, and the model infos that
+ * every later lookup reads.
+ *
+ * A resumed session can be running a model outside the `availableModels`
+ * allowlist (currentModelId is then the verbatim live id, see
+ * `matchResumedModel`); its capabilities are still known to the SDK's
+ * unfiltered list, so they are resolved from that before the model is treated
+ * as unknown — otherwise auto mode would be spuriously clamped and the
+ * Fast-mode/Effort options hidden for a model that supports them.
+ *
+ * The fallback-resolved capabilities are registered under the verbatim live
+ * id, so every modelInfos consumer (the effort option, later rebuilds) agrees
+ * with that gating. `buildModelConfigOption` lists this model as its own
+ * entry while it is current and drops it once the user switches to a listed
+ * model; it is never added to `availableModels`. The spread keeps every
+ * capability flag (current and future); the identity fields are overridden
+ * because the fuzzy-matched sibling's resolvedModel/displayName/description
+ * can describe a different context lane and would poison later resolvedModel
+ * matching (a model switch that the adapter did not make) and context-window
+ * inference if they traveled under this id. `allowlistedModelInfo` is the
+ * allowlisted entry alone, the only one whose identity strings are a
+ * trustworthy window signal.
+ */
+export function withCurrentModelInfo(
+  allowedModels: ModelInfo[],
+  sdkModels: ModelInfo[],
+  currentModelId: string,
+): {
+  allowlistedModelInfo: ModelInfo | undefined;
+  currentModelInfo: ModelInfo | undefined;
+  modelInfos: ModelInfo[];
+} {
+  const allowlistedModelInfo = allowedModels.find((m) => m.value === currentModelId);
+  const fallbackModelInfo = allowlistedModelInfo
+    ? undefined
+    : (resolveModelPreference(sdkModels, currentModelId) ?? undefined);
+  return {
+    allowlistedModelInfo,
+    currentModelInfo: allowlistedModelInfo ?? fallbackModelInfo,
+    modelInfos: fallbackModelInfo
+      ? [
+          ...allowedModels,
+          {
+            ...fallbackModelInfo,
+            value: currentModelId,
+            displayName: currentModelId,
+            description: "",
+            resolvedModel: undefined,
+          },
+        ]
+      : allowedModels,
+  };
 }
 
 /** Whether a rejected `setModel` was vetoed by a user-configured

@@ -142,7 +142,11 @@ On v2 the adapter serves the session baseline (`session/new`, `session/list`, `s
 with replay, `session/close`, `session/prompt`, `session/cancel`), `session/delete`,
 `session/fork`, additional directories, config options (the mode is one), plans, notices,
 compaction, display terminals for commands, permission requests, elicitation, providers, auth, and
-[subagents](#subagent-sessions). Steering and the AIR extensions are v1 only for now.
+[subagents](#subagent-sessions). Steering is v1 only for now.
+
+v2 is served by the v2 agent in `src/v2/`, which runs straight on Claude
+Code instead of translating to v1. A v2 client that declares JetBrains AIR
+(`_meta.jetbrains.air`) also gets the AIR extensions that ACP v2 does not cover.
 
 ## Contribution Policy
 

@@ -79,7 +79,7 @@ A page with more sessions after it has a `nextCursor`, as ACP defines.
 A client that does not follow `nextCursor` sees only the newest 1000 sessions of the directory.
 An unknown cursor gives an `invalidParams` error.
 
-`src/tests/acp-scenarios.test.ts` compares the traffic of a plain client and of Zed with recordings of origin/main.
+`src/tests/v1/acp-scenarios.test.ts` compares the traffic of a plain client and of Zed with recordings of origin/main.
 
 ## Negotiation
 
@@ -146,6 +146,15 @@ The `initialize` response of an AIR client carries the agent side of the extensi
 The agent list does not depend on the capabilities that AIR declares, except `sessionIndex`: the agent lists it, together with `sessionBatchGet`, `sessionArchive`, `sessionRename`, `sessionListSubscribe` and `sessionWorktrees`, only for a client that declared `sessionIndex`.
 An extension is active only when the client declared its capability. The client does not declare `sessionBatchGet`, `sessionArchive`, `sessionRename`, `sessionListSubscribe` and `sessionWorktrees`.
 The response to a client that is not AIR has no `_meta.jetbrains` key.
+
+### ACP v2
+
+The v2 core (`src/v2/`) serves an AIR client only the extensions that ACP v2 does not cover.
+Its `initialize` response lists `agentFileChangeReport` and `recommendedValue`.
+It also serves the [permission presentation](#permission-presentation), the [question custom answers](#question-custom-answers), the [predicted follow-up prompt](#predicted-follow-up-prompt), and [load replay end](#load-replay-end).
+The [agent file-change report](#agent-file-change-report) goes out at the end of the turn that serves the prompt, before the turn's idle `state_update`, because a v2 `session/prompt` is answered when Claude Code takes the prompt in.
+ACP v2 covers subagents, background work, file plans, patches, compaction, the system prompt, and turn failures itself, so the v2 core serves no `nativeSubagentSessions`, `backgroundSubagents`, `asyncTasks`, `planFile`, `diffPatch`, `contextCompaction`, `customInstructions`, or `sessionFailure`.
+It does not serve the [tool call contract](#tool-call-contract) yet.
 
 ### Capabilities
 
@@ -222,7 +231,7 @@ The adapter keeps them where they are.
 
 ## Auth source display
 
-The connection-scoped `_auth/status_update` continues to report agent-owned authentication, not client-owned `providers/set` routing. When the active key source is `apiKeyHelper`, the adapter reads the effective helper command through SDK `resolveSettings` / the session's `SettingsManager`, including programmatic settings overrides.
+The connection-scoped `_auth/status_update` continues to report agent-owned authentication, not client-owned `providers/set` routing. The adapter also reports the same identity through the ACP `auth/status` method and `auth/status_update` notification (advertised as `auth.status`), with `kind`, `detail` and `plan` under the account's `_meta.claudeCode`. The account's `label` also carries a `detail` in parentheses, e.g. `Anthropic API key (ANTHROPIC_API_KEY)`. Each notification is sent when its own payload changed. `auth/status` answers with the identity last reported and starts a new read, whose change arrives as a notification. When the active key source is `apiKeyHelper`, the adapter reads the effective helper command through SDK `resolveSettings` / the session's `SettingsManager`, including programmatic settings overrides.
 
 A command containing the whole word `central` and the word sequence `proxy start` is displayed as:
 
@@ -233,6 +242,8 @@ A command containing the whole word `central` and the word sequence `proxy start
 Matching is case-insensitive and accepts multiple whitespace characters between `proxy` and `start`. The command's flags, URL, host and route are not checked. This is a weak display heuristic, not proof of configuration provenance, account ownership or entitlement. Inactive helpers and external cloud backends retain their existing classification. No helper command, key, headers, private route or inferred account is included in this payload.
 
 Other active helpers use `label: "Anthropic API key"` and `detail: "API key helper"`; unknown key-source identifiers are not exposed as display text. CLI and SDK reads share this presentation, retain stale-probe protection, and suppress unchanged notifications.
+
+For Max subscriptions, the existing `claude auth status --json` probe's optional `planTier` distinguishes `max_20x` (displayed as `Claude Ultra`) from `max_5x` (`Claude Max`). Missing, unrecognized, or malformed tiers fall back to the subscription's usual label. Other subscriptions and auth sources keep their existing classification. The raw `account.plan` and ACP `_meta.claudeCode.plan` remain unchanged. SDK account reads lack the tier, so they preserve the known label for the same account and plan; a fresh CLI read replaces it, including when the tier is absent. This is display metadata, not an entitlement check, and requires no additional probe or direct credential-file reads.
 
 ## Zed conventions
 
@@ -551,7 +562,7 @@ AIR puts the hooks into `_meta.claudeCode.options.settings.hooks` of `session/ne
 ```
 
 - The settings go to the flag settings tier of that session only. Other sessions and the settings files do not change.
-- Claude Code runs the hooks of every settings tier, so the user, project and IDE hooks of one event all run. `src/tests/session-hooks.test.ts` checks this with the Claude Code binary.
+- Claude Code runs the hooks of every settings tier, so the user, project and IDE hooks of one event all run. `src/tests/v1/session-hooks.test.ts` checks this with the Claude Code binary.
 - `CLAUDE_MODEL_CONFIG` stays in effect (see [Model configuration](model-configuration.md#precedence)).
 - A `session/load` with different settings recreates the query, so it applies the new hooks.
 - Claude asks for no hook trust step.
@@ -1065,7 +1076,8 @@ The adapter ignores a malformed request and a repeated request id.
 
 ### Report
 
-The adapter sends one `session_info_update` before the `PromptResponse`:
+The adapter sends one `session_info_update` before the `PromptResponse`.
+On ACP v2 it comes before the idle `state_update` of the turn that serves the prompt (see [ACP v2](#acp-v2)):
 
 ```json
 {
@@ -1641,7 +1653,8 @@ The hold protects a client that stops listening at the prompt response.
 ### Behavior with the capability
 
 AIR declares `backgroundSubagents` in `initialize.clientCapabilities._meta.jetbrains.air.capabilities`.
-The capability applies to ACP v1 only. ACP v2 keeps the hold, and the agent does not advertise the capability to ACP v2.
+The capability applies to ACP v1 only, and the agent does not advertise it to ACP v2.
+ACP v2 has no hold: the v2 agent answers `session/prompt` when Claude Code takes the prompt in, lists a background subagent in its parent session's `background` while it works, and reports each subagent's work in the state of its child session (see [ACP v2](#acp-v2)).
 
 - The turn ends at its result with the stop reason of the result, usually `end_turn`.
 - The subagent updates, permission requests and elicitations go out after the prompt response.

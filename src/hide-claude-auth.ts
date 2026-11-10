@@ -2,7 +2,7 @@
  * `--hide-claude-auth`: this integration must never bill a claude.ai
  * subscription. Under the flag the agent hides the claude.ai login method from
  * `initialize`, and refuses with `authRequired` every session and every turn
- * that a subscription would pay for. `acp-agent.ts` decides when the guard
+ * that a subscription would pay for. `v1/acp-agent.ts` decides when the guard
  * applies (flag on, no provider override); this module decides what it refuses.
  *
  * The guard judges the `AccountInfo` that the SDK caches at `initialize`. That
@@ -35,8 +35,10 @@
 import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import type { AccountInfo, Query } from "@anthropic-ai/claude-agent-sdk";
 
+export const HIDE_CLAUDE_AUTH_FLAG = "--hide-claude-auth";
+
 export function shouldHideClaudeAuth(): boolean {
-  return process.argv.includes("--hide-claude-auth");
+  return process.argv.includes(HIDE_CLAUDE_AUTH_FLAG);
 }
 
 /**
@@ -208,14 +210,14 @@ type GuardOptions = {
  * covers a session created under a provider override that `providers/disable`
  * later removed, so the create-time check never ran for the routing in force
  * now. A sign-out ends the query (see `markSessionForSignOutRespawn` in
- * `acp-agent.ts`), so the next turn recreates it and `initialize` reports the
+ * `v1/acp-agent.ts`), so the next turn recreates it and `initialize` reports the
  * real account. This guard does not see the residual case the module header
  * names either.
  *
  * A turn is refused when the account bills a subscription, and also when it
  * holds nothing this integration accepts, which is the user signing out in
  * mid-session. The refusal mirrors the signed-out path exactly (see
- * `failActiveWithSessionFailure` for `auth_required` in `acp-agent.ts`): every
+ * `failActiveWithSessionFailure` for `auth_required` in `v1/acp-agent.ts`): every
  * client gets the `authRequired` JSON-RPC rejection that starts its own auth
  * flow. The guard sends no separate access message.
  *

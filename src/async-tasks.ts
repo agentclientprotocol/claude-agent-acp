@@ -105,6 +105,28 @@ type TaskProgress = TaskIdentity & {
   output_file?: unknown;
 };
 
+/** The display fields of a task progress report, shared by AIR and v2 cards. */
+export type TaskProgressFields = {
+  description?: string;
+  summary?: string;
+  lastToolName?: string;
+  usage?: { totalTokens: number; toolUses: number; durationMs: number };
+};
+
+/** Reads the display fields supplied by a task progress report. */
+export function taskProgressFields(message: TaskProgress): TaskProgressFields {
+  const usage = taskUsage(message.usage);
+  const description = nonBlankString(message.description);
+  const summary = nonBlankString(message.summary);
+  const lastToolName = nonBlankString(field(message, "lastToolName", "last_tool_name"));
+  return {
+    ...(description ? { description } : {}),
+    ...(summary ? { summary } : {}),
+    ...(lastToolName ? { lastToolName } : {}),
+    ...(usage ? { usage } : {}),
+  };
+}
+
 type BackgroundTaskLevel = TaskIdentity & {
   taskType?: unknown;
   task_type?: unknown;
@@ -267,15 +289,8 @@ export class AsyncTaskRuntime {
       return;
     }
 
-    const usage = taskUsage(message.usage);
-    const description = nonBlankString(message.description);
-    const summary = nonBlankString(message.summary);
-    const lastToolName = nonBlankString(field(message, "lastToolName", "last_tool_name"));
     const progress = {
-      ...(description ? { description } : {}),
-      ...(summary ? { summary } : {}),
-      ...(lastToolName ? { lastToolName } : {}),
-      ...(usage ? { usage } : {}),
+      ...taskProgressFields(message),
       ...(outputChanged && task.outputFilePath ? { outputFilePath: task.outputFilePath } : {}),
       ...(task.toolCallId !== previousToolCallId && task.toolCallId
         ? { toolCallId: task.toolCallId }
@@ -863,18 +878,29 @@ function recordPublished(task: AsyncTask, fields: Record<string, unknown>): void
  * Recovers a background Bash task from the structured `backgroundTaskId` of
  * its tool result. The text of a tool result never gives a task id: a
  * foreground command can print any text.
+ *
+ * Claude Code sends no `tool_use_result` with a subagent's tool results. For
+ * those, `startedTaskOf` gives the background `local_bash` task whose
+ * `task_started` named the Bash call, which comes before the result.
  */
 export function backgroundBashTaskFromToolResult(
   content: unknown,
   toolUseResult: unknown,
   toolUses: Record<string, { name: string; input: unknown }>,
+  startedTaskOf?: (toolUseId: string) => string | undefined,
 ): (AsyncTaskStarted & { taskId: string; toolCallId: string }) | undefined {
   if (!Array.isArray(content)) return undefined;
   const toolResults = content.flatMap(toolResultBlock);
   const bashResults = toolResults.filter((result) => toolUses[result.toolUseId]?.name === "Bash");
   if (bashResults.length === 0) return undefined;
 
-  const backgroundResults = structuredBackgroundResults(toolUseResult, toolUses);
+  let backgroundResults = structuredBackgroundResults(toolUseResult, toolUses);
+  if (backgroundResults.length === 0 && startedTaskOf) {
+    backgroundResults = bashResults.flatMap((result) => {
+      const taskId = result.isError ? undefined : startedTaskOf(result.toolUseId);
+      return taskId ? [{ taskId, toolUseId: result.toolUseId }] : [];
+    });
+  }
   const distinctTaskIds = new Set(backgroundResults.map((result) => result.taskId));
   if (distinctTaskIds.size !== 1) return undefined;
   const taskId = [...distinctTaskIds][0];

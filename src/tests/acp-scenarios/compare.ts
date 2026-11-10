@@ -25,6 +25,9 @@
  * - The `initialize` response also advertises
  *   `agentCapabilities.sessionCapabilities.systemPrompt`, which origin/main
  *   did not: the agent now applies the `systemPrompt` of session requests.
+ * - The `initialize` response also advertises `agentCapabilities.auth.status`,
+ *   which origin/main did not: the agent now answers `auth/status` and sends
+ *   `auth/status_update`.
  * - A SandboxNetworkAccess tool call is settled by a `tool_call_update` with
  *   only its final `status` once its permission request is answered. The
  *   callback runs nothing, so origin/main never settled the call (see
@@ -242,6 +245,19 @@ function withoutSessionCapability(record: Recorded, key: string): Recorded {
   } as Recorded;
 }
 
+/** `record` without `agentCapabilities.auth.status`, when it is an `initialize` response. */
+function withoutAuthStatusCapability(record: Recorded): Recorded {
+  if (record.kind !== "initialize") return record;
+  const payload = record.payload as Json;
+  const agent = payload.agentCapabilities as Json | undefined;
+  const auth = agent?.auth as Json | undefined;
+  if (!auth || !("status" in auth)) return record;
+  return {
+    ...record,
+    payload: { ...payload, agentCapabilities: { ...agent, auth: without(auth, "status") } },
+  } as Recorded;
+}
+
 /**
  * Returns the differences between the baseline and the current traffic that
  * the compatibility rule does not allow. An empty list means compatible.
@@ -254,7 +270,9 @@ export function compareWithBaseline(baseline: Recorded[], traffic: Recorded[]): 
       return !(update?.sessionUpdate === "session_info_update" && Object.keys(update).length === 1);
     });
   const current = withoutSandboxNetworkSettlements(
-    traffic.map((record) => withoutSessionCapability(record, "systemPrompt")),
+    traffic.map((record) =>
+      withoutAuthStatusCapability(withoutSessionCapability(record, "systemPrompt")),
+    ),
   );
   const violations: string[] = [];
   const state = new Map<string, Map<string, string>>();

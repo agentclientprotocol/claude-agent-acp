@@ -717,7 +717,7 @@ function airPatchContent(filePath: string, { change, hunks }: FilePatch): ToolCa
  *
  * The agent builds tool call content in v1 types, and v1 cannot express a v2
  * diff, so the diff travels as v1 content. Nothing in the agent reads inside a
- * diff, and only a v2 client gets one: the v2 surface sends it as it is
+ * diff, and only a v2 client gets one: the v2 core sends it as it is
  * (`src/v2/tool-call.ts`).
  */
 export function v2DiffContent(

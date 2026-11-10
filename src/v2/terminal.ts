@@ -56,7 +56,15 @@ export class V2Terminals {
   ): { terminal: v2.SessionUpdate[]; report: V1ToolCallReport | undefined } {
     const meta = (report._meta ?? {}) as TerminalMeta;
     const key = `${sessionId} ${report.toolCallId}`;
-    if (meta.terminal_info) this.running.set(key, { terminalId: meta.terminal_info.terminal_id });
+    // A replay of a command that still runs, such as one in the background,
+    // names its terminal again: the running entry keeps its command and
+    // `cancellable`.
+    if (
+      meta.terminal_info &&
+      this.running.get(key)?.terminalId !== meta.terminal_info.terminal_id
+    ) {
+      this.running.set(key, { terminalId: meta.terminal_info.terminal_id });
+    }
     const terminal: v2.SessionUpdate[] = [];
     const running = this.running.get(key);
     if (running) {
