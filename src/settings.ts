@@ -37,6 +37,8 @@ export interface SettingsManagerOptions {
   logger?: { log: (...args: any[]) => void; error: (...args: any[]) => void };
 }
 
+type ModelSelectionSettings = Pick<Settings, "availableModels" | "modelOverrides">;
+
 /**
  * Manages Claude Code settings using the SDK's `resolveSettings` merge engine
  * so the values we see match what `query()` would observe.
@@ -50,6 +52,7 @@ export class SettingsManager {
   private cwd: string;
   private effective: Settings = {};
   private managedDeniedModels: string[] = [];
+  private managedModelSettings: ModelSelectionSettings = {};
   private managedApiKeyHelper?: string;
   private watchers: fs.FSWatcher[] = [];
   private onChange?: () => void;
@@ -112,6 +115,15 @@ export class SettingsManager {
       this.managedDeniedModels = resolved.sources
         .filter((entry) => entry.source === "managed")
         .flatMap((entry) => entry.settings.deniedModels ?? []);
+      this.managedModelSettings = Object.assign(
+        {},
+        ...resolved.sources
+          .filter((entry) => entry.source === "managed")
+          .map((entry) => ({
+            availableModels: entry.settings.availableModels,
+            modelOverrides: entry.settings.modelOverrides,
+          })),
+      );
       this.managedApiKeyHelper =
         resolved.provenance.apiKeyHelper?.source === "managed"
           ? resolved.effective.apiKeyHelper
@@ -120,6 +132,7 @@ export class SettingsManager {
       this.logger.error("Failed to resolve settings:", error);
       this.effective = {};
       this.managedDeniedModels = [];
+      this.managedModelSettings = {};
       this.managedApiKeyHelper = undefined;
     }
   }
@@ -191,6 +204,26 @@ export class SettingsManager {
     return (
       this.managedApiKeyHelper ?? settingsOverride?.apiKeyHelper ?? this.effective.apiKeyHelper
     );
+  }
+
+  /** Model selection settings including the inline SDK settings tier. */
+  getModelSelectionSettings(override?: Settings): ModelSelectionSettings {
+    // The SDK unions non-managed allowlists, but a managed list owns the
+    // whole allowlist. Keep that policy when adding
+    // models the SDK did not include in its initialization result.
+    const lists = [this.effective.availableModels, override?.availableModels].filter(
+      (list): list is string[] => Array.isArray(list),
+    );
+    const managed = this.managedModelSettings;
+    return {
+      availableModels:
+        managed.availableModels ?? (lists.length > 0 ? [...new Set(lists.flat())] : undefined),
+      modelOverrides: {
+        ...this.effective.modelOverrides,
+        ...override?.modelOverrides,
+        ...managed.modelOverrides,
+      },
+    };
   }
 
   /**

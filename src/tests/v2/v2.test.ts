@@ -9,7 +9,7 @@
  * `session_state_changed`.
  */
 import { randomUUID } from "node:crypto";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -494,6 +494,51 @@ describe("ACP v2 core", () => {
       "console-login",
     );
   });
+
+  it.each(["environment", "caller object", "caller file"])(
+    "includes configured models omitted by the SDK from %s settings",
+    async (source) => {
+      const configured = {
+        availableModels: ["claude-haiku-4-5", "claude-haiku-5-5"],
+        modelOverrides: {
+          "claude-haiku-4-5": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+          "claude-haiku-5-5": "global.anthropic.claude-haiku-5-5",
+        },
+      };
+      let settings: typeof configured | string | undefined;
+      if (source === "environment") {
+        vi.stubEnv("CLAUDE_MODEL_CONFIG", JSON.stringify(configured));
+      } else if (source === "caller file") {
+        settings = "caller-settings.json";
+        await writeFile(path.join(cwd, settings), JSON.stringify(configured));
+      } else {
+        settings = configured;
+      }
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        await agent.request(v2.methods.agent.initialize, {
+          protocolVersion: v2.PROTOCOL_VERSION,
+          info: { name: "v2-test-client", version: "1" },
+        });
+        const response = await agent.request(v2.methods.agent.session.new, {
+          cwd,
+          _meta: { claudeCode: { options: { settings } } },
+        });
+        const ids = ["default", ...Object.values(configured.modelOverrides)];
+        const model = response.configOptions?.find((option) => option.configId === "model");
+        expect(model).toMatchObject({
+          options: ids.map((value) => expect.objectContaining({ value })),
+        });
+        await agent.request(v2.methods.agent.session.setConfigOption, {
+          sessionId: response.sessionId,
+          configId: "model",
+          type: "id",
+          value: ids[2],
+        } as v2.SetSessionConfigOptionRequest);
+        expect(sdk.processes[0].setModel).toHaveBeenLastCalledWith(ids[2]);
+      });
+    },
+  );
 
   it("routes the sessions started after a gateway login through the gateway", async () => {
     const client = v2Client();
