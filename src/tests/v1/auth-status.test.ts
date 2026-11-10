@@ -363,6 +363,48 @@ describe("auth status mappers", () => {
     ).toEqual({ kind: "account", label: "Claude subscription", detail: "OAuth token" });
   });
 
+  it.each([
+    ["max", "max_20x", "Claude Ultra"],
+    ["Claude Max", "max_20x", "Claude Ultra"],
+    ["max", "max_5x", "Claude Max"],
+    ["max", "max_other", "Claude Max"],
+    ["max", undefined, "Claude Max"],
+    ["max", "future_tier", "Claude Max"],
+    ["max", null, "Claude Max"],
+    ["max", 20, "Claude Max"],
+    ["max", { tier: "max_20x" }, "Claude Max"],
+    ["max", ["max_20x"], "Claude Max"],
+    ["pro", "max_20x", "Claude Pro"],
+    ["Future Plan", "future_tier", "Claude Future Plan"],
+  ])("labels CLI plan %j with tier %j as %j", (subscriptionType, planTier, label) => {
+    expect(
+      fromCliStatus(
+        JSON.stringify({
+          ...JSON.parse(CLI_SUBSCRIPTION),
+          subscriptionType,
+          planTier,
+        }),
+      ),
+    ).toEqual({
+      kind: "account",
+      label,
+      account: { plan: subscriptionType, email: "user@example.com", organization: "ACME" },
+    });
+  });
+
+  it.each([
+    [{ apiKeySource: "env" }, { kind: "api_key", label: "Anthropic API key", detail: "env" }],
+    [{ apiProvider: "bedrock" }, { kind: "external", label: "AWS Bedrock" }],
+    [{ apiProvider: "gateway" }, { kind: "gateway", label: "Custom model gateway" }],
+    [{ loggedIn: false }, { kind: "none", label: "Not logged in" }],
+  ])("does not let a subscription tier override auth fields %j", (fields, expected) => {
+    expect(
+      fromCliStatus(
+        JSON.stringify({ ...JSON.parse(CLI_SUBSCRIPTION), planTier: "max_20x", ...fields }),
+      ),
+    ).toEqual(expected);
+  });
+
   it("lets a third-party backend outrank the logged-out flag", () => {
     // `loggedIn` tracks the claude.ai login only; on Bedrock the credentials
     // are external and the agent is authenticated all the same.
@@ -384,19 +426,27 @@ describe("auth status mappers", () => {
     };
     // Same login, read from a source without the organization: it survives.
     expect(
-      mergeAuthStatus(stored, {
-        kind: "account",
-        label: "Claude Max",
-        account: { plan: "max", email: "user@example.com" },
-      }),
+      mergeAuthStatus(
+        stored,
+        {
+          kind: "account",
+          label: "Claude Max",
+          account: { plan: "max", email: "user@example.com" },
+        },
+        "cli",
+      ),
     ).toEqual(stored);
     // A different login replaces everything, organization included.
     expect(
-      mergeAuthStatus(stored, {
-        kind: "account",
-        label: "Claude Pro",
-        account: { plan: "pro", email: "other@example.com" },
-      }),
+      mergeAuthStatus(
+        stored,
+        {
+          kind: "account",
+          label: "Claude Pro",
+          account: { plan: "pro", email: "other@example.com" },
+        },
+        "cli",
+      ),
     ).toEqual({
       kind: "account",
       label: "Claude Pro",
@@ -404,7 +454,11 @@ describe("auth status mappers", () => {
     });
     // A different kind never merges, even when it looks adjacent.
     expect(
-      mergeAuthStatus(stored, { kind: "api_key", label: "Anthropic API key", detail: "env" }),
+      mergeAuthStatus(
+        stored,
+        { kind: "api_key", label: "Anthropic API key", detail: "env" },
+        "cli",
+      ),
     ).toEqual({ kind: "api_key", label: "Anthropic API key", detail: "env" });
     // Key sources identify api_key payloads.
     expect(
@@ -414,6 +468,29 @@ describe("auth status mappers", () => {
       ),
     ).toBe(false);
   });
+
+  it.each<["cli" | "session", string, string, string | undefined, string]>([
+    ["session", "max", "user@example.com", undefined, "Claude Ultra"],
+    ["session", "Claude Max", "user@example.com", undefined, "Claude Ultra"],
+    ["session", "pro", "user@example.com", undefined, "Claude Pro"],
+    ["session", "max", "other@example.com", undefined, "Claude Max"],
+    ["cli", "max", "user@example.com", "max_5x", "Claude Max"],
+    ["cli", "max", "user@example.com", undefined, "Claude Max"],
+    ["cli", "max", "user@example.com", "future_tier", "Claude Max"],
+  ])(
+    "merges a %s read of %s for %s with tier %s as %s",
+    (source, subscriptionType, email, planTier, label) => {
+      const previous = fromCliStatus(
+        JSON.stringify({ ...JSON.parse(CLI_SUBSCRIPTION), planTier: "max_20x" }),
+      );
+      const fields = { apiProvider: "firstParty" as const, subscriptionType, email };
+      const next =
+        source === "session"
+          ? fromAccountInfo(fields)
+          : fromCliStatus(JSON.stringify({ ...fields, loggedIn: true, planTier }));
+      expect(mergeAuthStatus(previous, next!, source).label).toBe(label);
+    },
+  );
 });
 
 describe("auth status over ACP", () => {
@@ -858,6 +935,32 @@ describe("auth status over ACP", () => {
       account: { plan: "max", email: "user@example.com", organization: "ACME" },
     });
   });
+
+  it.each(["max_5x", undefined, "future_tier"])(
+    "keeps Ultra across session reads and refreshes the label for CLI tier %j",
+    async (planTier) => {
+      statusStdout = JSON.stringify({ ...JSON.parse(CLI_SUBSCRIPTION), planTier: "max_20x" });
+      await initialize();
+      const sessionId = await scriptedSession({
+        apiProvider: "firstParty",
+        subscriptionType: "Claude Max",
+        email: "user@example.com",
+      });
+      await promptOnce(sessionId);
+      expect(updates().every((call) => call[1].authStatus.label === "Claude Ultra")).toBe(true);
+      expect(await agent.authStatusResponse()).toMatchObject({
+        accounts: [{ label: "Claude Ultra", _meta: { claudeCode: { plan: "max" } } }],
+      });
+      await settle();
+
+      statusStdout = JSON.stringify({ ...JSON.parse(CLI_SUBSCRIPTION), planTier });
+      await promptOnce(sessionId);
+      expect(lastPush()?.label).toBe("Claude Max");
+      expect(authStatusUpdate.mock.calls.at(-1)?.[0]).toMatchObject({
+        accounts: [{ label: "Claude Max" }],
+      });
+    },
+  );
 
   it("lets a probe of a different identity replace the stored one wholesale", async () => {
     const sessionId = await scriptedSession({

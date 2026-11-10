@@ -188,8 +188,8 @@ export class AuthStatusReporter {
   /**
    * Report the identity behind a session's `AccountInfo`.
    *
-   * `AccountInfo` is richer than the CLI probe (it is what the live query
-   * actually authenticates with). The v1 core calls it before the
+   * `AccountInfo` describes what the live query authenticates with, but lacks
+   * the CLI's plan tier. The v1 core calls it before the
    * `--hide-claude-auth` guard may refuse the session or the turn: that flag
    * blocks the *use* of a subscription, it does not make the state secret, and
    * a refusal is when the client most needs to know the account it was
@@ -225,7 +225,7 @@ export class AuthStatusReporter {
     }
     const fromSession = fromAccountInfo(account, apiKeyHelper);
     if (fromSession) {
-      this.set(fromSession);
+      this.set(mergeAuthStatus(this.current, fromSession, "session"));
     } else if (!this.loggedUninformativeAccount) {
       this.loggedUninformativeAccount = true;
       this.options.logger.log(
@@ -337,7 +337,7 @@ export class AuthStatusReporter {
     // The CLI probe can be poorer than the session `AccountInfo` for the very
     // same login (no organization, say). Keep those extra fields rather than
     // regressing the payload; a different identity replaces it wholesale.
-    const merged = mergeAuthStatus(this.current, status);
+    const merged = mergeAuthStatus(this.current, status, "cli");
     this.set(merged);
     this.options.onProbe?.(status.kind);
     return merged;
