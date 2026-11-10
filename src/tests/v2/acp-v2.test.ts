@@ -66,6 +66,14 @@ const sdk = vi.hoisted(() => ({
   interrupt: async (): Promise<void> => {},
   /** Claude Code stops one task, as `cancel()` does for a child session. */
   stopTask: async (_taskId: string): Promise<void> => {},
+  /** Claude Code reads the end of a shell task's output (`get_task_output`). */
+  getTaskOutput: async (
+    _taskId: string,
+  ): Promise<{ output: string; total_bytes: number; truncated: boolean }> => ({
+    output: "",
+    total_bytes: 0,
+    truncated: false,
+  }),
   /** The query is closed, as `session/close` closes it. */
   close: (): void => {},
   initializationResult: async (): Promise<Record<string, unknown>> => ({
@@ -141,6 +149,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         mcpAuthenticate: (serverName: string) => sdk.mcpAuthenticate(serverName),
         interrupt: () => sdk.interrupt(),
         stopTask: (taskId: string) => sdk.stopTask(taskId),
+        getTaskOutput: (taskId: string) => sdk.getTaskOutput(taskId),
         close: () => sdk.close(),
         accountInfo: () => sdk.accountInfo(),
         setMcpServers: (servers: Record<string, unknown>) => sdk.setMcpServers(servers),
@@ -8876,6 +8885,155 @@ describe("ACP v2 terminal of a command in the background", () => {
         },
       ]);
     });
+  });
+});
+
+describe("ACP v2 output of a command in the foreground", () => {
+  it("sends the output as chunks while the command runs, then the result's output as the terminal's", async () => {
+    let written = "line1\n";
+    sdk.getTaskOutput = async () => ({
+      output: written,
+      total_bytes: Buffer.byteLength(written),
+      truncated: false,
+    });
+    const done = Promise.withResolvers<void>();
+    scriptTurns(async function* (options) {
+      yield {
+        type: "assistant",
+        message: {
+          id: "msg_fg",
+          type: "message",
+          role: "assistant",
+          model: "claude-sonnet-4-6",
+          content: [
+            { type: "tool_use", id: "toolu_fg", name: "Bash", input: { command: "make test" } },
+          ],
+          stop_reason: "tool_use",
+          stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield {
+        type: "system",
+        subtype: "task_started",
+        task_id: "fg1",
+        task_type: "local_bash",
+        description: "make test",
+        tool_use_id: "toolu_fg",
+        is_backgrounded: false,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      await done.promise;
+      yield {
+        type: "user",
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "toolu_fg", content: "line1\nline2" }],
+        },
+        tool_use_result: { stdout: "line1\nline2", stderr: "", interrupted: false, isImage: false },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield result(options);
+      yield idleState(options);
+    });
+    const output = (client: ReturnType<typeof v2Client>) =>
+      client.sessionUpdates.flatMap(({ update }) => {
+        if (update.sessionUpdate === "terminal_output_chunk") {
+          return [`chunk ${Buffer.from(String(update.data), "base64").toString()}`];
+        }
+        if (update.sessionUpdate !== "terminal_update" || !update.output) return [];
+        return [
+          `output ${Buffer.from((update.output as { data: string }).data, "base64").toString()}`,
+        ];
+      });
+
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const prompt = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("hi"),
+      });
+      await vi.waitFor(() => expect(output(client)).toEqual(["chunk line1\n"]), { timeout: 2000 });
+      written = "line1\nline2";
+      await vi.waitFor(() => expect(output(client)).toHaveLength(2), { timeout: 2000 });
+      done.resolve();
+      await prompt;
+      await vi.waitFor(() => expect(output(client)).toHaveLength(3), { timeout: 2000 });
+    });
+
+    expect(output(client)).toEqual(["chunk line1\n", "chunk line2", "output line1\nline2"]);
+  });
+
+  it("reads no task output for a command that Claude Code runs in the background", async () => {
+    const reads: string[] = [];
+    sdk.getTaskOutput = async (taskId) => {
+      reads.push(taskId);
+      return { output: "x", total_bytes: 1, truncated: false };
+    };
+    const done = Promise.withResolvers<void>();
+    scriptTurns(async function* (options) {
+      yield {
+        type: "assistant",
+        message: {
+          id: "msg_bg",
+          type: "message",
+          role: "assistant",
+          model: "claude-sonnet-4-6",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_bg",
+              name: "Bash",
+              input: { command: "make serve", run_in_background: true },
+            },
+          ],
+          stop_reason: "tool_use",
+          stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield {
+        type: "system",
+        subtype: "task_started",
+        task_id: "bg1",
+        task_type: "local_bash",
+        description: "make serve",
+        tool_use_id: "toolu_bg",
+        is_backgrounded: true,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      await done.promise;
+      yield result(options);
+      yield idleState(options);
+    });
+
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const prompt = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("hi"),
+      });
+      // Longer than a few polls (BACKGROUND_OUTPUT_POLL_MS).
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      done.resolve();
+      await prompt;
+    });
+
+    expect(reads).toEqual([]);
   });
 });
 

@@ -57,6 +57,7 @@ import type { Logger } from "../logger.js";
 import type { McpCommand } from "../mcp-command.js";
 import type { ElicitationSupport } from "../elicitation.js";
 import { Pushable } from "../utils.js";
+import { supportsTaskOutput } from "../background-output.js";
 import { v1PromptRequest } from "./prompt.js";
 import { V2Background, stateUpdate as currentStateUpdate } from "./background.js";
 import type { V2UpdateTranslator } from "./update-translator.js";
@@ -295,6 +296,12 @@ export class V2Session implements RequestTarget {
         modes: () => this.config.availableModes(),
         stopTask: async (taskId) => {
           await this.query?.stopTask(taskId);
+        },
+        taskOutput: () => {
+          const query = this.query;
+          return query && supportsTaskOutput(query)
+            ? (taskId) => query.getTaskOutput(taskId)
+            : undefined;
         },
       },
       this.output,

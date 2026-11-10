@@ -56,7 +56,12 @@ import type {
 import type { Logger } from "../logger.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import { backgroundBashTaskFromToolResult, taskProgressFields } from "../async-tasks.js";
-import { BackgroundOutputTail, type BackgroundOutput } from "../background-output.js";
+import {
+  BackgroundOutputTail,
+  type BackgroundOutput,
+  type TaskOutput,
+  TaskOutputPoll,
+} from "../background-output.js";
 import {
   childModelOption,
   HANDBACK_TOOL,
@@ -76,7 +81,11 @@ import {
   type SubagentModels,
 } from "../native-subagents.js";
 import { subagentLineage } from "../subagent-history.js";
-import { withRunningTerminal, withRunningToolCall } from "../tool-calls/background.js";
+import {
+  withRunningTerminal,
+  withRunningToolCall,
+  withStreamedTerminal,
+} from "../tool-calls/background.js";
 import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { AcpToolCallRenderer } from "../tool-calls/renderer.js";
 import type { BackgroundItem, V2Background, WorkStateName } from "./background.js";
@@ -109,6 +118,11 @@ export interface TaskHost {
   /** The root session's modes, for a child's `mode`. */
   modes(): SessionModeState["availableModes"];
   stopTask(taskId: string): Promise<void>;
+  /**
+   * The reader of the end of a shell task's output (Claude Code's
+   * `get_task_output`), or undefined when the query does not have the control.
+   */
+  taskOutput(): ((taskId: string) => Promise<TaskOutput>) | undefined;
 }
 
 /** Where a permission request or elicitation goes: the root session or a child. */
@@ -271,6 +285,8 @@ export class SessionTasks {
       leveled?: boolean;
     }
   >();
+  /** The output polls of the commands that run in the foreground, by Bash tool call id. */
+  private readonly foreground = new Map<string, TaskOutputPoll>();
   /**
    * The tool calls whose tasks go on in the background, by task id. A call
    * that the adapter started for its task (see {@link adoptTasks}) has the
@@ -420,6 +436,7 @@ export class SessionTasks {
       (block) => block.type === "tool_result",
     ) as unknown as ToolResultBlock[];
     for (const { tool_use_id } of results) this.returned.add(tool_use_id);
+    const streamed = new Set<string>();
     const toolUses = output.toolUses();
     // Before the result's own updates: a SendMessage call whose message
     // reached its child is that message.
@@ -437,6 +454,16 @@ export class SessionTasks {
     // A fast command can end before its result: then its terminal exits with it.
     const runningTerminal =
       command && this.started.has(command.taskId) ? command.toolCallId : undefined;
+    // The output that a foreground command's terminal showed as it ran is
+    // replaced by the result's. A command that went to the background keeps
+    // it: its result has only Claude Code's "Command running in background"
+    // text, and its output file's tail goes on.
+    for (const { tool_use_id: toolCallId } of results) {
+      const poll = this.foreground.get(toolCallId);
+      if (!poll) continue;
+      this.foreground.delete(toolCallId);
+      if (poll.end() && toolCallId !== command?.toolCallId) streamed.add(toolCallId);
+    }
     if (command && runningTerminal) {
       this.terminals.set(command.taskId, {
         toolCallId: command.toolCallId,
@@ -480,7 +507,10 @@ export class SessionTasks {
       message,
       (notification) =>
         withRunningToolCall(
-          withRunningTerminal(notification as Notification, runningTerminal),
+          withRunningTerminal(
+            withStreamedTerminal(notification as Notification, streamed),
+            runningTerminal,
+          ),
           runningToolCalls,
         ) as AcpSessionNotification,
     );
@@ -633,6 +663,7 @@ export class SessionTasks {
    */
   withdrawAll(): void {
     this.closed = true;
+    this.stopForeground();
     for (const agentId of this.agentRequests.keys()) this.withdraw(agentId);
   }
 
@@ -817,6 +848,7 @@ export class SessionTasks {
    * `error`, as the root's work does.
    */
   queryEnded(error: { code: number; message: string } | undefined): void {
+    this.stopForeground();
     for (const [taskId, terminal] of this.terminals) {
       terminal.tail?.stop();
       if (error) this.exitTerminal(taskId);
@@ -893,6 +925,7 @@ export class SessionTasks {
   private taskStarted(message: Extract<SDKMessage, { subtype: "task_started" }>): void {
     const isAgent = message.task_type === "local_agent" || message.subagent_type !== undefined;
     if (!isAgent) {
+      this.followForeground(message);
       this.started.set(message.task_id, {
         ...(message.tool_use_id !== undefined ? { toolUseId: message.tool_use_id } : {}),
         ...(message.parent_task_id !== undefined ? { parentTaskId: message.parent_task_id } : {}),
@@ -1959,6 +1992,49 @@ export class SessionTasks {
       : listed.some((item) => item.type === "tool_call" && item.toolCallId === target.toolCallId)
         ? [...this.toolCalls].find(([, t]) => t.toolCallId === target.toolCallId)?.[0]
         : undefined;
+  }
+
+  /**
+   * Starts reading the output of the foreground command that the task
+   * `started` runs into its terminal, until its tool result (see
+   * {@link TaskOutputPoll}). Claude Code streams no output of a foreground
+   * Bash command: its `tool_progress` carries only the elapsed time. It starts
+   * the command's `local_bash` task once the command has run for a few
+   * seconds (about 3 s with CLI 2.1.321), and `get_task_output` reads the
+   * task's output from then on. A faster command ends with its output in the
+   * tool result, as before. A subagent's command goes to the subagent's
+   * session, and gets no poll before that session is announced.
+   */
+  private followForeground(started: Extract<SDKMessage, { subtype: "task_started" }>): void {
+    const read = this.host.taskOutput();
+    const toolCallId = started.tool_use_id;
+    if (
+      !read ||
+      started.task_type !== "local_bash" ||
+      started.is_backgrounded !== false ||
+      toolCallId === undefined ||
+      this.foreground.has(toolCallId)
+    ) {
+      return;
+    }
+    const parent =
+      started.parent_task_id === undefined ? undefined : this.children.get(started.parent_task_id);
+    const output = started.parent_task_id === undefined ? this.rootOutput : parent?.output;
+    if (!output?.holds(toolCallId) || output.toolUses()[toolCallId]?.name !== "Bash") return;
+    const taskId = started.task_id;
+    this.foreground.set(
+      toolCallId,
+      new TaskOutputPoll(
+        () => read(taskId),
+        async (text) => output.emitV1([terminalOutput(output.sessionId, toolCallId, text)]),
+      ),
+    );
+  }
+
+  /** Stops the output polls of the foreground commands: the query or the session ended. */
+  private stopForeground(): void {
+    for (const poll of this.foreground.values()) poll.stop();
+    this.foreground.clear();
   }
 
   private followOutput(taskId: string, outputFilePath: string | undefined): void {
