@@ -10599,7 +10599,8 @@ export class ClaudeAcpAgent {
             this.claudeIsWorking(sessionId, registered) ||
             (registered.openUserInputs?.size ?? 0) > 0,
           contextTokens: () => registered.contextUsedTokens,
-          settings: () => registered.settingsManager.getSettings(),
+          settings: () =>
+            registered.settingsManager.getCompactionSettings(configuredSettingsObject),
           compact: () =>
             this.prompt(
               { sessionId, prompt: [{ type: "text", text: "/compact" }] },

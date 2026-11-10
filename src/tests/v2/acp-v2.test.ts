@@ -4211,47 +4211,60 @@ describe("ACP v2 idle compaction", () => {
     },
   });
 
+  /**
+   * Prompts "hi" in a session created with `meta`, answers it with a large
+   * one-hour request, and waits 54 minutes. Returns the prompts Claude Code
+   * received and the client.
+   */
+  async function promptAndIdle(meta?: Record<string, unknown>) {
+    const received: string[] = [];
+    sdk.run = async function* (prompts, options) {
+      const input = prompts[Symbol.asyncIterator]();
+      for (;;) {
+        const { value, done } = await input.next();
+        if (done) return;
+        received.push((value.message.content as Array<{ text: string }>)[0].text);
+        if (received.length === 1) {
+          yield {
+            type: "user",
+            message: value.message,
+            parent_tool_use_id: null,
+            uuid: value.uuid,
+            session_id: options.sessionId,
+            isReplay: true,
+          };
+          yield largeOneHourRequest(options);
+        } else {
+          yield { type: "system", subtype: "status", status: "compacting", uuid: randomUUID() };
+        }
+        yield result(options);
+        yield idleState(options);
+      }
+    };
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, {
+        cwd,
+        _meta: meta,
+      });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(54 * 60_000);
+      for (let i = 0; i < 20 && received.length < 2; i++) await vi.advanceTimersByTimeAsync(0);
+      for (let i = 0; i < 20 && turnTrace(client.sessionUpdates).length < 6; i++) {
+        await vi.advanceTimersByTimeAsync(0);
+      }
+      await client.authUpdate(1);
+    });
+    return { received, client };
+  }
+
   /** The session is idle for 54 minutes after a large one-hour request, and the adapter's `/compact` runs. */
   it("reports the compaction that the adapter starts as running, then idle, with no user_message", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     try {
-      const received: string[] = [];
-      sdk.run = async function* (prompts, options) {
-        const input = prompts[Symbol.asyncIterator]();
-        for (;;) {
-          const { value, done } = await input.next();
-          if (done) return;
-          received.push((value.message.content as Array<{ text: string }>)[0].text);
-          if (received.length === 1) {
-            yield {
-              type: "user",
-              message: value.message,
-              parent_tool_use_id: null,
-              uuid: value.uuid,
-              session_id: options.sessionId,
-              isReplay: true,
-            };
-            yield largeOneHourRequest(options);
-          } else {
-            yield { type: "system", subtype: "status", status: "compacting", uuid: randomUUID() };
-          }
-          yield result(options);
-          yield idleState(options);
-        }
-      };
-      const client = v2Client();
-      await client.app.connectWith(connectRouter(), async (agent) => {
-        await initializeV2(agent);
-        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
-        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
-        await vi.advanceTimersByTimeAsync(0);
-        await vi.advanceTimersByTimeAsync(54 * 60_000);
-        for (let i = 0; i < 20 && received.length < 2; i++) await vi.advanceTimersByTimeAsync(0);
-        for (let i = 0; i < 20 && turnTrace(client.sessionUpdates).length < 6; i++) {
-          await vi.advanceTimersByTimeAsync(0);
-        }
-        await client.authUpdate(1);
-      });
+      const { received, client } = await promptAndIdle();
 
       expect(received).toEqual(["hi", "/compact"]);
       expect(turnTrace(client.sessionUpdates)).toEqual([
@@ -4262,6 +4275,20 @@ describe("ACP v2 idle compaction", () => {
         "running",
         "idle end_turn",
       ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** The client's `settings` option reaches the CLI as `--settings`, and idle compaction reads it too. */
+  it("does not compact a session whose client turned idle compaction off in the settings option", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const { received } = await promptAndIdle({
+        claudeCode: { options: { settings: { idleCompaction: false } } },
+      });
+
+      expect(received).toEqual(["hi"]);
     } finally {
       vi.useRealTimers();
     }

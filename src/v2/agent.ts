@@ -969,6 +969,7 @@ class V2Agent implements AgentHandle, SessionConnection {
     }
     session.reports.configure({
       settings,
+      configuredSettings: configured,
       env: options.env ?? {},
       mcpServers: request.mcpServers.map((server) => server.name),
       mcpOAuth: this.elicitation.url && supportsMcpOAuth(q),

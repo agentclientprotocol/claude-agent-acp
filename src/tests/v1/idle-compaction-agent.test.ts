@@ -226,7 +226,10 @@ function scriptClaudeCode({
   };
 }
 
-async function connect(clientCapabilities: Record<string, unknown> = {}) {
+async function connect(
+  clientCapabilities: Record<string, unknown> = {},
+  sessionMeta?: Record<string, unknown>,
+) {
   vi.resetModules();
   const { ClaudeAcpAgent } = await import("../../v1/acp-agent.js");
   const updates: Array<{ update: Record<string, any> }> = [];
@@ -241,7 +244,7 @@ async function connect(clientCapabilities: Record<string, unknown> = {}) {
     error: () => {},
   });
   await initializeClient(agent, clientCapabilities);
-  const session = await agent.newSession({ cwd, mcpServers: [] });
+  const session = await agent.newSession({ cwd, mcpServers: [], _meta: sessionMeta });
   return { agent, sessionId: session.sessionId, updates, logs };
 }
 
@@ -316,6 +319,22 @@ describe("idle compaction in the agent", () => {
     await claude.untilIdle();
     await vi.advanceTimersByTimeAsync(10 * MINUTE_MS);
     await agent.setSessionConfigOption({ sessionId, configId: "model", value: "claude-opus-4-6" });
+    await vi.advanceTimersByTimeAsync(2 * 60 * MINUTE_MS);
+
+    expect(claude.received).toEqual(["hi"]);
+    await agent.dispose();
+  });
+
+  /** The client's `settings` option reaches the CLI as `--settings`, and idle compaction reads it too. */
+  it("does not compact a session whose client turned idle compaction off in the settings option", async () => {
+    const claude = scriptClaudeCode();
+    const { agent, sessionId } = await connect(
+      {},
+      { claudeCode: { options: { settings: { idleCompaction: false } } } },
+    );
+
+    await promptHi(agent, sessionId);
+    await claude.untilIdle();
     await vi.advanceTimersByTimeAsync(2 * 60 * MINUTE_MS);
 
     expect(claude.received).toEqual(["hi"]);

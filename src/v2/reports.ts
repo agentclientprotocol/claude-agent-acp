@@ -21,6 +21,7 @@ import type {
   SDKMessage,
   SDKPartialAssistantMessage,
   SDKResultMessage,
+  Settings,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "../logger.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
@@ -78,7 +79,9 @@ export interface ReportsHost {
 /** What the session's query was started with (see {@link SessionReports.configure}). */
 export interface ReportsSetup {
   /** The session's live Claude Code settings, disposed with the reports. */
-  settings: Pick<SettingsManager, "getSettings" | "dispose">;
+  settings: Pick<SettingsManager, "getCompactionSettings" | "dispose">;
+  /** The client's `settings` option, which the query got as `--settings`. */
+  configuredSettings: Settings | undefined;
   /** The query's environment. */
   env: Record<string, string | undefined>;
   /** The names of the client's MCP servers. */
@@ -172,7 +175,7 @@ export class SessionReports {
       {
         isBusy: () => this.host.isBusy(),
         contextTokens: () => this.contextUsed,
-        settings: () => setup.settings.getSettings(),
+        settings: () => setup.settings.getCompactionSettings(setup.configuredSettings),
         compact: () => this.host.compact(),
         // The logger has no debug level.
         log: (message) => this.host.logger.log(message),
