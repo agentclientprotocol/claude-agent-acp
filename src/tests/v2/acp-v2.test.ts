@@ -5,7 +5,7 @@
  * schema, so a malformed v2 message fails the test.
  */
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -35,6 +35,7 @@ import {
   v1SetSessionConfigOptionRequest,
   v2ConfigOptions,
 } from "../../v2/session-requests.js";
+import { encodeProjectPath } from "../../session-index/project-dirs.js";
 import { startupFailure } from "../helpers.js";
 import packageJson from "../../../package.json" with { type: "json" };
 
@@ -108,6 +109,8 @@ const sdk = vi.hoisted(() => ({
   accountInfo: async (): Promise<Record<string, unknown>> => ({}),
   /** The query switches its model (`setModel`). */
   setModel: async (_model?: string): Promise<void> => {},
+  /** Claude Code stores a session title (`rename_session`). */
+  renameSession: async (_title: string, _sessionId?: string): Promise<void> => {},
   /** Set to serve Remote Control, as a query of a CLI that supports it does. */
   enableRemoteControl: undefined as
     ((enabled: boolean, name?: string) => Promise<{ session_url?: string }>) | undefined,
@@ -142,6 +145,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         accountInfo: () => sdk.accountInfo(),
         setMcpServers: (servers: Record<string, unknown>) => sdk.setMcpServers(servers),
         setModel: (model?: string) => sdk.setModel(model),
+        renameSession: (title: string, sessionId?: string) => sdk.renameSession(title, sessionId),
         ...(sdk.enableRemoteControl ? { enableRemoteControl: sdk.enableRemoteControl } : {}),
       });
       return Object.assign(messages, controls);
@@ -395,6 +399,7 @@ describe("ACP protocol routing", () => {
       additionalDirectories: {},
       systemPrompt: { mode: { override: {} } },
       status: {},
+      title: {},
     });
     expect(response.capabilities?.providers).toEqual({});
     // Not `_session/steering`, which v1 advertises in the top-level `_meta`.
@@ -880,6 +885,101 @@ describe("ACP v2 sessions", () => {
         "running",
         "idle end_turn",
       ]);
+    });
+  });
+
+  describe("session/set_title", () => {
+    it("titles an active session through Claude Code and publishes the stored title", async () => {
+      const renameSession = vi.fn(sdkDefaults.renameSession);
+      sdk.renameSession = renameSession;
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        client.sessionUpdates.length = 0;
+        const response = await agent.request(v2.methods.agent.session.setTitle, {
+          sessionId,
+          title: "  Investigate\n OAuth   timeout ",
+        });
+        expect(response).toEqual({ title: "Investigate OAuth timeout" });
+        expect(renameSession).toHaveBeenCalledWith("Investigate OAuth timeout", sessionId);
+        expect(client.sessionUpdates).toEqual([
+          {
+            sessionId,
+            update: { sessionUpdate: "session_info_update", title: "Investigate OAuth timeout" },
+          },
+        ]);
+        await client.authUpdate(1);
+      });
+    });
+
+    it("titles the query that a resume started while the rename ran", async () => {
+      let release!: () => void;
+      const renameSession = vi.fn(async (_title: string, _sessionId?: string) => {
+        if (renameSession.mock.calls.length === 1) {
+          await new Promise<void>((resolve) => (release = resolve));
+        }
+      });
+      sdk.renameSession = renameSession;
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        const renamed = agent.request(v2.methods.agent.session.setTitle, {
+          sessionId,
+          title: "Mine",
+        });
+        await vi.waitFor(() => expect(renameSession).toHaveBeenCalledTimes(1));
+        await agent.request(v2.methods.agent.session.close, { sessionId });
+        await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+        release();
+        expect(await renamed).toEqual({ title: "Mine" });
+        expect(renameSession.mock.calls).toEqual([
+          ["Mine", sessionId],
+          ["Mine", sessionId],
+        ]);
+        await client.authUpdate(1);
+      });
+    });
+
+    it("titles a stored session that is not active in its transcript", async () => {
+      const sessionId = randomUUID();
+      const dir = path.join(tempDir, "claude", "projects", encodeProjectPath(cwd));
+      await mkdir(dir, { recursive: true });
+      const file = path.join(dir, `${sessionId}.jsonl`);
+      const prompt = { type: "user", sessionId, cwd, message: { role: "user", content: "hi" } };
+      await writeFile(file, JSON.stringify(prompt) + "\n");
+      const { app, authUpdate } = v2Client();
+      await app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        expect(
+          await agent.request(v2.methods.agent.session.setTitle, { sessionId, title: "Stored" }),
+        ).toEqual({ title: "Stored" });
+        await authUpdate(1);
+      });
+      const records = (await readFile(file, "utf8"))
+        .trim()
+        .split("\n")
+        .slice(-2)
+        .map((line) => JSON.parse(line));
+      expect(records).toEqual([
+        { type: "custom-title", customTitle: "Stored", sessionId },
+        { type: "agent-name", agentName: "Stored", sessionId },
+      ]);
+    });
+
+    it.each([
+      ["an unknown session", { sessionId: randomUUID(), title: "Title" }, -32002],
+      ["a title that is empty once normalized", { sessionId: randomUUID(), title: " \n " }, -32602],
+    ])("refuses %s", async (_case, params, code) => {
+      const { app, authUpdate } = v2Client();
+      await app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        await expect(
+          agent.request(v2.methods.agent.session.setTitle, params),
+        ).rejects.toMatchObject({ code });
+        await authUpdate(1);
+      });
     });
   });
 

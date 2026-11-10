@@ -140,7 +140,7 @@ for v2 is negotiated down to v1. With `v2`, the adapter rejects the `initialize`
 
 On v2 the adapter serves the session baseline (`session/new`, `session/list`, `session/resume`
 with replay, `session/close`, `session/prompt`, `session/cancel`), `session/delete`,
-`session/fork`, `session/status`, additional directories, config options (the mode is one), plans, notices,
+`session/fork`, `session/status`, `session/set_title`, additional directories, config options (the mode is one), plans, notices,
 compaction, display terminals for commands, permission requests, elicitation, providers, auth, and
 [subagents](#subagent-sessions). Steering is v1 only for now.
 

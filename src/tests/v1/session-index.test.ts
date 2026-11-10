@@ -23,7 +23,7 @@ import {
   type InitializeResponse,
   type SessionInfo,
 } from "@agentclientprotocol/sdk/unstable";
-import { encodeProjectPath } from "../../v1/session-index/project-dirs.js";
+import { encodeProjectPath } from "../../session-index/project-dirs.js";
 import {
   archiveInsteadOfDelete,
   archiveTo,
@@ -31,16 +31,16 @@ import {
   parseBatchGetSessionsRequest,
   SessionIndexService,
   writeCustomTitleSidecar,
-} from "../../v1/session-index/service.js";
-import { scanTranscriptFile } from "../../v1/session-index/transcript-scan.js";
-import { repositoryWorktrees } from "../../v1/session-index/worktrees.js";
+} from "../../session-index/service.js";
+import { scanTranscriptFile } from "../../session-index/transcript-scan.js";
+import { repositoryWorktrees } from "../../session-index/worktrees.js";
 import {
   ListSubscriptions,
   MAX_SUBSCRIPTIONS,
   parseListSubscribeRequest,
   parseListUnsubscribeRequest,
   type ListChanges,
-} from "../../v1/session-index/list-subscriptions.js";
+} from "../../session-index/list-subscriptions.js";
 import { SessionTitles } from "../../session-titles.js";
 import { initializeClient } from "../helpers.js";
 import {
@@ -1350,6 +1350,48 @@ describe("_session/rename", () => {
   });
 });
 
+describe("session/set_title", () => {
+  it("titles a stored session for a client without the session index", async () => {
+    const session = await writeTranscript({});
+    const { agent } = createAgent();
+    await initializeClient(agent, {});
+    expect(
+      await agent.setSessionTitle({ sessionId: session.id, title: "  Investigate\n OAuth  " }),
+    ).toEqual({ title: "Investigate OAuth" });
+    expect(await lastRecords(session.file)).toEqual(titleRecords(session.id, "Investigate OAuth"));
+    const page = await agent.listSessions({ cwd: workspace });
+    expect(page.sessions[0]!.title).toBe("Investigate OAuth");
+  });
+
+  it.each([
+    ["an AIR client with sessionIndex", air("sessionIndex"), "Renamed"],
+    ["an AIR client without sessionIndex", air(), "Renamed"],
+    ["a client that is not AIR", {}, "[archived] Renamed"],
+  ])(
+    "keeps an archived session archived and answers the title %s shows",
+    async (_client, capabilities, shown) => {
+      const session = await writeTranscript({ trailer: titleRecords("", "[archived] Fix it") });
+      const { agent } = createAgent();
+      await initializeClient(agent, capabilities);
+      expect(await agent.setSessionTitle({ sessionId: session.id, title: "Renamed" })).toEqual({
+        title: shown,
+      });
+      expect(await lastRecords(session.file)).toEqual(
+        titleRecords(session.id, "[archived] Renamed"),
+      );
+    },
+  );
+
+  it.each([
+    ["an unknown session", () => ({ sessionId: randomUUID(), title: "x" }), -32002],
+    ["an empty title", () => ({ sessionId: randomUUID(), title: " \n " }), -32602],
+  ])("refuses %s", async (_case, params, code) => {
+    const { agent } = createAgent();
+    await initializeClient(agent, {});
+    await expect(agent.setSessionTitle(params())).rejects.toMatchObject({ code });
+  });
+});
+
 describe("_session/archive and _session/unarchive", () => {
   it("append AIR's archive title records, are idempotent and keep updatedAt", async () => {
     const session = await writeTranscript({ prompt: "Fix  the\nparser" });
@@ -1854,7 +1896,7 @@ describe("_session/list/subscribe", () => {
   });
 
   it("clears the failed turn of a session that runs here when a new turn starts", async () => {
-    const { noteSessionState } = await import("../../v1/session-index/connection.js");
+    const { noteSessionState } = await import("../../v1/session-index.js");
     const session = { lastTurnFailed: true } as any;
     noteSessionState(session, "idle", "running");
     expect(session.lastTurnFailed).toBe(false);

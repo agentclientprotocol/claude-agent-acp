@@ -49,7 +49,7 @@ import {
   type LiveSessionRegistry,
   type LiveSnapshot,
 } from "./live-registry.js";
-import { isSessionId, projectsRoot } from "../../paths.js";
+import { isSessionId, projectsRoot } from "../paths.js";
 import { isExactProjectDir, projectDirMatches } from "./project-dirs.js";
 import { type IndexRow, type SessionIndex, type TranscriptCandidate } from "./session-index.js";
 import { changeSignature, sessionInfoOf } from "./session-info.js";

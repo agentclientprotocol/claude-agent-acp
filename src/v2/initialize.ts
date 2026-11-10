@@ -28,6 +28,8 @@ export const V2_SESSION_CAPABILITIES: v2.SessionCapabilities = {
   additionalDirectories: {},
   systemPrompt: SYSTEM_PROMPT_CAPABILITY,
   status: SESSION_STATUS_CAPABILITY,
+  // `session/set_title`.
+  title: {},
 };
 
 /** v2 names the id of a method `methodId`, requires `type`, and lists `env` as name and value pairs. */

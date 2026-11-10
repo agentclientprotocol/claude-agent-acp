@@ -48,6 +48,8 @@ import {
   CloseSessionRequest,
   CloseSessionResponse,
   DeleteSessionRequest,
+  SetSessionTitleRequest,
+  SetSessionTitleResponse,
   DeleteSessionResponse,
   WriteTextFileRequest,
   WriteTextFileResponse,
@@ -133,16 +135,16 @@ import {
   clientSupportsAirCapability,
   withAirMeta,
 } from "../air-extension.js";
-import * as sessionIndex from "./session-index/connection.js";
+import * as sessionIndex from "./session-index.js";
 import type {
   BatchGetSessionsRequest,
   RenameSessionRequest,
   SessionIdRequest,
-} from "./session-index/service.js";
+} from "../session-index/service.js";
 import type {
   ListSubscribeRequest,
   ListUnsubscribeRequest,
-} from "./session-index/list-subscriptions.js";
+} from "../session-index/list-subscriptions.js";
 import {
   AsyncTaskRuntime,
   backgroundBashTaskFromToolResult,
@@ -2025,6 +2027,8 @@ export class ClaudeAcpAgent {
       resume: {},
       status: SESSION_STATUS_CAPABILITY,
       systemPrompt: SYSTEM_PROMPT_CAPABILITY,
+      // `session/set_title`.
+      title: {},
       ...(this.toolCallCapabilities.air.client ? { subagents: {} } : {}),
     };
 
@@ -7876,6 +7880,11 @@ export class ClaudeAcpAgent {
     return savedSessionStatus(sessionId);
   }
 
+  /** See {@link sessionIndex.SessionIndexConnection.setTitle}. */
+  setSessionTitle(params: SetSessionTitleRequest): Promise<SetSessionTitleResponse> {
+    return this.sessionIndex.setTitle(params);
+  }
+
   /** Per client: see {@link sessionIndex.SessionIndexConnection.deleteSession}. */
   async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
     return this.sessionIndex.deleteSession(params);
@@ -11149,6 +11158,7 @@ export function v1AgentApp(
     )
     .onRequest(methods.agent.session.list, (ctx) => agent.listSessions(ctx.params))
     .onRequest(methods.agent.session.delete, (ctx) => agent.deleteSession(ctx.params))
+    .onRequest(methods.agent.session.setTitle, (ctx) => agent.setSessionTitle(ctx.params))
     .onRequest(methods.agent.session.resume, (ctx) => agent.resumeSession(ctx.params))
     .onRequest(methods.agent.session.close, (ctx) => agent.closeSession(ctx.params))
     .onRequest(methods.agent.session.status, (ctx) => agent.sessionStatus(ctx.params))
