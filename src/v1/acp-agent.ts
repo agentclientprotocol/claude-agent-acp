@@ -25,7 +25,6 @@ import {
   LoadSessionResponse,
   LogoutRequest,
   methods,
-  ndJsonStream,
   NewSessionRequest,
   NewSessionResponse,
   PromptRequest,
@@ -312,14 +311,7 @@ import {
   isFinalToolCallStatus,
   type ToolCallUpdate,
 } from "../tool-calls/renderer.js";
-import {
-  messageLoopYielder,
-  nodeToWebReadable,
-  nodeToWebWritable,
-  Pushable,
-  raceTimeoutAndAbort,
-  unreachable,
-} from "../utils.js";
+import { messageLoopYielder, Pushable, raceTimeoutAndAbort, unreachable } from "../utils.js";
 import {
   acceptedPlanToolResult,
   ExitPlanCoordinator,
@@ -330,7 +322,6 @@ import { AGENT_CONFIG_ID, DEFAULT_AGENT_ID } from "../session-config-ids.js";
 import { type PersistedTaskNotification, taskNotificationsOf } from "../task-notifications.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "../usage-markdown.js";
 
-export { DEFAULT_AGENT_ID } from "../session-config-ids.js";
 import { parseMcpCommand, runMcpCommand } from "../mcp-command.js";
 import { configuredSettings, resolveThinkingConfig } from "../session-env.js";
 import {
@@ -408,33 +399,6 @@ import { STARTUP_FAILURE_RESULTS_ENV, startupFailureError } from "../startup-fai
 import { recordStreamedDelta, unstreamedRemainder, type StreamedBlock } from "../streamed-text.js";
 import { subagentHookOptions } from "../subagent-configuration.js";
 
-export {
-  AGENT_CONFIG_ID,
-  BUILTIN_AGENT_NAMES,
-  buildConfigOptions,
-  clientSupportsBooleanConfigOptions,
-  clientSupportsRecommendedConfigValue,
-  type ConfigOptionPresentation,
-  discoverCustomAgents,
-  MODE_CONFIG_ID,
-} from "../session-config-options.js";
-export {
-  createFastModeConfigOption,
-  FAST_MODE_CONFIG_ID,
-  FAST_MODE_OFF,
-  FAST_MODE_ON,
-  fastModeStateEnabled,
-  type FastModeOptionState,
-  normalizeFastModeDisabledReason,
-  resolveFastModeEnabled,
-} from "../session-fast-mode.js";
-export { EFFORT_CONFIG_ID, settingsEffortForModel } from "../session-effort.js";
-export {
-  applyAvailableModelsAllowlist,
-  matchResumedModel,
-  MODEL_CONFIG_ID,
-  resolveModelPreference,
-} from "../session-model.js";
 import type { AcpClient } from "../acp-client.js";
 import type { Logger } from "../logger.js";
 import {
@@ -455,28 +419,6 @@ import {
   type ToolUseCache,
 } from "../sdk-to-acp.js";
 import { getAvailableSlashCommands } from "../slash-commands.js";
-
-// Moved to their own modules; kept as exports for consumers that deep-import dist/acp-agent.js
-// (re-exported by `../acp-agent.ts`).
-export { AUTONOMOUS_RESULT_ORIGINS, isAbortedResult, isLoginRequiredText } from "../result-end.js";
-export type { AcpClient } from "../acp-client.js";
-export type { Logger } from "../logger.js";
-export {
-  isLocalCommandMetadata,
-  isReplayHiddenMetaMessage,
-  isSyntheticLoginMessage,
-  stripLocalCommandMetadata,
-} from "../message-filters.js";
-export type { NewSessionMeta, SDKMessageFilter } from "../new-session-meta.js";
-export { promptToClaude } from "../prompt-to-claude.js";
-export {
-  messageIdForGrouping,
-  streamEventToAcpNotifications,
-  toAcpNotifications,
-  type StreamedToolInputCache,
-  type ToolUseCache,
-} from "../sdk-to-acp.js";
-export { getAvailableSlashCommands } from "../slash-commands.js";
 
 /** Claude CLI emits this synthetic result when an interrupted cycle ends on
  *  queued user input before producing any assistant content. It is a hand-off
@@ -1745,8 +1687,6 @@ export function computeSessionFingerprint(params: {
 /** The JSON-RPC code ACP assigns to `authRequired`. Read from the SDK so it
  *  cannot drift from the errors this agent throws. */
 const AUTH_REQUIRED_CODE = RequestError.authRequired().code;
-
-export type { ToolUpdateMeta } from "../tool-calls/renderer.js";
 
 const SUBAGENT_TRANSCRIPT_CAPABILITY = "subagent-transcript";
 
@@ -11317,15 +11257,6 @@ export function v1AgentApp(
       (ctx) => agent.goal(ctx.params),
     );
   return sessionIndex.onSessionIndexRequests(app, () => agent);
-}
-
-/** Serves ACP v1 on stdio. */
-export function runAcp(logger?: Logger) {
-  const stream = ndJsonStream(nodeToWebWritable(process.stdout), nodeToWebReadable(process.stdin));
-  let agent!: ClaudeAcpAgent;
-  // `connect` runs the connect handlers before it returns, so `agent` is set.
-  const connection = v1AgentApp(logger, (created) => (agent = created)).connect(stream);
-  return { connection, agent };
 }
 
 /**

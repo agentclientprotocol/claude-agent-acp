@@ -37,12 +37,11 @@ import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
 import {
   ClaudeAcpAgent,
   computeSessionFingerprint,
-  buildConfigOptions,
-  createFastModeConfigOption,
-  discoverCustomAgents,
   runPromptWithCancellation,
   type SteerRequest,
 } from "../v1/acp-agent.js";
+import { buildConfigOptions, discoverCustomAgents } from "../session-config-options.js";
+import { createFastModeConfigOption } from "../session-fast-mode.js";
 import {
   toAcpNotifications,
   streamEventToAcpNotifications,

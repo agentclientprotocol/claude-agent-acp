@@ -61,11 +61,11 @@ export default [
       curly: ["error", "all"],
     },
   },
-  // `src/v2/` must not import the v1 agent (`src/v1/`, or `src/acp-agent.ts`, which re-exports it).
+  // `src/v2/` must not import the v1 agent.
   {
     files: ["src/v2/**/*.ts"],
     rules: protocolBoundary(
-      "^(\\.\\./)+(v1/|acp-agent\\.js$)",
+      "^(\\.\\./)+v1/",
       "src/v2/ must not import the v1 agent. Move what both versions need into a shared module in src/.",
     ),
   },
@@ -88,11 +88,10 @@ export default [
       "src/lib.ts",
       "src/serve.ts",
       "src/binary-entry.ts",
-      "src/acp-agent.ts",
     ],
     rules: protocolBoundary(
-      "^(\\./|(\\.\\./)+)(v1/|v2/|acp-agent\\.js$)",
-      "Shared modules must not import src/v1/, src/v2/ or src/acp-agent.ts. Move the code into the shared module, or pass it in from the agent.",
+      "^(\\./|(\\.\\./)+)(v1|v2)/",
+      "Shared modules must not import src/v1/ or src/v2/. Move the code into the shared module, or pass it in from the agent.",
     ),
   },
   prettierConfig,
