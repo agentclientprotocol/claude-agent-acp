@@ -220,7 +220,7 @@ describe("auth status mappers", () => {
         state: "authenticated",
         accounts: [
           {
-            label: "Anthropic API key",
+            label: "Anthropic API key (env)",
             active: true,
             _meta: { claudeCode: { kind: "api_key", detail: "env" } },
           },
@@ -765,7 +765,7 @@ describe("auth status over ACP", () => {
       state: "authenticated",
       accounts: [
         {
-          label: "Custom model gateway",
+          label: "Custom model gateway (gw.example.com)",
           active: true,
           _meta: { claudeCode: { kind: "gateway", detail: "gw.example.com" } },
         },
@@ -783,7 +783,7 @@ describe("auth status over ACP", () => {
     agent.setAuthStatus({ kind: "api_key", label: "Anthropic API key", detail: "env" });
     expect(await agent.authStatusResponse()).toMatchObject({
       state: "authenticated",
-      accounts: [{ label: "Anthropic API key" }],
+      accounts: [{ label: "Anthropic API key (env)" }],
     });
   });
 

@@ -104,8 +104,10 @@ export type AcpAuthStatus = Pick<AuthStatusResponse, "state" | "accounts">;
  * - No identity read yet (`undefined`): `unknown`, no accounts.
  * - `kind: "none"`: `unauthenticated`, no accounts.
  * - Any other kind: `authenticated`, with the identity as the one account,
- *   marked `active`. `_meta.claudeCode` carries the `kind`, `detail` and
- *   `plan` that the account fields have no place for.
+ *   marked `active`. The account has no field for `detail`, so its label
+ *   carries it in parentheses, e.g. "Anthropic API key (ANTHROPIC_API_KEY)",
+ *   for clients that show only the standard fields. `_meta.claudeCode`
+ *   carries the `kind`, `detail` and `plan` on their own.
  *
  * `--hide-claude-auth` does not change the payload: it reports the login the
  * CLI holds, also when the subscription guard refuses to use it.
@@ -117,7 +119,8 @@ export function toAcpAuthStatus(status: AuthStatus | undefined): AcpAuthStatus {
   if (status.kind === "none") {
     return { state: "unauthenticated" };
   }
-  const account: AuthAccount = { label: status.label, active: true };
+  const label = status.detail ? `${status.label} (${status.detail})` : status.label;
+  const account: AuthAccount = { label, active: true };
   if (status.account?.email) account.email = status.account.email;
   if (status.account?.organization) account.organization = status.account.organization;
   account._meta = {
