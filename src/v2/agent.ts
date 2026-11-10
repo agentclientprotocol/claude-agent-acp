@@ -44,6 +44,12 @@ import { mergeEffortSettings } from "../session-effort.js";
 import { configuredSettings, resolveThinkingConfig } from "../session-env.js";
 import { resolveInitialPermissionMode } from "../session-mode.js";
 import { sanitizeTitle } from "../session-titles.js";
+import { renameSession } from "../session-index/rename.js";
+import {
+  parseRenameSessionRequest,
+  transcriptWriter,
+  type SessionIndexService,
+} from "../session-index/service.js";
 import { SettingsManager } from "../settings.js";
 import { STARTUP_FAILURE_RESULTS_ENV, startupFailureError } from "../startup-failure.js";
 import { createPostToolUseHook } from "../tools.js";
@@ -109,6 +115,7 @@ export function v2AgentApp(
       .onRequest(v2.methods.agent.session.close, ({ params }) => agent.closeSession(params))
       .onRequest(v2.methods.agent.session.status, ({ params }) => agent.sessionStatus(params))
       .onRequest(v2.methods.agent.session.delete, ({ params }) => agent.deleteSession(params))
+      .onRequest(v2.methods.agent.session.setTitle, ({ params }) => agent.setTitle(params))
       .onRequest(v2.methods.agent.session.setConfigOption, ({ params }) =>
         agent.setConfigOption(params),
       )
@@ -154,6 +161,8 @@ class V2Agent implements AgentHandle, SessionConnection {
   private readonly guard: SubscriptionGuard;
   /** The restarts of the sessions' queries, for a new route or account (see `restarts.ts`). */
   private readonly restarts: SessionRestarts;
+  /** The transcript writes of `session/set_title`, made at its first call (see `transcriptWriter`). */
+  private transcripts: SessionIndexService | undefined;
   /** What the client declared in `initialize`. */
   private clientCapabilities: v2.ClientCapabilities | null | undefined;
   /** The elicitation modes that the client advertised in `initialize`. */
@@ -502,13 +511,39 @@ class V2Agent implements AgentHandle, SessionConnection {
     const live = this.sessions.get(sessionId);
     if (live || this.stopped.has(sessionId)) await this.closeSession({ sessionId });
     try {
-      await deleteSession(sessionId, live ? { dir: live.cwd } : undefined);
+      // After a `session/set_title` of the session in flight.
+      const remove = () => deleteSession(sessionId, live ? { dir: live.cwd } : undefined);
+      await (this.transcripts ? this.transcripts.exclusive(sessionId, remove) : remove());
     } catch (error) {
       // A session without a transcript, such as one never prompted, has nothing to delete.
       if (error instanceof Error && /not found/i.test(error.message)) return {};
       throw error;
     }
     return {};
+  }
+
+  /**
+   * `session/set_title`, as the v1 core does it (see `session-index/rename.ts`).
+   * The session need not be active. An active one publishes the title, and no
+   * generated title replaces it.
+   */
+  async setTitle(params: v2.SetSessionTitleRequest): Promise<v2.SetSessionTitleResponse> {
+    const request = parseRenameSessionRequest(params);
+    const { sessionId } = request;
+    if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "retitle");
+    // Renamed through the query that runs once a restart or resume settled.
+    await this.restarts.settled(sessionId);
+    await this.setupSettled(sessionId);
+    const writer = (this.transcripts ??= transcriptWriter(this.logger));
+    for (;;) {
+      const session = this.sessions.get(sessionId);
+      const title = await renameSession(writer, request, session?.reports.retitled());
+      // A restart or resume started another query of the session while the
+      // rename ran: its CLI may hold the old title and write it back, so it
+      // is renamed too. A session that only closed took the title already.
+      const now = this.sessions.get(sessionId);
+      if (now === undefined || now === session) return { title };
+    }
   }
 
   async setConfigOption(

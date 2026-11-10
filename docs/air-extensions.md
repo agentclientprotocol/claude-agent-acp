@@ -1408,6 +1408,8 @@ Each row carries `_meta.jetbrains.air` with flat row fields of the RFDs. `archiv
 
 `_session/rename { "sessionId": "…", "title": "…" }` returns `{}`.
 
+ACP's `session/set_title` renames the same way for every client, on v1 and v2, without `sessionIndex`, and returns `{ "title": "…" }`: the title as `session/list` shows it to the client. On v1 an AIR client gets it without the archive prefix, and every other client, and every v2 client, with it.
+
 - A blank title is `-32602`. The adapter collapses whitespace and keeps the first 200 characters, trimmed, as the CLI does. An `[archived] ` prefix of the requested title is dropped: a rename never changes the archive state.
 - The title is stored as the title records of [Archive](#archive): a `custom-title` and an `agent-name` record. An archived session keeps its `[archived] ` prefix (and the title is cut to 200 characters with it), so a rename does not unarchive it.
 - A session that runs here on a CLI without the `rename_session` control request is refused with `-32600`: its CLI holds the title and would write it back.

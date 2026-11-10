@@ -11,11 +11,11 @@ import * as fsSync from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { SessionInfo } from "@agentclientprotocol/sdk/unstable";
-import type { ActivityState } from "../../v1/session-index/activity.js";
-import { endedTaskId, searchBackgroundTasks } from "../../v1/session-index/background-tasks.js";
-import { encodeProjectPath } from "../../v1/session-index/project-dirs.js";
-import { SessionIndex } from "../../v1/session-index/session-index.js";
-import { SessionIndexService } from "../../v1/session-index/service.js";
+import type { ActivityState } from "../../session-index/activity.js";
+import { endedTaskId, searchBackgroundTasks } from "../../session-index/background-tasks.js";
+import { encodeProjectPath } from "../../session-index/project-dirs.js";
+import { SessionIndex } from "../../session-index/session-index.js";
+import { SessionIndexService } from "../../session-index/service.js";
 
 let configDir: string;
 let workspace: string;

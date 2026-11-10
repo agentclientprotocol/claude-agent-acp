@@ -53,6 +53,7 @@ import {
   type UsageSnapshot,
 } from "../session-usage.js";
 import { SessionTitles, type TitledSession } from "../session-titles.js";
+import type { RetitledSession } from "../session-index/rename.js";
 import type { SettingsManager } from "../settings.js";
 import { createTaskHook } from "../tools.js";
 import type { SessionOutput } from "./stream.js";
@@ -280,6 +281,13 @@ export class SessionReports {
   /** A live agent text chunk of the root session, for the title. */
   agentText(content: ContentBlock): void {
     this.titles.onAssistantText(content);
+  }
+
+  /** The session and its title state, as a client rename sets it
+   *  (`session/set_title`); undefined until it starts and once it ends. */
+  retitled(): RetitledSession | undefined {
+    const session = this.host.titledSession();
+    return session && { session, titles: this.titles };
   }
 
   /** Sends the session's current title and `updatedAt`, as `session/resume` asks. */

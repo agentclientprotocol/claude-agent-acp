@@ -18,8 +18,8 @@ import {
   type SessionInfo,
 } from "@agentclientprotocol/sdk/unstable";
 import { deleteSession as sdkDeleteSession } from "@anthropic-ai/claude-agent-sdk";
-import { airExtensionMeta } from "../../air-extension.js";
-import { sanitizeTitle } from "../../session-titles.js";
+import { airExtensionMeta } from "../air-extension.js";
+import { sanitizeTitle } from "../session-titles.js";
 import type { OwnSessionState } from "./activity.js";
 import {
   effectiveTitle,
@@ -36,7 +36,7 @@ import {
   type ListSubscriptionDeps,
 } from "./list-subscriptions.js";
 import { LiveSessionRegistry } from "./live-registry.js";
-import { isSessionId } from "../../paths.js";
+import { isSessionId } from "../paths.js";
 import {
   canonicalPath,
   exists,
@@ -466,6 +466,18 @@ export type SessionIndexDeps = {
   logError: (message: string, error: unknown) => void;
 };
 
+/** The transcript reads and writes of the session index, without its list
+ *  or watcher: what a client without `sessionIndex` uses for
+ *  `session/set_title`, AIR's archive on delete, and delete's ordering
+ *  after them (see {@link SessionIndexService.exclusive}). */
+export function transcriptWriter(logger: {
+  error: (message: string, error: unknown) => void;
+}): SessionIndexService {
+  return new SessionIndexService({
+    logError: (message, error) => logger.error(`[session-index] ${message}:`, error),
+  });
+}
+
 export class SessionIndexService {
   readonly index: SessionIndex;
   readonly registry: LiveSessionRegistry;
@@ -541,8 +553,10 @@ export class SessionIndexService {
     };
   }
 
-  /** Runs `mutation` after the previous mutation of the session ended. */
-  private exclusive<T>(sessionId: string, mutation: () => Promise<T>): Promise<T> {
+  /** Runs `mutation` after the previous mutation of the session ended, such
+   *  as a delete that does not go through {@link delete}, so that a retitle
+   *  cannot append to a transcript the delete is removing. */
+  exclusive<T>(sessionId: string, mutation: () => Promise<T>): Promise<T> {
     const previous = this.mutations.get(sessionId) ?? Promise.resolve();
     const next = previous.catch(() => undefined).then(mutation);
     const settled = next.catch(() => undefined);
