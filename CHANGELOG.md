@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.105.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.104.1...v0.105.0) (2026-11-10)
+
+
+### Features
+
+* serve session/set_title on ACP v1 and v2 ([#1585](https://github.com/agentclientprotocol/claude-agent-acp/issues/1585)) ([a4a8534](https://github.com/agentclientprotocol/claude-agent-acp/commit/a4a8534c23b08cdfd7f656d25f9ab16068fd8ffd))
+* serve session/status on v1 and v2 ([#1584](https://github.com/agentclientprotocol/claude-agent-acp/issues/1584)) ([6bc2e05](https://github.com/agentclientprotocol/claude-agent-acp/commit/6bc2e058cb27624b4307462ac46167535af400d1))
+
+
+### Bug Fixes
+
+* include inline model settings in the model picker ([#1488](https://github.com/agentclientprotocol/claude-agent-acp/issues/1488)) ([36cb674](https://github.com/agentclientprotocol/claude-agent-acp/commit/36cb6745897bf9dabcb967b54233c42b860436b3))
+* keep a v2 session idle when the model changes between turns ([#1586](https://github.com/agentclientprotocol/claude-agent-acp/issues/1586)) ([f5d7916](https://github.com/agentclientprotocol/claude-agent-acp/commit/f5d79167a649737bdeb1ce3b55ad449a34bb9d47))
+* report Claude Code's API error message as a notice in v2 ([#1582](https://github.com/agentclientprotocol/claude-agent-acp/issues/1582)) ([99cc1f3](https://github.com/agentclientprotocol/claude-agent-acp/commit/99cc1f324586fad07f1da14bb9764cd16c64e920))
+
 ## [0.104.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.104.0...v0.104.1) (2026-11-10)
 
 
