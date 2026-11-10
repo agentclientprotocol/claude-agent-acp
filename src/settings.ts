@@ -37,6 +37,8 @@ export interface SettingsManagerOptions {
   logger?: { log: (...args: any[]) => void; error: (...args: any[]) => void };
 }
 
+type ModelSelectionSettings = Pick<Settings, "availableModels" | "modelOverrides">;
+
 /**
  * Manages Claude Code settings using the SDK's `resolveSettings` merge engine
  * so the values we see match what `query()` would observe.
@@ -50,7 +52,7 @@ export class SettingsManager {
   private cwd: string;
   private effective: Settings = {};
   private managedDeniedModels: string[] = [];
-  private managedModelSettings: Pick<Settings, "availableModels" | "modelOverrides"> = {};
+  private managedModelSettings: ModelSelectionSettings = {};
   private managedApiKeyHelper?: string;
   private watchers: fs.FSWatcher[] = [];
   private onChange?: () => void;
@@ -205,9 +207,7 @@ export class SettingsManager {
   }
 
   /** Model selection settings including the inline SDK settings tier. */
-  getModelSelectionSettings(
-    override?: Settings,
-  ): Pick<Settings, "availableModels" | "modelOverrides"> {
+  getModelSelectionSettings(override?: Settings): ModelSelectionSettings {
     // The SDK unions non-managed allowlists, but a managed list owns the
     // whole allowlist. Keep that policy when adding
     // models the SDK did not include in its initialization result.
