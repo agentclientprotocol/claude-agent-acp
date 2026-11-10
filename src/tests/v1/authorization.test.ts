@@ -1635,61 +1635,57 @@ describe("authorization", () => {
     });
   });
 
-  it("SSH session falls back to single legacy login method", async () => {
-    const [agent] = await createAgentMock();
-    vi.stubGlobal("process", { ...process, env: { ...process.env, SSH_TTY: "/dev/pts/0" } });
-
-    const initializeResponse = await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: { auth: { terminal: true } },
-    });
-
-    expect(initializeResponse.authMethods).toContainEqual(
-      expect.objectContaining({ id: "claude-login" }),
+  describe("remote environment", () => {
+    const REMOTE_VARS = [
+      "NO_BROWSER",
+      "SSH_CONNECTION",
+      "SSH_CLIENT",
+      "SSH_TTY",
+      "CLAUDE_CODE_REMOTE",
+    ] as const;
+    const capabilityStyles = [
+      ["auth.terminal", { auth: { terminal: true } }],
+      ["_meta terminal-auth", { _meta: { "terminal-auth": true } }],
+    ] as const;
+    const cases = REMOTE_VARS.flatMap((variable) =>
+      capabilityStyles.flatMap(([style, clientCapabilities]) =>
+        [false, true].map((hide) => ({ variable, style, clientCapabilities, hide })),
+      ),
     );
-    expect(initializeResponse.authMethods).not.toContainEqual(
-      expect.objectContaining({ id: "claude-ai-login" }),
-    );
-    expect(initializeResponse.authMethods).not.toContainEqual(
-      expect.objectContaining({ id: "console-login" }),
-    );
-  });
 
-  it("CLAUDE_CODE_REMOTE falls back to single legacy login method", async () => {
-    const [agent] = await createAgentMock();
-    vi.stubGlobal("process", { ...process, env: { ...process.env, CLAUDE_CODE_REMOTE: "1" } });
+    /**
+     * With only one remote variable set, initialize offers the TUI login plus the
+     * console login, or only the console login under --hide-claude-auth.
+     */
+    it.each(cases)(
+      "$variable ($style, hide-claude-auth=$hide) offers console-login",
+      async ({ variable, clientCapabilities, hide }) => {
+        const [agent] = await createAgentMock();
+        const env: Record<string, string | undefined> = { ...process.env };
+        for (const name of REMOTE_VARS) delete env[name];
+        env[variable] = "1";
+        vi.stubGlobal("process", {
+          ...process,
+          argv: hide ? ["--hide-claude-auth"] : [],
+          env,
+        });
 
-    const initializeResponse = await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: { auth: { terminal: true } },
-    });
+        const initializeResponse = await agent.initialize({
+          protocolVersion: 1,
+          clientCapabilities,
+        });
 
-    expect(initializeResponse.authMethods).toContainEqual(
-      expect.objectContaining({ id: "claude-login" }),
-    );
-    expect(initializeResponse.authMethods).not.toContainEqual(
-      expect.objectContaining({ id: "claude-ai-login" }),
-    );
-    expect(initializeResponse.authMethods).not.toContainEqual(
-      expect.objectContaining({ id: "console-login" }),
-    );
-  });
-
-  it("remote environment respects hide-claude-auth", async () => {
-    const [agent] = await createAgentMock();
-    vi.stubGlobal("process", {
-      ...process,
-      argv: ["--hide-claude-auth"],
-      env: { ...process.env, SSH_CONNECTION: "192.168.1.1 12345 192.168.1.2 22" },
-    });
-
-    const initializeResponse = await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: { auth: { terminal: true } },
-    });
-
-    expect(initializeResponse.authMethods).not.toContainEqual(
-      expect.objectContaining({ id: "claude-login" }),
+        expect((initializeResponse.authMethods ?? []).map((method) => method.id)).toEqual(
+          hide ? ["console-login"] : ["claude-login", "console-login"],
+        );
+        const consoleLogin = initializeResponse.authMethods?.find(
+          (method) => method.id === "console-login",
+        );
+        if ("_meta" in clientCapabilities) {
+          const terminalAuth = (consoleLogin?._meta as any)?.["terminal-auth"];
+          expect(terminalAuth.args.slice(-4)).toEqual(["--cli", "auth", "login", "--console"]);
+        }
+      },
     );
   });
 

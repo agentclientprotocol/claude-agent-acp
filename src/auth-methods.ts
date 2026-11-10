@@ -12,10 +12,12 @@ import { shouldHideClaudeAuth } from "./hide-claude-auth.js";
  *
  * Without either, the client cannot run a login, and the list is empty. On a
  * remote machine (SSH, `NO_BROWSER`, `CLAUDE_CODE_REMOTE`, as the SDK's own
- * isRemote check) the OAuth redirect to localhost cannot reach a browser, and
- * `claude auth login` falls back to a manual flow that does not work over ACP,
- * so the one method runs the TUI's `claude /login` instead. The Claude
- * subscription method is left out when `shouldHideClaudeAuth()` says so.
+ * isRemote check) the subscription login runs the TUI's `claude /login`:
+ * clients such as Tidewave set `NO_BROWSER` to get it. The Anthropic Console
+ * login is offered there too, because since Claude Code 2.1.126 `auth login`
+ * accepts the OAuth code pasted into the terminal when the localhost callback
+ * can't be reached. The Claude subscription method is left out when
+ * `shouldHideClaudeAuth()` says so.
  */
 export function terminalAuthMethods({
   terminal,
@@ -42,10 +44,8 @@ export function terminalAuthMethods({
     process.env.SSH_TTY ||
     process.env.CLAUDE_CODE_REMOTE
   );
-  if (isRemote) {
-    if (shouldHideClaudeAuth()) return [];
-    return [
-      withMeta(
+  const subscriptionLogin = isRemote
+    ? withMeta(
         {
           description: "Run `claude /login` in the terminal",
           name: "Log in with Claude",
@@ -54,13 +54,8 @@ export function terminalAuthMethods({
           args: ["--cli"],
         },
         "Claude Login",
-      ),
-    ];
-  }
-  const methods: AuthMethod[] = [];
-  if (!shouldHideClaudeAuth()) {
-    methods.push(
-      withMeta(
+      )
+    : withMeta(
         {
           description: "Use Claude subscription ",
           name: "Claude Subscription",
@@ -69,9 +64,9 @@ export function terminalAuthMethods({
           args: ["--cli", "auth", "login", "--claudeai"],
         },
         "Claude Login",
-      ),
-    );
-  }
+      );
+  const methods: AuthMethod[] = [];
+  if (!shouldHideClaudeAuth()) methods.push(subscriptionLogin);
   methods.push(
     withMeta(
       {

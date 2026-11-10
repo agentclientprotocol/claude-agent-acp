@@ -9379,6 +9379,38 @@ describe("ACP v2 auth", () => {
     expect(acpAuthUpdates).toEqual([status]);
   });
 
+  /**
+   * In a remote environment with --hide-claude-auth, initialize offers the
+   * console login as a terminal method and hides the TUI subscription login.
+   */
+  it("offers console-login in a remote environment with hide-claude-auth", async () => {
+    vi.stubGlobal("process", {
+      ...process,
+      argv: ["--hide-claude-auth"],
+      env: { ...process.env, SSH_CONNECTION: "192.168.1.1 12345 192.168.1.2 22" },
+    });
+    try {
+      const { app } = v2Client();
+      const response = await app.connectWith(connectRouter(), (agent) =>
+        agent.request(v2.methods.agent.initialize, {
+          protocolVersion: v2.PROTOCOL_VERSION,
+          info: V2_CLIENT_INFO,
+          capabilities: { auth: { terminal: {} } },
+        }),
+      );
+
+      expect(response.authMethods).toEqual([
+        expect.objectContaining({
+          methodId: "console-login",
+          type: "terminal",
+          args: ["--cli", "auth", "login", "--console"],
+        }),
+      ]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("logs in to a gateway with auth/login and out with auth/logout", async () => {
     const { app, authUpdate } = v2Client();
     await app.connectWith(connectRouter(), async (agent) => {

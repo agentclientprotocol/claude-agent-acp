@@ -35,8 +35,10 @@
 import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import type { AccountInfo, Query } from "@anthropic-ai/claude-agent-sdk";
 
+export const HIDE_CLAUDE_AUTH_FLAG = "--hide-claude-auth";
+
 export function shouldHideClaudeAuth(): boolean {
-  return process.argv.includes("--hide-claude-auth");
+  return process.argv.includes(HIDE_CLAUDE_AUTH_FLAG);
 }
 
 /**
