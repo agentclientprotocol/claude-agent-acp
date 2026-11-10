@@ -16,7 +16,7 @@
       "types": "./dist/lib.d.ts",
       "import": "./dist/lib.js"
     },
-    "./*": "./*"
+    "./package.json": "./package.json"
   },
   "files": [
     "dist/",

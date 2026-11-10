@@ -1,9 +1,12 @@
 import { describe, it, expect, vi } from "vitest";
 import type { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import type { FastModeDisabledReason, ModelInfo } from "@anthropic-ai/claude-agent-sdk";
+import { ClaudeAcpAgent } from "../v1/acp-agent.js";
 import {
   buildConfigOptions,
   clientSupportsBooleanConfigOptions,
+} from "../session-config-options.js";
+import {
   createFastModeConfigOption,
   fastModeStateEnabled,
   normalizeFastModeDisabledReason,
@@ -11,8 +14,7 @@ import {
   FAST_MODE_CONFIG_ID,
   FAST_MODE_ON,
   FAST_MODE_OFF,
-  ClaudeAcpAgent,
-} from "../v1/acp-agent.js";
+} from "../session-fast-mode.js";
 import type { AcpClient } from "../acp-client.js";
 
 const MODES = {

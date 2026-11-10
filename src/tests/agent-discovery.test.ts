@@ -3,7 +3,7 @@ import { randomUUID } from "crypto";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { Pushable } from "../utils.js";
-import { discoverCustomAgents, BUILTIN_AGENT_NAMES } from "../v1/acp-agent.js";
+import { discoverCustomAgents, BUILTIN_AGENT_NAMES } from "../session-config-options.js";
 
 // `discoverCustomAgents` distinguishes user/plugin-configured agents from
 // Claude Code's built-in subagents by name (BUILTIN_AGENT_NAMES), since the
