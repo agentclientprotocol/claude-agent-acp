@@ -1012,6 +1012,30 @@ describe("ACP v2 core", () => {
     });
   });
 
+  it("stays idle at the echo of a model change's local command output", async () => {
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      const { claude } = await openSession(agent);
+      // As the bundled CLI sends it after `setModel`, with no turn: no
+      // `command_lifecycle` frame, result or `session_state_changed` follows.
+      claude.send({
+        type: "user",
+        message: {
+          role: "user",
+          content:
+            "<local-command-stdout>Set model to `haiku (claude-haiku-5-5)`</local-command-stdout>",
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "session",
+        timestamp: new Date().toISOString(),
+        isReplay: true,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(client.states()).toEqual([]);
+    });
+  });
+
   it("forwards the result of a local command, which streamed no text", async () => {
     const client = v2Client();
     await client.connect(async (agent) => {

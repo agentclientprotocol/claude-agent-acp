@@ -87,6 +87,22 @@ function hasMarkerTag(text: string, tag: string): boolean {
   return markerTagText(text, tag) !== undefined;
 }
 
+/**
+ * Whether the content of a user message is only the output of a local
+ * command, such as the `<local-command-stdout>Set model to …</local-command-stdout>`
+ * that Claude Code echoes when the model changes.
+ */
+export function isLocalCommandOutput(content: unknown): boolean {
+  if (typeof content !== "string") return false;
+  if (
+    !hasMarkerTag(content, "local-command-stdout") &&
+    !hasMarkerTag(content, "local-command-stderr")
+  ) {
+    return false;
+  }
+  return stripMarkerTags(content).trim() === "";
+}
+
 function commandInvocationFromMarkerOnlyText(text: string): string | null {
   if (hasMarkerTag(text, "local-command-stdout") || hasMarkerTag(text, "local-command-stderr")) {
     return null;

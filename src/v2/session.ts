@@ -60,6 +60,7 @@ import { Pushable } from "../utils.js";
 import { v1PromptRequest } from "./prompt.js";
 import { V2Background, stateUpdate as currentStateUpdate } from "./background.js";
 import type { V2UpdateTranslator } from "./update-translator.js";
+import { isLocalCommandOutput } from "../message-filters.js";
 import { MODEL_CONFIG_ID } from "../session-model.js";
 import { modelRefusalFallback, noticeUpdate } from "../session-notices.js";
 import { planModeUpdate } from "../exit-plan.js";
@@ -939,6 +940,12 @@ export class V2Session implements RequestTarget {
         // in. A prompt Claude Code reported `started` for is inserted already.
         if ("isReplay" in message && message.isReplay) {
           if (message.uuid && message.parent_tool_use_id === null) {
+            // The output of a local command that Claude Code ran outside a
+            // turn, such as the "Set model to …" of a model change, is no
+            // prompt: no result or `command_lifecycle` frame would end its turn.
+            if (!this.pending.has(message.uuid) && isLocalCommandOutput(message.message.content)) {
+              return;
+            }
             // A message typed in another client of the session.
             const remote = this.remoteControl.remoteMessage(message);
             if (remote !== undefined) this.output.userMessage(remote, message.uuid);
