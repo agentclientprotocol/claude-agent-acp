@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.104.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.103.0...v0.104.0) (2026-11-10)
+
+
+### Features
+
+* implement the ACP auth/status RFD next to _auth/status_update ([#1570](https://github.com/agentclientprotocol/claude-agent-acp/issues/1570)) ([d202748](https://github.com/agentclientprotocol/claude-agent-acp/commit/d20274897684e8813477389b83a268f2b4f4ad11))
+
+
+### Bug Fixes
+
+* offer Anthropic Console login in remote environments ([#1572](https://github.com/agentclientprotocol/claude-agent-acp/issues/1572)) ([c09543d](https://github.com/agentclientprotocol/claude-agent-acp/commit/c09543d85ae1067e8df315f1cd3179527701ea16))
+
 ## [0.103.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.102.0...v0.103.0) (2026-11-10)
 
 
