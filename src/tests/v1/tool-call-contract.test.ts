@@ -6,7 +6,12 @@ import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
 import { AcpClient } from "../../acp-client.js";
 import { toAcpNotifications, ToolUseCache } from "../../sdk-to-acp.js";
 import { ClientCapabilities as ToolCallCapabilities } from "../../tool-calls/client-capabilities.js";
-import { backgroundedBashToolCall, withRunningTerminal } from "../../tool-calls/background.js";
+import {
+  backgroundedBashToolCall,
+  withRunningTerminal,
+  withStreamedTerminal,
+} from "../../tool-calls/background.js";
+import { foregroundBashTerminal } from "../../v1/background-work.js";
 import { ChangedMetaFilter } from "../../v1/tool-calls/changed-meta-filter.js";
 import { ToolCallFieldTracker } from "../../tool-calls/field-tracker.js";
 import { AcpToolCallRenderer, mcpToolName } from "../../tool-calls/renderer.js";
@@ -846,5 +851,51 @@ describe("background Bash", () => {
       update: { ...completed.update, _meta: { terminal_exit: exit } },
     };
     expect(withRunningTerminal(onlyExit, "t")).toEqual(completed);
+  });
+
+  it("makes the result's output replace the output that a foreground command's terminal showed", () => {
+    const output = { terminal_id: "t", data: "line1\nline2" };
+    const withDelta = {
+      ...completed,
+      update: { ...completed.update, _meta: { terminal_output_delta: output } },
+    };
+    expect(withStreamedTerminal(withDelta, new Set(["t"]))).toEqual({
+      ...completed,
+      update: { ...completed.update, _meta: { terminal_output: output } },
+    });
+    expect(withStreamedTerminal(withDelta, new Set(["other"]))).toBe(withDelta);
+  });
+
+  describe("foregroundBashTerminal", () => {
+    const owner = {
+      liveBackgroundTasks: new Map([
+        ["agent1", { parentToolUseId: "toolu_agent", isSubagent: true }],
+      ]),
+      toolUseCache: { toolu_bash: { name: "Bash" }, toolu_read: { name: "Read" } },
+      emittedToolCalls: new Set(["toolu_bash", "toolu_read"]),
+    };
+    const started = {
+      task_type: "local_bash",
+      is_backgrounded: false,
+      tool_use_id: "toolu_bash",
+    };
+
+    it("names the terminal of a foreground command, under its subagent's Agent call if any", () => {
+      expect(foregroundBashTerminal(owner, started)).toEqual({ toolCallId: "toolu_bash" });
+      expect(foregroundBashTerminal(owner, { ...started, parent_task_id: "agent1" })).toEqual({
+        toolCallId: "toolu_bash",
+        parentToolUseId: "toolu_agent",
+      });
+    });
+
+    it.each([
+      ["a command in the background", { is_backgrounded: true }],
+      ["a task that is not a command", { task_type: "local_agent" }],
+      ["a tool call that is not Bash", { tool_use_id: "toolu_read" }],
+      ["a tool call the client was not sent", { tool_use_id: "toolu_other" }],
+      ["a subagent whose Agent call is not known", { parent_task_id: "agent2" }],
+    ])("names none for %s", (_case, fields) => {
+      expect(foregroundBashTerminal(owner, { ...started, ...fields })).toBeUndefined();
+    });
   });
 });

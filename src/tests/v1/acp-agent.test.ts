@@ -22942,6 +22942,141 @@ describe("terminal of a command in the background", () => {
   });
 });
 
+// A client that appends terminal chunks sees the output of a command in the
+// foreground as it runs: Claude Code streams none, so the adapter reads the
+// command's task with `get_task_output` from its `task_started` until the Bash
+// result, whose output then replaces what the terminal showed.
+describe("output of a command in the foreground", () => {
+  /** A turn that runs `make test` in the foreground until `done` resolves. */
+  function foregroundCommand(done: Promise<void>) {
+    return (input: Pushable<any>) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        yield userEcho((await iter.next()).value);
+        yield {
+          type: "assistant",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          message: {
+            id: "msg_fg",
+            role: "assistant",
+            model: "claude-sonnet-4-20250514",
+            content: [
+              { type: "tool_use", id: "toolu_fg", name: "Bash", input: { command: "make test" } },
+            ],
+            usage: {
+              input_tokens: 0,
+              output_tokens: 0,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+          },
+        };
+        // What CLI 2.1.321 sends once the command has run for about 3 s.
+        yield {
+          type: "system",
+          subtype: "task_started",
+          task_id: "fg1",
+          task_type: "local_bash",
+          description: "make test",
+          tool_use_id: "toolu_fg",
+          is_backgrounded: false,
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        await done;
+        yield {
+          type: "system",
+          subtype: "task_notification",
+          task_id: "fg1",
+          tool_use_id: "toolu_fg",
+          status: "completed",
+          output_file: "",
+          summary: "",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield {
+          type: "user",
+          message: {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: "toolu_fg", content: "line1\nline2" }],
+          },
+          tool_use_result: {
+            stdout: "line1\nline2",
+            stderr: "",
+            interrupted: false,
+            isImage: false,
+          },
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield successfulResultMessage();
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      })();
+  }
+
+  /** The terminal output of each report about the Bash call. */
+  const outputs = (updates: SessionNotification[]) =>
+    updates.flatMap(({ update }): ({ delta: string } | { snapshot: string })[] => {
+      if (update.sessionUpdate !== "tool_call_update" || update.toolCallId !== "toolu_fg")
+        return [];
+      const meta = update._meta as Record<string, { data: string } | undefined> | undefined;
+      if (meta?.terminal_output_delta) return [{ delta: meta.terminal_output_delta.data }];
+      if (meta?.terminal_output) return [{ snapshot: meta.terminal_output.data }];
+      return [];
+    });
+
+  /** Runs the turn for a client with `capabilities`. The command prints
+   *  `line1` and, once the client was sent it (or after 1.5 s), `line2`. */
+  async function run(capabilities: ClientCapabilities) {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      { sessionUpdate: async (n: SessionNotification) => void updates.push(n) } as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await initializeClient(agent, capabilities);
+    const done = Promise.withResolvers<void>();
+    injectGeneratorSession(agent, foregroundCommand(done.promise));
+    let written = "line1\n";
+    const getTaskOutput = vi.fn(async (taskId: string) => {
+      expect(taskId).toBe("fg1");
+      return { output: written, total_bytes: Buffer.byteLength(written), truncated: false };
+    });
+    // Not in the SDK's `Query` type (see `supportsTaskOutput`).
+    Object.assign(agent.sessions["test-session"]!.query, { getTaskOutput });
+    const prompt = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test it" }],
+    });
+    await vi
+      .waitFor(() => expect(outputs(updates)).not.toEqual([]), { timeout: 1500 })
+      .catch(() => {});
+    written = "line1\nline2";
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    done.resolve();
+    await prompt;
+    return { outputs: outputs(updates), reads: getTaskOutput.mock.calls.length };
+  }
+
+  it("appends the output while the command runs, then replaces it with the result's", async () => {
+    expect((await run({ _meta: { terminal_output_delta: true } })).outputs).toEqual([
+      { delta: "line1\n" },
+      { delta: "line2" },
+      { snapshot: "line1\nline2" },
+    ]);
+  });
+
+  it("sends a client that appends no chunks the output with the result, as before", async () => {
+    expect(await run({ _meta: { terminal_output: true } })).toEqual({
+      outputs: [{ snapshot: "line1\nline2" }],
+      reads: 0,
+    });
+  });
+});
+
 describe("deferred settlement for live background subagents (issues #864/#866)", () => {
   // A turn whose terminal result arrives while background subagents IT
   // spawned are still live must NOT settle at that result: ACP allows
