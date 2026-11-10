@@ -4,7 +4,9 @@ An ACP-compatible coding agent powered by the Claude Agent SDK. Source in `src/`
 TypeScript, ESM, Node >= 22. `src/v1/` holds the v1 agent (`ClaudeAcpAgent` in
 `src/v1/acp-agent.ts`), `src/v2/` the v2 agent, and the rest of `src/` the modules
 both share. `src/acp-agent.ts` only re-exports `src/v1/acp-agent.ts` for the
-published `dist/acp-agent.js` path.
+published `dist/acp-agent.js` path. ESLint rejects imports between `src/v1/` and
+`src/v2/`, and from shared modules into either agent. The entry points (`index.ts`, `lib.ts`,
+`serve.ts`, `binary-entry.ts`, `acp-agent.ts`) are exempt.
 
 ## Commands
 
