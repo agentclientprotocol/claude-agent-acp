@@ -1,8 +1,9 @@
 /**
  * The connection's `authStatus` state, shared by the v1 core and the v2
  * core: the last identity it reported, the `claude auth status --json` probe,
- * and the `_auth/status_update` pushes (see `auth-status.ts` for when each
- * core reads the identity).
+ * the `_auth/status_update` and `auth/status_update` pushes, and the
+ * `auth/status` answer (see `auth-status.ts` for when each core reads the
+ * identity).
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -15,6 +16,7 @@ import {
   type Settings,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
+  type AcpAuthStatus,
   AUTH_STATUS_PROBE_TIMEOUT_MS,
   type AuthStatus,
   type AuthStatusKind,
@@ -22,6 +24,7 @@ import {
   fromCliStatus,
   mergeAuthStatus,
   sameAuthStatus,
+  toAcpAuthStatus,
 } from "./auth-status.js";
 import { claudeCliPath } from "./claude-cli.js";
 import type { SettingsManager } from "./settings.js";
@@ -36,6 +39,8 @@ export type AuthStatusSettings = Pick<SettingsManager, "getCwd" | "getApiKeyHelp
 export interface AuthStatusReporterOptions {
   /** Sends `_auth/status_update`. */
   push: (status: AuthStatus) => Promise<void>;
+  /** Sends the ACP `auth/status_update`. */
+  pushAcp: (status: AcpAuthStatus) => Promise<void>;
   logger: ReporterLogger;
   /** An ACP gateway login is active: the gateway, not the CLI store, is the identity. */
   gatewayLogin: () => boolean;
@@ -72,11 +77,18 @@ export class AuthStatusReporter {
   /** Same, for the "the CLI probe timed out" warning: a wedged CLI stays wedged
    *  and would otherwise warn once per probe, i.e. once per user prompt. */
   private loggedProbeTimeout = false;
+  /** Numbers the probe runs in start order. */
+  private probeRuns = 0;
+  /** The latest-started probe run that published its read. */
+  private publishedRun = 0;
+  /** The last `auth/status_update` payload sent, as JSON. */
+  private sentAcp?: string;
 
   constructor(private readonly options: AuthStatusReporterOptions) {}
 
   /**
-   * Stores `next` and pushes it to the client.
+   * Stores `next` and pushes it to the client, as `_auth/status_update` and
+   * as the ACP `auth/status_update`.
    *
    * A push goes out only when the payload changed. The identity is read on many
    * occasions — each session create, each guarded turn, the start of each user
@@ -103,6 +115,44 @@ export class AuthStatusReporter {
       .catch((error) => {
         this.options.logger.error("Failed to send _auth/status_update:", error);
       });
+    // Compared on its own payload: two identities can map to the same one.
+    const acp = toAcpAuthStatus(next);
+    const sent = JSON.stringify(acp);
+    if (sent === this.sentAcp) {
+      return;
+    }
+    this.sentAcp = sent;
+    void Promise.resolve()
+      .then(() => this.options.pushAcp(acp))
+      .catch((error) => {
+        this.options.logger.error("Failed to send auth/status_update:", error);
+      });
+  }
+
+  /**
+   * The `auth/status` answer: the identity the connection holds, which is
+   * also what the last `auth/status_update` said.
+   *
+   * - No identity yet: it waits for a probe, joining the one `initialize`
+   *   started, so a query right after `initialize` gets the identity. The
+   *   probe is bounded by {@link AUTH_STATUS_PROBE_TIMEOUT_MS}. The answer is
+   *   `unknown` when that probe publishes nothing: the CLI failed, printed
+   *   no JSON, or timed out, or a login or logout overtook the read.
+   * - An identity is known: it answers at once and starts a new probe that
+   *   nothing waits for. A login or logout made outside the client then
+   *   arrives as `auth/status_update`.
+   *
+   * The probe is an ordinary one: it runs under the settings of the session
+   * that last started or prompted, pushes a change, and reports its kind to
+   * `onProbe`. Under an ACP gateway login it reads nothing.
+   */
+  async status(): Promise<AcpAuthStatus> {
+    if (this.current) {
+      void this.probe({ fresh: true });
+    } else {
+      await this.probe();
+    }
+    return toAcpAuthStatus(this.current);
   }
 
   /** A login or a logout: any probe already running read the world before it. */
@@ -210,6 +260,7 @@ export class AuthStatusReporter {
     // auth-affecting event describes a world that no longer exists. Remember
     // which one this read belongs to and drop the answer if it moved on.
     const epoch = this.epoch;
+    const run = ++this.probeRuns;
     const context = this.settings;
     const apiKeyHelper = context?.manager.getApiKeyHelper(context.override);
     // ACP gateway auth bypasses the CLI credential store entirely, so the
@@ -276,6 +327,13 @@ export class AuthStatusReporter {
       logger.log("[authStatus] discarding a probe that predates the latest auth change");
       return this.current;
     }
+    if (run < this.publishedRun) {
+      // Probes can overlap (`fresh`) and land out of order. A read that
+      // started before one already published is the older of the two.
+      logger.log("[authStatus] discarding a probe that a newer one overtook");
+      return this.current;
+    }
+    this.publishedRun = run;
     // The CLI probe can be poorer than the session `AccountInfo` for the very
     // same login (no organization, say). Keep those extra fields rather than
     // regressing the payload; a different identity replaces it wholesale.

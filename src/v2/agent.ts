@@ -95,6 +95,7 @@ export function v2AgentApp(
       .onRequest(v2.methods.agent.initialize, ({ params }) => agent.initialize(params))
       .onRequest(v2.methods.agent.auth.login, ({ params }) => agent.auth.login(params))
       .onRequest(v2.methods.agent.auth.logout, () => agent.auth.logout())
+      .onRequest(v2.methods.agent.auth.status, () => agent.auth.authStatus())
       .onRequest(v2.methods.agent.providers.list, () => agent.auth.listProviders())
       .onRequest(v2.methods.agent.providers.set, ({ params }) => agent.auth.setProvider(params))
       .onRequest(v2.methods.agent.providers.disable, ({ params }) =>
@@ -256,7 +257,7 @@ class V2Agent implements AgentHandle, SessionConnection {
       url: request.capabilities?.elicitation?.url != null,
     };
     this.air = airSupport(request.capabilities);
-    const { authMethods, _meta } = this.auth.initialize(request.capabilities);
+    const { authMethods, auth, _meta } = this.auth.initialize(request.capabilities);
     const airMeta = airInitializeMeta(this.air);
     return {
       ...(airMeta ? { _meta: airMeta } : {}),
@@ -266,6 +267,7 @@ class V2Agent implements AgentHandle, SessionConnection {
         session: V2_SESSION_CAPABILITIES,
         // `providers/list`, `set`, and `disable`, served for every client.
         providers: {},
+        auth,
         // A prompt that comes while Claude works waits in Claude Code's queue.
         _meta: { claudeCode: { promptQueueing: true }, ..._meta },
       },

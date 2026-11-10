@@ -10,6 +10,7 @@ import {
   fromCliStatus,
   mergeAuthStatus,
   sameIdentity,
+  toAcpAuthStatus,
 } from "../../auth-status.js";
 import { DEFAULT_CONTEXT_USAGE, makeMockQuery } from "../helpers.js";
 import { randomUUID } from "node:crypto";
@@ -187,6 +188,47 @@ describe("auth status mappers", () => {
       label: "Anthropic API key",
       detail: "API key helper",
     });
+  });
+
+  it.each<[string, AuthStatus | undefined, ReturnType<typeof toAcpAuthStatus>]>([
+    ["no identity read yet", undefined, { state: "unknown" }],
+    ["a logged-out CLI", { kind: "none", label: "Not logged in" }, { state: "unauthenticated" }],
+    [
+      "a subscription",
+      {
+        kind: "account",
+        label: "Claude Max",
+        account: { plan: "max", email: "user@example.com", organization: "ACME" },
+      },
+      {
+        state: "authenticated",
+        accounts: [
+          {
+            label: "Claude Max",
+            active: true,
+            email: "user@example.com",
+            organization: "ACME",
+            _meta: { claudeCode: { kind: "account", plan: "max" } },
+          },
+        ],
+      },
+    ],
+    [
+      "an API key",
+      { kind: "api_key", label: "Anthropic API key", detail: "env" },
+      {
+        state: "authenticated",
+        accounts: [
+          {
+            label: "Anthropic API key",
+            active: true,
+            _meta: { claudeCode: { kind: "api_key", detail: "env" } },
+          },
+        ],
+      },
+    ],
+  ])("maps %s to the ACP auth/status payload", (_name, status, expected) => {
+    expect(toAcpAuthStatus(status)).toEqual(expected);
   });
 
   it("does not use an inactive helper or override an external backend", () => {
@@ -377,6 +419,8 @@ describe("auth status mappers", () => {
 describe("auth status over ACP", () => {
   let agent: ClaudeAcpAgentType;
   let extNotification: ReturnType<typeof vi.fn>;
+  /** The `auth/status_update` notifications. */
+  let authStatusUpdate: ReturnType<typeof vi.fn>;
   /** stdout the fake `claude auth status --json` prints, and whether the exec
    *  fails (the logged-out case exits 1 with JSON still on stdout). */
   let statusStdout: string;
@@ -450,9 +494,11 @@ describe("auth status over ACP", () => {
     });
     mockQuery.mockImplementation(() => makeMockQuery());
     extNotification = vi.fn().mockResolvedValue(undefined);
+    authStatusUpdate = vi.fn().mockResolvedValue(undefined);
     agent = new ClaudeAcpAgent({
       sessionUpdate: async () => {},
       extNotification,
+      authStatusUpdate,
     } as unknown as AcpClient);
   });
 
@@ -622,6 +668,123 @@ describe("auth status over ACP", () => {
     expect(response.agentCapabilities?._meta?.authStatus).toEqual({});
     // The marker lives in agentCapabilities only — never at the top level.
     expect(response._meta?.authStatus).toBeUndefined();
+  });
+
+  it("advertises auth.status and sends auth/status_update with each _auth/status_update", async () => {
+    const response = await initialize();
+    expect(response.agentCapabilities?.auth?.status).toEqual({});
+    const subscription = {
+      state: "authenticated",
+      accounts: [
+        {
+          label: "Claude Max",
+          active: true,
+          email: "user@example.com",
+          organization: "ACME",
+          _meta: { claudeCode: { kind: "account", plan: "max" } },
+        },
+      ],
+    };
+    expect(authStatusUpdate.mock.calls).toEqual([[subscription]]);
+
+    // An unchanged identity sends neither notification again.
+    await agent.authStatusResponse();
+    await settle();
+    expect(updates()).toHaveLength(1);
+    expect(authStatusUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends auth/status_update only when its own payload changed", async () => {
+    agent.setAuthStatus({ kind: "api_key", label: "Anthropic API key", detail: "env" });
+    // Another `_auth/status_update` payload, the same `auth/status_update` one.
+    agent.setAuthStatus({
+      kind: "api_key",
+      label: "Anthropic API key",
+      detail: "env",
+      vendor: { claudeCode: {} },
+    });
+    await settle();
+
+    expect(updates()).toHaveLength(2);
+    expect(authStatusUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it("answers auth/status from the probe in flight while no identity is known", async () => {
+    deferStatus = true;
+    const init = agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    const status = agent.authStatusResponse();
+    await flushStatus();
+    await init;
+
+    expect(await status).toMatchObject({
+      state: "authenticated",
+      accounts: [{ label: "Claude Max" }],
+    });
+    expect(statusCalls()).toHaveLength(1);
+  });
+
+  it("answers auth/status at once with the known identity, and pushes what a new read finds", async () => {
+    statusStdout = CLI_LOGGED_OUT;
+    statusFails = true;
+    await initialize();
+
+    // A login made outside the client, and a CLI that has not answered yet.
+    statusStdout = CLI_SUBSCRIPTION;
+    statusFails = false;
+    deferStatus = true;
+    expect(await agent.authStatusResponse()).toEqual({ state: "unauthenticated" });
+
+    await flushStatus();
+    expect(authStatusUpdate.mock.calls.at(-1)?.[0]).toMatchObject({ state: "authenticated" });
+    expect(await agent.authStatusResponse()).toMatchObject({ state: "authenticated" });
+  });
+
+  it("discards a probe that lands after one that started later", async () => {
+    statusStdout = CLI_LOGGED_OUT;
+    statusFails = true;
+    await initialize();
+
+    deferStatus = true;
+    await agent.authStatusResponse();
+    statusStdout = CLI_SUBSCRIPTION;
+    statusFails = false;
+    await agent.authStatusResponse();
+
+    await releaseStatus(1);
+    await releaseStatus(0);
+    expect(lastPush()?.kind).toBe("account");
+  });
+
+  it("answers auth/status with the gateway login, without reading the CLI", async () => {
+    await agent.authenticate({
+      methodId: "gateway",
+      _meta: { gateway: { baseUrl: "https://gw.example.com/v1", headers: {} } },
+    } as never);
+
+    expect(await agent.authStatusResponse()).toEqual({
+      state: "authenticated",
+      accounts: [
+        {
+          label: "Custom model gateway",
+          active: true,
+          _meta: { claudeCode: { kind: "gateway", detail: "gw.example.com" } },
+        },
+      ],
+    });
+    await settle();
+    expect(statusCalls()).toHaveLength(0);
+  });
+
+  it("answers auth/status with unknown while the CLI cannot be read, and keeps a known identity", async () => {
+    statusStdout = "";
+    statusFails = true;
+    expect(await agent.authStatusResponse()).toEqual({ state: "unknown" });
+
+    agent.setAuthStatus({ kind: "api_key", label: "Anthropic API key", detail: "env" });
+    expect(await agent.authStatusResponse()).toMatchObject({
+      state: "authenticated",
+      accounts: [{ label: "Anthropic API key" }],
+    });
   });
 
   it("pushes the first identity after the initialize response, never before it", async () => {
@@ -1069,7 +1232,11 @@ describe("auth status over ACP", () => {
       logger = { log: vi.fn(), error: vi.fn(), warn: vi.fn() };
       extNotification = vi.fn().mockResolvedValue(undefined);
       agent = new ClaudeAcpAgent(
-        { sessionUpdate: async () => {}, extNotification } as unknown as AcpClient,
+        {
+          sessionUpdate: async () => {},
+          extNotification,
+          authStatusUpdate: async () => {},
+        } as unknown as AcpClient,
         logger as Logger,
       );
       agent.setAuthStatus({ ...KNOWN });
@@ -1099,6 +1266,14 @@ describe("auth status over ACP", () => {
       expect(logger.error).toHaveBeenCalledWith(
         "claude auth status did not answer within 5 s; the identity is not refreshed",
       );
+    });
+
+    it("answers auth/status with unknown when the first probe times out", async () => {
+      (agent as any).authStatus.current = undefined;
+      const status = agent.authStatusResponse();
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(await status).toEqual({ state: "unknown" });
     });
 
     it("warns once however many probes time out", async () => {

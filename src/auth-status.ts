@@ -3,10 +3,14 @@
  * identity the agent process itself uses (Claude subscription, API key,
  * gateway, external cloud credentials, or nothing).
  *
- * Push only. One carrier, connection-scoped (never per session): the
- * notification `_auth/status_update` → `{authStatus}`. The client never asks;
- * there is no request method. The empty `agentCapabilities._meta.authStatus`
- * marker means "this agent pushes its identity", nothing more.
+ * Two carriers of the one identity, both connection-scoped (never per
+ * session):
+ * - the extension: the notification `_auth/status_update` → `{authStatus}`,
+ *   advertised by the empty `agentCapabilities._meta.authStatus` marker. It
+ *   has no request method;
+ * - the ACP `auth/status` RFD: the `auth/status` request and the
+ *   `auth/status_update` notification, advertised as `auth.status`.
+ *   {@link toAcpAuthStatus} maps the identity to their payload.
  *
  * The agent reads the identity at these moments:
  * - `initialize`, with an asynchronous CLI probe. Nothing waits for it, and its
@@ -20,7 +24,10 @@
  *   login or a logout done in another terminal, including the sign-in a client
  *   performs after a refusal, because the retried prompt is a new prompt.
  *   Nothing waits for it and the push goes out mid-turn if that is when the
- *   read lands.
+ *   read lands;
+ * - each `auth/status` request, with an asynchronous CLI probe. The request
+ *   waits for it only while no identity is known yet (see
+ *   `AuthStatusReporter.status`).
  *
  * A probe whose kind differs from a live session's account marks that session
  * for recreation under `--hide-claude-auth`. The mark is a flag, consumed at
@@ -29,18 +36,18 @@
  * guard decides on the account it reports.
  *
  * A read does not always cause a push. The agent sends `_auth/status_update`
- * only when the payload is different from the last one it sent.
+ * only when its payload is different from the last one it sent, and
+ * `auth/status_update` likewise.
  *
  * "Cannot determine" is expressed by silence: an agent that cannot read its own
- * identity pushes nothing, and the client shows "not reported". A known
- * logged-out state is a payload of its own (`kind: "none"`), which is what
- * distinguishes the two.
+ * identity pushes nothing, and `auth/status` answers `unknown`. A known
+ * logged-out state is a payload of its own (`kind: "none"`, `unauthenticated`),
+ * which is what distinguishes the two.
  *
- * Reporting only — there is no write path in v1. When the upstream RFD lands,
- * the same payload moves from `_meta` to first-class fields and this module
- * is retired.
+ * Reporting only — there is no write path in v1.
  */
 
+import type { AuthAccount, AuthStatusResponse } from "@agentclientprotocol/sdk/unstable";
 import type { AccountInfo } from "@anthropic-ai/claude-agent-sdk";
 
 /** Change notification, agent → client. Fire and forget: clients that do not
@@ -83,6 +90,44 @@ export type AuthStatusCapability = Record<string, never>;
 
 export function authStatusCapability(): AuthStatusCapability {
   return {};
+}
+
+/** The fields of an `auth/status` response and of an `auth/status_update`
+ *  notification, which are the same on ACP v1 and v2. */
+export type AcpAuthStatus = Pick<AuthStatusResponse, "state" | "accounts">;
+
+/**
+ * Maps the identity to the ACP `auth/status` payload. The identity is the
+ * agent's own login, so `state` does not count a route that the client set
+ * with `providers/set`: a logged-out CLI is `unauthenticated` under one too.
+ *
+ * - No identity read yet (`undefined`): `unknown`, no accounts.
+ * - `kind: "none"`: `unauthenticated`, no accounts.
+ * - Any other kind: `authenticated`, with the identity as the one account,
+ *   marked `active`. `_meta.claudeCode` carries the `kind`, `detail` and
+ *   `plan` that the account fields have no place for.
+ *
+ * `--hide-claude-auth` does not change the payload: it reports the login the
+ * CLI holds, also when the subscription guard refuses to use it.
+ */
+export function toAcpAuthStatus(status: AuthStatus | undefined): AcpAuthStatus {
+  if (!status) {
+    return { state: "unknown" };
+  }
+  if (status.kind === "none") {
+    return { state: "unauthenticated" };
+  }
+  const account: AuthAccount = { label: status.label, active: true };
+  if (status.account?.email) account.email = status.account.email;
+  if (status.account?.organization) account.organization = status.account.organization;
+  account._meta = {
+    claudeCode: {
+      kind: status.kind,
+      ...(status.detail !== undefined ? { detail: status.detail } : {}),
+      ...(status.account?.plan !== undefined ? { plan: status.account.plan } : {}),
+    },
+  };
+  return { state: "authenticated", accounts: [account] };
 }
 
 /** Shape of `claude auth status --json`. Absent fields are omitted, not null,

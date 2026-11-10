@@ -1,7 +1,8 @@
 /**
- * The connection's auth and LLM routing on the v2 core: the `authStatus`
- * extension (`_meta.authStatus` and `_auth/status_update`), the gateway logins
- * of `auth/login`, `auth/logout`, and `providers/list|set|disable`.
+ * The connection's auth and LLM routing on the v2 core: `auth/status` and
+ * `auth/status_update`, the `authStatus` extension (`_meta.authStatus` and
+ * `_auth/status_update`), the gateway logins of `auth/login`, `auth/logout`,
+ * and `providers/list|set|disable`.
  *
  * The state and its rules are the v1 core's (`AuthStatusReporter`,
  * `providers.ts`). The identity is read at the same moments as there: after
@@ -96,6 +97,7 @@ export class V2Auth {
   ) {
     this.status = new AuthStatusReporter({
       push: (authStatus) => ctx.notify(AUTH_STATUS_UPDATE_METHOD, { authStatus }),
+      pushAcp: (status) => ctx.notify(v2.methods.client.auth.statusUpdate, status),
       logger,
       gatewayLogin: () => this.gatewayLogin !== undefined,
       providerOverride: () => this.provider !== undefined,
@@ -109,6 +111,7 @@ export class V2Auth {
    */
   initialize(capabilities: v2.ClientCapabilities | null | undefined): {
     authMethods: v2.AuthMethod[];
+    auth: v2.AgentAuthCapabilities;
     _meta: { authStatus: Record<string, never> };
   } {
     void this.status.probe();
@@ -121,9 +124,16 @@ export class V2Auth {
         // Only offered when the client advertises `auth._meta.gateway`.
         ...(capabilities?.auth?._meta?.gateway === true ? gatewayAuthMethods() : []),
       ].map(v2AuthMethod),
+      // `auth/status` and `auth/status_update`.
+      auth: { status: {} },
       // The `authStatus` marker: this agent pushes its identity.
       _meta: { authStatus: authStatusCapability() },
     };
+  }
+
+  /** `auth/status` (see `AuthStatusReporter.status`). */
+  authStatus(): Promise<v2.AuthStatusResponse> {
+    return this.status.status();
   }
 
   /** `auth/login`: a gateway login. The terminal logins are the client's to run. */
