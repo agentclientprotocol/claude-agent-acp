@@ -41,6 +41,7 @@ import {
   mcpServerStartupNotice,
   normalizeNoticeText,
   noticeUpdate,
+  splitNoticeText,
 } from "../session-notices.js";
 import {
   DEFAULT_CONTEXT_WINDOW,
@@ -221,6 +222,24 @@ export class SessionReports {
       this.compaction.hasDeliveredOutput ||
       this.noticeTexts.includes(normalizeNoticeText(resultText))
     );
+  }
+
+  /**
+   * A notice of the message that Claude Code wrote for a failed API request
+   * (see `TurnReport.takeApiError`). It is a turn's notice, so a result that
+   * repeats its text is not shown again.
+   */
+  apiError(text: string): void {
+    this.host.emit([
+      {
+        sessionId: this.host.sessionId,
+        update: noticeUpdate({
+          severity: "error",
+          ...splitNoticeText(text, "Claude reported an API error"),
+        }),
+      },
+    ]);
+    this.noticeTexts.push(normalizeNoticeText(text));
   }
 
   /**

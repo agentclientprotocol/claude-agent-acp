@@ -2120,6 +2120,44 @@ describe("ACP v2 core", () => {
   });
 
   it.each([
+    ["a notice when the turn goes on to end", { result: "" }, "end_turn", 1],
+    ["a notice once when the result repeats its text", {}, "end_turn", 1],
+    ["the idle's error when the turn fails", { is_error: true }, "error", 0],
+  ])(
+    "reports Claude Code's message for a failed API request as %s, not as Claude's text",
+    async (_, fields, stopReason, notices) => {
+      const text = "API Error: Connection lost mid-response. The response above may be incomplete.";
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { claude } = await openSession(agent);
+        claude.send(cycleStart());
+        claude.send({
+          ...assistant("msg_api_error", [{ type: "text", text }]),
+          message: {
+            id: "msg_api_error",
+            type: "message",
+            role: "assistant",
+            model: "<synthetic>",
+            content: [{ type: "text", text }],
+            usage: {},
+          },
+          error: "server_error",
+        });
+        claude.send(result({ result: text, ...fields }));
+        await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+      });
+
+      expect(
+        client.sessionUpdates.filter((update) => update.sessionUpdate === "agent_message_chunk"),
+      ).toEqual([]);
+      expect(client.sessionUpdates.filter((update) => update.sessionUpdate === "notice")).toEqual(
+        Array(notices).fill({ sessionUpdate: "notice", severity: "error", title: text }),
+      );
+      expect(client.sessionUpdates.at(-1)).toMatchObject({ state: "idle", stopReason });
+    },
+  );
+
+  it.each([
     [
       "an error at the turn limit",
       { subtype: "error_max_turns", is_error: true, errors: ["a", "b"] },
