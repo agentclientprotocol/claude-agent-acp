@@ -77,7 +77,7 @@ import {
   type SDKControlGetUsageResponse,
 } from "@anthropic-ai/claude-agent-sdk";
 import { createHash, randomUUID } from "crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -14951,6 +14951,79 @@ describe("session/fork", () => {
       upToMessageId: "inactive-assistant-uuid",
     });
   });
+});
+
+describe("session/status", () => {
+  it("answers open for the sessions it holds, and the others from their stored transcripts", async () => {
+    const configDir = await mkdtemp(path.join(os.tmpdir(), "session-status-"));
+    vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
+    try {
+      const agent = new ClaudeAcpAgent({ sessionUpdate: async () => {} } as unknown as AcpClient, {
+        log: () => {},
+        error: () => {},
+      });
+      const { agentCapabilities } = await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {},
+      });
+      expect(agentCapabilities?.sessionCapabilities?.status).toEqual({});
+      const status = (sessionId: string) => agent.sessionStatus({ sessionId });
+      const unknown = (sessionId: string) => ({ code: -32002, data: { sessionId } });
+
+      const sessionId = randomUUID();
+      agent.sessions[sessionId] = {} as ClaudeAcpAgent["sessions"][string];
+      await expect(status(sessionId)).resolves.toEqual({ status: "open" });
+      // A held session whose query ended stays open: a load returns it as it is.
+      agent.sessions[sessionId]!.queryClosed = true;
+      await expect(status(sessionId)).resolves.toEqual({ status: "open" });
+      // A subagent's session id, and a name that every object inherits.
+      await expect(status("agent-1")).rejects.toMatchObject(unknown("agent-1"));
+      await expect(status("constructor")).rejects.toMatchObject(unknown("constructor"));
+
+      // Closed, and never prompted: no projects directory exists yet.
+      delete agent.sessions[sessionId];
+      await expect(status(sessionId)).rejects.toMatchObject(unknown(sessionId));
+      // A transcript of any project counts, next to a project without one.
+      await mkdir(path.join(configDir, "projects", "-other"), { recursive: true });
+      const project = path.join(configDir, "projects", "-project");
+      // A directory of that name is no transcript.
+      await mkdir(path.join(project, `${sessionId}.jsonl`), { recursive: true });
+      await expect(status(sessionId)).rejects.toMatchObject(unknown(sessionId));
+      await rm(path.join(project, `${sessionId}.jsonl`), { recursive: true });
+      await writeFile(path.join(project, `${sessionId}.jsonl`), "{}\n");
+      await expect(status(sessionId)).resolves.toEqual({ status: "saved" });
+      // The request loaded nothing.
+      expect(agent.sessions[sessionId]).toBeUndefined();
+    } finally {
+      vi.unstubAllEnvs();
+      await rm(configDir, { recursive: true, force: true });
+    }
+  });
+
+  // Not on Windows, where `chmod` does not take the read permission away.
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "fails, not -32002, when a project directory cannot be read",
+    async () => {
+      const configDir = await mkdtemp(path.join(os.tmpdir(), "session-status-"));
+      vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
+      const project = path.join(configDir, "projects", "-project");
+      await mkdir(project, { recursive: true });
+      await chmod(project, 0o000);
+      try {
+        const agent = new ClaudeAcpAgent(
+          { sessionUpdate: async () => {} } as unknown as AcpClient,
+          { log: () => {}, error: () => {} },
+        );
+        await expect(agent.sessionStatus({ sessionId: randomUUID() })).rejects.toMatchObject({
+          code: "EACCES",
+        });
+      } finally {
+        await chmod(project, 0o700);
+        vi.unstubAllEnvs();
+        await rm(configDir, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 describe("session/close", () => {

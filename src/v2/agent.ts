@@ -58,6 +58,7 @@ import { modelSwitchHook, SessionConfig } from "./config.js";
 import { fileChangePreviewHook } from "./file-preview.js";
 import { canUseTool, denyingStoppedWork } from "./permissions.js";
 import { reportHooks } from "./reports.js";
+import { savedSessionStatus } from "../session-status.js";
 import { SessionRestarts, type SetupParams } from "./restarts.js";
 import { V2Session, type SessionConnection } from "./session.js";
 import {
@@ -106,6 +107,7 @@ export function v2AgentApp(
       .onRequest(v2.methods.agent.session.fork, ({ params }) => agent.forkSession(params))
       .onRequest(v2.methods.agent.session.list, ({ params }) => agent.listSessions(params))
       .onRequest(v2.methods.agent.session.close, ({ params }) => agent.closeSession(params))
+      .onRequest(v2.methods.agent.session.status, ({ params }) => agent.sessionStatus(params))
       .onRequest(v2.methods.agent.session.delete, ({ params }) => agent.deleteSession(params))
       .onRequest(v2.methods.agent.session.setConfigOption, ({ params }) =>
         agent.setConfigOption(params),
@@ -450,6 +452,25 @@ class V2Agent implements AgentHandle, SessionConnection {
     return stored.length > SESSION_LIST_PAGE_SIZE
       ? { sessions, nextCursor: `offset:${offset + SESSION_LIST_PAGE_SIZE}` }
       : { sessions };
+  }
+
+  /**
+   * `session/status`. `open`, with its foreground state, for a session whose
+   * query runs here. Every other session is `saved` or unknown by its stored
+   * transcript (see `session-status.ts`): one that a resume is still
+   * starting, and one whose query ended without `session/close`, which a
+   * resume starts again.
+   *
+   * A subagent's session does not advertise `status`, and is refused like
+   * its other requests. Its parent's `subagent_update` reports its state.
+   *
+   * It waits for no resume, restart or close, and changes nothing.
+   */
+  async sessionStatus({ sessionId }: v2.SessionStatusRequest): Promise<v2.SessionStatusResponse> {
+    const session = this.sessions.get(sessionId);
+    if (session) return { status: "open", state: session.statusState() };
+    if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "ask the status of");
+    return savedSessionStatus(sessionId);
   }
 
   /** Closing is idempotent: a session that is not active closes at once. */

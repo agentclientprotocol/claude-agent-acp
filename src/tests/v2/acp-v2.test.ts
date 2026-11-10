@@ -394,6 +394,7 @@ describe("ACP protocol routing", () => {
       fork: {},
       additionalDirectories: {},
       systemPrompt: { mode: { override: {} } },
+      status: {},
     });
     expect(response.capabilities?.providers).toEqual({});
     // Not `_session/steering`, which v1 advertises in the top-level `_meta`.
@@ -744,6 +745,141 @@ describe("ACP v2 sessions", () => {
 
       await agent.request(v2.methods.agent.session.delete, { sessionId });
       await authUpdate(1);
+    });
+  });
+
+  describe("session/status", () => {
+    /** Stores a transcript of `sessionId`, as Claude Code does at the first prompt. */
+    async function storeTranscript(sessionId: string, content = "{}\n") {
+      const project = path.join(tempDir, "claude", "projects", "-project");
+      await mkdir(project, { recursive: true });
+      await writeFile(path.join(project, `${sessionId}.jsonl`), content);
+    }
+    const status = (agent: v2.ClientContext, sessionId: string) =>
+      agent.request(v2.methods.agent.session.status, { sessionId });
+    const unknown = (sessionId: string) => ({ code: -32002, data: { sessionId } });
+
+    it("answers from memory and the stored transcript, and starts or sends nothing", async () => {
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const neverUsed = randomUUID();
+        await expect(status(agent, neverUsed)).rejects.toMatchObject(unknown(neverUsed));
+        // Not a UUID: no file is looked up under such a name.
+        await expect(status(agent, "../settings")).rejects.toMatchObject(unknown("../settings"));
+
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await client.authUpdate(1);
+        // The agent's post-setup work runs on a timer.
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const sent = client.sessionUpdates.length;
+        // The state as a `state_update` snapshot holds it, with the session's list.
+        expect(await status(agent, sessionId)).toEqual({
+          status: "open",
+          state: { state: "idle", background: [] },
+        });
+
+        await agent.request(v2.methods.agent.session.close, { sessionId });
+        // Claude Code writes the transcript at the first prompt: none is stored.
+        await expect(status(agent, sessionId)).rejects.toMatchObject(unknown(sessionId));
+        // An empty transcript holds no conversation to resume.
+        await storeTranscript(sessionId, "");
+        await expect(status(agent, sessionId)).rejects.toMatchObject(unknown(sessionId));
+        await storeTranscript(sessionId);
+        expect(await status(agent, sessionId)).toEqual({ status: "saved" });
+
+        expect(sdk.queryOptions).toHaveLength(1);
+        expect(client.sessionUpdates).toHaveLength(sent);
+      });
+    });
+
+    it("answers a session whose query ended without session/close from its transcript", async () => {
+      // Claude Code exits right after it started.
+      sdk.run = async function* () {};
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await vi.waitFor(() => expect(v2Session(sessionId)).toBeUndefined());
+
+        await expect(status(agent, sessionId)).rejects.toMatchObject(unknown(sessionId));
+        await storeTranscript(sessionId);
+        expect(await status(agent, sessionId)).toEqual({ status: "saved" });
+        await client.authUpdate(1);
+      });
+    });
+
+    it("answers saved while a resume still starts the session, without waiting for it", async () => {
+      const sessionId = randomUUID();
+      await storeTranscript(sessionId);
+      let started!: () => void;
+      const starting = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      const initialization = sdk.initializationResult;
+      sdk.initializationResult = async () => {
+        await starting;
+        return initialization();
+      };
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const resumed = agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+        await vi.waitFor(() => expect(sdk.queryOptions).toHaveLength(1));
+
+        expect(await status(agent, sessionId)).toEqual({ status: "saved" });
+
+        started();
+        await resumed;
+        expect(await status(agent, sessionId)).toMatchObject({ status: "open" });
+        await client.authUpdate(1);
+      });
+    });
+
+    it("reports a session that waits for a permission as requires_action", async () => {
+      let answer!: (response: v2.RequestPermissionResponse) => void;
+      scriptTurns(async function* (options) {
+        await options.canUseTool!("Bash", { command: "ls" }, {
+          signal: new AbortController().signal,
+          suggestions: [],
+          toolUseID: "toolu_ls",
+          requestId: randomUUID(),
+        } as Parameters<NonNullable<Options["canUseTool"]>>[2]);
+        yield result(options);
+        yield idleState(options);
+      });
+      const client = v2Client({
+        answerPermission: (() =>
+          new Promise<v2.RequestPermissionResponse>((resolve) => {
+            answer = resolve;
+          })) as unknown as () => v2.RequestPermissionResponse,
+      });
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("go") });
+        await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(1));
+        await vi.waitFor(() =>
+          expect(turnTrace(client.sessionUpdates).at(-1)).toBe("requires_action"),
+        );
+
+        expect(await agent.request(v2.methods.agent.session.status, { sessionId })).toEqual({
+          status: "open",
+          state: { state: "requires_action", background: [] },
+        });
+
+        answer({ outcome: { outcome: "selected", optionId: "allow-once" } });
+        await vi.waitFor(() => expect(turnTrace(client.sessionUpdates).at(-1)).toMatch(/^idle/));
+        await client.authUpdate(1);
+      });
+      // The status request added no state to the turn's.
+      expect(turnTrace(client.sessionUpdates)).toEqual([
+        "user_message",
+        "running",
+        "requires_action",
+        "running",
+        "idle end_turn",
+      ]);
     });
   });
 
@@ -5675,6 +5811,57 @@ describe("ACP v2 requests that subagents make", () => {
         ["mode=acceptEdits", "effort=high", "agent=Explore"],
         ["mode=acceptEdits", "model=claude-sonnet-4-6", "effort=high", "agent=Explore"],
       ]);
+    });
+
+    it("refuses session/status of a subagent's session, which does not advertise it", async () => {
+      let finish!: () => void;
+      const finished = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      scriptTurns(async function* (options) {
+        yield toolUseMessage(options, "toolu_agent-1", "Agent", {
+          description: "Explore the project",
+          prompt: "Look around",
+          subagent_type: "Explore",
+        });
+        yield taskStarted(options, "agent-1", { prompt: "Look around" });
+        await finished;
+        yield taskNotification(options, "agent-1", {});
+        yield result(options);
+        yield idleState(options);
+      });
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+        await vi.waitFor(() =>
+          expect(
+            client.sessionUpdates.some(
+              (notification) =>
+                notification.sessionId === "agent-1" &&
+                notification.update.sessionUpdate === "state_update",
+            ),
+          ).toBe(true),
+        );
+
+        await expect(
+          agent.request(v2.methods.agent.session.status, { sessionId: "agent-1" }),
+        ).rejects.toMatchObject({
+          code: -32602,
+          message: expect.stringContaining("agent-1 is a subagent session"),
+        });
+
+        finish();
+        await vi.waitFor(() =>
+          expect(
+            client
+              .updates("state_update")
+              .some((update) => (update as { state: string }).state === "idle"),
+          ).toBe(true),
+        );
+        await client.authUpdate(1);
+      });
     });
 
     it("sends a live child's configuration again after a replay's response, when the replay sent another", async () => {

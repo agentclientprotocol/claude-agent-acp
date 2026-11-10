@@ -28,6 +28,9 @@
  * - The `initialize` response also advertises `agentCapabilities.auth.status`,
  *   which origin/main did not: the agent now answers `auth/status` and sends
  *   `auth/status_update`.
+ * - The `initialize` response also advertises
+ *   `agentCapabilities.sessionCapabilities.status`, which origin/main did
+ *   not: the agent now serves `session/status`.
  * - A SandboxNetworkAccess tool call is settled by a `tool_call_update` with
  *   only its final `status` once its permission request is answered. The
  *   callback runs nothing, so origin/main never settled the call (see
@@ -271,7 +274,9 @@ export function compareWithBaseline(baseline: Recorded[], traffic: Recorded[]): 
     });
   const current = withoutSandboxNetworkSettlements(
     traffic.map((record) =>
-      withoutAuthStatusCapability(withoutSessionCapability(record, "systemPrompt")),
+      withoutAuthStatusCapability(
+        withoutSessionCapability(withoutSessionCapability(record, "systemPrompt"), "status"),
+      ),
     ),
   );
   const violations: string[] = [];

@@ -43,6 +43,8 @@ import {
   SetSessionConfigOptionResponse,
   SetSessionModeRequest,
   SetSessionModeResponse,
+  SessionStatusRequest,
+  SessionStatusResponse,
   CloseSessionRequest,
   CloseSessionResponse,
   DeleteSessionRequest,
@@ -91,6 +93,7 @@ import {
 } from "./goal-extension.js";
 import { checklistPlanUpdate, resetPlanUpdates, type SubagentChecklists } from "../plans.js";
 import { PromptSuggestions } from "../prompt-suggestions.js";
+import { savedSessionStatus, SESSION_STATUS_CAPABILITY } from "../session-status.js";
 import { sanitizeTitle, SessionTitles } from "../session-titles.js";
 import {
   AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
@@ -2020,6 +2023,7 @@ export class ClaudeAcpAgent {
       fork: {},
       list: {},
       resume: {},
+      status: SESSION_STATUS_CAPABILITY,
       systemPrompt: SYSTEM_PROMPT_CAPABILITY,
       ...(this.toolCallCapabilities.air.client ? { subagents: {} } : {}),
     };
@@ -7859,6 +7863,19 @@ export class ClaudeAcpAgent {
     return {};
   }
 
+  /**
+   * `session/status`: `open` for a session that this connection holds. A held
+   * session whose query ended (`queryClosed`) is `open` too: a `session/load`
+   * with the same params returns it as it is, and its prompts fail with what
+   * happened. Every other session is `saved` or unknown by its stored
+   * transcript (see `session-status.ts`). A subagent's session is unknown,
+   * as for the other session requests.
+   */
+  async sessionStatus({ sessionId }: SessionStatusRequest): Promise<SessionStatusResponse> {
+    if (Object.hasOwn(this.sessions, sessionId)) return { status: "open" };
+    return savedSessionStatus(sessionId);
+  }
+
   /** Per client: see {@link sessionIndex.SessionIndexConnection.deleteSession}. */
   async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
     return this.sessionIndex.deleteSession(params);
@@ -11134,6 +11151,7 @@ export function v1AgentApp(
     .onRequest(methods.agent.session.delete, (ctx) => agent.deleteSession(ctx.params))
     .onRequest(methods.agent.session.resume, (ctx) => agent.resumeSession(ctx.params))
     .onRequest(methods.agent.session.close, (ctx) => agent.closeSession(ctx.params))
+    .onRequest(methods.agent.session.status, (ctx) => agent.sessionStatus(ctx.params))
     .onRequest(methods.agent.session.setMode, (ctx) => agent.setSessionMode(ctx.params))
     .onRequest(methods.agent.session.setConfigOption, (ctx) =>
       agent.setSessionConfigOption(ctx.params),
