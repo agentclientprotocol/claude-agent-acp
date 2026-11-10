@@ -26,12 +26,10 @@ import { AcpClient } from "../acp-client.js";
 import { toAcpNotifications, ToolUseCache } from "../sdk-to-acp.js";
 import { Logger } from "../logger.js";
 import {
-  toolUpdateFromToolResult,
   createPostToolUseHook,
   createTaskHook,
   clearHookCallbacks,
   registerHookCallback,
-  toolInfoFromToolUse,
   planEntries,
   applyTaskCreate,
   applyTaskList,
@@ -43,6 +41,7 @@ import {
 } from "../tools.js";
 import { ClientCapabilities as ToolCallCapabilities } from "../tool-calls/client-capabilities.js";
 import { AcpToolCallRenderer } from "../tool-calls/renderer.js";
+import { toolInfoFromToolUse, toolUpdateFromToolResult } from "./tool-render.js";
 
 /** An AIR client: it gets the ACP tool call contract (`docs/air-extensions.md`). */
 const AIR_CLIENT: ClientCapabilities = {

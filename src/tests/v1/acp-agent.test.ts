@@ -25,13 +25,7 @@ import {
 import type { AcpSessionNotification } from "../../acp-subagents.js";
 import { NativeSubagentRuntime } from "../../native-subagents.js";
 import { nodeToWebWritable, nodeToWebReadable } from "../../utils.js";
-import {
-  createPostToolUseHook,
-  markdownEscape,
-  toolInfoFromToolUse,
-  toDisplayPath,
-  toolUpdateFromToolResult,
-} from "../../tools.js";
+import { createPostToolUseHook, markdownEscape, toDisplayPath } from "../../tools.js";
 import { toolUpdateFromDiffToolResponse } from "../../diff.js";
 import { ToolCallFieldTracker } from "../../tool-calls/field-tracker.js";
 import {
@@ -50,7 +44,6 @@ import {
 } from "../../sdk-to-acp.js";
 import { promptToClaude } from "../../prompt-to-claude.js";
 import {
-  isLocalCommandMetadata,
   isReplayHiddenMetaMessage,
   isSyntheticLoginMessage,
   stripLocalCommandMetadata,
@@ -124,6 +117,11 @@ import type {
   BetaCodeExecutionToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { validateRecorded } from "../acp-scenarios/schema.js";
+import {
+  isLocalCommandMetadata,
+  toolInfoFromToolUse,
+  toolUpdateFromToolResult,
+} from "../tool-render.js";
 
 /** The capabilities of an AIR client. Only AIR gets the AIR extensions of
  *  `docs/air-extensions.md`. */
