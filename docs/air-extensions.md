@@ -32,6 +32,7 @@ It describes only this adapter.
 - [Question custom answers](#question-custom-answers)
 - [Load replay end](#load-replay-end)
 - [Session fork point](#session-fork-point)
+- [Session rewind](#session-rewind)
 - [Presentation hints](#presentation-hints)
 - [Removed keys](#removed-keys)
 
@@ -127,7 +128,8 @@ The `initialize` response of an AIR client carries the agent side of the extensi
           "recommendedValue",
           "diffPatch",
           "planFile",
-          "backgroundSubagents"
+          "backgroundSubagents",
+          "sessionRewind"
         ],
         "goal": {
           "version": 1,
@@ -166,6 +168,7 @@ It does not serve the [tool call contract](#tool-call-contract) yet.
 | `nativeSubagentSessions` | yes                 | Reports an Agent or Task subagent as a native ACP child session.                                                | [Native subagent sessions](#native-subagent-sessions)   |
 | `planFile`               | yes                 | Sends the path of the plan file in place of the plan text of an ExitPlanMode.                                   | [Plan file](#plan-file)                                 |
 | `backgroundSubagents`    | yes                 | Ends a prompt turn at its result while background subagents still run.                                          | [Background subagents](#background-subagents)           |
+| `sessionRewind`          | yes                 | Nothing on its own: the agent lists it to tell that it supports `_session/rewind`.                              | [Session rewind](#session-rewind)                       |
 | `sessionIndex`           | on request          | Pages, orders and annotates `session/list`; adds rename, archive and a list subscription.                       | [Session index](#session-index)                         |
 | `sessionBatchGet`        | with `sessionIndex` | Supports `_session/batch_get` for metadata of known session IDs.                                                | [Batch get](#batch-get)                                 |
 | `sessionArchive`         | with `sessionIndex` | Nothing on its own: the agent lists it to tell that it supports `_session/archive` and `_session/unarchive`.    | [Archive](#archive)                                     |
@@ -1788,6 +1791,58 @@ It adds this object to the `session/fork` request:
 - The fork keeps the history up to that message.
 - With or without this object, the forked session runs once the response arrives, so the client can prompt it without `session/load` or `session/resume`.
   A later load replays its history into it, and a later resume returns it. A load or resume with other settings (`cwd`, MCP servers, additional directories, or the session options in `_meta`) restarts it, as for any loaded session.
+
+## Session rewind
+
+AIR edits a user message by removing that message and everything after it, and loading its text back into the composer.
+`_session/rewind` asks the agent for the same removal, in the session the client already holds:
+
+```json
+{
+  "sessionId": "0f7c…",
+  "beforeMessage": {
+    "messageId": "user-12",
+    "messageFingerprint": "sha256:<64 hex>",
+    "messageOccurrence": 1
+  },
+  "resumeAtMessage": {
+    "messageId": "msg-11",
+    "messageFingerprint": "sha256:<64 hex>",
+    "messageOccurrence": 1
+  }
+}
+```
+
+- Only the ACP v1 surface serves `_session/rewind`; ACP v2 does not list `sessionRewind`.
+- `beforeMessage` is the user message that the retained conversation excludes.
+  `resumeAtMessage` is the last agent message retained before it, and is absent when the edited message is the first of the session.
+  Both carry the triple of [Session fork point](#session-fork-point), with the same `:segment:<n>` tolerance and the same meaning of the fingerprint and its occurrence.
+  The occurrence of a user message counts user messages, as the occurrence of an agent message counts agent messages.
+- The adapter resolves `beforeMessage` against the id this adapter reported for the message, then against its fingerprint and occurrence.
+  Both count only the branch the session continues: the transcript keeps the turns an earlier rewind dropped, so a prompt sent again after a rewind has the same text as the one it replaced.
+  Neither counts the summary that a compaction writes in the user's place.
+  A user message the client spells differently than the transcript resolves through `resumeAtMessage` instead: the first user prompt after the retained message.
+  When nothing resolves, the request fails with `invalidParams` and the conversation is unchanged.
+- The response is `{ "rewound": true }` when the agent removed the messages, and `{ "rewound": false }` when it left the conversation as it was.
+  The client keeps its own history in that case.
+- The session id does not change, and neither does the transcript behind it: the agent replaces its query with a resume of that same conversation, stopped at the last retained entry.
+  The subagent history of the session, which a fork would not copy, stays with it.
+  Any user message after the first can be removed, with the turns after it, unless a compaction follows it (see below).
+- Claude Code writes the removal to the transcript only with the next prompt.
+  The agent records the rewind point in `rewind.json` beside the session's `subagents/` directory: until the next prompt, every resume of the session (`session/load`, `session/resume`, a restart of the agent or of the session's query) stops at it, a replay ends there, and a `session/fork` without a fork point forks there.
+- Claude Code resumes the branch that the last `last-prompt` line of the transcript names, and a process that resumed at a rewind point keeps naming the branch it loaded until it exits.
+  So before each resume of a rewound session, the agent appends a `last-prompt` line for the end of the session's conversation, unless the last one already names it: with `explicit: true` at a pending rewind point, since a line without it stands for the newest entry descending from its leaf, which is in the dropped branch.
+  At the first resume after the next prompt, the agent writes the line for the newest entry and removes `rewind.json`.
+- The agent answers `rewound: false` without changing anything:
+  - for the first user message: Claude Code has no entry before it to resume at, and does not start a new conversation under an id whose transcript exists;
+  - for a user message before the newest compaction of the conversation: Claude Code resumes a compacted conversation from that compaction on, and does not find an entry before it;
+  - for a session whose context was cleared when a plan was accepted: its conversation went on in another Claude Code session, and the transcript of the session id holds the one before;
+  - while Claude is working: a turn runs or is queued, Claude Code runs a cycle on its own, or a background task or subagent runs. AIR stops the turn before it sends the request.
+- A prompt sent while the rewind runs, or still being set up when the rewind starts, waits for it, and runs on the rewound conversation.
+- When the removed message is the last user message, Claude Code also checks the removed range and refuses a truncation that would remove what the client never saw, such as a message the session absorbed mid-turn.
+  The refusal is deterministic, so the adapter never retries it: it resumes the conversation as it was once, answers `rewound: false`, and leaves the session promptable with its task list, its failures, and its model, mode, effort, agent, Fast mode and ultracode.
+  If that resume fails too, the request fails, the session ends, and the client loads it again.
+  When it fails because the account needs a sign-in, the request fails with `authRequired` and the session stays: the next prompt after the sign-in resumes it.
 
 ## Presentation hints
 

@@ -1,5 +1,10 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { randomUUID } from "crypto";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { prepareRewoundResume } from "../../resumed-session.js";
+import { encodeProjectPath } from "../../v1/session-index/project-dirs.js";
 import { RequestError, SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import { query, getSessionMessages } from "@anthropic-ai/claude-agent-sdk";
 import { ClaudeAcpAgent } from "../../v1/acp-agent.js";
@@ -381,4 +386,108 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("session load/resume lifecyc
       await agent.dispose();
     }
   }, 120000);
+});
+
+// The bundled CLI against fixture transcripts. The CLI initializes without
+// reaching the API, so these make no model calls.
+describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("rewound session resume in Claude Code", () => {
+  let configDir: string;
+  let cwd: string;
+  const sessionId = randomUUID();
+  const ids = Object.fromEntries(
+    ["U1", "A1", "U2", "A2", "U3", "A3"].map((k) => [k, randomUUID()]),
+  );
+
+  beforeEach(async () => {
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "rewound-resume-")));
+    configDir = path.join(root, "config");
+    cwd = path.join(root, "work");
+    await mkdir(cwd, { recursive: true });
+    vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
+    const projectDir = path.join(configDir, "projects", encodeProjectPath(cwd));
+    await mkdir(path.join(projectDir, sessionId), { recursive: true });
+    let parentUuid: string | null = null;
+    const lines = ["U1", "A1", "U2", "A2", "U3", "A3"].map((key, index) => {
+      const common = {
+        parentUuid,
+        isSidechain: false,
+        userType: "external",
+        cwd,
+        sessionId,
+        uuid: ids[key],
+        timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+      };
+      parentUuid = ids[key]!;
+      return JSON.stringify(
+        key.startsWith("U")
+          ? { ...common, type: "user", message: { role: "user", content: `prompt ${key}` } }
+          : {
+              ...common,
+              type: "assistant",
+              message: {
+                id: `msg_${key}`,
+                type: "message",
+                role: "assistant",
+                model: "claude-sonnet-4-5",
+                content: [{ type: "text", text: `answer ${key}` }],
+                stop_reason: "end_turn",
+                usage: { input_tokens: 1, output_tokens: 1 },
+              },
+            },
+      );
+    });
+    // The third turn was rewound and no prompt followed: the process that
+    // resumed at the point still named the branch it loaded.
+    lines.push(JSON.stringify({ type: "last-prompt", leafUuid: ids.A3, sessionId }));
+    await writeFile(path.join(projectDir, `${sessionId}.jsonl`), lines.join("\n") + "\n");
+    await writeFile(
+      path.join(projectDir, sessionId, "rewind.json"),
+      JSON.stringify({ resumeSessionAt: ids.A2, droppedPromptUuid: ids.U3 }),
+    );
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await rm(path.dirname(configDir), { recursive: true, force: true });
+  });
+
+  /** Starts Claude Code on the rewind of the second turn, which after the
+   *  first rewind is the last one, and returns how its initialization ended. */
+  async function rewindSecondTurn(): Promise<string> {
+    const q = query({
+      prompt: new Pushable<SDKUserMessage>(),
+      options: {
+        cwd,
+        resume: sessionId,
+        resumeSessionAt: ids.A1,
+        resumeDropsTurn: ids.U2,
+        env: {
+          PATH: process.env.PATH,
+          HOME: path.dirname(configDir),
+          CLAUDE_CONFIG_DIR: configDir,
+          ANTHROPIC_API_KEY: "sk-test",
+          ANTHROPIC_BASE_URL: "http://127.0.0.1:9",
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+        },
+      },
+    });
+    try {
+      await q.initializationResult();
+      return "resumed";
+    } catch (error) {
+      return String(error);
+    } finally {
+      q.close();
+    }
+  }
+
+  it("refuses the second of two rewinds when the transcript names the dropped branch", async () => {
+    expect(await rewindSecondTurn()).toContain("Resume rejected by --resume-drops-turn");
+  });
+
+  it("accepts it once the pending rewind point is named explicitly", async () => {
+    expect(await prepareRewoundResume(sessionId)).toBe(ids.A2);
+
+    expect(await rewindSecondTurn()).toBe("resumed");
+  });
 });

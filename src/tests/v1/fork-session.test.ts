@@ -16,6 +16,8 @@ let sessionId: string;
 let sourceFile: string;
 let transcript: string;
 let activeUuid: string;
+let firstUuid: string;
+let followupUuid: string;
 
 beforeEach(async () => {
   root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "fork-session-")));
@@ -27,8 +29,8 @@ beforeEach(async () => {
   await fs.mkdir(destinationCwd);
   sessionId = randomUUID();
   const userUuid = randomUUID();
-  const firstUuid = randomUUID();
-  const followupUuid = randomUUID();
+  firstUuid = randomUUID();
+  followupUuid = randomUUID();
   activeUuid = randomUUID();
   const common = { sessionId, cwd: sourceCwd, isSidechain: false };
   const entries = [
@@ -185,4 +187,24 @@ describe.each(["same directory", "different directory"])("fork into %s", (direct
     });
     expect(await fs.readFile(sourceFile, "utf8")).toBe(transcript);
   });
+});
+
+it("forks a session with a pending rewind where the rewind left its conversation", async () => {
+  // The rewind dropped the follow-up, and no prompt has been sent since.
+  await fs.mkdir(path.join(path.dirname(sourceFile), sessionId));
+  await fs.writeFile(
+    path.join(path.dirname(sourceFile), sessionId, "rewind.json"),
+    JSON.stringify({ resumeSessionAt: firstUuid, droppedPromptUuid: followupUuid }),
+  );
+
+  const result = await forkSession(
+    { sessionId, cwd: sourceCwd, mcpServers: [] },
+    { messageIdForGrouping },
+  );
+
+  const messages = await getSessionMessages(result.sessionId);
+  expect(messages.map((message) => messageIdForGrouping(message))).toEqual([
+    expect.any(String),
+    "msg_first",
+  ]);
 });
