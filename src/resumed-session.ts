@@ -85,8 +85,13 @@ export async function readResumedSession(
  * `logicalParentUuid`. For a chain that starts at a summary, this links each
  * boundary to that message and reads the transcript through
  * `getSessionMessages` again. For a session compacted twice, the result has
- * both summaries and the messages before, between and after them. Any other
- * chain is returned as it is, and so is the chain when the read fails.
+ * both summaries and the messages before, between and after them. The result
+ * ends at the last message of `messages`. Any other chain is returned as it
+ * is, and so is the chain when the read fails or when its result does not
+ * reach that last message (e.g. the transcript changed between the reads).
+ *
+ * `dir` is the project directory of the first read: both reads then resolve
+ * the same transcript file. Without it, all project directories are searched.
  *
  * The preserved-message metadata of each boundary is dropped. With it,
  * `getSessionMessages` moves the messages that a compaction kept to after the
@@ -98,13 +103,24 @@ export async function readHistoryAcrossCompactions(
   sessionId: string,
   messages: SessionMessage[],
   logger?: ResumeLogger,
+  dir?: string,
 ): Promise<SessionMessage[]> {
   if (!isCompactSummaryMessage(messages[0])) return messages;
   try {
-    const entries = (await loadFullSessionHistory(sessionId)).map(linkCompactBoundary);
-    return await getSessionMessages(sessionId, {
+    const entries = (await loadFullSessionHistory(sessionId, dir)).map(linkCompactBoundary);
+    const history = await getSessionMessages(sessionId, {
+      dir,
       sessionStore: { append: async () => {}, load: async () => entries },
     });
+    const leaf = messages.at(-1)?.uuid;
+    const end = history.findIndex((message) => message.uuid === leaf);
+    if (end < 0) {
+      logger?.error(
+        `The history before the last compaction of session ${sessionId} does not reach message ${leaf}: replaying the messages after it`,
+      );
+      return messages;
+    }
+    return history.slice(0, end + 1);
   } catch (error) {
     logger?.error(
       `Failed to read the history before the last compaction of session ${sessionId}:`,
@@ -116,9 +132,11 @@ export async function readHistoryAcrossCompactions(
 
 /** Every record of a session's transcript, including the inactive branches
  *  and the history before a compaction that `getSessionMessages` leaves out.
- *  All project directories are searched: the SDK's `dir` would restrict the
- *  lookup to one. */
-export async function loadFullSessionHistory(sessionId: string): Promise<SessionStoreEntry[]> {
+ *  Without `dir`, all project directories are searched. */
+export async function loadFullSessionHistory(
+  sessionId: string,
+  dir?: string,
+): Promise<SessionStoreEntry[]> {
   const entries: SessionStoreEntry[] = [];
   const store: SessionStore = {
     append: async (_key, batch) => {
@@ -126,7 +144,7 @@ export async function loadFullSessionHistory(sessionId: string): Promise<Session
     },
     load: async () => null,
   };
-  await importSessionToStore(sessionId, store, { includeSubagents: false });
+  await importSessionToStore(sessionId, store, { dir, includeSubagents: false });
   return entries;
 }
 

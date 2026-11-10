@@ -7958,7 +7958,7 @@ export class ClaudeAcpAgent {
   ): Promise<void> {
     const replayStartedAt = performance.now();
     const toolUseCache: ToolUseCache = {};
-    // A load replays the whole conversation, including the messages before each compaction.
+    // A load replays the messages before each compaction too, unless reading them fails.
     const messages = await readHistoryAcrossCompactions(
       sessionId,
       resumedMessages ?? (await getSessionMessages(sessionId)),

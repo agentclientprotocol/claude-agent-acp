@@ -380,6 +380,8 @@ class V2Agent implements AgentHandle, SessionConnection {
     await this.startSettled(sessionId);
     let session = this.sessions.get(sessionId);
     let history: Promise<SessionMessage[]> | undefined;
+    // The replay: the messages before each compaction too, unless reading them fails.
+    let replayed: Promise<SessionMessage[]> | undefined;
     if (session) {
       // Resuming the active session synchronizes it again. Its work goes on,
       // and the request's MCP servers and additional directories replace the
@@ -406,18 +408,22 @@ class V2Agent implements AgentHandle, SessionConnection {
     } else {
       // One read of the transcript serves the replay and the resumed model.
       history = replayFrom != null ? getSessionMessages(sessionId, { dir: params.cwd }) : undefined;
-      // A failed start leaves it unawaited.
+      // The read across compactions overlaps the start of the query.
+      replayed = history?.then((messages) =>
+        readHistoryAcrossCompactions(sessionId, messages, this.logger, params.cwd),
+      );
+      // A failed start leaves them unawaited.
       history?.catch(() => {});
+      replayed?.catch(() => {});
       session = await this.startSession(sessionId, params, sessionId, history);
     }
     let subagents: SubagentReplay | undefined;
     if (replayFrom != null) {
-      // A replay sends the whole conversation, including the messages before each compaction.
-      const messages = await readHistoryAcrossCompactions(
-        sessionId,
-        await (history ?? getSessionMessages(sessionId, { dir: session.cwd })),
-        this.logger,
-      );
+      const cwd = session.cwd;
+      const messages = await (replayed ??
+        getSessionMessages(sessionId, { dir: cwd }).then((chain) =>
+          readHistoryAcrossCompactions(sessionId, chain, this.logger, cwd),
+        ));
       subagents = await session.tasks.loadReplay(messages);
       session.output.replay(
         messages,

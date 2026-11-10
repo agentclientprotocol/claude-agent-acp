@@ -58,7 +58,16 @@ import {
   parseUsageResponse,
 } from "../../usage-markdown.js";
 import { Pushable } from "../../utils.js";
-import { heldRequest, initializeClient, makeMockQuery } from "../helpers.js";
+import {
+  heldRequest,
+  initializeClient,
+  makeMockQuery,
+  transcriptAssistant,
+  transcriptCompactBoundary,
+  transcriptCompactSummary,
+  transcriptUser,
+  writeTranscript,
+} from "../helpers.js";
 import { acpProtocolRouter } from "../../serve.js";
 import * as agentSdk from "@anthropic-ai/claude-agent-sdk";
 import {
@@ -3636,67 +3645,16 @@ describe("compacted session replay", () => {
     process.env.CLAUDE_CONFIG_DIR = configDir;
     try {
       const sessionId = "44444444-4444-4444-8444-444444444444";
-      const directory = path.join(configDir, "projects", "-tmp-proj");
-      await mkdir(directory, { recursive: true });
-      const base = { sessionId, isSidechain: false, timestamp: "2026-10-11T00:00:00.000Z" };
-      const summary =
-        "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n" +
-        "Summary:\n1. Primary Request and Intent:\n   Say hi.\n\n" +
-        "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary.";
-      const assistant = (uuid: string, parentUuid: string, text: string) => ({
-        ...base,
-        type: "assistant",
-        uuid,
-        parentUuid,
-        message: {
-          id: `msg_${uuid}`,
-          role: "assistant",
-          model: "claude-opus-5",
-          content: [{ type: "text", text }],
-        },
-      });
       // The records of `/compact` between two prompts, as Claude Code writes
       // them: the boundary has no parent and links "Hello" logically.
-      await writeFile(
-        path.join(directory, `${sessionId}.jsonl`),
-        [
-          {
-            ...base,
-            type: "user",
-            uuid: "u1",
-            parentUuid: null,
-            message: { role: "user", content: "hi" },
-          },
-          assistant("a1", "u1", "Hello"),
-          {
-            ...base,
-            type: "system",
-            subtype: "compact_boundary",
-            uuid: "b1",
-            parentUuid: null,
-            logicalParentUuid: "a1",
-            compactMetadata: { trigger: "manual", preTokens: 1000 },
-          },
-          {
-            ...base,
-            type: "user",
-            uuid: "s1",
-            parentUuid: "b1",
-            isCompactSummary: true,
-            message: { role: "user", content: summary },
-          },
-          {
-            ...base,
-            type: "user",
-            uuid: "u2",
-            parentUuid: "s1",
-            message: { role: "user", content: "identify yourself" },
-          },
-          assistant("a2", "u2", "Claude"),
-        ]
-          .map((record) => JSON.stringify(record))
-          .join("\n") + "\n",
-      );
+      await writeTranscript(path.join(configDir, "projects", "-tmp-proj"), sessionId, [
+        transcriptUser("u1", "hi"),
+        transcriptAssistant("a1", "Hello"),
+        transcriptCompactBoundary("b1", "a1"),
+        transcriptCompactSummary("s1"),
+        transcriptUser("u2", "identify yourself"),
+        transcriptAssistant("a2", "Claude"),
+      ]);
       const updates: SessionNotification[] = [];
       const client = {
         sessionUpdate: async (update: SessionNotification) => {
