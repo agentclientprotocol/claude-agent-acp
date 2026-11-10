@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.103.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.102.0...v0.103.0) (2026-11-10)
+
+
+### ⚠ BREAKING CHANGES
+
+* deep imports of `dist/` files fail with `ERR_PACKAGE_PATH_NOT_EXPORTED`, and `lib.ts` exports only `serveAcp`, `AUTH_STATUS_UPDATE_METHOD` and their types.
+
+### Features
+
+* serve ACP v2 with a direct v2 agent and remove the v1 bridge ([#1560](https://github.com/agentclientprotocol/claude-agent-acp/issues/1560)) ([cb285cd](https://github.com/agentclientprotocol/claude-agent-acp/commit/cb285cd2857924c07038c129cc836da007e2737f))
+
+
+### Bug Fixes
+
+* give subagent checklists their own plan ID ([#1558](https://github.com/agentclientprotocol/claude-agent-acp/issues/1558)) ([2f7e386](https://github.com/agentclientprotocol/claude-agent-acp/commit/2f7e386f3600658d905906f3b37301120b07605f))
+
+
+### Code Refactoring
+
+* export only lib.ts, with serveAcp and the authStatus wire names ([#1566](https://github.com/agentclientprotocol/claude-agent-acp/issues/1566)) ([566e265](https://github.com/agentclientprotocol/claude-agent-acp/commit/566e2652a9da5a31dab57a23ea1b06e9fff2ead8))
+
 ## [0.102.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.101.1...v0.102.0) (2026-11-09)
 
 
