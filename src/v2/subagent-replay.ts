@@ -35,40 +35,36 @@
  * parent, and a notice at the end says that subagent history is missing, as
  * it does for a child whose transcript cannot be read.
  */
-import * as fs from "node:fs";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk/unstable";
 import type { SessionMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "../logger.js";
-import type { AcpSessionNotification, SubagentState } from "../acp-subagents.js";
+import type { AcpSessionNotification } from "../acp-subagents.js";
 import {
   childModelOption,
-  HANDBACK_TOOL,
-  handbackMessage,
-  isNativeSubagentControlTool,
   launchReply,
   linkedSessionMessages,
   nativeSubagentState,
   responseModelEntry,
-  rfdEndState,
   rfdLabels,
-  type ModelEntry,
   type SubagentModels,
-  type WorkState,
 } from "../native-subagents.js";
 import {
   readSubagentMessages,
   subagentHistory,
   subagentLaunchIds,
   type SubagentHistory,
-  type SubagentRecord,
 } from "../subagent-history.js";
 import {
   deliveredCall,
   firstResponseModel,
   isDelivery,
+  isDirectory,
   missingHistoryNotice,
-  replaySubagentTerminalState,
+  ReplayTranscript,
+  replayEndState,
+  textOf,
+  type ReplayChild as SharedReplayChild,
 } from "../subagent-replay.js";
 import { taskNotificationsOf } from "../task-notifications.js";
 import type { V2UpdateTranslator } from "./update-translator.js";
@@ -96,53 +92,11 @@ export interface LiveChildren {
 
 const NO_LIVE_CHILDREN: LiveChildren = { tracks: () => false, configuration: () => undefined };
 
-type ReplayChild = {
-  launchId: string;
-  sessionId: string;
-  record: SubagentRecord;
-  parentSessionId: string;
-  input: Record<string, unknown>;
-  /** How the launch's tool result ended a foreground child's run. */
-  launchEnd?: "completed" | "failed" | "cancelled";
-  /** The state of the child's last persisted task notification. */
-  notified?: SubagentState;
-  announced: boolean;
-  promptSent: boolean;
-  /** Whether it handed a report to its parent with a SubagentHandback call. */
-  handedBack?: boolean;
-  /** The `model` option entry that the replay sent. */
-  model?: ModelEntry;
-  /** The model id of its latest replayed response. */
-  responseModel?: string;
-  /** The `cwd` it was announced with, when not its parent's. */
-  cwd?: string;
-  output?: SessionOutput;
-};
-
-type SendMessageCall = {
-  toolUseId: string;
-  to: string;
-  message: string;
-  senderSessionId: string;
-  /** The child the replay delivered the message to. */
-  recipientSessionId?: string;
-  /** The replay reached the call before the delivery, so it stays a tool call. */
-  shownAsToolCall: boolean;
-  /** The sender's view of the message went out, at the call. */
-  outgoingSent: boolean;
-};
+/** A replayed child, with the output of its session once announced. */
+type ReplayChild = SharedReplayChild & { output?: SessionOutput };
 
 export class SubagentReplay {
-  /** The children, by the id of the call that launched each. */
-  private readonly children = new Map<string, ReplayChild>();
-  private readonly sendMessages: SendMessageCall[] = [];
-  /** The SubagentHandback calls, with their report and whether their result failed. */
-  private readonly handbacks = new Map<
-    string,
-    { message: string; failed: boolean; sent: boolean }
-  >();
-  /** Launches without metadata, which the replay leaves out. */
-  private readonly omitted = new Set<string>();
+  private readonly transcript: ReplayTranscript<ReplayChild>;
   /** Children whose transcript could not be read: only their association is replayed. */
   private withoutHistory = 0;
   private rootOutput: SessionOutput | undefined;
@@ -153,7 +107,9 @@ export class SubagentReplay {
     /** The transcript of each child, by agent id. */
     private readonly transcripts: Map<string, SessionMessage[]>,
     private readonly live: LiveChildren,
-  ) {}
+  ) {
+    this.transcript = new ReplayTranscript(history);
+  }
 
   /**
    * Reads the subagent history that `messages`, the session's transcript,
@@ -183,7 +139,7 @@ export class SubagentReplay {
   /** The hooks of the replay of the root session's history (`messages`). */
   hooks(output: SessionOutput, messages: SessionMessage[]): ReplayHooks {
     this.rootOutput = output;
-    this.scan(messages, output.sessionId);
+    this.transcript.scan(messages, output.sessionId);
     return this.ownerHooks(output, undefined);
   }
 
@@ -192,24 +148,24 @@ export class SubagentReplay {
    * stream, and the notice when subagent history is missing.
    */
   finish(): void {
-    const announced = [...this.children.values()].filter((child) => child.announced);
+    const announced = [...this.transcript.children.values()].filter((child) => child.announced);
     for (const child of [...announced].reverse()) {
       this.host.send({
         sessionId: child.parentSessionId,
         update: {
           sessionUpdate: "subagent_update",
           sessionId: child.sessionId,
-          state: endState(child) as v2.StateUpdate,
+          state: replayEndState(child) as v2.StateUpdate,
         },
       });
     }
     for (const child of announced) {
       this.host.send({
         sessionId: child.sessionId,
-        update: { sessionUpdate: "state_update", ...endState(child) } as v2.SessionUpdate,
+        update: { sessionUpdate: "state_update", ...replayEndState(child) } as v2.SessionUpdate,
       });
     }
-    const missing = this.omitted.size + this.withoutHistory;
+    const missing = this.transcript.omitted.size + this.withoutHistory;
     if (missing > 0) {
       this.rootOutput?.emitV1([
         { sessionId: this.host.sessionId, update: missingHistoryNotice(missing) },
@@ -227,7 +183,7 @@ export class SubagentReplay {
    * the session's model list.
    */
   afterResponse(): void {
-    for (const child of this.children.values()) {
+    for (const child of this.transcript.children.values()) {
       if (!child.announced) continue;
       if (!this.live.tracks(child.sessionId)) this.sendEndState(child);
       this.sendConfiguration(child);
@@ -249,7 +205,7 @@ export class SubagentReplay {
   }
 
   private sendEndState(child: ReplayChild): void {
-    const state = endState(child);
+    const state = replayEndState(child);
     this.host.send({
       sessionId: child.parentSessionId,
       update: {
@@ -280,63 +236,6 @@ export class SubagentReplay {
    * Registers the launches, the launch results, the SendMessage calls and the
    * SubagentHandback calls in `messages`, of the session `ownerSessionId`.
    */
-  private scan(messages: readonly SessionMessage[], ownerSessionId: string): void {
-    for (const message of messages) {
-      for (const block of contentBlocks(message)) {
-        if (block.type === "tool_use" && typeof block.id === "string") {
-          if (isNativeSubagentControlTool(block.name)) {
-            this.registerLaunch(block.id, inputOf(block), ownerSessionId);
-          } else if (block.name === HANDBACK_TOOL) {
-            const report = handbackMessage(block.input);
-            if (report)
-              this.handbacks.set(block.id, { message: report, failed: false, sent: false });
-          } else if (block.name === "SendMessage") {
-            const input = inputOf(block);
-            if (typeof input.to === "string" && typeof input.message === "string") {
-              this.sendMessages.push({
-                toolUseId: block.id,
-                to: input.to,
-                message: input.message,
-                senderSessionId: ownerSessionId,
-                shownAsToolCall: false,
-                outgoingSent: false,
-              });
-            }
-          }
-        } else if (block.type === "tool_result" && typeof block.tool_use_id === "string") {
-          const handback = this.handbacks.get(block.tool_use_id);
-          if (handback && block.is_error === true) handback.failed = true;
-          const child = this.children.get(block.tool_use_id);
-          // A background launch answers at once; its result is not the end.
-          if (child && !child.record.background)
-            child.launchEnd = replaySubagentTerminalState(block);
-        }
-      }
-    }
-  }
-
-  private registerLaunch(
-    launchId: string,
-    input: Record<string, unknown>,
-    parentSessionId: string,
-  ): void {
-    if (this.children.has(launchId)) return;
-    const record = this.history.agents.get(launchId);
-    if (!record) {
-      this.omitted.add(launchId);
-      return;
-    }
-    this.children.set(launchId, {
-      launchId,
-      sessionId: record.agentId,
-      record,
-      parentSessionId,
-      input,
-      announced: false,
-      promptSent: false,
-    });
-  }
-
   /**
    * A replayed update of a tool call of `output`, the session of `owner`
    * when it is a child's. The client is not shown the launch of a replayed
@@ -354,7 +253,9 @@ export class SubagentReplay {
     if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") {
       return [notification];
     }
-    const sendMessage = this.sendMessages.find((call) => call.toolUseId === update.toolCallId);
+    const sendMessage = this.transcript.sendMessages.find(
+      (call) => call.toolUseId === update.toolCallId,
+    );
     if (sendMessage) {
       if (sendMessage.recipientSessionId === undefined) {
         sendMessage.shownAsToolCall = true;
@@ -370,7 +271,7 @@ export class SubagentReplay {
       );
       return [outgoing!];
     }
-    const handback = owner ? this.handbacks.get(update.toolCallId) : undefined;
+    const handback = owner ? this.transcript.handbacks.get(update.toolCallId) : undefined;
     if (owner && handback && !handback.failed) {
       if (handback.sent) return [];
       handback.sent = true;
@@ -386,7 +287,7 @@ export class SubagentReplay {
       this.outputOf(owner.parentSessionId)?.emitV1([incoming!]);
       return [];
     }
-    const child = this.children.get(update.toolCallId);
+    const child = this.transcript.children.get(update.toolCallId);
     if (!child) return [notification];
     if (
       update.status === "completed" &&
@@ -412,7 +313,9 @@ export class SubagentReplay {
       return;
     }
     for (const notification of taskNotificationsOf(inner?.content)) {
-      const child = [...this.children.values()].find((c) => c.sessionId === notification.task_id);
+      const child = [...this.transcript.children.values()].find(
+        (c) => c.sessionId === notification.task_id,
+      );
       if (child) child.notified = nativeSubagentState(notification.status) ?? child.notified;
     }
   }
@@ -421,13 +324,13 @@ export class SubagentReplay {
   private replayed(message: SessionMessage, parent: SessionOutput): void {
     if (message.type !== "assistant") return;
     for (const launchId of launchIdsOf(message)) {
-      const child = this.children.get(launchId);
+      const child = this.transcript.children.get(launchId);
       if (!child || child.announced) continue;
       const messages = this.transcripts.get(child.sessionId) ?? [];
       if (messages.length === 0) this.withoutHistory++;
       this.announce(child);
       this.sendModel(child, firstResponseModel(messages));
-      this.scan(messages, child.sessionId);
+      this.transcript.scan(messages, child.sessionId);
       child.output!.replay(messages, this.ownerHooks(child.output!, child));
       if (!child.promptSent && typeof child.input.prompt === "string") {
         this.sendPrompt(child, parent, child.input.prompt);
@@ -517,7 +420,7 @@ export class SubagentReplay {
    */
   private sendDelivery(child: ReplayChild, message: SessionMessage, text: string): void {
     const call = deliveredCall(
-      this.sendMessages,
+      this.transcript.sendMessages,
       [child.sessionId, child.record.name, child.input.name],
       text,
     );
@@ -553,63 +456,18 @@ export class SubagentReplay {
 
   private outputOf(sessionId: string): SessionOutput | undefined {
     if (sessionId === this.host.sessionId) return this.rootOutput;
-    return [...this.children.values()].find((child) => child.sessionId === sessionId)?.output;
+    return [...this.transcript.children.values()].find((child) => child.sessionId === sessionId)
+      ?.output;
   }
 
   private cwdOf(sessionId: string): string {
-    const child = [...this.children.values()].find((c) => c.sessionId === sessionId);
+    const child = [...this.transcript.children.values()].find((c) => c.sessionId === sessionId);
     if (!child) return this.host.cwd;
     return child.cwd ?? this.cwdOf(child.parentSessionId);
   }
 }
 
-/**
- * How a replayed child's work ended: the state of its last task
- * notification, else a stop by the user, else its foreground launch's result.
- */
-function endState(child: ReplayChild): WorkState {
-  const end =
-    child.notified ??
-    nativeSubagentState(child.record.stoppedByUser ? "cancelled" : child.launchEnd);
-  return end ? rfdEndState(end, undefined) : { state: "idle" };
-}
-
 function launchIdsOf(message: SessionMessage): string[] {
   if (message.type !== "assistant") return [];
   return subagentLaunchIds((message.message as { content?: unknown } | undefined)?.content);
-}
-
-function contentBlocks(message: SessionMessage): Record<string, unknown>[] {
-  const content = (message as { message?: { content?: unknown } }).message?.content;
-  return Array.isArray(content)
-    ? content.filter(
-        (block): block is Record<string, unknown> => typeof block === "object" && block !== null,
-      )
-    : [];
-}
-
-function inputOf(block: Record<string, unknown>): Record<string, unknown> {
-  return typeof block.input === "object" && block.input !== null
-    ? (block.input as Record<string, unknown>)
-    : {};
-}
-
-/** The text of user message content: a string, or its text blocks. */
-function textOf(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .flatMap((block) =>
-      typeof block === "object" && block !== null && block.type === "text" ? [block.text] : [],
-    )
-    .filter((text): text is string => typeof text === "string")
-    .join("\n");
-}
-
-function isDirectory(dir: string): boolean {
-  try {
-    return fs.statSync(dir).isDirectory();
-  } catch {
-    return false;
-  }
 }
