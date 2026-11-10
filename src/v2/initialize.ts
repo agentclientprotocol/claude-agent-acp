@@ -131,13 +131,14 @@ function asRecord(value: unknown): Record<string, unknown> {
  * - `session/delete`, `session/fork` (which returns a session the client can
  *   prompt at once), and `additionalDirectories`.
  * - The prompt content and MCP transports that the agent's v1 `initialize`
- *   lists: images, embedded context, and HTTP servers. Stdio servers are in the
- *   v1 baseline; v2 has no SSE transport.
+ *   lists: images, embedded context, HTTP servers, and servers the client
+ *   provides over ACP. Stdio servers are in the v1 baseline; v2 has no SSE
+ *   transport.
  * - `systemPrompt`, in `append` and `override` mode.
  */
 export const V2_SESSION_CAPABILITIES: v2.SessionCapabilities = {
   prompt: { image: {}, embeddedContext: {} },
-  mcp: { stdio: {}, http: {} },
+  mcp: { stdio: {}, http: {}, acp: {} },
   delete: {},
   fork: {},
   additionalDirectories: {},
