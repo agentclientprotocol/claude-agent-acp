@@ -228,7 +228,7 @@ The adapter keeps them where they are.
 
 ## Auth source display
 
-The connection-scoped `_auth/status_update` continues to report agent-owned authentication, not client-owned `providers/set` routing. The adapter also reports the same identity through the ACP `auth/status` method and `auth/status_update` notification (advertised as `auth.status`), with `kind`, `detail` and `plan` under the account's `_meta.claudeCode`. Each notification is sent when its own payload changed. `auth/status` answers with the identity last reported and starts a new read, whose change arrives as a notification. When the active key source is `apiKeyHelper`, the adapter reads the effective helper command through SDK `resolveSettings` / the session's `SettingsManager`, including programmatic settings overrides.
+The connection-scoped `_auth/status_update` continues to report agent-owned authentication, not client-owned `providers/set` routing. The adapter also reports the same identity through the ACP `auth/status` method and `auth/status_update` notification (advertised as `auth.status`), with `kind`, `detail` and `plan` under the account's `_meta.claudeCode`. The account's `label` also carries a `detail` in parentheses, e.g. `Anthropic API key (ANTHROPIC_API_KEY)`. Each notification is sent when its own payload changed. `auth/status` answers with the identity last reported and starts a new read, whose change arrives as a notification. When the active key source is `apiKeyHelper`, the adapter reads the effective helper command through SDK `resolveSettings` / the session's `SettingsManager`, including programmatic settings overrides.
 
 A command containing the whole word `central` and the word sequence `proxy start` is displayed as:
 
