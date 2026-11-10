@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { cliArgs } from "./agent-command.js";
 import { claudeCliPath } from "./claude-cli.js";
 import { applyManagedPolicyEnv } from "./managed-policy.js";
 import { acpProtocolsFromEnv, serveAcp } from "./serve.js";
@@ -12,7 +13,7 @@ import { join } from "node:path";
 // handler below. Our version flag only applies when not delegating.
 if (process.argv.includes("--cli")) {
   const { spawn } = await import("node:child_process");
-  const args = process.argv.slice(2).filter((arg) => arg !== "--cli");
+  const args = cliArgs();
   const child = spawn(await claudeCliPath(), args, { stdio: "inherit" });
 
   const signals =
