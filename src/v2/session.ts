@@ -363,6 +363,15 @@ export class V2Session implements RequestTarget {
   }
 
   /**
+   * The `state` of `session/status`: the foreground state now, with the
+   * session's list and without a stop reason. It sends nothing and changes
+   * nothing.
+   */
+  statusState(): v2.StateUpdate {
+    return this.background.snapshot(this.sessionId, this.foregroundState());
+  }
+
+  /**
    * Replaces the session's MCP servers, as a resume of the active session
    * asks. The same servers stay as they are, connected.
    */

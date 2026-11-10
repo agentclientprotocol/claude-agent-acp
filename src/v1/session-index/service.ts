@@ -36,11 +36,11 @@ import {
   type ListSubscriptionDeps,
 } from "./list-subscriptions.js";
 import { LiveSessionRegistry } from "./live-registry.js";
+import { isSessionId } from "../../paths.js";
 import {
   canonicalPath,
   exists,
   isExactProjectDir,
-  isSessionId,
   projectDirMatches,
   sameProjectPath,
 } from "./project-dirs.js";
