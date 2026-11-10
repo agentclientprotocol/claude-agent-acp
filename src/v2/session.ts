@@ -917,7 +917,8 @@ export class V2Session implements RequestTarget {
         if (message.parent_tool_use_id === null) this.usage.assistant(message.message.model);
         if (this.stopped.drops(message)) return;
         if (message.parent_tool_use_id === null) {
-          // Claude Code's sign-in message is not shown (see `TurnReport`).
+          // Claude Code's sign-in message and its message for a failed API
+          // request are not shown as Claude's text (see `TurnReport`).
           if (this.turnReport.assistant(message)) return;
           this.outputStarts();
           this.reports.assistant(message);
@@ -1121,6 +1122,8 @@ export class V2Session implements RequestTarget {
       this.fastModeReported(message);
     }
     this.reports.result(message);
+    // Before the result's text below, which can repeat the failed request's.
+    this.reportApiError(end);
     // The turn goes on in a fresh context (see `ClearContext`).
     if (this.clearContext.holdsResult(message, end)) {
       this.turnReport.reset();
@@ -1170,6 +1173,19 @@ export class V2Session implements RequestTarget {
     const reporting = this.fileChanges?.turnEnding(stopReason, this.query);
     if (!reporting) return this.closeTurn();
     return reporting.then(() => this.closeTurn());
+  }
+
+  /**
+   * Sends the text of a failed API request that Claude Code wrote into the
+   * conversation (see `TurnReport.assistant`) as a notice. A turn whose idle
+   * fails sends none: its error carries the failure. `end` is the turn's
+   * result, if it has one.
+   */
+  private reportApiError(end: TurnEnd | undefined): void {
+    const text = this.turnReport.takeApiError();
+    if (!text) return;
+    if (idleOutcome(end, this.cancelledWork, this.turnReport).stopReason === "error") return;
+    this.reports.apiError(text);
   }
 
   /**
@@ -1281,6 +1297,8 @@ export class V2Session implements RequestTarget {
         if (request.coveredByCancel) request.abort.abort();
       }
     }
+    // A turn that ends without a result, such as an interrupted one.
+    this.reportApiError(this.lastEnd);
     this.reports.turnEnded();
     this.elicitations.turnEnded();
     this.fileChanges?.turnClosed(cancelled);
