@@ -250,6 +250,8 @@ function v2Client({
   ) => v2.CreateElicitationResponse | Promise<v2.CreateElicitationResponse>;
 } = {}) {
   const authUpdates: AuthStatusUpdateNotification[] = [];
+  /** The `auth/status_update` notifications. */
+  const acpAuthUpdates: v2.AuthStatusUpdateNotification[] = [];
   const sessionUpdates: v2.UpdateSessionNotification[] = [];
   const elicitations: v2.CreateElicitationRequest[] = [];
   const completedElicitations: v2.CompleteElicitationNotification[] = [];
@@ -278,6 +280,9 @@ function v2Client({
         notifyAuthUpdate();
       },
     )
+    .onNotification(v2.methods.client.auth.statusUpdate, ({ params }) => {
+      acpAuthUpdates.push(params);
+    })
     .onNotification(v2.methods.client.session.update, ({ params }) => {
       sessionUpdates.push(params);
     })
@@ -315,6 +320,7 @@ function v2Client({
   return {
     app,
     authUpdate,
+    acpAuthUpdates,
     sessionUpdates,
     updates,
     elicitations,
@@ -9353,6 +9359,24 @@ describe("ACP v2 auth", () => {
       kind: "account",
       account: { email: "user@example.com" },
     });
+  });
+
+  it("advertises auth.status, sends auth/status_update, and answers auth/status", async () => {
+    const { app, authUpdate, acpAuthUpdates } = v2Client();
+    const status = await app.connectWith(connectRouter(), async (agent) => {
+      const response = await initializeV2(agent);
+      expect(response.capabilities?.auth?.status).toEqual({});
+      await authUpdate(1);
+      return agent.request(v2.methods.agent.auth.status, {});
+    });
+
+    expect(status).toMatchObject({
+      state: "authenticated",
+      accounts: [{ active: true, email: "user@example.com" }],
+    });
+    // The same payload as the notification, and the unchanged read of
+    // `auth/status` sent no second one.
+    expect(acpAuthUpdates).toEqual([status]);
   });
 
   it("logs in to a gateway with auth/login and out with auth/logout", async () => {

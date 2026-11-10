@@ -1,4 +1,5 @@
 import type {
+  AuthStatusUpdateNotification,
   CompleteElicitationNotification,
   CreateElicitationRequest,
   CreateElicitationResponse,
@@ -38,6 +39,8 @@ export interface AcpClient {
     signal?: AbortSignal,
   ): Promise<CreateElicitationResponse>;
   completeElicitation(params: CompleteElicitationNotification): Promise<void>;
+  /** Sends `auth/status_update`: the connection's auth state changed. */
+  authStatusUpdate(params: AuthStatusUpdateNotification): Promise<void>;
   /** Send a custom (extension) notification, e.g. `_claude/sdkMessage`. */
   extNotification(method: string, params: Record<string, unknown>): Promise<void>;
 }

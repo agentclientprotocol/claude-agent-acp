@@ -12,7 +12,7 @@ import {
 
 // The agent reads the CLI's auth status on each prompt. Answer it, so that the
 // tests checking `logError` don't see "claude auth status failed". The answer
-// makes the agent send an auth status `extNotification`; the client stubs it.
+// makes the agent send the auth status notifications; the client stubs them.
 vi.mock("node:child_process", async () => ({
   ...(await vi.importActual<typeof import("node:child_process")>("node:child_process")),
   execFile: (...args: unknown[]) =>
@@ -1270,6 +1270,7 @@ function createTestSession(
       },
       requestPermission: async () => ({ outcome: { outcome: "selected", optionId: "allow-once" } }),
       extNotification: async () => {},
+      authStatusUpdate: async () => {},
     } as unknown as AcpClient,
     { log: () => {}, error: logError },
   );

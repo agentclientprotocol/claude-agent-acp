@@ -4,6 +4,8 @@ import {
   AgentContext,
   AuthenticateRequest,
   AuthMethod,
+  AuthStatusResponse,
+  AuthStatusUpdateNotification,
   AvailableCommand,
   CancelNotification,
   ClientCapabilities,
@@ -1794,6 +1796,10 @@ class ClientConnection implements AcpClient {
     return this.ctx.notify(methods.client.elicitation.complete, params);
   }
 
+  authStatusUpdate(params: AuthStatusUpdateNotification): Promise<void> {
+    return this.ctx.notify(methods.client.auth.statusUpdate, params);
+  }
+
   extNotification(method: string, params: Record<string, unknown>): Promise<void> {
     return this.ctx.notify(method, params);
   }
@@ -1844,6 +1850,10 @@ class ChangedMetaClient implements AcpClient {
 
   completeElicitation(params: CompleteElicitationNotification): Promise<void> {
     return this.inner.completeElicitation(params);
+  }
+
+  authStatusUpdate(params: AuthStatusUpdateNotification): Promise<void> {
+    return this.inner.authStatusUpdate(params);
   }
 
   extNotification(method: string, params: Record<string, unknown>): Promise<void> {
@@ -1943,6 +1953,7 @@ export class ClaudeAcpAgent {
    *  `authenticate`/`logout`. */
   private readonly authStatus = new AuthStatusReporter({
     push: (authStatus) => this.client.extNotification(AUTH_STATUS_UPDATE_METHOD, { authStatus }),
+    pushAcp: (status) => this.client.authStatusUpdate(status),
     logger: {
       log: (...args) => this.logger.log(...args),
       error: (...args) => this.logger.error(...args),
@@ -2150,6 +2161,8 @@ export class ClaudeAcpAgent {
         },
         auth: {
           logout: {},
+          // `auth/status` and `auth/status_update`.
+          status: {},
         },
         // Client-managed LLM routing via `providers/list`, `providers/set`, and
         // `providers/disable`. Advertised unconditionally; there is no client
@@ -2431,6 +2444,11 @@ export class ClaudeAcpAgent {
       { methodId: _params.methodId },
       `Unsupported authentication method: ${_params.methodId}`,
     );
+  }
+
+  /** `auth/status` (see {@link AuthStatusReporter.status}). */
+  authStatusResponse(): Promise<AuthStatusResponse> {
+    return this.authStatus.status();
   }
 
   /** Stores `next` and pushes it to the client when it changed (see {@link AuthStatusReporter.set}). */
@@ -11239,6 +11257,7 @@ export function v1AgentApp(
     .onRequest(methods.agent.providers.set, (ctx) => agent.unstable_setProvider(ctx.params))
     .onRequest(methods.agent.providers.disable, (ctx) => agent.unstable_disableProvider(ctx.params))
     .onRequest(methods.agent.logout, (ctx) => agent.logout(ctx.params))
+    .onRequest(methods.agent.auth.status, () => agent.authStatusResponse())
     .onRequest(methods.agent.session.prompt, (ctx) =>
       runPromptWithCancellation(agent, ctx.params, ctx.signal),
     )

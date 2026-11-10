@@ -373,6 +373,8 @@ export async function runScenario(
     async extNotification(method: string, params: unknown) {
       record("extNotification", { method, params });
     },
+    // Not recorded: no scenario reads the auth status.
+    async authStatusUpdate() {},
     async readTextFile() {
       return { content: "" };
     },
@@ -559,7 +561,8 @@ export async function runScenarioV2(
       "_auth/status_update",
       (params) => params,
       () => {},
-    );
+    )
+    .onNotification(v2.methods.client.auth.statusUpdate, () => {});
 
   try {
     await client.connectWith(
