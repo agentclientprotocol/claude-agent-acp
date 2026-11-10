@@ -39,7 +39,11 @@ import { forkSession } from "../fork-session.js";
 import { supportsMcpOAuth } from "../mcp-oauth.js";
 import { sdkMcpServers } from "../mcp-servers.js";
 import { ALLOW_BYPASS, autoModeDisabled } from "../permissions/modes.js";
-import { readResumedTail, resumedModelFromTranscript } from "../resumed-session.js";
+import {
+  readHistoryAcrossCompactions,
+  readResumedTail,
+  resumedModelFromTranscript,
+} from "../resumed-session.js";
 import { mergeEffortSettings } from "../session-effort.js";
 import { configuredSettings, resolveThinkingConfig } from "../session-env.js";
 import { resolveInitialPermissionMode } from "../session-mode.js";
@@ -408,7 +412,12 @@ class V2Agent implements AgentHandle, SessionConnection {
     }
     let subagents: SubagentReplay | undefined;
     if (replayFrom != null) {
-      const messages = await (history ?? getSessionMessages(sessionId, { dir: session.cwd }));
+      // A replay sends the whole conversation, including the messages before each compaction.
+      const messages = await readHistoryAcrossCompactions(
+        sessionId,
+        await (history ?? getSessionMessages(sessionId, { dir: session.cwd })),
+        this.logger,
+      );
       subagents = await session.tasks.loadReplay(messages);
       session.output.replay(
         messages,

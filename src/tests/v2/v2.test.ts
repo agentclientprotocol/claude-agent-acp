@@ -9,7 +9,7 @@
  * `session_state_changed`.
  */
 import { randomUUID } from "node:crypto";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -1917,6 +1917,99 @@ describe("ACP v2 core", () => {
       },
       { sessionUpdate: "user_message", messageId: "u2", content: [] },
     ]);
+  });
+
+  it("replays the messages before a compaction from the transcript", async () => {
+    const sessionId = randomUUID();
+    const directory = path.join(tempDir, "claude", "projects", cwd.replace(/[^a-zA-Z0-9]/g, "-"));
+    await mkdir(directory, { recursive: true });
+    const base = { sessionId, isSidechain: false, timestamp: "2026-10-11T00:00:00.000Z" };
+    // The records of `/compact` between two prompts, as Claude Code writes
+    // them: the boundary has no parent and links "Hello" logically.
+    await writeFile(
+      path.join(directory, `${sessionId}.jsonl`),
+      [
+        {
+          ...base,
+          type: "user",
+          uuid: "u1",
+          parentUuid: null,
+          message: { role: "user", content: "hi" },
+        },
+        {
+          ...base,
+          type: "assistant",
+          uuid: "a1",
+          parentUuid: "u1",
+          message: {
+            id: "msg_a1",
+            role: "assistant",
+            model: "claude-opus-5",
+            content: [{ type: "text", text: "Hello" }],
+          },
+        },
+        {
+          ...base,
+          type: "system",
+          subtype: "compact_boundary",
+          uuid: "b1",
+          parentUuid: null,
+          logicalParentUuid: "a1",
+          compactMetadata: { trigger: "manual", preTokens: 1000 },
+        },
+        {
+          ...base,
+          type: "user",
+          uuid: "s1",
+          parentUuid: "b1",
+          isCompactSummary: true,
+          message: {
+            role: "user",
+            content:
+              "This session is being continued from a previous conversation that ran out of context.\n\n" +
+              "Summary:\nSay hi.\n\n" +
+              "Continue the conversation from where it left off without asking the user any further questions.",
+          },
+        },
+        {
+          ...base,
+          type: "user",
+          uuid: "u2",
+          parentUuid: "s1",
+          message: { role: "user", content: "identify yourself" },
+        },
+      ]
+        .map((record) => JSON.stringify(record))
+        .join("\n") + "\n",
+    );
+    // The transcript read and the read across the compaction both go to disk.
+    const actual = await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
+      "@anthropic-ai/claude-agent-sdk",
+    );
+    vi.mocked(getSessionMessages)
+      .mockImplementationOnce(actual.getSessionMessages)
+      .mockImplementationOnce(actual.getSessionMessages);
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      await agent.request(v2.methods.agent.initialize, {
+        protocolVersion: v2.PROTOCOL_VERSION,
+        info: { name: "v2-test-client", version: "1.0.0" },
+        capabilities: {},
+      });
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+    });
+
+    expect(
+      client.sessionUpdates.flatMap((update) =>
+        update.sessionUpdate === "user_message" || update.sessionUpdate === "compaction_update"
+          ? [update.sessionUpdate]
+          : [],
+      ),
+    ).toEqual(["user_message", "compaction_update", "user_message"]);
   });
 
   it.each([
