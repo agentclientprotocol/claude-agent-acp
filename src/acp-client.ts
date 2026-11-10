@@ -16,7 +16,7 @@ import type { AcpPermissionRequest } from "./permissions/presentation.js";
  * Client-facing surface the agent calls back into. This is the subset of ACP
  * client methods the agent actually uses, expressed as a narrow interface so
  * tests can supply lightweight mocks. In the v1 agent it is backed by
- * `ClientConnection` (`v1/acp-agent.ts`) over the SDK's typed `AgentContext`.
+ * `ClientConnection` (`v1/client-connection.ts`) over the SDK's typed `AgentContext`.
  * The v2 session output passes one that only takes `sessionUpdate`
  * (`v2/stream.ts`).
  */
