@@ -857,6 +857,7 @@ class V2Agent implements AgentHandle, SessionConnection {
         resumed,
         sessionId,
         this.logger,
+        configured,
       );
     } catch (error) {
       // Claude Code refused a fresh session's model pin.

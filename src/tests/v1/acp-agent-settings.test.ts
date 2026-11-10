@@ -944,7 +944,7 @@ describe("ClaudeAcpAgent settings", () => {
           { value: "default", displayName: "Default", description: "" },
           { value: "sonnet", displayName: "Sonnet", description: "" },
         ]);
-        const { ClaudeAcpAgent } = await import("../acp-agent.js");
+        const { ClaudeAcpAgent } = await import("../../v1/acp-agent.js");
         const agent = new ClaudeAcpAgent(createMockClient());
         try {
           const response = await (agent as any).createSession({
@@ -996,7 +996,7 @@ describe("ClaudeAcpAgent settings", () => {
         }),
       );
       mockQueryWithModels([{ value: "default", displayName: "Default", description: "" }]);
-      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const { ClaudeAcpAgent } = await import("../../v1/acp-agent.js");
       const agent = new ClaudeAcpAgent(createMockClient());
       const settings = {
         availableModels: ["claude-haiku-4-5", "claude-haiku-5-5"],
@@ -1036,7 +1036,7 @@ describe("ClaudeAcpAgent settings", () => {
           { value: "default", displayName: "Default", description: "" },
           { value: "sonnet", displayName: "Sonnet", description: "" },
         ]);
-        const { ClaudeAcpAgent } = await import("../acp-agent.js");
+        const { ClaudeAcpAgent } = await import("../../v1/acp-agent.js");
         const agent = new ClaudeAcpAgent(createMockClient());
         try {
           const response = await (agent as any).createSession({ cwd: tempDir, mcpServers: [] });
