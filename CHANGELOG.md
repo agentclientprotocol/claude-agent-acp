@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.104.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.104.0...v0.104.1) (2026-11-10)
+
+
+### Bug Fixes
+
+* carry the auth detail in the ACP account label ([#1573](https://github.com/agentclientprotocol/claude-agent-acp/issues/1573)) ([3d6eb7b](https://github.com/agentclientprotocol/claude-agent-acp/commit/3d6eb7b5b650a1f9e5d2e869e92e313c32dbdc86))
+* distinguish Ultra from Max in auth status ([#1574](https://github.com/agentclientprotocol/claude-agent-acp/issues/1574)) ([7d95d30](https://github.com/agentclientprotocol/claude-agent-acp/commit/7d95d30ec3a4813d580b3bfdedb08f03d93a3571))
+* update to @anthropic-ai/claude-agent-sdk 0.3.322 ([#1577](https://github.com/agentclientprotocol/claude-agent-acp/issues/1577)) ([b89e449](https://github.com/agentclientprotocol/claude-agent-acp/commit/b89e4497da9184072e7f3c4bb28de79801659222))
+
 ## [0.104.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.103.0...v0.104.0) (2026-11-10)
 
 
