@@ -365,6 +365,14 @@ import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "./u
 export { DEFAULT_AGENT_ID } from "./session-config-ids.js";
 import { MCP_AVAILABLE_COMMAND, parseMcpCommand, runMcpCommand } from "./mcp-command.js";
 import {
+  acpMcpServerConfig,
+  isAcpMcpServer,
+  mcpOverAcpCaller,
+  preferAcpMcpServers,
+  mcpOverAcpRequest,
+  type McpOverAcpRequest,
+} from "./mcp-over-acp.js";
+import {
   MODE_CONFIG_ID,
   resolveInitialPermissionMode,
   SessionModeManager,
@@ -2453,6 +2461,8 @@ export interface AcpClient {
   completeElicitation(params: CompleteElicitationNotification): Promise<void>;
   /** Send a custom (extension) notification, e.g. `_claude/sdkMessage`. */
   extNotification(method: string, params: Record<string, unknown>): Promise<void>;
+  /** Sends an MCP request to a server the client declared with `"type": "acp"`. */
+  mcpRequest: McpOverAcpRequest;
 }
 
 /**
@@ -2462,7 +2472,11 @@ export interface AcpClient {
  * construction.
  */
 class ClientConnection implements AcpClient {
-  constructor(private readonly ctx: AgentContext) {}
+  readonly mcpRequest: McpOverAcpRequest;
+
+  constructor(private readonly ctx: AgentContext) {
+    this.mcpRequest = mcpOverAcpRequest(ctx);
+  }
 
   sessionUpdate(params: AcpSessionNotification): Promise<void> {
     return this.ctx.notify(methods.client.session.update, asSdkSessionNotification(params));
@@ -2555,6 +2569,8 @@ class ChangedMetaClient implements AcpClient {
   extNotification(method: string, params: Record<string, unknown>): Promise<void> {
     return this.inner.extNotification(method, params);
   }
+
+  readonly mcpRequest: McpOverAcpRequest = (...request) => this.inner.mcpRequest(...request);
 }
 
 function raceWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -2600,8 +2616,10 @@ function startMcpAuthentication(
   sessionId: string,
   mcpServers: NewSessionRequest["mcpServers"],
 ): void {
-  if (mcpServers.length === 0) return;
-  startMcpServerAuthentication(host, sessionId, new Set(mcpServers.map((server) => server.name)));
+  // The client authorizes the servers it provides over ACP itself.
+  const servers = mcpServers.filter((server) => !isAcpMcpServer(server));
+  if (servers.length === 0) return;
+  startMcpServerAuthentication(host, sessionId, new Set(servers.map((server) => server.name)));
 }
 
 /** Start OAuth in the background for the servers in `requestedServers` that
@@ -3097,6 +3115,7 @@ export class ClaudeAcpAgent {
         mcpCapabilities: {
           http: true,
           sse: true,
+          acp: true,
         },
         auth: {
           logout: {},
@@ -12074,7 +12093,9 @@ export class ClaudeAcpAgent {
     const mcpServers: Record<string, McpServerConfig> = {};
     if (Array.isArray(params.mcpServers)) {
       for (const server of params.mcpServers) {
-        if ("type" in server && (server.type === "http" || server.type === "sse")) {
+        if (isAcpMcpServer(server)) {
+          mcpServers[server.name] = acpMcpServerConfig(server, this.client.mcpRequest);
+        } else if ("type" in server && (server.type === "http" || server.type === "sse")) {
           // HTTP or SSE type MCP server
           mcpServers[server.name] = {
             type: server.type,
@@ -12237,13 +12258,14 @@ export class ClaudeAcpAgent {
     // Claude Code applies env from settings.json after the subprocess env. Put
     // an active ACP route in the programmatic settings tier too so user/project
     // settings cannot silently restore a different ANTHROPIC_BASE_URL.
-    const settings = resolvedProvider
+    const routedSettings = resolvedProvider
       ? {
           ...configuredSettingsObject,
           apiKeyHelper: "",
           env: { ...configuredSettingsObject?.env, ...providerEnv },
         }
       : configuredSettingsObject;
+    const settings = preferAcpMcpServers(routedSettings, params.mcpServers ?? []);
     const env = {
       ...process.env,
       ...userProvidedOptions?.env,
@@ -14945,6 +14967,7 @@ export function v1AgentApp(
       runPromptWithCancellation(agent, ctx.params, ctx.signal),
     )
     .onNotification(methods.agent.session.cancel, (ctx) => agent.cancel(ctx.params))
+    .onNotification(methods.agent.mcp.message, mcpOverAcpCaller.handleNotification)
     .onRequest<SteerRequest, SteerResponse>(STEER_METHOD, { parse: parseSteerRequest }, (ctx) =>
       agent.steer(ctx.params),
     )

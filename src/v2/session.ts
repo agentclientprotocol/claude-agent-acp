@@ -167,8 +167,8 @@ function v2ConfigOptionsField(options: SessionConfigOption[] | null | undefined)
 /**
  * The v1 list of the MCP servers of a v2 setup request, or undefined for no
  * list. A request with two servers of the same `name`, or with a transport
- * that the agent does not advertise in `session.mcp` (such as `acp` or a
- * custom `_` type), fails with invalid params (-32602): the v1 session setup
+ * that the agent does not advertise in `session.mcp` (such as a custom `_`
+ * type), fails with invalid params (-32602): the v1 session setup
  * would otherwise drop the server without telling the client.
  */
 function v1McpServers(servers: v2.McpServer[] | null | undefined): McpServer[] | undefined {
@@ -180,7 +180,8 @@ function v1McpServers(servers: v2.McpServer[] | null | undefined): McpServer[] |
 /**
  * v2 requires a `type` on every transport and makes the empty lists optional.
  * The agent recognizes a v1 stdio server by its missing `type`, so the v2 tag
- * is dropped. {@link v1McpServers} has already rejected every other transport.
+ * is dropped. A server the client provides over ACP is the same in both
+ * versions. {@link v1McpServers} has already rejected every other transport.
  */
 function v1McpServer(server: v2.McpServer): McpServer {
   if (v2.McpServer.isStdio(server)) {
@@ -189,6 +190,10 @@ function v1McpServer(server: v2.McpServer): McpServer {
   }
   if (v2.McpServer.isHttp(server)) {
     return { ...server, headers: server.headers ?? [] };
+  }
+  if (v2.isMcpServerAcp(server)) {
+    const { name, serverId, _meta } = server;
+    return { type: "acp", name, serverId, ...(_meta != null ? { _meta } : {}) };
   }
   throw new Error(`Unreachable: MCP server of type ${server.type} passed the transport check`);
 }

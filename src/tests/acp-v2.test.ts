@@ -294,6 +294,11 @@ describe("ACP protocol routing", () => {
 
     expect(response.protocolVersion).toBe(1);
     expect(response.agentCapabilities?.loadSession).toBe(true);
+    expect(response.agentCapabilities?.mcpCapabilities).toEqual({
+      http: true,
+      sse: true,
+      acp: true,
+    });
     expect(response.agentCapabilities?.sessionCapabilities?.resume).toEqual({});
     expect(response.authMethods?.length).toBeGreaterThan(0);
     for (const method of response.authMethods ?? []) {
@@ -323,7 +328,7 @@ describe("ACP protocol routing", () => {
     // and the providers methods.
     expect(response.capabilities?.session).toEqual({
       prompt: { image: {}, embeddedContext: {} },
-      mcp: { stdio: {}, http: {} },
+      mcp: { stdio: {}, http: {}, acp: {} },
       delete: {},
       fork: {},
       additionalDirectories: {},
@@ -443,6 +448,7 @@ describe("ACP v2 sessions", () => {
       files: { type: "stdio", command: "/usr/local/bin/mcp-files", args: [] },
       linear: { type: "http", url: "https://mcp.linear.app/mcp" },
     });
+    expect(sdk.queryOptions[0].settings ?? {}).not.toHaveProperty("deniedMcpServers");
     expect(response).not.toHaveProperty("modes");
     expect(response.configOptions?.map((option) => option.configId)).toEqual(["mode", "model"]);
     for (const option of response.configOptions ?? []) {
@@ -525,21 +531,6 @@ describe("ACP v2 sessions", () => {
           mcpServers: [{ type: "_custom", name: "custom" }],
         }),
       ).rejects.toMatchObject({ code: -32602 });
-      await authUpdate(1);
-    });
-    expect(sdk.queryOptions).toHaveLength(0);
-  });
-
-  it("rejects an MCP-over-ACP server, which the agent does not advertise", async () => {
-    const { app, authUpdate } = v2Client();
-    await app.connectWith(connectRouter(), async (agent) => {
-      await initializeV2(agent);
-      await expect(
-        agent.request(v2.methods.agent.session.new, {
-          cwd,
-          mcpServers: [{ type: "acp", name: "tools", serverId: "server-1" }],
-        }),
-      ).rejects.toMatchObject({ code: -32602, data: { type: "acp" } });
       await authUpdate(1);
     });
     expect(sdk.queryOptions).toHaveLength(0);
@@ -773,6 +764,227 @@ describe("ACP v2 sessions", () => {
     });
 
     expect(events).toEqual(["response", "elicitation"]);
+  });
+});
+
+/**
+ * Claude Code's end of an in-process SDK MCP server: it sends the server
+ * JSON-RPC requests, as the SDK does over the transport it connects, and
+ * collects what the server sends back.
+ */
+async function connectSdkMcpServer(config: unknown) {
+  const sent: Array<Record<string, unknown>> = [];
+  const transport: {
+    onmessage?: (message: Record<string, unknown>) => void;
+    onclose?: () => void;
+    send: (message: Record<string, unknown>) => Promise<void>;
+  } = {
+    send: async (message) => {
+      sent.push(message);
+    },
+  };
+  expect(config).toMatchObject({ type: "sdk" });
+  await (config as { instance: { connect(t: typeof transport): Promise<void> } }).instance.connect(
+    transport,
+  );
+  let nextId = 1;
+  return {
+    sent,
+    request: (method: string, params?: Record<string, unknown>) => {
+      const id = nextId++;
+      transport.onmessage?.({ jsonrpc: "2.0", id, method, ...(params ? { params } : {}) });
+      return vi.waitFor(() => {
+        const response = sent.find((message) => message.id === id);
+        expect(response).toBeDefined();
+        return response;
+      });
+    },
+  };
+}
+
+describe("MCP servers provided over ACP", () => {
+  const DISCOVERY = {
+    supportedVersions: [v2.MCP_PROTOCOL_VERSION],
+    capabilities: { tools: {}, prompts: {} },
+    serverInfo: { name: "project-tools", version: "1.2.3" },
+    instructions: "Use echo.",
+  };
+
+  /** The client's MCP server `tools`, and the requests it received. */
+  function toolsServer() {
+    const requests: v2.McpOperationContext[] = [];
+    const handler: v2.McpRequestHandler = async (context) => {
+      requests.push(context);
+      if (context.method === "server/discover") return { result: DISCOVERY };
+      if (context.method === "tools/list") {
+        return { result: { tools: [{ name: "echo", inputSchema: { type: "object" } }] } };
+      }
+      if (context.method === "tools/call" && context.params?.name === "echo") {
+        await context.notify("notifications/progress", { progressToken: "p1", progress: 1 });
+        // The ACP SDK resolves a response before it runs the handler of a
+        // notification that arrived just ahead of it, and the caller drops
+        // the notifications of a settled request. Progress that is not the
+        // last message before the result arrives in time.
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return {
+          result: {
+            resultType: "complete",
+            content: [{ type: "text", text: "hello" }],
+            isError: false,
+          },
+        };
+      }
+      if (context.method === "tools/call" && context.params?.name === "ask") {
+        return { result: { resultType: "input_required", requestState: "state" } };
+      }
+      throw new v2.McpProtocolError(-32602, "Unknown tool", { name: context.params?.name });
+    };
+    return { requests, handler };
+  }
+
+  /**
+   * Creates a session with the MCP server `tools`, declared with
+   * `"type": "acp"`, over a connection of `version`, and runs `drive` with the
+   * session's SDK configuration of the server while the connection is open.
+   */
+  async function withToolsSession(
+    version: "v1" | "v2",
+    handler: v2.McpRequestHandler | undefined,
+    drive: (claude: Awaited<ReturnType<typeof connectSdkMcpServer>>) => Promise<void>,
+  ) {
+    const provider = new v2.McpOverAcpProvider();
+    // The v1 and v2 client apps take the same handlers for the methods below.
+    const api = (version === "v1" ? v1 : v2) as typeof v2;
+    await api
+      .client({ name: V2_CLIENT_INFO.name })
+      .onNotification(
+        "_auth/status_update",
+        (params) => params,
+        () => {},
+      )
+      .onNotification(api.methods.client.session.update, () => {})
+      .onRequest(api.methods.client.mcp.message, provider.handleRequest)
+      .connectWith(connectRouter() as v2.Stream, async (agent) => {
+        await agent.request(
+          api.methods.agent.initialize,
+          (version === "v1"
+            ? { protocolVersion: v1.PROTOCOL_VERSION, clientCapabilities: {} }
+            : {
+                protocolVersion: v2.PROTOCOL_VERSION,
+                info: V2_CLIENT_INFO,
+                capabilities: {},
+              }) as v2.InitializeRequest,
+        );
+        const declaration = handler
+          ? provider.registerServer(agent, { name: "tools", handler }).declaration
+          : // No registration: the client answers every request with `-33001`.
+            ({ type: "acp", name: "tools", serverId: "released" } as const);
+        await agent.request(api.methods.agent.session.new, { cwd, mcpServers: [declaration] });
+        await drive(await connectSdkMcpServer(sdk.queryOptions[0].mcpServers?.tools));
+      });
+  }
+
+  it.each(["v1", "v2"] as const)(
+    "serves a %s client's server to Claude Code through mcp/message",
+    async (version) => {
+      const { requests, handler } = toolsServer();
+      await withToolsSession(version, handler, async (claude) => {
+        // Claude Code's handshake is answered from `server/discover`.
+        expect(
+          await claude.request("initialize", {
+            protocolVersion: "2025-11-25",
+            capabilities: {},
+            clientInfo: { name: "claude-code", version: "1" },
+          }),
+        ).toMatchObject({
+          result: {
+            protocolVersion: "2025-11-25",
+            capabilities: DISCOVERY.capabilities,
+            serverInfo: DISCOVERY.serverInfo,
+            instructions: DISCOVERY.instructions,
+          },
+        });
+        expect(await claude.request("ping")).toMatchObject({ result: {} });
+        expect(await claude.request("tools/list")).toMatchObject({
+          result: { tools: [{ name: "echo" }] },
+        });
+        expect(
+          await claude.request("tools/call", {
+            name: "echo",
+            arguments: { message: "hello" },
+            _meta: { progressToken: "p1" },
+          }),
+        ).toMatchObject({ result: { content: [{ type: "text", text: "hello" }], isError: false } });
+        expect(claude.sent).toContainEqual({
+          jsonrpc: "2.0",
+          method: "notifications/progress",
+          params: { progressToken: "p1", progress: 1 },
+        });
+        // An MCP error of the client's server reaches Claude Code unchanged.
+        expect(await claude.request("tools/call", { name: "missing" })).toMatchObject({
+          error: { code: -32602, message: "Unknown tool", data: { name: "missing" } },
+        });
+        expect(await claude.request("tools/call", { name: "ask" })).toMatchObject({
+          error: { code: -32603, message: expect.stringContaining("asked for more input") },
+        });
+      });
+
+      // The client's server wins over a server of the same name that the
+      // user configured in Claude Code.
+      expect(sdk.queryOptions[0].settings).toMatchObject({
+        deniedMcpServers: [{ serverName: "tools" }],
+      });
+      expect(requests.map((request) => request.method)).toEqual([
+        "server/discover",
+        "tools/list",
+        "tools/call",
+        "tools/call",
+        "tools/call",
+      ]);
+      expect(requests[2]).toMatchObject({
+        protocolVersion: v2.MCP_PROTOCOL_VERSION,
+        clientInfo: { name: packageJson.name, version: packageJson.version },
+        params: {
+          name: "echo",
+          arguments: { message: "hello" },
+          _meta: { progressToken: "p1" },
+        },
+      });
+    },
+  );
+
+  it("reports tools and an error when the client's server can't be reached", async () => {
+    await withToolsSession("v2", undefined, async (claude) => {
+      expect(await claude.request("initialize", { protocolVersion: "2025-11-25" })).toMatchObject({
+        result: {
+          capabilities: { tools: {} },
+          serverInfo: { name: "tools", version: "unknown" },
+        },
+      });
+      expect(await claude.request("tools/list")).toMatchObject({
+        error: {
+          code: v2.McpBindingErrorCode.serverUnavailable,
+          message: expect.stringContaining("could not be reached through the ACP client"),
+        },
+      });
+    });
+  });
+
+  it("starts no OAuth for a server the client provides over ACP", async () => {
+    sdk.mcpServerStatus = async () => [{ name: "tools", status: "needs-auth" }];
+    const mcpAuthenticate = vi.fn(sdkDefaults.mcpAuthenticate);
+    sdk.mcpAuthenticate = mcpAuthenticate;
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent, { elicitation: { url: {} } });
+      await agent.request(v2.methods.agent.session.new, {
+        cwd,
+        mcpServers: [{ type: "acp", name: "tools", serverId: "server-1" }],
+      });
+      // The agent's post-setup work runs on a timer.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(mcpAuthenticate).not.toHaveBeenCalled();
   });
 });
 

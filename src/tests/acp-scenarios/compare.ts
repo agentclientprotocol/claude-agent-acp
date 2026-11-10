@@ -25,6 +25,9 @@
  * - The `initialize` response also advertises
  *   `agentCapabilities.sessionCapabilities.systemPrompt`, which origin/main
  *   did not: the agent now applies the `systemPrompt` of session requests.
+ * - The `initialize` response also advertises
+ *   `agentCapabilities.mcpCapabilities.acp`, which origin/main did not: the
+ *   agent now serves the MCP servers that a client provides over ACP.
  * - A SandboxNetworkAccess tool call is settled by a `tool_call_update` with
  *   only its final `status` once its permission request is answered. The
  *   callback runs nothing, so origin/main never settled the call (see
@@ -242,6 +245,19 @@ function withoutSessionCapability(record: Recorded, key: string): Recorded {
   } as Recorded;
 }
 
+/** `record` without the `acp` MCP transport capability, when it is an `initialize` response. */
+function withoutAcpMcpCapability(record: Recorded): Recorded {
+  if (record.kind !== "initialize") return record;
+  const payload = record.payload as Json;
+  const agent = payload.agentCapabilities as Json | undefined;
+  const mcp = agent?.mcpCapabilities as Json | undefined;
+  if (!mcp || !("acp" in mcp)) return record;
+  return {
+    ...record,
+    payload: { ...payload, agentCapabilities: { ...agent, mcpCapabilities: without(mcp, "acp") } },
+  } as Recorded;
+}
+
 /**
  * Returns the differences between the baseline and the current traffic that
  * the compatibility rule does not allow. An empty list means compatible.
@@ -254,7 +270,9 @@ export function compareWithBaseline(baseline: Recorded[], traffic: Recorded[]): 
       return !(update?.sessionUpdate === "session_info_update" && Object.keys(update).length === 1);
     });
   const current = withoutSandboxNetworkSettlements(
-    traffic.map((record) => withoutSessionCapability(record, "systemPrompt")),
+    traffic.map((record) =>
+      withoutAcpMcpCapability(withoutSessionCapability(record, "systemPrompt")),
+    ),
   );
   const violations: string[] = [];
   const state = new Map<string, Map<string, string>>();

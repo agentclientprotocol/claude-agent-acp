@@ -16,6 +16,7 @@ import type {
 } from "@agentclientprotocol/sdk/unstable";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import { ClaudeAcpAgent, type AcpClient, type Logger } from "../acp-agent.js";
+import { mcpOverAcpCaller, mcpOverAcpRequest, type McpOverAcpRequest } from "../mcp-over-acp.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import type { AcpPermissionRequest } from "../permissions/presentation.js";
 import { stateUpdate, V2Background } from "./background.js";
@@ -185,7 +186,8 @@ export function v2AgentApp(
       await agent.cancelBackgroundToolCall(params);
       return {};
     })
-    .onNotification(v2.methods.agent.session.cancel, ({ params }) => agent.cancel(params));
+    .onNotification(v2.methods.agent.session.cancel, ({ params }) => agent.cancel(params))
+    .onNotification(v2.methods.agent.mcp.message, mcpOverAcpCaller.handleNotification);
 }
 
 /**
@@ -275,10 +277,14 @@ class V2ClientConnection implements AcpClient {
   /** The `background` list of each session's `state_update`s. */
   readonly background = new V2Background(this.terminals);
 
+  readonly mcpRequest: McpOverAcpRequest;
+
   constructor(
     private readonly ctx: v2.AgentContext,
     private readonly logger: Logger,
-  ) {}
+  ) {
+    this.mcpRequest = mcpOverAcpRequest(ctx);
+  }
 
   /**
    * Runs `restore`, which replays the history of `sessionId`.
