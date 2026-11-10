@@ -12,7 +12,7 @@ import {
   FAST_MODE_ON,
   FAST_MODE_OFF,
   ClaudeAcpAgent,
-} from "../acp-agent.js";
+} from "../v1/acp-agent.js";
 import type { AcpClient } from "../acp-client.js";
 
 const MODES = {

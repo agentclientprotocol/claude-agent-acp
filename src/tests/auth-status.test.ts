@@ -1,9 +1,9 @@
 import type { Mock } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../v1/acp-agent.js";
 import type { AcpClient } from "../acp-client.js";
 import type { Logger } from "../logger.js";
-import { ClaudeAcpAgent } from "../acp-agent.js";
+import { ClaudeAcpAgent } from "../v1/acp-agent.js";
 import type { AuthStatus } from "../auth-status.js";
 import { fromAccountInfo, fromCliStatus, mergeAuthStatus, sameIdentity } from "../auth-status.js";
 import { DEFAULT_CONTEXT_USAGE, makeMockQuery } from "./helpers.js";

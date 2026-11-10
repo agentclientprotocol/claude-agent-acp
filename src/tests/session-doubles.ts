@@ -7,7 +7,7 @@
 
 import { vi } from "vitest";
 import { randomUUID } from "crypto";
-import { SessionBackgroundWork } from "../background-work.js";
+import { SessionBackgroundWork } from "../v1/background-work.js";
 import { PromptSuggestions } from "../prompt-suggestions.js";
 import { SessionTitles } from "../session-titles.js";
 

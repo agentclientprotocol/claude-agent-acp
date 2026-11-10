@@ -1,7 +1,10 @@
 # Agent guide
 
 An ACP-compatible coding agent powered by the Claude Agent SDK. Source in `src/`,
-TypeScript, ESM, Node >= 22.
+TypeScript, ESM, Node >= 22. `src/v1/` holds the v1 agent (`ClaudeAcpAgent` in
+`src/v1/acp-agent.ts`), `src/v2/` the v2 agent, and the rest of `src/` the modules
+both share. `src/acp-agent.ts` only re-exports `src/v1/acp-agent.ts` for the
+published `dist/acp-agent.js` path.
 
 ## Commands
 
@@ -40,9 +43,9 @@ opening a PR.
 
 - Before coding, read the code the change plugs into and find the module that
   owns the state or concept. Build on that module, not beside it.
-- Don't add new features or components to `acp-agent.ts`. If no existing module fits the new
-  code cleanly, create a dedicated one that owns the feature's state and logic,
-  and keep the change in `acp-agent.ts` to the calls that wire it in.
+- Don't add new features or components to `src/v1/acp-agent.ts`. If no existing module fits
+  the new code cleanly, create a dedicated one that owns the feature's state and logic,
+  and keep the change in `src/v1/acp-agent.ts` to the calls that wire it in.
 - Prefer extending an existing mechanism over adding a new one, even if it takes
   a small refactor (moving a helper, generalizing a function). Add a parallel
   path, special case or flag only when the existing structure can't support the

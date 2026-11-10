@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, Mock, vi, afterEach, beforeEach } from "vitest";
 import type { AccountInfo } from "@anthropic-ai/claude-agent-sdk";
-import { ClaudeAcpAgent } from "../acp-agent.js";
+import { ClaudeAcpAgent } from "../v1/acp-agent.js";
 import { AcpClient } from "../acp-client.js";
 import {
   billsClaudeSubscription,

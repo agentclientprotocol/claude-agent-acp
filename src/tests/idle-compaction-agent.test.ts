@@ -9,7 +9,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Options, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
-import type { ClaudeAcpAgent } from "../acp-agent.js";
+import type { ClaudeAcpAgent } from "../v1/acp-agent.js";
 import type { AcpClient } from "../acp-client.js";
 import { initializeClient } from "./helpers.js";
 import { successfulResultMessage } from "./session-doubles.js";
@@ -228,7 +228,7 @@ function scriptClaudeCode({
 
 async function connect(clientCapabilities: Record<string, unknown> = {}) {
   vi.resetModules();
-  const { ClaudeAcpAgent } = await import("../acp-agent.js");
+  const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
   const updates: Array<{ update: Record<string, any> }> = [];
   const client = {
     sessionUpdate: async (notification: { update: Record<string, any> }) => {

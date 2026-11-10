@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { ClaudeAcpAgent } from "../acp-agent.js";
+import { ClaudeAcpAgent } from "../v1/acp-agent.js";
 import type { AcpClient } from "../acp-client.js";
 import { appendTitleContext, sanitizeTitle } from "../session-titles.js";
 import { Pushable } from "../utils.js";

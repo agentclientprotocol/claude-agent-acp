@@ -16,14 +16,14 @@ import {
   listSessions,
 } from "@anthropic-ai/claude-agent-sdk";
 import { spawn } from "node:child_process";
-import { ClaudeAcpAgent, v1AgentApp } from "../acp-agent.js";
+import { ClaudeAcpAgent, v1AgentApp } from "../v1/acp-agent.js";
 import type { AcpClient } from "../acp-client.js";
 import {
   client as acpClient,
   type InitializeResponse,
   type SessionInfo,
 } from "@agentclientprotocol/sdk/unstable";
-import { encodeProjectPath } from "../session-index/project-dirs.js";
+import { encodeProjectPath } from "../v1/session-index/project-dirs.js";
 import {
   archiveInsteadOfDelete,
   archiveTo,
@@ -31,16 +31,16 @@ import {
   parseBatchGetSessionsRequest,
   SessionIndexService,
   writeCustomTitleSidecar,
-} from "../session-index/service.js";
-import { scanTranscriptFile } from "../session-index/transcript-scan.js";
-import { repositoryWorktrees } from "../session-index/worktrees.js";
+} from "../v1/session-index/service.js";
+import { scanTranscriptFile } from "../v1/session-index/transcript-scan.js";
+import { repositoryWorktrees } from "../v1/session-index/worktrees.js";
 import {
   ListSubscriptions,
   MAX_SUBSCRIPTIONS,
   parseListSubscribeRequest,
   parseListUnsubscribeRequest,
   type ListChanges,
-} from "../session-index/list-subscriptions.js";
+} from "../v1/session-index/list-subscriptions.js";
 import { SessionTitles } from "../session-titles.js";
 import { initializeClient } from "./helpers.js";
 import {
@@ -1854,7 +1854,7 @@ describe("_session/list/subscribe", () => {
   });
 
   it("clears the failed turn of a session that runs here when a new turn starts", async () => {
-    const { noteSessionState } = await import("../session-index/connection.js");
+    const { noteSessionState } = await import("../v1/session-index/connection.js");
     const session = { lastTurnFailed: true } as any;
     noteSessionState(session, "idle", "running");
     expect(session.lastTurnFailed).toBe(false);

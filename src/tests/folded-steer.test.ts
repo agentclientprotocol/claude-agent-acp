@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
-import { ClaudeAcpAgent } from "../acp-agent.js";
+import { ClaudeAcpAgent } from "../v1/acp-agent.js";
 import type { AcpClient } from "../acp-client.js";
 import { Pushable } from "../utils.js";
 import {

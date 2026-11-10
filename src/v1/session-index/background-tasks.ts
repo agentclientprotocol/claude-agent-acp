@@ -40,7 +40,7 @@
 
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
-import { TASK_NOTIFICATION_TAG, taskNotificationsOf } from "../task-notifications.js";
+import { TASK_NOTIFICATION_TAG, taskNotificationsOf } from "../../task-notifications.js";
 
 export type BackgroundTasks = {
   /** The ids of the tasks that started and did not end, in start order. */

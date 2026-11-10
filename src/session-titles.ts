@@ -12,7 +12,7 @@
  * `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` set), the same request generates it.
  *
  * {@link SessionTitles} holds the per-session state and is owned by the
- * session, in the v1 core (`acp-agent.ts`) and the v2 core
+ * session, in the v1 core (`v1/acp-agent.ts`) and the v2 core
  * (`v2/session.ts`). Each drives it from the same places:
  * {@link SessionTitles.onPrompt} and {@link SessionTitles.onAssistantText} to
  * collect text, {@link SessionTitles.onPromptQueued} once a prompt is sent to

@@ -18,8 +18,8 @@ import {
 } from "@agentclientprotocol/sdk/unstable";
 import type { Query } from "@anthropic-ai/claude-agent-sdk";
 import type { Session } from "../acp-agent.js";
-import type { AcpClient } from "../acp-client.js";
-import type { Logger } from "../logger.js";
+import type { AcpClient } from "../../acp-client.js";
+import type { Logger } from "../../logger.js";
 import {
   AIR_SESSION_ARCHIVE_CAPABILITY,
   AIR_SESSION_BATCH_GET_CAPABILITY,
@@ -29,7 +29,7 @@ import {
   AIR_SESSION_WORKTREES_CAPABILITY,
   clientSupportsAirCapability,
   withAirMeta,
-} from "../air-extension.js";
+} from "../../air-extension.js";
 import type { OwnSessionState } from "./activity.js";
 import { isArchivedTitle, storedTitle, visibleTitle } from "./archive-title.js";
 import {

@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
 import type { ModelInfo, Query } from "@anthropic-ai/claude-agent-sdk";
-import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../v1/acp-agent.js";
 import type { AcpClient } from "../acp-client.js";
 import {
   createUltracodeConfigOption,
@@ -169,7 +169,7 @@ describe("ultracode session config option", () => {
         ...(opts.getSettings ? { getSettings: opts.getSettings } : {}),
       }),
     );
-    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
     const agent: ClaudeAcpAgentType = new ClaudeAcpAgent({
       sessionUpdate: async () => {},
       requestPermission: async () => ({ outcome: { outcome: "cancelled" } }),

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import type { SessionNotification } from "@agentclientprotocol/sdk/unstable";
-import { ClaudeAcpAgent } from "../acp-agent.js";
+import { ClaudeAcpAgent } from "../v1/acp-agent.js";
 import type { AcpClient } from "../acp-client.js";
 import { makeMockQuery } from "./helpers.js";
 

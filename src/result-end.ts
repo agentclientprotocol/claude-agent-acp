@@ -2,7 +2,7 @@
  * How Claude Code's `result` ends the work that it reports, and whether that
  * work was the user's turn or a cycle Claude Code started on its own: the
  * rules that both cores read a turn's result with (the v1 prompt loop in
- * `acp-agent.ts` and `v2/`). Each core adds its own side effects, such as v1's
+ * `v1/acp-agent.ts` and `v2/`). Each core adds its own side effects, such as v1's
  * session failure category.
  */
 import type {

@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
-import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../v1/acp-agent.js";
 import type { AcpClient } from "../acp-client.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -47,7 +47,7 @@ describe("additionalRoots", () => {
     capturedOptions = undefined;
     tempDirs.length = 0;
     vi.resetModules();
-    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
     agent = new ClaudeAcpAgent({
       sessionUpdate: async (_notification: SessionNotification) => {},
       requestPermission: async () => ({ outcome: { outcome: "cancelled" } }),

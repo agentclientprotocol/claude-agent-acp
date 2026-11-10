@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ClaudeAcpAgent } from "../acp-agent.js";
+import { ClaudeAcpAgent } from "../v1/acp-agent.js";
 import type { AcpClient } from "../acp-client.js";
 import { clearHookCallbacks, createPostToolUseHook, hasHookCallback } from "../tools.js";
 import { Pushable } from "../utils.js";

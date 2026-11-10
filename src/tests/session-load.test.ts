@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { randomUUID } from "crypto";
 import { RequestError, SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import { query, getSessionMessages } from "@anthropic-ai/claude-agent-sdk";
-import { ClaudeAcpAgent } from "../acp-agent.js";
+import { ClaudeAcpAgent } from "../v1/acp-agent.js";
 import { AcpClient } from "../acp-client.js";
 import { Pushable } from "../utils.js";
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";

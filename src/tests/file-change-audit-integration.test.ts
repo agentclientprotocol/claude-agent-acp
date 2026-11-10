@@ -3,7 +3,7 @@ import type { SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../v1/acp-agent.js";
 import type { AcpClient } from "../acp-client.js";
 import {
   AGENT_FILE_CHANGE_REPORT_CAPABILITY,
@@ -258,7 +258,7 @@ describe("native file-change report integration", () => {
       readTextFile: async () => ({ content: "" }),
       writeTextFile: async () => ({}),
     } as unknown as AcpClient;
-    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const { ClaudeAcpAgent } = await import("../v1/acp-agent.js");
     const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(client, {
       log: () => {},
       error: () => {},

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
-import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../v1/acp-agent.js";
 import type { AcpClient } from "../acp-client.js";
 import { makeMockQuery } from "./helpers.js";
 
@@ -133,7 +133,7 @@ describe("session config options", () => {
     registerHookCallbackSpy.mockClear();
 
     vi.resetModules();
-    const acpAgent = await import("../acp-agent.js");
+    const acpAgent = await import("../v1/acp-agent.js");
     ClaudeAcpAgent = acpAgent.ClaudeAcpAgent;
 
     agent = new ClaudeAcpAgent(createMockClient());

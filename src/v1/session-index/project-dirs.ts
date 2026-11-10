@@ -14,7 +14,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { claudeConfigDir } from "../paths.js";
+import { claudeConfigDir } from "../../paths.js";
 
 /** The SDK cuts an encoded path at this length and appends a hash. */
 const MAX_SANITIZED_LENGTH = 200;
