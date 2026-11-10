@@ -240,6 +240,8 @@ Matching is case-insensitive and accepts multiple whitespace characters between 
 
 Other active helpers use `label: "Anthropic API key"` and `detail: "API key helper"`; unknown key-source identifiers are not exposed as display text. CLI and SDK reads share this presentation, retain stale-probe protection, and suppress unchanged notifications.
 
+For Max subscriptions, the existing `claude auth status --json` probe's optional `planTier` distinguishes `max_20x` (displayed as `Claude Ultra`) from `max_5x` (`Claude Max`). Missing, unrecognized, or malformed tiers fall back to the subscription's usual label. Other subscriptions and auth sources keep their existing classification. The raw `account.plan` and ACP `_meta.claudeCode.plan` remain unchanged. SDK account reads lack the tier, so they preserve the known label for the same account and plan; a fresh CLI read replaces it, including when the tier is absent. This is display metadata, not an entitlement check, and requires no additional probe or direct credential-file reads.
+
 ## Zed conventions
 
 The adapter keeps these Zed and upstream conventions unchanged for every client.

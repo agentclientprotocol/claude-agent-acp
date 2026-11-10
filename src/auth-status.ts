@@ -144,6 +144,8 @@ export type CliAuthStatus = {
   orgId?: string;
   orgName?: string;
   subscriptionType?: string;
+  /** CLI-only tier, e.g. "max_5x" or "max_20x"; not in SDK AccountInfo. */
+  planTier?: string;
 };
 
 const NOT_LOGGED_IN: AuthStatus = {
@@ -270,6 +272,7 @@ export function fromCliStatus(stdout: string, apiKeyHelper?: string): AuthStatus
   return mapAuthFields({
     apiProvider: status.apiProvider,
     subscriptionType: status.subscriptionType,
+    planTier: status.planTier,
     apiKeySource: status.apiKeySource,
     email: status.email,
     organization: status.orgName,
@@ -290,6 +293,7 @@ export function fromCliStatus(stdout: string, apiKeyHelper?: string): AuthStatus
 function mapAuthFields(fields: {
   apiProvider?: string;
   subscriptionType?: string;
+  planTier?: string;
   apiKeySource?: string;
   email?: string;
   organization?: string;
@@ -329,7 +333,7 @@ function mapAuthFields(fields: {
     if (organization) account.organization = organization;
     return {
       kind: "account",
-      label: planLabel(subscriptionType),
+      label: planLabel(subscriptionType, fields.planTier),
       // No detail: the client falls back to `account.email` for line 2.
       account,
     };
@@ -337,12 +341,14 @@ function mapAuthFields(fields: {
   return notLoggedInAuthStatus();
 }
 
-/** Names the plan with exactly one "Claude". A newer CLI already reports
- *  "Claude Max", an older one reports "max", and both must read "Claude Max".
- *  Each word is title-cased; a word that already carries capitals is kept. */
-function planLabel(plan: string): string {
+/** Names the plan with exactly one "Claude". Without a tier, "Claude Max"
+ *  from a newer CLI and "max" from an older one both read "Claude Max".
+ *  Each word is title-cased; a word that already carries capitals is kept.
+ *  The CLI's max_20x tier identifies Ultra; other tiers keep the plan label. */
+function planLabel(plan: string, planTier?: string): string {
   const titled = plan.replace(/\S+/g, (word) => word.charAt(0).toUpperCase() + word.slice(1));
-  return /^claude(\s|$)/i.test(plan) ? titled : `Claude ${titled}`;
+  const label = /^claude(\s|$)/i.test(plan) ? titled : `Claude ${titled}`;
+  return label.toLowerCase() === "claude max" && planTier === "max_20x" ? "Claude Ultra" : label;
 }
 
 /**
@@ -370,8 +376,14 @@ export function sameIdentity(a: AuthStatus, b: AuthStatus): boolean {
  * organization the CLI probe omits. So when the read describes the same
  * identity, its values win field by field but the fields it lacks are kept;
  * when it describes a different identity, it replaces the old one wholesale.
+ * Session reads lack the CLI's plan tier, so keep the label for the same plan.
+ * A CLI read always replaces the label, including when its tier is absent.
  */
-export function mergeAuthStatus(previous: AuthStatus | undefined, next: AuthStatus): AuthStatus {
+export function mergeAuthStatus(
+  previous: AuthStatus | undefined,
+  next: AuthStatus,
+  source: "cli" | "session",
+): AuthStatus {
   if (!previous || !sameIdentity(previous, next)) {
     return next;
   }
@@ -381,6 +393,14 @@ export function mergeAuthStatus(previous: AuthStatus | undefined, next: AuthStat
   }
   if (previous.account || next.account) {
     merged.account = { ...previous.account, ...next.account };
+  }
+  if (
+    source === "session" &&
+    previous.account?.plan &&
+    next.account?.plan &&
+    planLabel(previous.account.plan).toLowerCase() === planLabel(next.account.plan).toLowerCase()
+  ) {
+    merged.label = previous.label;
   }
   if (merged.vendor === undefined && previous.vendor !== undefined) {
     merged.vendor = previous.vendor;

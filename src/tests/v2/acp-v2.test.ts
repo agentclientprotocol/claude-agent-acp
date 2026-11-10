@@ -9379,6 +9379,48 @@ describe("ACP v2 auth", () => {
     expect(acpAuthUpdates).toEqual([status]);
   });
 
+  it.each(["max_5x", undefined, "future_tier"])(
+    "keeps Ultra across session reads and refreshes the label for CLI tier %j",
+    async (nextTier) => {
+      let planTier: string | undefined = "max_20x";
+      execFileSpy.mockImplementation((...invocation: unknown[]) => {
+        const callback = invocation[invocation.length - 1] as (...a: unknown[]) => void;
+        callback(null, {
+          stdout: JSON.stringify({ ...JSON.parse(CLI_SUBSCRIPTION), planTier }),
+          stderr: "",
+        });
+      });
+      const account = {
+        apiProvider: "firstParty",
+        subscriptionType: "Claude Max",
+        email: "user@example.com",
+      };
+      const initializationResult = sdk.initializationResult;
+      sdk.initializationResult = async () => ({ ...(await initializationResult()), account });
+      sdk.accountInfo = async () => account;
+      const { app, authUpdate, acpAuthUpdates } = v2Client();
+      await app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        expect((await authUpdate(1)).authStatus.label).toBe("Claude Ultra");
+        await agent.request(v2.methods.agent.session.new, { cwd });
+        expect(await agent.request(v2.methods.agent.auth.status, {})).toMatchObject({
+          accounts: [{ label: "Claude Ultra" }],
+        });
+        expect(
+          acpAuthUpdates.every((update) => update.accounts?.[0].label === "Claude Ultra"),
+        ).toBe(true);
+
+        planTier = nextTier;
+        await agent.request(v2.methods.agent.auth.status, {});
+        await vi.waitFor(() =>
+          expect(acpAuthUpdates.at(-1)).toMatchObject({
+            accounts: [{ label: "Claude Max", _meta: { claudeCode: { plan: "max" } } }],
+          }),
+        );
+      });
+    },
+  );
+
   /**
    * In a remote environment with --hide-claude-auth, initialize offers the
    * console login as a terminal method and hides the TUI subscription login.
