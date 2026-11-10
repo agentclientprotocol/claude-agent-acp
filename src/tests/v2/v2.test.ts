@@ -24,6 +24,13 @@ import { acpProtocolRouter } from "../../serve.js";
 import { SettingsManager } from "../../settings.js";
 import type { AgentHandle } from "../../v2/agent.js";
 import { StoppedWork } from "../../v2/stopped-work.js";
+import {
+  transcriptAssistant,
+  transcriptCompactBoundary,
+  transcriptCompactSummary,
+  transcriptUser,
+  writeTranscript,
+} from "../helpers.js";
 
 /** One Claude Code process: the prompts it reads and the messages it sends. */
 type FakeClaudeCode = {
@@ -1962,6 +1969,49 @@ describe("ACP v2 core", () => {
       },
       { sessionUpdate: "user_message", messageId: "u2", content: [] },
     ]);
+  });
+
+  it("replays the messages before a compaction from the transcript", async () => {
+    const sessionId = randomUUID();
+    // The records of `/compact` between two prompts, as Claude Code writes
+    // them: the boundary has no parent and links "Hello" logically. The SDK
+    // looks the project up by the real path of `cwd` (`/private/var` on macOS).
+    const project = (await realpath(cwd)).replace(/[^a-zA-Z0-9]/g, "-");
+    await writeTranscript(path.join(tempDir, "claude", "projects", project), sessionId, [
+      transcriptUser("u1", "hi"),
+      transcriptAssistant("a1", "Hello"),
+      transcriptCompactBoundary("b1", "a1"),
+      transcriptCompactSummary("s1"),
+      transcriptUser("u2", "identify yourself"),
+    ]);
+    // The transcript read and the read across the compaction both go to disk.
+    const actual = await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
+      "@anthropic-ai/claude-agent-sdk",
+    );
+    vi.mocked(getSessionMessages)
+      .mockImplementationOnce(actual.getSessionMessages)
+      .mockImplementationOnce(actual.getSessionMessages);
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      await agent.request(v2.methods.agent.initialize, {
+        protocolVersion: v2.PROTOCOL_VERSION,
+        info: { name: "v2-test-client", version: "1.0.0" },
+        capabilities: {},
+      });
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+    });
+
+    expect(
+      client.sessionUpdates.flatMap((update) =>
+        update.sessionUpdate === "user_message" || update.sessionUpdate === "compaction_update"
+          ? [update.sessionUpdate]
+          : [],
+      ),
+    ).toEqual(["user_message", "compaction_update", "user_message"]);
   });
 
   it.each([

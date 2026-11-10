@@ -58,7 +58,16 @@ import {
   parseUsageResponse,
 } from "../../usage-markdown.js";
 import { Pushable } from "../../utils.js";
-import { heldRequest, initializeClient, makeMockQuery } from "../helpers.js";
+import {
+  heldRequest,
+  initializeClient,
+  makeMockQuery,
+  transcriptAssistant,
+  transcriptCompactBoundary,
+  transcriptCompactSummary,
+  transcriptUser,
+  writeTranscript,
+} from "../helpers.js";
 import { acpProtocolRouter } from "../../serve.js";
 import * as agentSdk from "@anthropic-ai/claude-agent-sdk";
 import {
@@ -3626,6 +3635,63 @@ describe("usage-limit failure replay", () => {
       .find(Boolean);
     expect(failure).toEqual(expect.objectContaining({ category: "limit", severity: "error" }));
     expect(failure.title).toContain("individual spend limit");
+  });
+});
+
+describe("compacted session replay", () => {
+  it("replays the messages before the compaction, then the compaction", async () => {
+    const configDir = await mkdtemp(path.join(os.tmpdir(), "claude-acp-compacted-replay-"));
+    const originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = configDir;
+    try {
+      const sessionId = "44444444-4444-4444-8444-444444444444";
+      // The records of `/compact` between two prompts, as Claude Code writes
+      // them: the boundary has no parent and links "Hello" logically.
+      await writeTranscript(path.join(configDir, "projects", "-tmp-proj"), sessionId, [
+        transcriptUser("u1", "hi"),
+        transcriptAssistant("a1", "Hello"),
+        transcriptCompactBoundary("b1", "a1"),
+        transcriptCompactSummary("s1"),
+        transcriptUser("u2", "identify yourself"),
+        transcriptAssistant("a2", "Claude"),
+      ]);
+      const updates: SessionNotification[] = [];
+      const client = {
+        sessionUpdate: async (update: SessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient;
+      const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+      await initializeClient(agent, { session: { compaction: {} } } as ClientCapabilities);
+
+      await (
+        agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+      ).replaySessionHistory(sessionId);
+
+      expect(
+        updates.flatMap(({ update }) => {
+          if (update.sessionUpdate === "compaction_update") return [["compaction", update.status]];
+          if (
+            (update.sessionUpdate === "user_message_chunk" ||
+              update.sessionUpdate === "agent_message_chunk") &&
+            update.content.type === "text"
+          ) {
+            return [[update.sessionUpdate, update.content.text]];
+          }
+          return [];
+        }),
+      ).toEqual([
+        ["user_message_chunk", "hi"],
+        ["agent_message_chunk", "Hello"],
+        ["compaction", "completed"],
+        ["user_message_chunk", "identify yourself"],
+        ["agent_message_chunk", "Claude"],
+      ]);
+    } finally {
+      if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
+      await rm(configDir, { recursive: true, force: true });
+    }
   });
 });
 

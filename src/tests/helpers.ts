@@ -9,6 +9,8 @@ import {
   type ClientCapabilities,
   type InitializeRequest,
 } from "@agentclientprotocol/sdk/unstable";
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
 
 /** The context-usage report the base mock query returns. `rawMaxTokens`
  *  matches the agent's DEFAULT_CONTEXT_WINDOW so window-related assertions
@@ -81,4 +83,74 @@ export function heldRequest<T>(_params?: unknown, signal?: AbortSignal): Promise
     if (signal?.aborted) cancel();
     else signal?.addEventListener("abort", cancel, { once: true });
   });
+}
+
+/** A transcript record of a user message. */
+export function transcriptUser(uuid: string, content: string, extra: object = {}) {
+  return { type: "user", uuid, message: { role: "user", content }, ...extra };
+}
+
+/** A transcript record of an assistant text response. */
+export function transcriptAssistant(uuid: string, text: string) {
+  return {
+    type: "assistant",
+    uuid,
+    message: {
+      id: `msg_${uuid}`,
+      role: "assistant",
+      model: "claude-opus-5",
+      content: [{ type: "text", text }],
+    },
+  };
+}
+
+/** A `compact_boundary` as Claude Code writes it: no parent, and the last
+ *  message before it in `logicalParentUuid`. */
+export function transcriptCompactBoundary(
+  uuid: string,
+  logicalParentUuid: string,
+  compactMetadata: object = {},
+) {
+  return {
+    type: "system",
+    subtype: "compact_boundary",
+    uuid,
+    parentUuid: null,
+    logicalParentUuid,
+    compactMetadata: { trigger: "manual", preTokens: 1000, ...compactMetadata },
+  };
+}
+
+/** The summary message that follows a `compact_boundary`. */
+export function transcriptCompactSummary(
+  uuid: string,
+  content = "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n" +
+    "Summary:\n1. Primary Request and Intent:\n   Say hi.\n\n" +
+    "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary.",
+) {
+  return transcriptUser(uuid, content, { isCompactSummary: true });
+}
+
+/** Writes `<directory>/<sessionId>.jsonl` as Claude Code does: each record
+ *  links to the record before it, except a record that sets its own
+ *  `parentUuid`. */
+export async function writeTranscript(
+  directory: string,
+  sessionId: string,
+  records: Record<string, unknown>[],
+): Promise<void> {
+  await mkdir(directory, { recursive: true });
+  let parentUuid: unknown = null;
+  const lines = records.map((record) => {
+    const line = {
+      parentUuid,
+      sessionId,
+      isSidechain: false,
+      timestamp: "2026-10-11T00:00:00.000Z",
+      ...record,
+    };
+    parentUuid = record.uuid;
+    return JSON.stringify(line);
+  });
+  await writeFile(path.join(directory, `${sessionId}.jsonl`), lines.join("\n") + "\n");
 }
