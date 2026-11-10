@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.106.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.105.0...v0.106.0) (2026-11-10)
+
+
+### Features
+
+* report the auth detail as the account's description ([#1591](https://github.com/agentclientprotocol/claude-agent-acp/issues/1591)) ([f6d6429](https://github.com/agentclientprotocol/claude-agent-acp/commit/f6d64291876177f9f593415abfc7e50eb7e7ff56))
+* serve session/options and initial config options ([#1592](https://github.com/agentclientprotocol/claude-agent-acp/issues/1592)) ([b1763c7](https://github.com/agentclientprotocol/claude-agent-acp/commit/b1763c750aef83fd05ce16901ff1a0d9b4b90234))
+
+
+### Bug Fixes
+
+* honour the client's settings option in idle compaction ([#1555](https://github.com/agentclientprotocol/claude-agent-acp/issues/1555)) ([b73ee49](https://github.com/agentclientprotocol/claude-agent-acp/commit/b73ee491c8f60a1584a95a7f03557f356e1a991c))
+* replay the messages before each compaction on ACP v1 and v2 ([#1430](https://github.com/agentclientprotocol/claude-agent-acp/issues/1430)) ([626015b](https://github.com/agentclientprotocol/claude-agent-acp/commit/626015bf81fd34f952406ae77bf60feb9ca39a16))
+* stop the release executable from loading the project's .env and bunfig.toml ([#1589](https://github.com/agentclientprotocol/claude-agent-acp/issues/1589)) ([4a3ff6a](https://github.com/agentclientprotocol/claude-agent-acp/commit/4a3ff6a1eb16075b96676616ab2bbb98694a4d24))
+* update to @agentclientprotocol/sdk 2.6.0 ([#1590](https://github.com/agentclientprotocol/claude-agent-acp/issues/1590)) ([9fca22a](https://github.com/agentclientprotocol/claude-agent-acp/commit/9fca22a03bdec5dc265bfdc42df316fb286a8142))
+
 ## [0.105.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.104.1...v0.105.0) (2026-11-10)
 
 
