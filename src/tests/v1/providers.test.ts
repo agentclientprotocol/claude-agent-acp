@@ -651,6 +651,43 @@ describe("providers", () => {
       expect(setModel).toHaveBeenCalledWith("sonnet");
     });
 
+    it("starts on an older provider Sonnet when the SDK family default is absent", async () => {
+      const [agent, mockQuery] = await createAgentMock();
+      const setModel = mockQueryWithModels(mockQuery, [
+        {
+          value: "default",
+          resolvedModel: "claude-sonnet-5-5",
+          displayName: "Default",
+          description: "",
+        },
+        {
+          value: "sonnet",
+          resolvedModel: "claude-sonnet-5-5",
+          displayName: "Sonnet",
+          description: "",
+        },
+        {
+          value: "haiku",
+          resolvedModel: "claude-haiku-5-5",
+          displayName: "Haiku",
+          description: "",
+        },
+      ]);
+      stubListing(["claude-sonnet-5", "claude-haiku-5-5"]);
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      await agent.unstable_setProvider({
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gateway.example",
+      });
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(modelOptionValues(response)).toEqual(["claude-sonnet-5", "haiku"]);
+      expect(response.configOptions?.find((o: any) => o.id === "model")?.currentValue).toBe(
+        "claude-sonnet-5",
+      );
+      expect(setModel).toHaveBeenCalledWith("claude-sonnet-5");
+    });
+
     it("fails providers/set and keeps the current provider when the listing fails", async () => {
       const [agent, mockQuery] = await createAgentMock();
       mockQueryWithModels(mockQuery);

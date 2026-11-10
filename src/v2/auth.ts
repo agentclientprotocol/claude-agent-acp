@@ -43,7 +43,7 @@ import {
   validatedGatewayAuthRequest,
   withListedModels,
 } from "../providers.js";
-import { narrowToGatewayModels } from "../session-model.js";
+import { narrowToGatewayModels, type GatewayFamilyFallback } from "../session-model.js";
 import { v2AuthMethod } from "./initialize.js";
 
 /** The route of a session that starts now. */
@@ -57,7 +57,7 @@ export interface SessionRouting {
    */
   settings?: Settings;
   /** The models the session offers: those the provider's gateway listed. */
-  models(models: ModelInfo[]): ModelInfo[];
+  models(models: ModelInfo[], fallback?: GatewayFamilyFallback): ModelInfo[];
   /** Whether {@link models} narrows the models to a gateway's list. */
   narrowsModels: boolean;
 }
@@ -244,9 +244,9 @@ export class V2Auth {
     return {
       env,
       ...(config ? { settings: { apiKeyHelper: "", env } } : {}),
-      models: (models) =>
+      models: (models, fallback) =>
         config?.listedModels
-          ? narrowToGatewayModels(models, config.listedModels, config.bedrockRegionPrefix)
+          ? narrowToGatewayModels(models, config.listedModels, config.bedrockRegionPrefix, fallback)
           : models,
       narrowsModels: config?.listedModels !== undefined,
     };

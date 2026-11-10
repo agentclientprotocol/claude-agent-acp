@@ -507,6 +507,55 @@ export function applyAvailableModelsAllowlist(
   return result;
 }
 
+/** User policy and launch env for replacing an unavailable SDK family default. */
+export type GatewayFamilyFallback = {
+  settings: Settings;
+  env: Record<string, string | undefined>;
+  deniedModels: readonly string[];
+};
+
+function gatewayFamilyFallback(
+  model: ModelInfo,
+  listedModelIds: readonly string[],
+  regionPrefix: string | undefined,
+  policy: GatewayFamilyFallback,
+): ModelInfo | undefined {
+  // An explicit picker allowlist or family override owns this choice. Never
+  // replace it with a model inferred from a provider listing.
+  const family = model.value;
+  if (!MODEL_FAMILY_ALIASES.has(family) || policy.settings.availableModels !== undefined) return;
+  const key = `ANTHROPIC_DEFAULT_${family.toUpperCase()}_MODEL`;
+  if (policy.settings.env?.[key] || policy.env[key]) return;
+  const pattern = new RegExp(`^claude-${family}-(\\d+)(?:-(\\d+))?$`);
+  const version = (id: string) => {
+    const match = normalizeModelId(id).match(pattern);
+    return match ? [Number(match[1]), Number(match[2] ?? 0)] : undefined;
+  };
+  const sdkVersion = model.resolvedModel && version(model.resolvedModel);
+  if (!sdkVersion) return;
+  const candidates = listedModelIds.flatMap((id) => {
+    const candidate = version(id);
+    const prefix = bedrockRegionPrefix(id);
+    if (
+      !candidate ||
+      (regionPrefix !== undefined && prefix !== regionPrefix) ||
+      isDeniedModel(id, policy.deniedModels) ||
+      candidate[0] > sdkVersion[0] ||
+      (candidate[0] === sdkVersion[0] && candidate[1] >= sdkVersion[1])
+    )
+      return [];
+    return [{ id, version: candidate }];
+  });
+  candidates.sort(
+    (a, b) =>
+      b.version[0] - a.version[0] || b.version[1] - a.version[1] || a.id.localeCompare(b.id),
+  );
+  const id = candidates[0]?.id;
+  // The older model's capabilities are unknown. Do not copy the newer SDK
+  // default's effort, fast-mode or context-window metadata.
+  return id ? { value: id, resolvedModel: id, displayName: id, description: "" } : undefined;
+}
+
 /**
  * Keep the SDK models the `providers/set` gateway listed (`listGatewayModels`,
  * `listBedrockModels`). A row matches when its `resolvedModel` (or
@@ -522,17 +571,21 @@ export function applyAvailableModelsAllowlist(
  * it is checked as far as the alias allows: `default` is kept, and a family
  * alias such as `opus` is kept when the gateway lists a model of that family.
  *
- * When no row matches by its model (a `default` row kept only for lacking a
- * `resolvedModel` does not count), the gateway serves none of the SDK's
- * models, and nothing is left: the session offers no model.
+ * With `fallback`, an unavailable family alias can offer the highest older
+ * provider version as an exact ID. Explicit family overrides and allowlists
+ * prevent that replacement; unknown/newer versions are never inferred.
+ *
+ * When no row names a listed model after replacement (a `default` row kept
+ * only for lacking a `resolvedModel` does not count), the session offers no model.
  */
 export function narrowToGatewayModels(
   models: ModelInfo[],
   listedModelIds: readonly string[],
   regionPrefix?: string,
+  fallback?: GatewayFamilyFallback,
 ): ModelInfo[] {
   const listed = new Set(listedModelIds.map(normalizeModelId).filter(Boolean));
-  const narrowed = models.filter((model) => {
+  const matches = (model: ModelInfo): boolean => {
     const modelId = model.resolvedModel ?? model.value;
     const prefix = bedrockRegionPrefix(modelId);
     if (regionPrefix !== undefined && prefix !== undefined && prefix !== regionPrefix) {
@@ -543,6 +596,19 @@ export function narrowToGatewayModels(
     if (model.resolvedModel !== undefined) return false;
     if (model.value === "default") return true;
     return MODEL_FAMILY_ALIASES.has(id) && [...listed].some((entry) => entry.includes(`-${id}`));
+  };
+  const matched = models.filter(matches);
+  const narrowed = models.flatMap((model) => {
+    if (matches(model)) return [model];
+    const replacement =
+      fallback && gatewayFamilyFallback(model, listedModelIds, regionPrefix, fallback);
+    return replacement &&
+      !matched.some(
+        (row) =>
+          normalizeModelId(row.resolvedModel ?? row.value) === normalizeModelId(replacement.value),
+      )
+      ? [replacement]
+      : [];
   });
   return narrowed.some((model) => listed.has(normalizeModelId(model.resolvedModel ?? model.value)))
     ? narrowed

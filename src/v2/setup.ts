@@ -11,6 +11,7 @@ import {
   type ModelInfo,
   type Options,
   type Query,
+  type Settings,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "../logger.js";
 import type { NewSessionMeta } from "../new-session-meta.js";
@@ -24,6 +25,7 @@ import {
   aliasResumedModelRow,
   applyAvailableModelsAllowlist,
   getAvailableModels,
+  type GatewayFamilyFallback,
   type SessionModelState,
   withCurrentModelInfo,
 } from "../session-model.js";
@@ -62,11 +64,15 @@ export async function sessionModels(
   query: Query,
   sdkModels: ModelInfo[],
   settings: SettingsManager,
-  narrow: (models: ModelInfo[]) => ModelInfo[],
+  narrow: (models: ModelInfo[], fallback?: GatewayFamilyFallback) => ModelInfo[],
   narrowedByProvider: boolean,
   resumed: { model?: string } | undefined,
   sessionId: string,
   logger: Logger,
+  launch: {
+    env?: Record<string, string | undefined>;
+    settings?: Settings;
+  } = {},
 ): Promise<{
   models: SessionModelState;
   modelInfos: ModelInfo[];
@@ -84,7 +90,15 @@ export async function sessionModels(
         settings.getManagedDeniedModels(),
       )
     : listed;
-  const narrowed = narrow(allowed);
+  const narrowed = narrow(allowed, {
+    settings: {
+      ...settings.getSettings(),
+      ...launch.settings,
+      env: { ...settings.getSettings().env, ...launch.settings?.env },
+    },
+    env: launch.env ?? process.env,
+    deniedModels: settings.getManagedDeniedModels(),
+  });
   const models = await getAvailableModels(
     query,
     narrowed,
