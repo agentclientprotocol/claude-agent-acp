@@ -15,6 +15,7 @@ import {
   ForkSessionResponse,
   InitializeRequest,
   InitializeResponse,
+  InitialSessionConfigOption,
   ListProvidersRequest,
   ListProvidersResponse,
   McpServer,
@@ -43,6 +44,8 @@ import {
   SetSessionConfigOptionResponse,
   SetSessionModeRequest,
   SetSessionModeResponse,
+  SessionOptionsRequest,
+  SessionOptionsResponse,
   SessionStatusRequest,
   SessionStatusResponse,
   CloseSessionRequest,
@@ -96,6 +99,11 @@ import {
 import { checklistPlanUpdate, resetPlanUpdates, type SubagentChecklists } from "../plans.js";
 import { PromptSuggestions } from "../prompt-suggestions.js";
 import { savedSessionStatus, SESSION_STATUS_CAPABILITY } from "../session-status.js";
+import {
+  applyInitialConfigOptions,
+  initialConfigOptions,
+  SESSION_OPTIONS_CAPABILITY,
+} from "../initial-config-options.js";
 import { sanitizeTitle, SessionTitles } from "../session-titles.js";
 import {
   AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
@@ -2025,6 +2033,8 @@ export class ClaudeAcpAgent {
       delete: {},
       fork: {},
       list: {},
+      // `session/options`, and `configOptions` on `session/new`, `load` and `resume`.
+      options: SESSION_OPTIONS_CAPABILITY,
       resume: {},
       status: SESSION_STATUS_CAPABILITY,
       systemPrompt: SYSTEM_PROMPT_CAPABILITY,
@@ -2110,13 +2120,75 @@ export class ClaudeAcpAgent {
   }
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
+    // Without `configOptions`: a restart of the query restores the session's choices itself.
+    const { configOptions, ...request } = params;
+    const initial = initialConfigOptions(configOptions);
     while (this.providerUpdate) await this.providerUpdate;
-    const response = await this.createSession(params, {
+    const created = await this.createSession(request, {
       // Revisit these meta values once we support resume
       resume: (params._meta as NewSessionMeta | undefined)?.claudeCode?.options?.resume,
     });
+    const response = await this.withInitialConfigOptions(created, initial);
     this.afterSetupResponse(response.sessionId, params.mcpServers);
     return response;
+  }
+
+  /**
+   * `session/options`: the modes and config options that `session/new` with
+   * the same `cwd`, additional directories and `_meta` would answer with, or
+   * `session/load` and `session/resume` of `sessionId`.
+   *
+   * A session that this connection holds answers with what it has now.
+   * Otherwise a query starts as the session's would, without MCP servers, and
+   * closes once its options are read (`optionsOnly` in `createSession`). The
+   * query does not persist: it stores no session, and it does not write to
+   * the transcript of `sessionId`. Claude Code runs the user's `SessionStart`
+   * hooks in it, as in every query.
+   *
+   * It sends no update, and it creates, loads and changes no session. A
+   * `sessionId` without a stored conversation fails with `-32002`.
+   */
+  async sessionOptions(params: SessionOptionsRequest): Promise<SessionOptionsResponse> {
+    while (this.providerUpdate) await this.providerUpdate;
+    const held = params.sessionId != null ? this.sessions[params.sessionId] : undefined;
+    if (held) {
+      await this.validateCwd(params.cwd, params.additionalDirectories);
+      return { modes: held.modes, configOptions: held.configOptions };
+    }
+    const { modes, configOptions } = await this.createSession(
+      {
+        cwd: params.cwd,
+        mcpServers: [],
+        additionalDirectories: params.additionalDirectories,
+        _meta: params._meta,
+      },
+      { resume: params.sessionId ?? undefined, optionsOnly: true },
+    );
+    return { modes, configOptions };
+  }
+
+  /**
+   * The setup response once the request's `configOptions` are set on the
+   * session, in list order, as `session/set_config_option` sets each one. An
+   * entry that the session refuses is skipped (`applyInitialConfigOptions`).
+   * No update goes out for them: the response carries the modes and options.
+   */
+  private async withInitialConfigOptions<R extends NewSessionResponse>(
+    response: R,
+    entries: readonly InitialSessionConfigOption[],
+  ): Promise<R> {
+    if (entries.length === 0) return response;
+    const { sessionId } = response;
+    await this.serializeConfigurationChange(sessionId, () =>
+      applyInitialConfigOptions(
+        entries,
+        (entry) => this.selectSessionConfigOption({ ...entry, sessionId }, true),
+        this.logger,
+      ),
+    );
+    const session = this.sessions[sessionId];
+    if (!session) return response;
+    return { ...response, modes: session.modes, configOptions: session.configOptions };
   }
 
   /**
@@ -2224,8 +2296,12 @@ export class ClaudeAcpAgent {
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+    const initial = initialConfigOptions(params.configOptions);
     while (this.providerUpdate) await this.providerUpdate;
-    const result = await this.getOrCreateSession(params);
+    const result = await this.withInitialConfigOptions(
+      await this.getOrCreateSession(params),
+      initial,
+    );
 
     this.afterSetupResponse(params.sessionId, params.mcpServers ?? []);
     return result;
@@ -2233,6 +2309,7 @@ export class ClaudeAcpAgent {
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     const timing = new SessionTiming(this.logger, "load", params.sessionId);
+    const initial = initialConfigOptions(params.configOptions);
     while (this.providerUpdate) await this.providerUpdate;
     let result: NewSessionResponse;
     if (this.sessions[params.sessionId]) {
@@ -2244,6 +2321,7 @@ export class ClaudeAcpAgent {
       result = await this.createSessionWhileReplaying(params, timing);
     }
     timing.phase("replay");
+    result = await this.withInitialConfigOptions(result, initial);
 
     // After the replay, so the commands do not interleave with the history.
     this.afterSetupResponse(params.sessionId, params.mcpServers ?? []);
@@ -7905,8 +7983,14 @@ export class ClaudeAcpAgent {
     );
   }
 
+  /**
+   * `duringSetup`: the value is one of a setup request's `configOptions`. No
+   * mode update goes out, and the warning of an Auto mode fallback waits for
+   * the next prompt.
+   */
   private async selectSessionConfigOption(
     params: SetSessionConfigOptionRequest,
+    duringSetup = false,
   ): Promise<SetSessionConfigOptionResponse> {
     const session = this.sessions[params.sessionId];
     if (!session) {
@@ -7937,8 +8021,12 @@ export class ClaudeAcpAgent {
 
     let effectiveValue = resolvedValue;
     if (params.configId === MODE_CONFIG_ID) {
-      effectiveValue = await this.sessionModes.selectMode(params.sessionId, resolvedValue);
-      await this.sessionModes.publishCurrent(params.sessionId, effectiveValue);
+      effectiveValue = await this.sessionModes.selectMode(
+        params.sessionId,
+        resolvedValue,
+        duringSetup,
+      );
+      if (!duringSetup) await this.sessionModes.publishCurrent(params.sessionId, effectiveValue);
     } else if (params.configId === MODEL_CONFIG_ID) {
       await this.sessions[params.sessionId].query.setModel(resolvedValue);
     }
@@ -7946,7 +8034,13 @@ export class ClaudeAcpAgent {
     // effort changes and effort changes induced by a model switch go through
     // the same path.
 
-    await this.applyConfigOptionValue(params.sessionId, session, params.configId, effectiveValue);
+    await this.applyConfigOptionValue(
+      params.sessionId,
+      session,
+      params.configId,
+      effectiveValue,
+      duringSetup,
+    );
 
     return { configOptions: session.configOptions };
   }
@@ -9462,6 +9556,8 @@ export class ClaudeAcpAgent {
     session: Session,
     configId: string,
     value: string,
+    /** See {@link selectSessionConfigOption}. */
+    duringSetup = false,
   ): Promise<void> {
     if (configId === MODE_CONFIG_ID) {
       this.sessionModes.syncConfig(session, value);
@@ -9571,7 +9667,8 @@ export class ClaudeAcpAgent {
       // still precedes the caller's config_option_update so order-sensitive
       // clients update currentModeId before re-rendering the option list.
       if (modeDowngraded) {
-        await this.sessionModes.publishFallbackState(sessionId, session);
+        if (duringSetup) this.sessionModes.deferFallbackWarning(session);
+        else await this.sessionModes.publishFallbackState(sessionId, session);
       }
       // Last, so the switch's own control requests don't queue behind it.
       if (modelChanged) this.refreshContextWindowInBackground(sessionId, session);
@@ -9870,6 +9967,12 @@ export class ClaudeAcpAgent {
       replayState?: ReplayState;
       /** A close of this session during startup cancels registration of its replacement. */
       replacingSession?: Session;
+      /**
+       * `session/options`: the query answers with the modes and config options
+       * and closes. No session is registered, and Claude Code stores nothing
+       * of the query (`persistSession: false`).
+       */
+      optionsOnly?: boolean;
     } = {},
   ): Promise<NewSessionResponse> {
     const createStartedAt = performance.now();
@@ -10262,6 +10365,7 @@ export class ClaudeAcpAgent {
       },
       ...(creationOpts.resume !== undefined && { resume: creationOpts.resume }),
       ...(creationOpts.forkSession !== undefined && { forkSession: creationOpts.forkSession }),
+      ...(creationOpts.optionsOnly ? { persistSession: false } : {}),
       abortController,
     };
 
@@ -10481,6 +10585,10 @@ export class ClaudeAcpAgent {
         },
         ultracode,
       );
+      if (creationOpts.optionsOnly) {
+        this.discardUnregisteredQuery(q, input, settingsManager);
+        return { sessionId, modes, configOptions };
+      }
       const initialEffort = configOptions.find((option) => option.id === EFFORT_CONFIG_ID);
       if (useRecommendedValue && typeof initialEffort?.currentValue === "string") {
         await q.applyFlagSettings(effortFlagSettings(initialEffort.currentValue, ultracodeEnabled));
@@ -11169,6 +11277,7 @@ export function v1AgentApp(
     .onRequest(methods.agent.session.resume, (ctx) => agent.resumeSession(ctx.params))
     .onRequest(methods.agent.session.close, (ctx) => agent.closeSession(ctx.params))
     .onRequest(methods.agent.session.status, (ctx) => agent.sessionStatus(ctx.params))
+    .onRequest(methods.agent.session.options, (ctx) => agent.sessionOptions(ctx.params))
     .onRequest(methods.agent.session.setMode, (ctx) => agent.setSessionMode(ctx.params))
     .onRequest(methods.agent.session.setConfigOption, (ctx) =>
       agent.setSessionConfigOption(ctx.params),

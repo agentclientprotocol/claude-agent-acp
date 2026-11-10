@@ -16,12 +16,13 @@ import {
   type SystemPrompt,
 } from "@agentclientprotocol/sdk/unstable";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
+import { initialConfigOptions } from "../initial-config-options.js";
 import { V2_SESSION_CAPABILITIES } from "./initialize.js";
 import { v1ContentBlock } from "./prompt.js";
 
 /**
- * Without `configOptions`: a client sends them only to an agent that
- * advertises `session.options`, which this one does not.
+ * Without `configOptions`: the session applies them once it started (see
+ * {@link initialConfigRequests}).
  */
 export function v1NewSessionRequest(params: v2.NewSessionRequest): NewSessionRequest {
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -74,6 +75,23 @@ export function v1SetSessionConfigOptionRequest(
     { type: params.type },
     `Config option values of type ${params.type} are not supported`,
   );
+}
+
+/**
+ * The `configOptions` of a setup request, as the `session/set_config_option`
+ * requests of `sessionId` that set them. Fails with invalid params (-32602)
+ * for two entries with the same `configId`, and for an entry of a value type
+ * that `session/set_config_option` does not take: any but `id` and `boolean`.
+ */
+export function initialConfigRequests(
+  sessionId: string,
+  entries: v2.InitialSessionConfigOption[] | null | undefined,
+): v2.SetSessionConfigOptionRequest[] {
+  return initialConfigOptions(entries).map((entry) => {
+    const request = { ...entry, sessionId };
+    v1SetSessionConfigOptionRequest(request);
+    return request;
+  });
 }
 
 /** v2 names the id of an option `configId` and the id of a select group `groupId`. */

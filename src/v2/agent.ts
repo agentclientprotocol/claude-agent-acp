@@ -59,7 +59,12 @@ import { STARTUP_FAILURE_RESULTS_ENV, startupFailureError } from "../startup-fai
 import { createPostToolUseHook } from "../tools.js";
 import { Pushable } from "../utils.js";
 import { V2_SESSION_CAPABILITIES } from "./initialize.js";
-import { v1ForkSessionRequest, v1NewSessionRequest } from "./session-requests.js";
+import {
+  initialConfigRequests,
+  v1ForkSessionRequest,
+  v1NewSessionRequest,
+} from "./session-requests.js";
+import { SessionCommands } from "./commands.js";
 import { V2UpdateTranslator } from "./update-translator.js";
 import { airInitializeMeta, airSupport, NO_AIR, type AirSupport } from "./air.js";
 import { V2Auth } from "./auth.js";
@@ -118,6 +123,7 @@ export function v2AgentApp(
       .onRequest(v2.methods.agent.session.list, ({ params }) => agent.listSessions(params))
       .onRequest(v2.methods.agent.session.close, ({ params }) => agent.closeSession(params))
       .onRequest(v2.methods.agent.session.status, ({ params }) => agent.sessionStatus(params))
+      .onRequest(v2.methods.agent.session.options, ({ params }) => agent.sessionOptions(params))
       .onRequest(v2.methods.agent.session.delete, ({ params }) => agent.deleteSession(params))
       .onRequest(v2.methods.agent.session.setTitle, ({ params }) => agent.setTitle(params))
       .onRequest(v2.methods.agent.session.setConfigOption, ({ params }) =>
@@ -321,7 +327,9 @@ class V2Agent implements AgentHandle, SessionConnection {
 
   async newSession(params: v2.NewSessionRequest): Promise<v2.NewSessionResponse> {
     const sessionId = randomUUID();
+    const initial = initialConfigRequests(sessionId, params.configOptions);
     const session = await this.startSession(sessionId, params, undefined);
+    await session.setInitialConfigOptions(initial);
     const response = { sessionId, ...(await this.setupFields(session)) };
     this.afterSetup(session, params);
     return response;
@@ -348,7 +356,9 @@ class V2Agent implements AgentHandle, SessionConnection {
   /**
    * Resumes a stored session, or attaches to a live one. With `replayFrom:
    * { type: "start" }` the stored history replays first. Either way, the
-   * state snapshot goes out after any replay and before the response.
+   * state snapshot goes out after any replay and before the response. The
+   * request's `configOptions` are set before the replay, on an active session
+   * too.
    */
   resumeSession(params: v2.ResumeSessionRequest): Promise<v2.ResumeSessionResponse> {
     const { sessionId } = params;
@@ -374,6 +384,7 @@ class V2Agent implements AgentHandle, SessionConnection {
       );
     }
     if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "resume");
+    const initial = initialConfigRequests(sessionId, params.configOptions);
     await this.restarts.settled(sessionId);
     // A concurrent resume of this session started its query: this one then
     // attaches to the session that it started.
@@ -387,12 +398,7 @@ class V2Agent implements AgentHandle, SessionConnection {
       // and the request's MCP servers and additional directories replace the
       // session's.
       const request = await validatedSetup(params);
-      if (request.cwd !== session.cwd) {
-        throw RequestError.invalidParams(
-          { cwd: request.cwd },
-          `Session ${sessionId} works in ${session.cwd}: resume it with that \`cwd\``,
-        );
-      }
+      assertCwdOf(session, request.cwd, "resume it");
       await session.setMcpServers({
         ...clientOptions(params._meta)?.mcpServers,
         ...sdkMcpServers(request.mcpServers),
@@ -417,6 +423,7 @@ class V2Agent implements AgentHandle, SessionConnection {
       replayed?.catch(() => {});
       session = await this.startSession(sessionId, params, sessionId, history);
     }
+    await session.setInitialConfigOptions(initial);
     let subagents: SubagentReplay | undefined;
     if (replayFrom != null) {
       const cwd = session.cwd;
@@ -495,6 +502,66 @@ class V2Agent implements AgentHandle, SessionConnection {
     if (session) return { status: "open", state: session.statusState() };
     if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "ask the status of");
     return savedSessionStatus(sessionId);
+  }
+
+  /**
+   * `session/options`: the config options and commands that `session/new`
+   * with the same `cwd`, additional directories and `_meta` would answer
+   * with, or `session/resume` of `sessionId`.
+   *
+   * An active session answers with what it has now. Otherwise a query starts
+   * as the session's would, without MCP servers, and closes once its options
+   * are read. So the commands lack the MCP prompts, and a failed read of the
+   * commands leaves them out. The query does not persist
+   * (`persistSession: false`): it stores no session, and it does not write to
+   * the transcript of `sessionId`. Claude Code runs the user's `SessionStart`
+   * hooks in it, as in every query.
+   *
+   * It sends no update, and it creates, resumes and changes no session. A
+   * `sessionId` without a stored conversation fails with `-32002`.
+   */
+  async sessionOptions(params: v2.SessionOptionsRequest): Promise<v2.SessionOptionsResponse> {
+    const { sessionId } = params;
+    const setup: v2.NewSessionRequest = {
+      cwd: params.cwd,
+      additionalDirectories: params.additionalDirectories,
+      _meta: params._meta,
+    };
+    let session: V2Session | undefined;
+    if (sessionId != null) {
+      if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "read the options of");
+      // A restart or a resume that runs makes the session active.
+      await this.restarts.settled(sessionId);
+      await this.startSettled(sessionId);
+      session = this.sessions.get(sessionId);
+    }
+    const fields = (config: SessionConfig, commands: v2.AvailableCommand[]) => ({
+      configOptions: config.options(),
+      // The draft leaves out an empty list.
+      ...(commands.length > 0 ? { availableCommands: commands } : {}),
+    });
+    const listed = (commands: SessionCommands) =>
+      commands.list().catch((error: unknown) => {
+        this.logger.error("session/options: failed to read the commands", error);
+        return [];
+      });
+    if (session) {
+      assertCwdOf(session, (await validatedSetup(setup)).cwd, "ask for its options");
+      return fields(session.config, await listed(session.commands));
+    }
+    // The probe's own id: its records never meet those of the session `sessionId`.
+    const probeId = randomUUID();
+    const probe = await this.openQuery(probeId, setup, sessionId ?? undefined, undefined, {
+      persist: false,
+    });
+    try {
+      return fields(probe.config, await listed(new SessionCommands(probe.query)));
+    } finally {
+      probe.query.close();
+      probe.settings.dispose();
+      this.auth.sessionEnded(probeId);
+      this.guard.sessionEnded(probeId);
+    }
   }
 
   /** Closing is idempotent: a session that is not active closes at once. */
@@ -733,10 +800,7 @@ class V2Agent implements AgentHandle, SessionConnection {
     return start;
   }
 
-  /**
-   * The query start of {@link startSession}. Its options are the client's
-   * `_meta.claudeCode.options` under the ones this core controls.
-   */
+  /** The query start of {@link startSession}: {@link openQuery}, then the session is active. */
   private async launchSession(
     sessionId: string,
     params: v2.NewSessionRequest | v2.ResumeSessionRequest | v2.ForkSessionRequest,
@@ -744,6 +808,50 @@ class V2Agent implements AgentHandle, SessionConnection {
     /** The resumed transcript, when the caller reads it anyway (a replay). */
     history?: Promise<SessionMessage[]>,
   ): Promise<V2Session> {
+    const {
+      session,
+      query: q,
+      config,
+      models,
+      ...opened
+    } = await this.openQuery(sessionId, params, resume, history);
+    session.reports.configure({
+      settings: opened.settings,
+      configuredSettings: opened.configured,
+      env: opened.env,
+      mcpServers: opened.request.mcpServers.map((server) => server.name),
+      mcpOAuth: this.elicitation.url && supportsMcpOAuth(q),
+      query: q,
+      model: { id: models.models.currentModelId, info: models.allowlistedModelInfo },
+    });
+    session.start(q, config, opened.mcpServers, resume !== undefined);
+    this.sessions.set(sessionId, session);
+    this.stopped.delete(sessionId);
+    // A route change during the start did not find this session live.
+    this.restarts.track(sessionId, params, {
+      staleRoute: this.auth.routeGeneration !== opened.routeGeneration,
+    });
+    return session;
+  }
+
+  /**
+   * Starts the query of a session and builds its config. Its options are the
+   * client's `_meta.claudeCode.options` under the ones this core controls.
+   * The session is not active yet, and nothing of it goes out. The caller
+   * closes the query and disposes the settings when it does not keep them.
+   *
+   * `resume`: the stored session that the query resumes, `sessionId` itself
+   * but for a `session/options` probe. Without `persist`, Claude Code stores
+   * nothing of the query (see {@link sessionOptions}).
+   */
+  private async openQuery(
+    sessionId: string,
+    params: v2.NewSessionRequest | v2.ResumeSessionRequest | v2.ForkSessionRequest,
+    resume: string | undefined,
+    /** The resumed transcript, when the caller reads it anyway (a replay). */
+    history?: Promise<SessionMessage[]>,
+    { persist = true } = {},
+  ) {
     const request = await validatedSetup(params);
     const client = clientOptions(params._meta);
     // After a provider change that is still listing its models.
@@ -892,6 +1000,7 @@ class V2Agent implements AgentHandle, SessionConnection {
         ...STARTUP_FAILURE_RESULTS_ENV,
       },
       ...(resume !== undefined ? { resume } : { sessionId }),
+      ...(persist ? {} : { persistSession: false }),
     };
     const q = query({ prompt: input, options });
     let initialization;
@@ -905,7 +1014,7 @@ class V2Agent implements AgentHandle, SessionConnection {
         error instanceof Error &&
         error.message.includes("No conversation found with session ID")
       ) {
-        throw RequestError.sessionNotFound(sessionId);
+        throw RequestError.sessionNotFound(resume);
       }
       throw startupFailureError(error) ?? error;
     }
@@ -967,23 +1076,18 @@ class V2Agent implements AgentHandle, SessionConnection {
       settings.dispose();
       throw error;
     }
-    session.reports.configure({
-      settings,
-      configuredSettings: configured,
-      env: options.env ?? {},
-      mcpServers: request.mcpServers.map((server) => server.name),
-      mcpOAuth: this.elicitation.url && supportsMcpOAuth(q),
+    return {
+      session,
       query: q,
-      model: { id: models.models.currentModelId, info: models.allowlistedModelInfo },
-    });
-    session.start(q, config, mcpServers, resume !== undefined);
-    this.sessions.set(sessionId, session);
-    this.stopped.delete(sessionId);
-    // A route change during the start did not find this session live.
-    this.restarts.track(sessionId, params, {
-      staleRoute: this.auth.routeGeneration !== routeGeneration,
-    });
-    return session;
+      config,
+      models,
+      settings,
+      configured,
+      env: options.env ?? {},
+      request,
+      mcpServers,
+      routeGeneration,
+    };
   }
 }
 
@@ -1016,6 +1120,15 @@ async function validatedSetup(
     }
   }
   return request;
+}
+
+/** A request of the active `session` names its `cwd`, as `session/resume` must. */
+function assertCwdOf(session: V2Session, cwd: string, action: string): void {
+  if (cwd === session.cwd) return;
+  throw RequestError.invalidParams(
+    { cwd },
+    `Session ${session.sessionId} works in ${session.cwd}: ${action} with that \`cwd\``,
+  );
 }
 
 function sameDirectories(left: readonly string[], right: readonly string[]): boolean {

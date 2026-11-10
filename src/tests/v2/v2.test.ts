@@ -496,6 +496,7 @@ describe("ACP v2 core", () => {
 
     expect(response.protocolVersion).toBe(2);
     expect(response.capabilities?.session?.fork).toEqual({});
+    expect(response.capabilities?.session?.options).toEqual({});
     expect(response.capabilities?.session?.prompt).toEqual({ image: {}, embeddedContext: {} });
     expect((response.authMethods ?? []).map((method) => method.methodId)).toContain(
       "console-login",
@@ -1810,6 +1811,234 @@ describe("ACP v2 core", () => {
     });
 
     expect(error).toMatchObject({ code: -32602 });
+  });
+
+  describe("session options", () => {
+    const STORED = "7f1c5b0e-3c53-4c0c-9d0a-0d6c1f0a2b11";
+    const values = (options: v2.SessionConfigOption[] | undefined) =>
+      Object.fromEntries((options ?? []).map((o) => [o.configId, o.currentValue]));
+    const initialize = (agent: v2.ClientContext) =>
+      agent.request(v2.methods.agent.initialize, {
+        protocolVersion: v2.PROTOCOL_VERSION,
+        info: { name: "v2-test-client", version: "1.0.0" },
+        capabilities: {},
+      });
+
+    beforeEach(() => {
+      sdk.models = [
+        {
+          value: "default",
+          displayName: "Default",
+          description: "Recommended",
+          supportsAutoMode: true,
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high"],
+        },
+        {
+          value: "haiku",
+          displayName: "Haiku",
+          description: "Fast",
+          supportsAutoMode: false,
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium"],
+        },
+      ];
+    });
+
+    it("answers session/options with what session/new returns, from a query that it closes", async () => {
+      const client = v2Client();
+      const { options, created } = await client.connect(async (agent) => {
+        await initialize(agent);
+        const options = await agent.request(v2.methods.agent.session.options, {
+          cwd,
+          additionalDirectories: ["/extra"],
+        });
+        const created = await agent.request(v2.methods.agent.session.new, { cwd });
+        return { options, created };
+      });
+
+      const [probe, session] = sdk.processes;
+      expect(probe.options).toMatchObject({
+        cwd,
+        additionalDirectories: ["/extra"],
+        mcpServers: {},
+        persistSession: false,
+      });
+      expect(probe.close).toHaveBeenCalledTimes(1);
+      expect(session.options.persistSession).toBeUndefined();
+      const { sessionId, ...fields } = created;
+      expect(sessionId).not.toBe(probe.options.sessionId);
+      expect(options).toEqual(fields);
+      expect(options.availableCommands?.map((command) => command.name)).toContain("review");
+      expect(client.notifications).toEqual([]);
+    });
+
+    it("answers session/options of an active session with its current options, without a query", async () => {
+      const client = v2Client();
+      const { options, configOptions, wrongCwd } = await client.connect(async (agent) => {
+        const { response } = await openSession(agent);
+        const { sessionId } = response;
+        const { configOptions } = await agent.request(v2.methods.agent.session.setConfigOption, {
+          sessionId,
+          configId: "model",
+          type: "id",
+          value: "haiku",
+        });
+        const options = await agent.request(v2.methods.agent.session.options, { cwd, sessionId });
+        const wrongCwd = await agent
+          .request(v2.methods.agent.session.options, { cwd: tempDir, sessionId })
+          .catch((error: unknown) => error);
+        return { options, configOptions, wrongCwd };
+      });
+
+      expect(sdk.processes).toHaveLength(1);
+      expect(options.configOptions).toEqual(configOptions);
+      expect(values(options.configOptions).model).toBe("haiku");
+      expect(wrongCwd).toMatchObject({ code: -32602 });
+    });
+
+    it("answers session/options of a stored session from a query that resumes it", async () => {
+      const client = v2Client();
+      const status = await client.connect(async (agent) => {
+        await initialize(agent);
+        await agent.request(v2.methods.agent.session.options, { cwd, sessionId: STORED });
+        return agent
+          .request(v2.methods.agent.session.status, { sessionId: STORED })
+          .catch((error: unknown) => error);
+      });
+
+      const [probe] = sdk.processes;
+      expect(probe.options).toMatchObject({ resume: STORED, persistSession: false });
+      expect(probe.options.sessionId).toBeUndefined();
+      expect(probe.close).toHaveBeenCalledTimes(1);
+      // The session is not active: it has no transcript in this test.
+      expect(status).toMatchObject({ code: -32002 });
+    });
+
+    it("fails session/options of an unknown session with -32002", async () => {
+      sdk.startFailure = new Error(`No conversation found with session ID: ${STORED}`);
+      const client = v2Client();
+      const error = await client.connect(async (agent) => {
+        await initialize(agent);
+        return agent
+          .request(v2.methods.agent.session.options, { cwd, sessionId: STORED })
+          .catch((error: unknown) => error);
+      });
+
+      expect(error).toMatchObject({ code: -32002, data: { sessionId: STORED } });
+      expect(sdk.processes[0].close).toHaveBeenCalled();
+    });
+
+    it("starts a new session with the request's configOptions, in list order, without an update", async () => {
+      const client = v2Client();
+      const response = await client.connect(async (agent) => {
+        await initialize(agent);
+        return agent.request(v2.methods.agent.session.new, {
+          cwd,
+          configOptions: [
+            // Skipped: an unknown option, a boolean for a select, and a value not offered.
+            { configId: "nope", type: "id", value: "x" },
+            { configId: "ultracode", type: "boolean", value: true },
+            { configId: "model", type: "id", value: "haiku" },
+            // Haiku offers no "high": the entry is checked against the options the model left.
+            { configId: "effort", type: "id", value: "high" },
+            { configId: "mode", type: "id", value: "plan" },
+          ],
+        });
+      });
+
+      const [claude] = sdk.processes;
+      expect(claude.setModel).toHaveBeenCalledWith("haiku");
+      expect(claude.setPermissionMode).toHaveBeenCalledWith("plan");
+      expect(values(response.configOptions)).toMatchObject({ model: "haiku", mode: "plan" });
+      expect(values(response.configOptions).effort).not.toBe("high");
+      expect(client.notifications).toEqual([]);
+    });
+
+    it.each<[string, v2.InitialSessionConfigOption[]]>([
+      [
+        "two entries of one configId",
+        [
+          { configId: "mode", type: "id", value: "plan" },
+          { configId: "mode", type: "id", value: "default" },
+        ],
+      ],
+      ["a value type it does not take", [{ configId: "mode", type: "_custom", value: 1 }]],
+    ])("rejects %s before it starts a query", async (_name, configOptions) => {
+      const client = v2Client();
+      const errors = await client.connect(async (agent) => {
+        await initialize(agent);
+        return Promise.all(
+          [
+            agent.request(v2.methods.agent.session.new, { cwd, configOptions }),
+            agent.request(v2.methods.agent.session.resume, {
+              sessionId: STORED,
+              cwd,
+              configOptions,
+            }),
+          ].map((request) => request.catch((error: unknown) => error)),
+        );
+      });
+
+      expect(errors).toEqual([
+        expect.objectContaining({ code: -32602 }),
+        expect.objectContaining({ code: -32602 }),
+      ]);
+      expect(sdk.processes).toHaveLength(0);
+    });
+
+    it("sets the configOptions of a session/resume on the session, an active one too", async () => {
+      const client = v2Client();
+      const { started, active } = await client.connect(async (agent) => {
+        await initialize(agent);
+        const resume = (configOptions: v2.InitialSessionConfigOption[]) =>
+          agent.request(v2.methods.agent.session.resume, { sessionId: STORED, cwd, configOptions });
+        const started = await resume([{ configId: "mode", type: "id", value: "plan" }]);
+        const active = await resume([{ configId: "model", type: "id", value: "haiku" }]);
+        return { started, active };
+      });
+
+      expect(sdk.processes).toHaveLength(1);
+      expect(values(started.configOptions).mode).toBe("plan");
+      expect(values(active.configOptions)).toMatchObject({ mode: "plan", model: "haiku" });
+      expect(client.sessionUpdates.map((update) => update.sessionUpdate)).not.toContain(
+        "config_option_update",
+      );
+    });
+
+    it("leaves the notice of an Auto mode fallback for the first prompt", async () => {
+      const client = v2Client();
+      const { response, before } = await client.connect(async (agent) => {
+        await initialize(agent);
+        const response = await agent.request(v2.methods.agent.session.new, {
+          cwd,
+          configOptions: [
+            { configId: "mode", type: "id", value: "auto" },
+            // Haiku cannot serve Auto.
+            { configId: "model", type: "id", value: "haiku" },
+          ],
+        });
+        const before = [...client.sessionUpdates];
+        const claude = sdk.processes[0];
+        const prompted = agent.request(v2.methods.agent.session.prompt, {
+          sessionId: response.sessionId,
+          prompt: PROMPT,
+        });
+        const prompt = await claude.prompt(0);
+        claude.send(lifecycle(prompt, "started"));
+        claude.send(echo(prompt));
+        claude.send(result());
+        claude.send(sessionState("idle"));
+        await prompted;
+        return { response, before };
+      });
+
+      expect(values(response.configOptions)).toMatchObject({ mode: "acceptEdits", model: "haiku" });
+      expect(before).toEqual([]);
+      expect(client.sessionUpdates.filter((update) => update.sessionUpdate === "notice")).toEqual([
+        expect.objectContaining({ title: "Auto mode unavailable" }),
+      ]);
+    });
   });
 
   it("rejects additional directories that are not absolute", async () => {

@@ -43,6 +43,7 @@ import type {
   Query,
   Settings,
 } from "@anthropic-ai/claude-agent-sdk";
+import { applyInitialConfigOptions } from "../initial-config-options.js";
 import type { Logger } from "../logger.js";
 import type { SubagentModels } from "../native-subagents.js";
 import { DEFAULT_AGENT_ID } from "../session-config-ids.js";
@@ -347,6 +348,19 @@ export class SessionConfig {
   }
 
   /**
+   * Sets the initial values of a setup request's `configOptions`, in list
+   * order, as {@link set} sets each one. An entry that the session refuses is
+   * skipped (`applyInitialConfigOptions`). Nothing goes out: the setup
+   * response carries the options, and the notice of an Auto mode fallback
+   * waits for the next prompt.
+   */
+  setInitial(entries: readonly v2.SetSessionConfigOptionRequest[]): Promise<void> {
+    return this.serialized(() =>
+      applyInitialConfigOptions(entries, (entry) => this.apply(entry, true), this.logger),
+    );
+  }
+
+  /**
    * Sets the choices of `previous`, the config of the query that this one
    * replaced (see `restarts.ts`), as the v1 core's `restoreSessionChoices`
    * does: the model, then the mode, which the model decides, and its
@@ -411,7 +425,11 @@ export class SessionConfig {
     return result;
   }
 
-  private async apply(params: v2.SetSessionConfigOptionRequest): Promise<void> {
+  /** `duringSetup`: see {@link setInitial}. */
+  private async apply(
+    params: v2.SetSessionConfigOptionRequest,
+    duringSetup = false,
+  ): Promise<void> {
     const request = v1SetSessionConfigOptionRequest(params);
     const option = this.session.configOptions.find((entry) => entry.id === request.configId);
     if (!option) {
@@ -429,11 +447,11 @@ export class SessionConfig {
     const value = selected.value;
     switch (request.configId) {
       case MODE_CONFIG_ID:
-        await this.applyMode(value as PermissionMode);
+        await this.applyMode(value as PermissionMode, duringSetup);
         return;
       case MODEL_CONFIG_ID:
         await this.session.query.setModel(value);
-        await this.recordModel(value);
+        await this.recordModel(value, duringSetup);
         return;
       case EFFORT_CONFIG_ID:
         // Applied first, so a rejected control request leaves the option as it was.
@@ -472,11 +490,17 @@ export class SessionConfig {
     return this.rules.effectiveMode(this.session, requested);
   }
 
-  private async applyMode(requested: PermissionMode): Promise<void> {
+  private async applyMode(requested: PermissionMode, duringSetup = false): Promise<void> {
     const mode = this.rules.effectiveMode(this.session, requested);
     await this.session.query.setPermissionMode(mode);
     this.rules.syncConfig(this.session, mode);
-    if (mode !== requested) await this.rules.publishFallbackWarning(this.sessionId, this.session);
+    if (mode !== requested) await this.warnOfFallback(duringSetup);
+  }
+
+  /** The notice of an Auto mode fallback: now, or with the next prompt during setup. */
+  private async warnOfFallback(duringSetup: boolean): Promise<void> {
+    if (duringSetup) this.rules.deferFallbackWarning(this.session);
+    else await this.rules.publishFallbackWarning(this.sessionId, this.session);
   }
 
   /** Claude Code switched the mode itself. Returns whether the option changed. */
@@ -606,7 +630,7 @@ export class SessionConfig {
    * show only on a model that supports them, with the user's retained
    * choice.
    */
-  private async recordModel(value: string): Promise<void> {
+  private async recordModel(value: string, duringSetup = false): Promise<void> {
     const info = this.modelInfos.find((model) => model.value === value);
     this.session.models = { ...this.session.models, currentModelId: value };
     const modeDowngraded = await this.rules.reconcileForModel(this.session, info);
@@ -664,7 +688,7 @@ export class SessionConfig {
         effort.error,
       );
     }
-    if (modeDowngraded) await this.rules.publishFallbackWarning(this.sessionId, this.session);
+    if (modeDowngraded) await this.warnOfFallback(duringSetup);
   }
 }
 

@@ -399,6 +399,7 @@ describe("ACP protocol routing", () => {
       additionalDirectories: {},
       systemPrompt: { mode: { override: {} } },
       status: {},
+      options: {},
       title: {},
     });
     expect(response.capabilities?.providers).toEqual({});
