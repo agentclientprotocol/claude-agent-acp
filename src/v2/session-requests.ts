@@ -19,8 +19,13 @@ import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import { V2_SESSION_CAPABILITIES } from "./initialize.js";
 import { v1ContentBlock } from "./prompt.js";
 
+/**
+ * Without `configOptions`: a client sends them only to an agent that
+ * advertises `session.options`, which this one does not.
+ */
 export function v1NewSessionRequest(params: v2.NewSessionRequest): NewSessionRequest {
-  const { mcpServers, systemPrompt, ...request } = params;
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { mcpServers, systemPrompt, configOptions, ...request } = params;
   // v1 requires the list; v2 treats an omitted list as an empty one.
   return {
     ...request,
