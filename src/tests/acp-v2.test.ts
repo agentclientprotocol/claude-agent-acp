@@ -23,6 +23,7 @@ import type { AuthStatusUpdateNotification } from "../auth-status.js";
 import { clientSupportsCompactionUpdates } from "../context-compaction.js";
 import { v2DiffContent } from "../diff.js";
 import { type AcpProtocols, acpProtocolRouter, acpProtocolsFromEnv } from "../serve.js";
+import { airCapabilityMeta } from "../air-extension.js";
 import { clientSupportsNotices } from "../session-notices.js";
 import { v1PermissionResponse, v2PermissionRequest } from "../v2/permission.js";
 import { v1PromptRequest } from "../v2/prompt.js";
@@ -38,6 +39,7 @@ import {
   v2ConfigOptions,
 } from "../v2/session.js";
 import { startupFailure } from "./helpers.js";
+import { validateV2Message } from "./acp-scenarios/schema.js";
 import packageJson from "../../package.json" with { type: "json" };
 
 const execFileSpy = vi.hoisted(() => vi.fn());
@@ -219,6 +221,9 @@ function v2Client({
       },
     )
     .onNotification(v2.methods.client.session.update, ({ params }) => {
+      expect(
+        validateV2Message({ kind: "notification", method: "session/update", payload: params }),
+      ).toEqual([]);
       sessionUpdates.push(params);
     })
     .onRequest(v2.methods.client.elicitation.create, ({ params, signal }) => {
@@ -271,6 +276,15 @@ async function initializeV2(agent: v2.ClientContext, capabilities: v2.ClientCapa
     capabilities,
   });
 }
+
+const AIR_TASK_CAPABILITIES: v2.ClientCapabilities = {
+  _meta: airCapabilityMeta(
+    "nativeSubagentSessions",
+    "asyncTasks",
+    "backgroundSubagents",
+    "sessionFailure",
+  ),
+};
 
 describe("ACP protocol routing", () => {
   it("serves the unchanged v1 handshake to a v1 client", async () => {
@@ -340,7 +354,7 @@ describe("ACP protocol routing", () => {
     }
   });
 
-  it("does not advertise the AIR async tasks and goal extensions to a v2 AIR client", async () => {
+  it("advertises the AIR async tasks extension on v2 and omits the unserved goal extension", async () => {
     const { app, authUpdate } = v2Client();
     const response = await app.connectWith(connectRouter(), async (agent) => {
       const response = await initializeV2(agent, {
@@ -350,10 +364,10 @@ describe("ACP protocol routing", () => {
       return response;
     });
 
-    // The v2 app registers neither `_session/async_task/stop` nor `_session/goal`.
+    // The v2 app serves `_session/async_task/stop`, but not `_session/goal`.
     const air = (response._meta as any)?.jetbrains?.air;
     expect(air.capabilities).toContain("sessionFailure");
-    expect(air.capabilities).not.toContain("asyncTasks");
+    expect(air.capabilities).toContain("asyncTasks");
     expect(air).not.toHaveProperty("goal");
   });
 
@@ -999,6 +1013,69 @@ describe("ACP v2 prompts", () => {
     });
   });
 
+  it.each([true, false])("keeps custom answers beside their questions for AIR=%s", async (air) => {
+    let answer: unknown;
+    scriptTurns(async function* (options) {
+      const input = {
+        questions: [false, true].map((multiSelect) => ({
+          question: multiSelect ? "Which features?" : "Which package?",
+          header: multiSelect ? "Features" : "Package",
+          options: [
+            { label: "core", description: "Core" },
+            { label: "cli", description: "CLI" },
+          ],
+          multiSelect,
+        })),
+      };
+      yield toolUseMessage(options, "toolu_question", "AskUserQuestion", input);
+      answer = await options.canUseTool!("AskUserQuestion", input, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "toolu_question",
+        requestId: randomUUID(),
+      } as Parameters<NonNullable<Options["canUseTool"]>>[2]);
+      yield toolResultMessage(options, "toolu_question", {});
+      yield result(options);
+    });
+    const client = v2Client({
+      answerElicitation: () => ({
+        action: "accept",
+        content: {
+          question_0: "core",
+          question_0_custom: "A note",
+          question_1_custom: "My feature",
+        },
+      }),
+    });
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent, {
+        elicitation: { form: {} },
+        ...(air ? { _meta: { jetbrains: { air: { version: 1, capabilities: [] } } } } : {}),
+      });
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("Ask me") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+    });
+
+    expect(client.elicitations).toHaveLength(1);
+    expect(client.elicitations[0]._meta).toEqual(
+      air
+        ? {
+            jetbrains: {
+              air: { version: 1, customAnswerFields: ["question_0_custom", "question_1_custom"] },
+            },
+          }
+        : undefined,
+    );
+    expect(answer).toMatchObject({
+      behavior: "allow",
+      updatedInput: {
+        answers: { "Which package?": "core", "Which features?": "My feature" },
+        annotations: { "Which package?": { notes: "A note" } },
+      },
+    });
+  });
+
   it("reports waiting on a question as requires_action", async () => {
     scriptTurns(async function* (options) {
       await options.onElicitation!(
@@ -1356,10 +1433,10 @@ describe("ACP v2 prompts", () => {
     });
   });
 
-  it("replays a subagent's history to its own session, and clears each replayed message there first", async () => {
+  it.each([false, true])("replays and clears the child history for AIR=%s", async (air) => {
     const client = v2Client();
     await client.app.connectWith(connectRouter(), async (agent) => {
-      await initializeV2(agent);
+      await initializeV2(agent, air ? AIR_TASK_CAPABILITIES : undefined);
       const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
       // Claude Code keeps the subagent's history in its own transcript, beside
       // the session's, with a metadata file that names its launch.
@@ -1427,25 +1504,29 @@ describe("ACP v2 prompts", () => {
         sessionId: "response",
         update: { sessionUpdate: "response" },
       } as never);
-      await vi.waitFor(() =>
-        expect(
-          client.sessionUpdates.filter(
-            ({ sessionId, update }) =>
-              sessionId === "abc123" && update.sessionUpdate === "state_update",
-          ),
-        ).toHaveLength(2),
-      );
+      if (!air) {
+        await vi.waitFor(() =>
+          expect(
+            client.sessionUpdates.filter(
+              ({ sessionId, update }) =>
+                sessionId === "abc123" && update.sessionUpdate === "state_update",
+            ),
+          ).toHaveLength(2),
+        );
+      }
       await client.authUpdate(1);
     });
 
+    const spawn = client.sessionUpdates.find(
+      ({ update }) => update.sessionUpdate === (air ? "_subagent_update" : "subagent_update"),
+    )?.update as { sessionId?: string; subagentSessionId?: string } | undefined;
+    const childSessionId = air ? spawn?.subagentSessionId : spawn?.sessionId;
+    expect(childSessionId).toBeDefined();
     const child = client.sessionUpdates.flatMap(({ sessionId, update }) =>
-      sessionId === "abc123" || sessionId === "response" ? [update] : [],
+      sessionId === childSessionId || sessionId === "response" ? [update] : [],
     );
-    // The child's past `running` does not replay; its last state goes once,
-    // after the replay. That state is history to the client, so the child's
-    // current state follows the response: its process is gone, so it is idle.
-    // The child's model, from its transcript, goes right after its
-    // announcement. It does not go again after the response: it is unchanged.
+    // The RFD form sends the child's idle state before and after the response.
+    // AIR sends the child's terminal state to its parent instead.
     const model = expect.objectContaining({
       sessionUpdate: "config_option_update",
       configOptions: [
@@ -1453,8 +1534,23 @@ describe("ACP v2 prompts", () => {
       ],
     });
     expect(child).toEqual([
-      model,
-      expect.objectContaining({ sessionUpdate: "session_message", content: text("Look around") }),
+      ...(air
+        ? [
+            { sessionUpdate: "user_message", messageId: "c1", content: [] },
+            expect.objectContaining({
+              sessionUpdate: "user_message_chunk",
+              messageId: "c1",
+              content: text("Look around")[0],
+            }),
+            model,
+          ]
+        : [
+            model,
+            expect.objectContaining({
+              sessionUpdate: "session_message",
+              content: text("Look around"),
+            }),
+          ]),
       // The client may still hold the child's message, so the replay clears it.
       { sessionUpdate: "agent_message", messageId: "msg_child", content: [] },
       expect.objectContaining({
@@ -1462,10 +1558,35 @@ describe("ACP v2 prompts", () => {
         messageId: "msg_child",
         content: text("Child report.")[0],
       }),
-      { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn", background: [] },
+      ...(air
+        ? []
+        : [
+            {
+              sessionUpdate: "state_update",
+              state: "idle",
+              stopReason: "end_turn",
+              background: [],
+            },
+          ]),
       { sessionUpdate: "response" },
-      { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn", background: [] },
+      ...(air
+        ? []
+        : [
+            {
+              sessionUpdate: "state_update",
+              state: "idle",
+              stopReason: "end_turn",
+              background: [],
+            },
+          ]),
     ]);
+    if (air) {
+      expect(client.updates("_subagent_update")).toContainEqual({
+        sessionUpdate: "_subagent_update",
+        subagentSessionId: childSessionId,
+        state: "completed",
+      });
+    }
     // The current state on the parent grants nothing: the child cannot run again here.
     expect(
       client.sessionUpdates.filter(
@@ -4322,6 +4443,71 @@ describe("ACP v2 requests that subagents make", () => {
     });
   }
 
+  it("runs two AIR subagents and keeps their output in their own sessions", async () => {
+    scriptTurns(async function* (options) {
+      for (const id of ["agent-1", "agent-2"]) {
+        yield toolUseMessage(options, `toolu_${id}`, "Agent", {
+          description: `Explore ${id}`,
+          prompt: `Look around ${id}`,
+          subagent_type: "Explore",
+        });
+        yield taskStarted(options, id, { prompt: `Look around ${id}`, task_type: "local_agent" });
+      }
+      for (const id of ["agent-1", "agent-2"]) {
+        yield {
+          ...assistantText(options, `Report ${id}`, `msg_${id}`),
+          parent_tool_use_id: `toolu_${id}`,
+        };
+        yield toolResultMessage(options, `toolu_${id}`, { content: `Report ${id}` });
+        yield {
+          type: "system",
+          subtype: "task_notification",
+          task_id: id,
+          status: "completed",
+          summary: `Report ${id}`,
+          tool_use_id: `toolu_${id}`,
+          output_file: "",
+          uuid: randomUUID(),
+          session_id: options.sessionId,
+        };
+      }
+      yield assistantText(options, "Both reports arrived.");
+      yield result(options);
+      yield idleState(options);
+    });
+    const client = await promptToIdle(v2Client(), AIR_TASK_CAPABILITIES);
+    for (const id of ["agent-1", "agent-2"]) {
+      expect(client.sessionUpdates).toContainEqual(
+        expect.objectContaining({
+          update: expect.objectContaining({
+            sessionUpdate: "_subagent_update",
+            subagentSessionId: id,
+            prompt: `Look around ${id}`,
+          }),
+        }),
+      );
+      expect(client.sessionUpdates).toContainEqual(
+        expect.objectContaining({
+          update: expect.objectContaining({
+            sessionUpdate: "_subagent_update",
+            subagentSessionId: id,
+            state: "completed",
+          }),
+        }),
+      );
+      expect(client.sessionUpdates).toContainEqual({
+        sessionId: id,
+        update: expect.objectContaining({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: `Report ${id}` },
+        }),
+      });
+    }
+    expect(client.updates("state_update").at(-1)?._meta).not.toHaveProperty(
+      "jetbrains.air.sessionFailure",
+    );
+  });
+
   it("reports a subagent as a child session, with its work state also on the child's stream", async () => {
     scriptTurns(async function* (options) {
       yield {
@@ -6696,7 +6882,102 @@ describe("ACP v2 terminal of a command in the background", () => {
   });
 });
 
+describe("ACP v2 AIR task control", () => {
+  it("stops a background command through the AIR extension", async () => {
+    const stopped = Promise.withResolvers<string>();
+    sdk.stopTask = async (id) => {
+      stopped.resolve(id);
+    };
+    scriptTurns(async function* (options) {
+      yield toolUseMessage(options, "toolu_bg", "Bash", {
+        command: "sleep 60",
+        run_in_background: true,
+      });
+      yield {
+        type: "system",
+        subtype: "task_started",
+        task_id: "bash_1",
+        task_type: "local_bash",
+        description: "sleep 60",
+        tool_use_id: "toolu_bg",
+        is_backgrounded: true,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield toolResultMessage(options, "toolu_bg", {
+        content: "Command running in background with ID: bash_1.",
+      });
+      yield result(options);
+      yield idleState(options);
+      await stopped.promise;
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent, AIR_TASK_CAPABILITIES);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("Run in background"),
+      });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      expect(client.sessionUpdates).toContainEqual({
+        sessionId,
+        update: expect.objectContaining({
+          sessionUpdate: "_async_task_spawned",
+          asyncTaskId: "bash_1",
+          canStop: true,
+        }),
+      });
+      await expect(
+        agent.request("_session/async_task/stop", { sessionId, asyncTaskId: "bash_1" }),
+      ).resolves.toEqual({ stopped: true });
+      await expect(stopped.promise).resolves.toBe("bash_1");
+      expect(client.sessionUpdates).toContainEqual({
+        sessionId,
+        update: expect.objectContaining({
+          sessionUpdate: "_async_task_state_update",
+          asyncTaskId: "bash_1",
+          state: "stopped",
+        }),
+      });
+      await expect(
+        agent.request("_session/async_task/stop", { sessionId, asyncTaskId: "bash_1" }),
+      ).resolves.toEqual({ stopped: false });
+    });
+  });
+
+  it.each([null, {}, { sessionId: "s", asyncTaskId: " " }])(
+    "rejects invalid task stop params: %j",
+    async (params) => {
+      await v2Client().app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent, AIR_TASK_CAPABILITIES);
+        await expect(agent.request("_session/async_task/stop", params)).rejects.toMatchObject({
+          code: -32602,
+        });
+      });
+    },
+  );
+});
+
 describe("ACP v2 session translation", () => {
+  it.each([
+    "subagent_spawned",
+    "subagent_state_update",
+    "async_task_spawned",
+    "async_task_progress",
+    "async_task_state_update",
+  ])("rejects the unprefixed extension tag %s", (sessionUpdate) => {
+    expect(
+      validateV2Message({
+        kind: "notification",
+        method: "session/update",
+        payload: { sessionId: "s", update: { sessionUpdate } },
+      }),
+    ).toEqual([
+      `notification session/update has an unknown unprefixed sessionUpdate '${sessionUpdate}'`,
+    ]);
+  });
+
   it("renames the group id of grouped select options", () => {
     expect(
       v2ConfigOptions([
@@ -6757,11 +7038,9 @@ describe("ACP v2 session translation", () => {
   it("fails on session updates that it does not translate yet", () => {
     expect(() =>
       v2SessionUpdate({
-        sessionUpdate: "subagent_state_update",
-        subagentSessionId: "agent_n",
-        state: "failed",
-      }),
-    ).toThrow("does not translate subagent_state_update session updates yet");
+        sessionUpdate: "_unsupported",
+      } as never),
+    ).toThrow("does not translate _unsupported session updates yet");
   });
 
   it("passes the subagent updates through, which v1 and v2 share", () => {

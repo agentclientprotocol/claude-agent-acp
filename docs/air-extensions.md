@@ -196,6 +196,7 @@ The adapter sends these keys only to an AIR client. "AIR" in the Gate column mea
 | `mcp`                          | MCP tool call `_meta.jetbrains.air`                                                   | `{server, tool}`                                                       | AIR                                                                                    |
 | `contextCompaction`            | compaction tool call or `compaction_update`, `_meta.jetbrains.air`                    | `{version: 1, trigger?, preTokens?, postTokens?, durationMs?, error?}` | AIR                                                                                    |
 | `customAnswer`                 | elicitation schema property `_meta.jetbrains.air`                                     | `{questionId, isCustomAnswer: true}`                                   | AIR, when the client supports form elicitation                                         |
+| `customAnswerFields`           | elicitation request `_meta.jetbrains.air`                                             | companion field keys                                                   | AIR on ACP v2, when the client supports form elicitation                               |
 | `kind`                         | session mode `_meta.jetbrains.air` and mode config option value `_meta.jetbrains.air` | `standard`, `plan`, `auto_review`, or `full_access`                    | AIR                                                                                    |
 | `kind`                         | available command `_meta.jetbrains.air` of a skill                                    | `skill`                                                                | AIR, when the skill's `SKILL.md` is found; not for a built-in command or an MCP prompt |
 | `skillPath`                    | available command `_meta.jetbrains.air` of a skill                                    | absolute path of the skill's `SKILL.md`                                | AIR, together with `kind: "skill"`                                                     |
@@ -1276,6 +1277,11 @@ This section covers only the AIR bridge.
 - Either signal enables native subagent sessions, and AIR gets this earlier draft of the RFD whichever it declares.
 - The agent advertises `nativeSubagentSessions` and `agentCapabilities.sessionCapabilities.subagents` to AIR.
 - A client that is not AIR and declares `clientCapabilities.subagents` gets the revised RFD instead (`subagent_update`, `session_message`), see the README.
+- The AIR subagent and async task extensions work on ACP v1 and ACP v2.
+  ACP v2 uses `_subagent_update` for both subagent updates.
+  It uses `_async_task_spawned`, `_async_task_progress`, and `_async_task_state_update` for task updates.
+  The payload fields stay the same.
+  ACP v2 also serves `_session/async_task/stop` and advertises `asyncTasks`.
 - With native sessions, the adapter sends `subagent_spawned` and `subagent_state_update`.
   The child output goes to the child session. The Agent or Task tool call is not the subagent card.
 - `subagent_spawned` can carry an optional `prompt`: the exact prompt of the child session.
@@ -1702,7 +1708,7 @@ The `compaction_update` form carries no `_meta`.
 Without form elicitation support, the adapter disables the tool when it creates the Claude session.
 
 Each question gets a select field and a companion text field named `Other`.
-For AIR, the companion field carries `_meta.jetbrains.air.customAnswer`:
+For AIR on both ACP versions, the companion field carries `_meta.jetbrains.air.customAnswer`:
 
 ```json
 { "questionId": "<select field key>", "isCustomAnswer": true }
@@ -1714,6 +1720,19 @@ A client can render the companion as the free-text choice of that question.
 For AIR, the companion field also carries the same value under the root key `_meta._askUserQuestionCustomAnswer`.
 Released AIR versions read only that key.
 A client that is not AIR gets neither key.
+
+On ACP v2, the request also lists the companion field keys in `_meta.jetbrains.air.customAnswerFields`:
+
+```json
+{ "jetbrains": { "air": { "version": 1, "customAnswerFields": ["question_0_custom"] } } }
+```
+
+The TypeScript SDK retains property `_meta` on both protocol versions.
+Some AIR clients use Kotlin v2 property models that omit this metadata.
+These clients read the request list to show the companion with its question.
+The adapter retains both property markers for clients that can read them.
+The field keys and the response content stay the same in both versions.
+A client that is not AIR gets no `customAnswerFields` key.
 
 ## Load replay end
 

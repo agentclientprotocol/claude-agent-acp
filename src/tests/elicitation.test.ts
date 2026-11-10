@@ -16,6 +16,7 @@ import {
   refusalFallbackResultFromResponse,
   refusalFallbackToCreateRequest,
 } from "../elicitation.js";
+import { v2ElicitationRequest } from "../v2/elicitation.js";
 
 const SESSION_ID = "session-1";
 
@@ -708,5 +709,60 @@ describe("refusalFallbackResultFromResponse", () => {
     for (const response of cases) {
       expect(refusalFallbackResultFromResponse(response)).toBe("cancelled");
     }
+  });
+});
+
+describe("v2ElicitationRequest", () => {
+  it.each([
+    [{ jetbrains: { air: { customAnswer: true } } }, true],
+    [
+      { jetbrains: { air: { customAnswer: { questionId: "choice", isCustomAnswer: true } } } },
+      true,
+    ],
+    [{ _askUserQuestionCustomAnswer: true }, true],
+    [{ _askUserQuestionCustomAnswer: { questionId: "choice", isCustomAnswer: true } }, true],
+    [{ jetbrains: { air: { customAnswer: false } }, _askUserQuestionCustomAnswer: true }, false],
+    [{ jetbrains: { air: { customAnswer: {} } } }, false],
+    [{ _askUserQuestionCustomAnswer: false }, false],
+    [{ customAnswer: true }, false],
+    [undefined, false],
+  ] as const)("preserves companion markers and request metadata: %j", (meta, marked) => {
+    const requestMeta = {
+      claudeCode: { origin: "tool" },
+      jetbrains: { other: true, air: { version: 1, existing: true } },
+    };
+    const request: CreateElicitationRequest = {
+      sessionId: SESSION_ID,
+      mode: "form",
+      message: "Choose",
+      _meta: requestMeta,
+      requestedSchema: { type: "object", properties: { note: { type: "string", _meta: meta } } },
+    };
+    const converted = v2ElicitationRequest(request);
+    expect(converted._meta).toEqual(
+      marked
+        ? {
+            ...requestMeta,
+            jetbrains: {
+              other: true,
+              air: { version: 1, existing: true, customAnswerFields: ["note"] },
+            },
+          }
+        : requestMeta,
+    );
+    expect(request._meta).toBe(requestMeta);
+    expect(converted).toMatchObject({ requestedSchema: request.requestedSchema });
+    if (!marked) expect(converted).toBe(request);
+  });
+
+  it("keeps URL requests unchanged", () => {
+    const request: CreateElicitationRequest = {
+      sessionId: SESSION_ID,
+      mode: "url",
+      message: "Sign in",
+      url: "https://example.com",
+      elicitationId: "login",
+    };
+    expect(v2ElicitationRequest(request)).toBe(request);
   });
 });

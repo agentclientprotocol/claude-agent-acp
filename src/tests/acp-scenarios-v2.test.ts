@@ -22,6 +22,10 @@ import { fileURLToPath } from "node:url";
 import type { ClaudeAcpAgent } from "../acp-agent.js";
 import {
   resetIds,
+  PROFILES,
+  assistantTurn,
+  result,
+  type Scenario,
   runScenarioV2,
   type ScenarioRunV2,
   type WireRecorded,
@@ -29,6 +33,7 @@ import {
 import { SCENARIOS } from "./acp-scenarios/scenarios.js";
 import { canonical } from "./acp-scenarios/compare.js";
 import { validateV2Message } from "./acp-scenarios/schema.js";
+import { airExtensionMeta } from "../air-extension.js";
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@anthropic-ai/claude-agent-sdk")>();
@@ -83,26 +88,28 @@ beforeAll(async () => {
   vi.stubEnv("CLAUDE_CODE_EXECUTABLE", "/usr/bin/false");
   configDir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-scenario-config-"));
   vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
-  const { acpProtocolRouter } = await import("../serve.js");
-  for (const scenario of SCENARIOS) {
-    resetIds();
-    const agents: ClaudeAcpAgent[] = [];
-    const quiet = { log: () => {}, error: () => {} };
-    runs.set(
-      scenario.name,
-      await runScenarioV2(
-        (stream) => acpProtocolRouter(quiet, (agent) => agents.push(agent)).connect(stream),
-        scenario,
-      ),
-    );
-    await Promise.all(agents.map((agent) => agent.dispose()));
-  }
+  for (const scenario of SCENARIOS) runs.set(scenario.name, await runV2(scenario));
 }, 120_000);
 
 afterAll(() => {
   vi.unstubAllEnvs();
   fs.rmSync(configDir, { recursive: true, force: true });
 });
+
+async function runV2(scenario: Scenario): Promise<ScenarioRunV2> {
+  resetIds();
+  const agents: ClaudeAcpAgent[] = [];
+  const { acpProtocolRouter } = await import("../serve.js");
+  const quiet = { log: () => {}, error: () => {} };
+  try {
+    return await runScenarioV2(
+      (stream) => acpProtocolRouter(quiet, (agent) => agents.push(agent)).connect(stream),
+      scenario,
+    );
+  } finally {
+    await Promise.all(agents.map((agent) => agent.dispose()));
+  }
+}
 
 function run(scenario: string): ScenarioRunV2 {
   const recorded = runs.get(scenario);
@@ -168,5 +175,60 @@ describe("ACP v2 scenarios", () => {
         path.join(here, "acp-scenarios", "__snapshots__", "v2", `${scenario}.jsonl`),
       );
     });
+  });
+});
+
+describe("AIR task scenarios on ACP v2", () => {
+  it.each([
+    "subagent-native-sessions",
+    "subagent-agent-async",
+    "subagent-nested",
+    "subagent-late-child-update",
+    "bash-background",
+    "async-task-held-until-tool-id",
+    "async-task-ends-before-tool-id",
+    "async-task-released-at-turn-end",
+  ])("%s keeps the session usable", async (name) => {
+    const scenario = SCENARIOS.find((scenario) => scenario.name === name)!;
+    const recorded = await runV2({
+      ...scenario,
+      capabilities: {
+        ...scenario.capabilities,
+        _meta: {
+          ...scenario.capabilities?._meta,
+          ...PROFILES.air.capabilities._meta,
+        },
+      },
+      turns: [
+        ...scenario.turns,
+        async function* () {
+          yield* assistantTurn("msg_followup", [{ type: "text", text: "Follow-up worked." }]);
+          yield result();
+        },
+      ],
+    });
+    const updates = recorded.raw.flatMap((message) =>
+      message.kind === "notification" && message.method === "session/update"
+        ? [(message.payload as { update: Record<string, unknown> }).update]
+        : [],
+    );
+    expect(recorded.status).toBe(PASSES);
+    expect(
+      updates.flatMap((update) => airExtensionMeta(update._meta)?.sessionFailure ?? []),
+    ).toEqual([]);
+    expect(updates).toContainEqual(
+      expect.objectContaining({
+        sessionUpdate: name.startsWith("subagent") ? "_subagent_update" : "_async_task_spawned",
+      }),
+    );
+    const followup = updates
+      .filter(
+        (update) =>
+          update.sessionUpdate === "agent_message_chunk" && update.messageId === "msg_followup",
+      )
+      .map((update) => (update.content as { text: string }).text)
+      .join("");
+    expect(followup).toBe("Follow-up worked.");
+    expect(recorded.raw.flatMap(validateV2Message)).toEqual([]);
   });
 });

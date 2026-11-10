@@ -165,6 +165,10 @@ import type {
   ListUnsubscribeRequest,
 } from "./session-index/list-subscriptions.js";
 import {
+  ASYNC_TASK_STOP_METHOD,
+  type AsyncTaskStopRequest,
+  type AsyncTaskStopResponse,
+  parseAsyncTaskStopRequest,
   AsyncTaskRuntime,
   backgroundBashTaskFromToolResult,
   backgroundedBashToolCallIds,
@@ -708,40 +712,6 @@ const TURN_NO_RESULT_MESSAGE =
  *  agreed ACP steering wire protocol; advertised to clients via the top-level
  *  `InitializeResponse._meta.steering.supported`. */
 const STEER_METHOD = "_session/steering";
-
-/** Stops one Claude background task without cancelling the parent prompt turn. */
-const ASYNC_TASK_STOP_METHOD = "_session/async_task/stop";
-
-type AsyncTaskStopRequest = {
-  sessionId: string;
-  asyncTaskId: string;
-};
-
-type AsyncTaskStopResponse = {
-  stopped: boolean;
-};
-
-function parseAsyncTaskStopRequest(value: unknown): AsyncTaskStopRequest {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw RequestError.invalidParams(undefined, "async task stop params must be an object");
-  }
-  const params = value as Record<string, unknown>;
-  const sessionId = typeof params.sessionId === "string" ? params.sessionId.trim() : "";
-  const asyncTaskId = typeof params.asyncTaskId === "string" ? params.asyncTaskId.trim() : "";
-  if (!sessionId) {
-    throw RequestError.invalidParams(
-      undefined,
-      "async task stop params require a non-empty sessionId",
-    );
-  }
-  if (!asyncTaskId) {
-    throw RequestError.invalidParams(
-      undefined,
-      "async task stop params require a non-empty asyncTaskId",
-    );
-  }
-  return { sessionId, asyncTaskId };
-}
 
 /** How urgently the SDK delivers a steered message relative to the running
  *  turn — an internal Claude implementation detail, not part of the wire

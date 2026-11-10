@@ -12,6 +12,7 @@
  * This file defines the unsigned integer formats of the ACP schema.
  */
 import { createRequire } from "node:module";
+import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 // The named exports load under the ESM build of TypeScript. The default
 // exports of these CommonJS modules are not constructable or callable there.
 import { Ajv2020, type ValidateFunction } from "ajv/dist/2020.js";
@@ -174,6 +175,12 @@ export function validateV2Message(message: WireRecorded): string[] {
     return Number.isInteger(code) && typeof text === "string"
       ? []
       : [`${label} is not a JSON-RPC error`];
+  }
+  if (message.kind === "notification" && message.method === "session/update") {
+    const update = (message.payload as v2.UpdateSessionNotification).update;
+    if (v2.SessionUpdate.isCustom(update) && !update.sessionUpdate.startsWith("_")) {
+      return [`${label} has an unknown unprefixed sessionUpdate '${update.sessionUpdate}'`];
+    }
   }
   const definition = v2Definition(message);
   let validate = v2Validators.get(definition);

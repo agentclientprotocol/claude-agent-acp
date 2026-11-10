@@ -18,7 +18,14 @@ import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import { ClaudeAcpAgent, type AcpClient, type Logger } from "../acp-agent.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import type { AcpPermissionRequest } from "../permissions/presentation.js";
+import {
+  ASYNC_TASK_STOP_METHOD,
+  type AsyncTaskStopRequest,
+  type AsyncTaskStopResponse,
+  parseAsyncTaskStopRequest,
+} from "../async-tasks.js";
 import { stateUpdate, V2Background } from "./background.js";
+import { v2ElicitationRequest } from "./elicitation.js";
 import { v1InitializeRequest, v2InitializeResponse } from "./initialize.js";
 import { v1PermissionResponse, v2PermissionRequest } from "./permission.js";
 import { v2Foreground, v2Prompt } from "./prompt.js";
@@ -185,6 +192,11 @@ export function v2AgentApp(
       await agent.cancelBackgroundToolCall(params);
       return {};
     })
+    .onRequest<AsyncTaskStopRequest, AsyncTaskStopResponse>(
+      ASYNC_TASK_STOP_METHOD,
+      { parse: parseAsyncTaskStopRequest },
+      ({ params }) => agent.stopAsyncTask(params),
+    )
     .onNotification(v2.methods.agent.session.cancel, ({ params }) => agent.cancel(params));
 }
 
@@ -339,14 +351,20 @@ class V2ClientConnection implements AcpClient {
   async sessionUpdate({ update, ...notification }: AcpSessionNotification): Promise<void> {
     // A subagent that a replay announces replays too, so its messages are
     // cleared before their first replayed chunk, as the parent's are.
+    const childSessionId =
+      update.sessionUpdate === "subagent_update"
+        ? update.sessionId
+        : update.sessionUpdate === "subagent_spawned"
+          ? update.subagentSessionId
+          : undefined;
     if (
-      update.sessionUpdate === "subagent_update" &&
+      childSessionId &&
       this.replays.has(notification.sessionId) &&
-      !this.replays.has(update.sessionId)
+      !this.replays.has(childSessionId)
     ) {
-      this.replays.set(update.sessionId, new Set());
+      this.replays.set(childSessionId, new Set());
       this.replayRoots.set(
-        update.sessionId,
+        childSessionId,
         this.replayRoots.get(notification.sessionId) ?? notification.sessionId,
       );
     }
@@ -442,19 +460,14 @@ class V2ClientConnection implements AcpClient {
     return v1PermissionResponse(response);
   }
 
-  // Elicitation is the same in v1 and v2.
   createElicitation(
     params: CreateElicitationRequest,
     signal?: AbortSignal,
   ): Promise<CreateElicitationResponse> {
-    return this.ctx.request(
-      v2.methods.client.elicitation.create,
-      // The v1 types accept a property schema with any tag; the v2 types accept
-      // one only in a received value. As on v1, an MCP server's schema is
-      // relayed here unchanged, so this cast does not check it.
-      params as v2.CreateElicitationRequest,
-      { cancellationSignal: signal, stopWaitingOnCancel: true },
-    );
+    return this.ctx.request(v2.methods.client.elicitation.create, v2ElicitationRequest(params), {
+      cancellationSignal: signal,
+      stopWaitingOnCancel: true,
+    });
   }
 
   completeElicitation(params: CompleteElicitationNotification): Promise<void> {

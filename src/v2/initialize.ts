@@ -14,7 +14,7 @@ import {
   type InitializeResponse,
 } from "@agentclientprotocol/sdk/unstable";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
-import { AIR_ASYNC_TASKS_CAPABILITY, AIR_GOAL_KEY } from "../air-extension.js";
+import { AIR_GOAL_KEY } from "../air-extension.js";
 import { SYSTEM_PROMPT_CAPABILITY } from "../client-system-prompt.js";
 
 /** The v1 `initialize` request that a v2 client means. */
@@ -100,19 +100,13 @@ export function v2InitializeResponse(response: InitializeResponse): v2.Initializ
 
 /**
  * `meta` without the AIR extensions whose methods the v2 surface does not
- * register: the `asyncTasks` capability (`_session/async_task/stop`) and the
- * `goal` entry (`_session/goal`) of `_meta.jetbrains.air`.
+ * register: the `goal` entry (`_session/goal`) of `_meta.jetbrains.air`.
  */
 function withoutUnservedAirExtensions(meta: Record<string, unknown>): Record<string, unknown> {
   const jetbrains = asRecord(meta.jetbrains);
   const air = asRecord(jetbrains.air);
   if (Object.keys(air).length === 0) return meta;
   const served = Object.fromEntries(Object.entries(air).filter(([key]) => key !== AIR_GOAL_KEY));
-  if (Array.isArray(served.capabilities)) {
-    served.capabilities = served.capabilities.filter(
-      (capability) => capability !== AIR_ASYNC_TASKS_CAPABILITY,
-    );
-  }
   return { ...meta, jetbrains: { ...jetbrains, air: served } };
 }
 
