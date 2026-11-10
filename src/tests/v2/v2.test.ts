@@ -528,6 +528,53 @@ describe("ACP v2 core", () => {
         baseUrl: "https://gateway.example.com",
       });
 
+    it.each([{ listing: [] }, { listing: ["gpt-5"] }])(
+      "rejects an incompatible provider listing %j before a prompt and recovers",
+      async ({ listing }) => {
+        sdk.models = [
+          {
+            value: "sonnet",
+            displayName: "Sonnet",
+            description: "",
+            resolvedModel: "claude-sonnet-5-5",
+          },
+        ];
+        const client = v2Client();
+        await client.connect(async (agent) => {
+          await agent.request(v2.methods.agent.initialize, {
+            protocolVersion: v2.PROTOCOL_VERSION,
+            info: { name: "v2-test-client", version: "1" },
+          });
+          vi.mocked(fetch).mockResolvedValueOnce(
+            Response.json({ data: listing.map((id) => ({ id })) }),
+          );
+          await setProvider(agent);
+          await expect(agent.request(v2.methods.agent.session.new, { cwd })).rejects.toMatchObject({
+            code: -32603,
+            message: expect.stringContaining(
+              "The selected provider offers no compatible Claude models.",
+            ),
+          });
+          expect(sdk.processes[0].close).toHaveBeenCalledOnce();
+          expect(sdk.processes[0].prompts).toEqual([]);
+          vi.mocked(fetch).mockResolvedValueOnce(
+            Response.json({ data: [{ id: "claude-sonnet-5-5" }] }),
+          );
+          await agent.request(v2.methods.agent.providers.set, {
+            providerId: "main",
+            apiType: "anthropic",
+            baseUrl: "https://recovered.example.com",
+          });
+          const response = await agent.request(v2.methods.agent.session.new, { cwd });
+          expect(
+            response.configOptions?.find((option) => option.configId === "model"),
+          ).toMatchObject({
+            options: [expect.objectContaining({ value: "sonnet" })],
+          });
+        });
+      },
+    );
+
     it("answers at once while a background subagent runs, and restarts the session once it ends", async () => {
       const client = v2Client();
       await client.connect(async (agent) => {
