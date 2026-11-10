@@ -1,5 +1,6 @@
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
-import { v1AgentApp, type ClaudeAcpAgent, type Logger } from "./acp-agent.js";
+import { v1AgentApp, type ClaudeAcpAgent } from "./acp-agent.js";
+import type { Logger } from "./logger.js";
 import { nodeToWebReadable, nodeToWebWritable } from "./utils.js";
 import { v2AgentApp, type AgentHandle } from "./v2/agent.js";
 

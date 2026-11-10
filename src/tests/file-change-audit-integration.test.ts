@@ -3,7 +3,8 @@ import type { SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import type { AcpClient } from "../acp-client.js";
 import {
   AGENT_FILE_CHANGE_REPORT_CAPABILITY,
   type AgentFileChangeReportResult,

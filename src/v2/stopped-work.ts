@@ -26,7 +26,7 @@ import type {
   SDKPartialAssistantMessage,
   SDKResultMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { isAbortedResult } from "../acp-agent.js";
+import { isAbortedResult } from "../result-end.js";
 
 /**
  * How long `canUseTool` waits, after a cancel, for the session to read the

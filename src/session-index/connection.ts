@@ -17,7 +17,9 @@ import {
   type ListSessionsResponse,
 } from "@agentclientprotocol/sdk/unstable";
 import type { Query } from "@anthropic-ai/claude-agent-sdk";
-import type { AcpClient, Logger, Session } from "../acp-agent.js";
+import type { Session } from "../acp-agent.js";
+import type { AcpClient } from "../acp-client.js";
+import type { Logger } from "../logger.js";
 import {
   AIR_SESSION_ARCHIVE_CAPABILITY,
   AIR_SESSION_BATCH_GET_CAPABILITY,

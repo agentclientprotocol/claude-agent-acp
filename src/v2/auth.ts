@@ -18,7 +18,7 @@ import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { AccountInfo, ModelInfo, Settings } from "@anthropic-ai/claude-agent-sdk";
 import type { AuthStatusKind } from "../auth-status.js";
-import type { Logger } from "../acp-agent.js";
+import type { Logger } from "../logger.js";
 import { terminalAuthMethods } from "../auth-methods.js";
 import {
   AUTH_STATUS_UPDATE_METHOD,

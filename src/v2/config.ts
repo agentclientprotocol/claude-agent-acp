@@ -43,7 +43,7 @@ import type {
   Query,
   Settings,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { Logger } from "../acp-agent.js";
+import type { Logger } from "../logger.js";
 import type { SubagentModels } from "../native-subagents.js";
 import { DEFAULT_AGENT_ID } from "../session-config-ids.js";
 import {

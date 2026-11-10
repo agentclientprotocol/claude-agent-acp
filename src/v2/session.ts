@@ -51,7 +51,9 @@ import type {
   SDKResultMessage,
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { AUTONOMOUS_RESULT_ORIGINS, promptToClaude, type Logger } from "../acp-agent.js";
+import { AUTONOMOUS_RESULT_ORIGINS } from "../result-end.js";
+import { promptToClaude } from "../prompt-to-claude.js";
+import type { Logger } from "../logger.js";
 import type { McpCommand } from "../mcp-command.js";
 import type { ElicitationSupport } from "../elicitation.js";
 import { Pushable } from "../utils.js";

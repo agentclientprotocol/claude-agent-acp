@@ -12,7 +12,8 @@ import {
   type Options,
   type Query,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { Logger, NewSessionMeta } from "../acp-agent.js";
+import type { Logger } from "../logger.js";
+import type { NewSessionMeta } from "../new-session-meta.js";
 import {
   AIR_LOAD_REPLAY_END_CAPABILITY,
   AIR_LOAD_REPLAY_END_KEY,

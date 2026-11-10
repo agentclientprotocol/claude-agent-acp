@@ -2,7 +2,9 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import type { McpServerStatus } from "@anthropic-ai/claude-agent-sdk";
 import type { SessionNotification } from "@agentclientprotocol/sdk/unstable";
-import { ClaudeAcpAgent, stripLocalCommandMetadata, type AcpClient } from "../acp-agent.js";
+import { ClaudeAcpAgent } from "../acp-agent.js";
+import { stripLocalCommandMetadata } from "../message-filters.js";
+import type { AcpClient } from "../acp-client.js";
 import {
   cleanMcpError,
   formatMcpStatus,

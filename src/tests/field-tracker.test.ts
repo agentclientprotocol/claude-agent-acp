@@ -3,13 +3,13 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { AcpClient } from "../acp-client.js";
 import {
-  AcpClient,
   StreamedToolInputCache,
   streamEventToAcpNotifications,
   toAcpNotifications,
   ToolUseCache,
-} from "../acp-agent.js";
+} from "../sdk-to-acp.js";
 import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
 import { createPostToolUseHook } from "../tools.js";
 

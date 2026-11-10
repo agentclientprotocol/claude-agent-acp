@@ -52,7 +52,7 @@
  */
 import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
-import type { Logger } from "../acp-agent.js";
+import type { Logger } from "../logger.js";
 import { withoutEffort } from "../session-effort.js";
 import type { V2Session } from "./session.js";
 import { afterSetupResponse } from "./setup.js";

@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
-import { messageIdForGrouping } from "../acp-agent.js";
+import { messageIdForGrouping } from "../sdk-to-acp.js";
 import { forkSession } from "../fork-session.js";
 import { encodeProjectPath } from "../session-index/project-dirs.js";
 

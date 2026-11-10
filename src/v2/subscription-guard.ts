@@ -20,7 +20,7 @@
  * The `/remote-control` command that the adapter runs is not guarded.
  */
 import type { AccountInfo, Query } from "@anthropic-ai/claude-agent-sdk";
-import type { Logger } from "../acp-agent.js";
+import type { Logger } from "../logger.js";
 import { type AuthStatusKind, fromAccountInfo } from "../auth-status.js";
 import {
   billsClaudeSubscription,

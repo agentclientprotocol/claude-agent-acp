@@ -35,25 +35,29 @@ import {
 import { toolUpdateFromDiffToolResponse } from "../diff.js";
 import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
 import {
-  toAcpNotifications,
-  promptToClaude,
-  isLocalCommandMetadata,
-  isReplayHiddenMetaMessage,
-  isSyntheticLoginMessage,
-  stripLocalCommandMetadata,
   ClaudeAcpAgent,
   computeSessionFingerprint,
-  streamEventToAcpNotifications,
-  messageIdForGrouping,
   buildConfigOptions,
   createFastModeConfigOption,
   discoverCustomAgents,
   runPromptWithCancellation,
-  type AcpClient,
-  type SDKMessageFilter,
   type SteerRequest,
-  type StreamedToolInputCache,
 } from "../acp-agent.js";
+import {
+  toAcpNotifications,
+  streamEventToAcpNotifications,
+  messageIdForGrouping,
+  type StreamedToolInputCache,
+} from "../sdk-to-acp.js";
+import { promptToClaude } from "../prompt-to-claude.js";
+import {
+  isLocalCommandMetadata,
+  isReplayHiddenMetaMessage,
+  isSyntheticLoginMessage,
+  stripLocalCommandMetadata,
+} from "../message-filters.js";
+import type { AcpClient } from "../acp-client.js";
+import type { SDKMessageFilter } from "../new-session-meta.js";
 import { SessionTitles } from "../session-titles.js";
 import { SessionBackgroundWork } from "../background-work.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "../usage-markdown.js";

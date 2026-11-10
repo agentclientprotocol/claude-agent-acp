@@ -3,7 +3,7 @@
  *
  * {@link SessionOutput} maps the SDK's content messages (stream events,
  * consolidated assistant messages, tool results) through the shared mapping
- * of `acp-agent.ts` (`toAcpNotifications`), whose v1 updates the connection's
+ * of `sdk-to-acp.ts` (`toAcpNotifications`), whose v1 updates the connection's
  * {@link V2UpdateTranslator} turns into v2 updates. It knows nothing about
  * prompts or turns: the session decides what the output belongs to.
  */
@@ -25,15 +25,17 @@ import type {
 import {
   isReplayHiddenMetaMessage,
   isSyntheticLoginMessage,
-  messageIdForGrouping,
   stripLocalCommandMetadata,
+} from "../message-filters.js";
+import {
+  messageIdForGrouping,
   streamEventToAcpNotifications,
   toAcpNotifications,
-  type AcpClient,
-  type Logger,
   type StreamedToolInputCache,
   type ToolUseCache,
-} from "../acp-agent.js";
+} from "../sdk-to-acp.js";
+import type { AcpClient } from "../acp-client.js";
+import type { Logger } from "../logger.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import { isCompactSummaryMessage, replayCompactSummary } from "../context-compaction.js";
 import { ClientCapabilities } from "../tool-calls/client-capabilities.js";

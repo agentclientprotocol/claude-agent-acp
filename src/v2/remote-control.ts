@@ -13,7 +13,7 @@
  */
 import { randomUUID } from "node:crypto";
 import type { Query, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
-import type { Logger } from "../acp-agent.js";
+import type { Logger } from "../logger.js";
 import {
   adapterRemoteControlCommand,
   isRemoteHumanMessage,

@@ -3,7 +3,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
-import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import type { AcpClient } from "../acp-client.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 let capturedOptions: Options | undefined;
