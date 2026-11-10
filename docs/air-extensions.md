@@ -78,7 +78,7 @@ A page with more sessions after it has a `nextCursor`, as ACP defines.
 A client that does not follow `nextCursor` sees only the newest 1000 sessions of the directory.
 An unknown cursor gives an `invalidParams` error.
 
-`src/tests/acp-scenarios.test.ts` compares the traffic of a plain client and of Zed with recordings of origin/main.
+`src/tests/v1/acp-scenarios.test.ts` compares the traffic of a plain client and of Zed with recordings of origin/main.
 
 ## Negotiation
 
@@ -557,7 +557,7 @@ AIR puts the hooks into `_meta.claudeCode.options.settings.hooks` of `session/ne
 ```
 
 - The settings go to the flag settings tier of that session only. Other sessions and the settings files do not change.
-- Claude Code runs the hooks of every settings tier, so the user, project and IDE hooks of one event all run. `src/tests/session-hooks.test.ts` checks this with the Claude Code binary.
+- Claude Code runs the hooks of every settings tier, so the user, project and IDE hooks of one event all run. `src/tests/v1/session-hooks.test.ts` checks this with the Claude Code binary.
 - `CLAUDE_MODEL_CONFIG` stays in effect (see [Model configuration](model-configuration.md#precedence)).
 - A `session/load` with different settings recreates the query, so it applies the new hooks.
 - Claude asks for no hook trust step.

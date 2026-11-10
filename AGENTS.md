@@ -85,9 +85,13 @@ opening a PR.
 
 ## Testing guidelines
 
-- Before adding a test, search `src/tests/` for existing tests of the same API
-  and scenario, and add to their file and `describe` block. Use the helpers in
-  `helpers.ts` and `session-doubles.ts` instead of copying setup.
+- Tests live in `src/tests/`: `v1/` holds the tests that drive the v1 agent,
+  `v2/` the tests of the v2 agent, and the top level the tests of shared
+  modules, with `helpers.ts`, the scenario harness (`acp-scenarios/`) and
+  `fixtures/`. Before adding a test, search `src/tests/` for existing tests of
+  the same API and scenario, and add to their file and `describe` block. Use
+  the helpers in `helpers.ts` and `v1/session-doubles.ts` instead of copying
+  setup.
 - Don't add cases that take the same code path. Tests that differ only in input
   and expected output belong in one `it.each`. Don't repeat another test's
   assertions; assert only what this test is about.
