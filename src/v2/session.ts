@@ -621,6 +621,22 @@ export class V2Session implements RequestTarget {
     if (heldTurn) this.closeTurn();
   }
 
+  /**
+   * Sets the initial values of a setup request's `configOptions` (see
+   * `SessionConfig.setInitial`), and has the reports follow the model they
+   * leave. It sends nothing, on a session that a `session/resume` found
+   * active too: the setup response carries the options to the connection
+   * that asked, and a session is active on one connection only.
+   */
+  async setInitialConfigOptions(
+    entries: readonly v2.SetSessionConfigOptionRequest[],
+  ): Promise<void> {
+    if (entries.length === 0) return;
+    await this.config.setInitial(entries);
+    // Nothing changes for the same model.
+    this.modelChangedReports();
+  }
+
   async setConfigOption(
     params: v2.SetSessionConfigOptionRequest,
   ): Promise<v2.SessionConfigOption[]> {

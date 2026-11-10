@@ -6,6 +6,7 @@
 import type { AuthMethod } from "@agentclientprotocol/sdk/unstable";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import { SYSTEM_PROMPT_CAPABILITY } from "../client-system-prompt.js";
+import { SESSION_OPTIONS_CAPABILITY } from "../initial-config-options.js";
 import { SESSION_STATUS_CAPABILITY } from "../session-status.js";
 
 /**
@@ -19,6 +20,8 @@ import { SESSION_STATUS_CAPABILITY } from "../session-status.js";
  *   images, embedded context, and HTTP servers. v2 has no SSE transport.
  * - `systemPrompt`, in `append` and `override` mode.
  * - `session/status` (unstable), with the foreground state of an open session.
+ * - `session/options` (unstable), and `configOptions` on `session/new` and
+ *   `session/resume`.
  */
 export const V2_SESSION_CAPABILITIES: v2.SessionCapabilities = {
   prompt: { image: {}, embeddedContext: {} },
@@ -28,6 +31,7 @@ export const V2_SESSION_CAPABILITIES: v2.SessionCapabilities = {
   additionalDirectories: {},
   systemPrompt: SYSTEM_PROMPT_CAPABILITY,
   status: SESSION_STATUS_CAPABILITY,
+  options: SESSION_OPTIONS_CAPABILITY,
   // `session/set_title`.
   title: {},
 };
