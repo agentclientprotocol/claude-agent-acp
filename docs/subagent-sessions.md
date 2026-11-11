@@ -32,6 +32,9 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
     message to the parent instead, in both transcripts and linked the same way.
   - A launch whose child is never exposed is shown as a tool call after all, with its final
     status.
+- The parent's prompt turn ends at its result, also while a background child that it launched or
+  resumed still runs. The child's updates and requests, and the parent's summary when the child
+  ends, follow the prompt response, as the RFD expects of a client.
 - A SendMessage call that resumes the child is not shown either. Its message is a
   `session_message` in both transcripts, the sender's outgoing view and the child's incoming one,
   linked like a launch's prompt. A SendMessage call whose message resumes no announced child,
