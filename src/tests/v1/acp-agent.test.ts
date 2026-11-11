@@ -32,8 +32,8 @@ import {
   ClaudeAcpAgent,
   computeSessionFingerprint,
   runPromptWithCancellation,
-  type SteerRequest,
 } from "../../v1/acp-agent.js";
+import type { SteerRequest } from "../../v1/steering.js";
 import { buildConfigOptions, discoverCustomAgents } from "../../session-config-options.js";
 import { createFastModeConfigOption } from "../../session-fast-mode.js";
 import {
