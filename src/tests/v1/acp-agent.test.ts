@@ -11948,6 +11948,85 @@ describe("stop reason propagation", () => {
     expect(terminal).not.toHaveProperty("details");
   });
 
+  it("keeps the api retries of one turn and its failure in one row before the echo", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => updates.push(update),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await initializeClient(agent, airSessionFailureCapabilities);
+    const retry = (attempt: number) => ({
+      type: "system" as const,
+      subtype: "api_retry" as const,
+      attempt,
+      max_retries: 10,
+      retry_delay_ms: 1_000,
+      error_status: 503,
+      error: "server_error" as const,
+      uuid: randomUUID(),
+      session_id: "test-session",
+    });
+    const input = new Pushable<any>();
+    async function* cli() {
+      const iter = input[Symbol.asyncIterator]();
+      for (const turn of [1, 2]) {
+        const { value: userMessage } = await iter.next();
+        const echo = {
+          type: "user",
+          message: userMessage.message,
+          parent_tool_use_id: null,
+          uuid: userMessage.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+        // The CLI holds the echo back until the first assistant frame or
+        // stream event of the turn. A request that gets a 503 has neither, so
+        // its retries come before the echo.
+        if (turn === 1) {
+          yield retry(1);
+          yield retry(2);
+          yield echo;
+          yield createAssistantError("server_error", "API Error: 503");
+          yield createResultMessage({
+            subtype: "success",
+            stop_reason: "end_turn",
+            is_error: true,
+            result: "API Error: 503",
+          });
+        } else {
+          yield retry(1);
+          yield echo;
+          yield createResultMessage({
+            subtype: "success",
+            stop_reason: "end_turn",
+            is_error: false,
+            result: "ok",
+          });
+        }
+      }
+    }
+    agent.sessions["test-session"] = mockSessionState({ query: wrapQuery(cli()), input });
+
+    const first = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "second" }] });
+    const warnings = updates
+      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
+      .filter((failure) => failure?.severity === "warning");
+
+    expect(warnings.map((warning) => warning.revision)).toEqual([1, 2, 1]);
+    expect(warnings[1].id).toBe(warnings[0].id);
+    expect(warnings[0].id).toMatch(/:error$/);
+    expect(sessionFailureFromResponse(first)).toEqual(
+      expect.objectContaining({ id: warnings[0].id, revision: 3, severity: "error" }),
+    );
+    expect(warnings[2].id).not.toBe(warnings[0].id);
+  });
+
   it("replaces the cause of an api retry warning on the next retry", async () => {
     const updates: SessionNotification[] = [];
     const agent = new ClaudeAcpAgent(

@@ -3606,12 +3606,17 @@ export class ClaudeAcpAgent {
       kind: ClaudeFailureKind,
       options: {
         turnScoped?: boolean;
+        /** The turn the failure belongs to, when it is not `activeTurn`. */
+        turnId?: string;
         title?: string;
         details?: string;
         severity?: "warning" | "error";
       } = {},
     ) => {
-      const turnId = options.turnScoped === false ? undefined : session.activeTurn?.promptUuid;
+      const turnId =
+        options.turnScoped === false
+          ? undefined
+          : (options.turnId ?? session.activeTurn?.promptUuid);
       await sessionFailures.publish(kind, {
         turnId,
         sessionScoped: options.turnScoped === false,
@@ -5590,7 +5595,17 @@ export class ClaudeAcpAgent {
                 // here would outlive the `auth_required` rejection with no
                 // action to clear it (issue #1072).
                 if (kind === "auth_required") break;
+                // The CLI holds the echo of a prompt back until the first
+                // assistant frame or stream event of the turn, so the retries
+                // of a request that gets no response come before the echo
+                // activates the turn. Give them the queue head, the prompt
+                // being sent: all retries and the terminal failure of one turn
+                // then share its `${turnId}:error` row.
+                const retryTurn =
+                  session.activeTurn ??
+                  (asyncTasks.autonomousTurnOpen ? undefined : firstUnsettledQueuedTurn());
                 await publishSessionFailure(kind, {
+                  turnId: retryTurn?.promptUuid,
                   ...apiRetryWarning(message),
                   severity: "warning",
                 });
