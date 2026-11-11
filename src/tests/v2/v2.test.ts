@@ -2505,6 +2505,53 @@ describe("ACP v2 core", () => {
     },
   );
 
+  it("reports a failed API request that the turn goes on past where it failed", async () => {
+    const text = "API Error: Connection lost mid-response. The response above may be incomplete.";
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      const { claude } = await openSession(agent);
+      claude.send(cycleStart());
+      // Claude Code keeps the tool call of the response that broke off, and runs it.
+      claude.send(
+        assistant("msg_partial", [
+          { type: "tool_use", id: "toolu_kept", name: "Bash", input: { command: "ls" } },
+        ]),
+      );
+      claude.send({
+        ...assistant("msg_api_error", [{ type: "text", text }]),
+        message: {
+          id: "msg_api_error",
+          type: "message",
+          role: "assistant",
+          model: "<synthetic>",
+          content: [{ type: "text", text }],
+          usage: {},
+        },
+        error: "server_error",
+      });
+      claude.send({
+        type: "user",
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "toolu_kept", content: "src" }],
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+      });
+      claude.send(assistant("msg_after", [{ type: "text", text: "Done." }]));
+      claude.send(result({ result: "Done." }));
+      await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+    });
+
+    const notice = { sessionUpdate: "notice", severity: "error", title: text };
+    const shown = client.sessionUpdates.filter(
+      (update) =>
+        update.sessionUpdate === "notice" || update.sessionUpdate === "agent_message_chunk",
+    );
+    expect(shown).toMatchObject([notice, { sessionUpdate: "agent_message_chunk" }]);
+    expect(shown[0]).toEqual(notice);
+  });
+
   it.each([
     [
       "an error at the turn limit",

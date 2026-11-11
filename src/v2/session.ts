@@ -903,6 +903,7 @@ export class V2Session implements RequestTarget {
       this.tasks.toolResults(this.output, message);
       return;
     }
+    this.wentOnPastApiError();
     // The rewrite applies to the updates of this message only.
     this.output.rewrite = this.clearContext.toolResults(message);
     try {
@@ -935,6 +936,7 @@ export class V2Session implements RequestTarget {
         if (this.stopped.drops(message)) return;
         if (message.parent_tool_use_id === null) {
           this.outputStarts();
+          this.wentOnPastApiError();
           this.reports.streamEvent(message);
         }
         this.output.streamEvent(message);
@@ -947,6 +949,7 @@ export class V2Session implements RequestTarget {
           // request are not shown as Claude's text (see `TurnReport`).
           if (this.turnReport.assistant(message)) return;
           this.outputStarts();
+          this.wentOnPastApiError();
           this.reports.assistant(message);
         }
         this.output.assistant(message);
@@ -1208,10 +1211,21 @@ export class V2Session implements RequestTarget {
   }
 
   /**
-   * Sends the text of a failed API request that Claude Code wrote into the
-   * conversation (see `TurnReport.assistant`) as a notice. A turn whose idle
-   * fails sends none: its error carries the failure. `end` is the turn's
-   * result, if it has one.
+   * The turn went on past a failed API request: Claude Code kept the tool
+   * calls of a response that broke off ("Connection lost mid-response. The
+   * response above may be incomplete.") and ran them. Its notice goes out
+   * here, after the output it is about, and not at the turn's end.
+   */
+  private wentOnPastApiError(): void {
+    const text = this.turnReport.takeApiError();
+    if (text) this.reports.apiError(text);
+  }
+
+  /**
+   * At the turn's end, sends the text of a failed API request that Claude
+   * Code wrote into the conversation (see `TurnReport.assistant`) as a
+   * notice. A turn whose idle fails sends none: its error carries the
+   * failure. `end` is the turn's result, if it has one.
    */
   private reportApiError(end: TurnEnd | undefined): void {
     const text = this.turnReport.takeApiError();
