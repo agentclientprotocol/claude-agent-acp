@@ -2433,7 +2433,7 @@ describe("ACP v2 core", () => {
     expect(client.sessionUpdates.at(-1)).toMatchObject({
       state: "idle",
       stopReason: "error",
-      error: { code: -32000 },
+      error: { code: -32000, message: "Authentication required" },
     });
   });
 
@@ -2442,7 +2442,7 @@ describe("ACP v2 core", () => {
       "an authentication failure as authRequired",
       "authentication_failed",
       "Failed to authenticate. API Error: 401",
-      { code: -32000 },
+      { code: -32000, message: "Authentication required: Failed to authenticate. API Error: 401" },
     ],
     [
       "another failure with its error kind",
