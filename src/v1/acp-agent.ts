@@ -229,6 +229,7 @@ import { decodeClaudePermissionResponse } from "../permissions/response.js";
 import { SettingsManager } from "../settings.js";
 import {
   activeUsageLimitMessage,
+  apiRetryWarning,
   airSessionFailureCapabilityMeta,
   assistantMessageText,
   type ClaudeFailureKind,
@@ -3605,12 +3606,17 @@ export class ClaudeAcpAgent {
       kind: ClaudeFailureKind,
       options: {
         turnScoped?: boolean;
+        /** The turn the failure belongs to, when it is not `activeTurn`. */
+        turnId?: string;
         title?: string;
         details?: string;
         severity?: "warning" | "error";
       } = {},
     ) => {
-      const turnId = options.turnScoped === false ? undefined : session.activeTurn?.promptUuid;
+      const turnId =
+        options.turnScoped === false
+          ? undefined
+          : (options.turnId ?? session.activeTurn?.promptUuid);
       await sessionFailures.publish(kind, {
         turnId,
         sessionScoped: options.turnScoped === false,
@@ -5589,19 +5595,20 @@ export class ClaudeAcpAgent {
                 // here would outlive the `auth_required` rejection with no
                 // action to clear it (issue #1072).
                 if (kind === "auth_required") break;
-                // `no_response` (SDK 0.3.261+): the API sent no response headers
-                // within the first-byte window, so this retry waits longer for
-                // them. Say so — "attempt 1 of 1" alone reads like a final
-                // failure, and the wait is what the user is about to sit through.
-                const seconds = (ms: number) => `${Math.max(1, Math.round(ms / 1000))}s`;
-                const noResponse = message.no_response
-                  ? ` No response after ${seconds(message.no_response.waited_ms)}; waiting up to ${seconds(message.no_response.retry_wait_ms)}.`
-                  : "";
-                const title =
-                  message.error_status === null
-                    ? `Reconnecting to Claude, attempt ${message.attempt} of ${message.max_retries}.${noResponse}`
-                    : `Retrying Claude, attempt ${message.attempt} of ${message.max_retries}.${noResponse}`;
-                await publishSessionFailure(kind, { title, severity: "warning" });
+                // The CLI holds the echo of a prompt back until the first
+                // assistant frame or stream event of the turn, so the retries
+                // of a request that gets no response come before the echo
+                // activates the turn. Give them the queue head, the prompt
+                // being sent: all retries and the terminal failure of one turn
+                // then share its `${turnId}:error` row.
+                const retryTurn =
+                  session.activeTurn ??
+                  (asyncTasks.autonomousTurnOpen ? undefined : firstUnsettledQueuedTurn());
+                await publishSessionFailure(kind, {
+                  turnId: retryTurn?.promptUuid,
+                  ...apiRetryWarning(message),
+                  severity: "warning",
+                });
                 break;
               }
               case "model_refusal_fallback": {

@@ -1,6 +1,7 @@
 import type { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import {
   getSessionMessages,
+  type SDKAPIRetryMessage,
   type SDKAssistantMessageError,
   USAGE_LIMIT_ERROR_PREFIXES,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -444,6 +445,84 @@ export class SessionFailureController {
     }
     return true;
   }
+}
+
+/** Formats a wait in whole seconds, at least 1s: `8000` → `"8s"`. */
+function retrySeconds(ms: number): string {
+  return `${Math.max(1, Math.round(ms / 1000))}s`;
+}
+
+/** The wait before the next attempt: `0` → `"now"`, `8000` → `"in 8s"`, and
+ *  from 120 s whole minutes rounded up: `1_800_000` → `"in 30m"`. The CLI sends
+ *  `0` for a `no_response` retry and minutes for a background rate-limit wait. */
+function nextAttemptDelay(ms: number): string {
+  const seconds = Math.round(ms / 1000);
+  if (seconds <= 0) return "now";
+  if (seconds < 120) return `in ${seconds}s`;
+  return `in ${Math.ceil(ms / 60_000)}m`;
+}
+
+/** Plain-English names of the SDK error kinds. `unknown` has none: it adds
+ *  nothing to the HTTP status or the connection error. */
+const RETRY_ERROR_KIND_LABELS: Record<Exclude<SDKAssistantMessageError, "unknown">, string> = {
+  authentication_failed: "authentication failed",
+  oauth_org_not_allowed: "organization not allowed",
+  account_on_hold: "account on hold",
+  verification_required: "verification required",
+  billing_error: "billing error",
+  rate_limit: "rate limited",
+  overloaded: "overloaded",
+  invalid_request: "invalid request",
+  model_not_found: "model not found",
+  server_error: "server error",
+  max_output_tokens: "output token limit",
+  cloud_credential_error: "cloud credential error",
+};
+
+/** The `api_retry` message fields the warning reads. `error` is optional
+ *  because an older CLI can omit it; the warning then treats it as `unknown`. */
+type ApiRetryWarningInput = Pick<
+  SDKAPIRetryMessage,
+  "attempt" | "max_retries" | "error_status" | "retry_delay_ms" | "no_response"
+> & { error?: SDKAssistantMessageError };
+
+/** The cause of a retry. A null `error_status` with a kind is not always a
+ *  lost connection: the CLI maps an SSE `overloaded_error` event after HTTP 200
+ *  to `overloaded` with no status. */
+function apiRetryCause(message: ApiRetryWarningInput): string {
+  const kind = message.error ?? "unknown";
+  const label =
+    kind === "unknown"
+      ? undefined
+      : (RETRY_ERROR_KIND_LABELS[kind] ?? String(kind).replaceAll("_", " "));
+  if (message.error_status !== null) {
+    return `HTTP ${message.error_status}${label ? ` (${label})` : ""}.`;
+  }
+  return label ? `No HTTP status (${label}).` : "Connection error: no HTTP response.";
+}
+
+/** The title and the `details` of an `api_retry` warning. The title says the
+ *  attempt and, for a `no_response` retry, how long the CLI waited and will
+ *  wait. The details say the cause and the wait before the next attempt, e.g.
+ *  "HTTP 529 (overloaded). Next attempt in 8s." The details do not repeat the
+ *  `no_response` wait. */
+export function apiRetryWarning(message: ApiRetryWarningInput): {
+  title: string;
+  details: string;
+} {
+  // `no_response` (SDK 0.3.261+): the API sent no response headers
+  // within the first-byte window, so this retry waits longer for
+  // them. Say so — "attempt 1 of 1" alone reads like a final
+  // failure, and the wait is what the user is about to sit through.
+  const noResponse = message.no_response
+    ? ` No response after ${retrySeconds(message.no_response.waited_ms)}; waiting up to ${retrySeconds(message.no_response.retry_wait_ms)}.`
+    : "";
+  const title =
+    message.error_status === null
+      ? `Reconnecting to Claude, attempt ${message.attempt} of ${message.max_retries}.${noResponse}`
+      : `Retrying Claude, attempt ${message.attempt} of ${message.max_retries}.${noResponse}`;
+  const delay = nextAttemptDelay(message.retry_delay_ms);
+  return { title, details: `${apiRetryCause(message)} Next attempt ${delay}.` };
 }
 
 export function providerFailureCategory(
