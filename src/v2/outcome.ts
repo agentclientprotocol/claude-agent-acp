@@ -132,8 +132,9 @@ export class TurnReport {
    * - Claude Code's sign-in message. Its `/login` instruction is for Claude
    *   Code's terminal, and the turn's idle fails with `authRequired` instead.
    * - The message that Claude Code wrote for a failed API request (`error` on
-   *   a `<synthetic>` message). The turn's idle carries it when the turn
-   *   fails, and a notice otherwise (see {@link takeApiError}).
+   *   a `<synthetic>` message). A notice carries it where the turn goes on
+   *   past it. At the turn's end, the idle carries it when the turn fails,
+   *   and a notice otherwise (see {@link takeApiError}).
    */
   assistant(message: SDKAssistantMessage): boolean {
     if (message.error) this.errorKind = message.error;
