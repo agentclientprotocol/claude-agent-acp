@@ -91,7 +91,11 @@ export function idleOutcome(
       providerFailureCategory(kind) === "auth_required");
   return failed(
     authFailure
-      ? RequestError.authRequired()
+      ? // Claude Code's `/login` instruction is for its terminal, so that text
+        // is left out. Any other says why the login failed, e.g. "Failed to
+        // authenticate: this login reached its time limit and cannot be
+        // renewed."
+        RequestError.authRequired(undefined, ended.loginRequired ? undefined : ended.error)
       : RequestError.internalError(kind ? { errorKind: kind } : undefined, ended.error),
   );
 }
