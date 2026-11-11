@@ -714,8 +714,9 @@ type Turn = {
    *  issue #866), and the model's task-notification followup summary all
    *  land inside the turn.
    *
-   *  An ACP v1 AIR client that declares `backgroundSubagents` gets no hold:
-   *  this field stays unset, and the turn settles at its result. AIR keeps
+   *  An ACP v1 AIR client that declares `backgroundSubagents`, and an ACP v1
+   *  client in the `rfd` form of subagent sessions, get no hold: this field
+   *  stays unset, and the turn settles at its result. Such a client keeps
    *  listening after the prompt response, so the subagent updates, their
    *  permission requests and elicitations, and the followup summary go out
    *  after it, with the same routing. A held turn hides the end of the
@@ -1679,14 +1680,16 @@ export class ClaudeAcpAgent {
 
   /**
    * Whether a turn ends at its result while background subagents that it
-   * spawned or resumed still run. Only an AIR client that declares
-   * `backgroundSubagents` gets this. Every other client keeps the hold of
+   * spawned or resumed still run. An AIR client that declares
+   * `backgroundSubagents` gets this, and so does a client in the `rfd` form
+   * of subagent sessions: the RFD has the client keep receiving child events
+   * after the parent's prompt response. Every other client keeps the hold of
    * `Turn.deferredSettle`.
    */
   private endsTurnsWithLiveSubagents(): boolean {
-    return clientSupportsAirCapability(
-      this.clientCapabilities,
-      AIR_BACKGROUND_SUBAGENTS_CAPABILITY,
+    return (
+      subagentForm(this.clientCapabilities) === "rfd" ||
+      clientSupportsAirCapability(this.clientCapabilities, AIR_BACKGROUND_SUBAGENTS_CAPABILITY)
     );
   }
 
