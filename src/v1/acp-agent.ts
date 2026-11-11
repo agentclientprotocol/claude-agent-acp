@@ -229,6 +229,7 @@ import { decodeClaudePermissionResponse } from "../permissions/response.js";
 import { SettingsManager } from "../settings.js";
 import {
   activeUsageLimitMessage,
+  apiRetryDetails,
   airSessionFailureCapabilityMeta,
   assistantMessageText,
   type ClaudeFailureKind,
@@ -236,6 +237,7 @@ import {
   isSyntheticUsageLimitMessage,
   type PublishedSessionFailure,
   providerFailureCategory,
+  retrySeconds,
   SessionFailureController,
   type SessionFailureState,
   sessionFailureMeta,
@@ -5593,15 +5595,18 @@ export class ClaudeAcpAgent {
                 // within the first-byte window, so this retry waits longer for
                 // them. Say so — "attempt 1 of 1" alone reads like a final
                 // failure, and the wait is what the user is about to sit through.
-                const seconds = (ms: number) => `${Math.max(1, Math.round(ms / 1000))}s`;
                 const noResponse = message.no_response
-                  ? ` No response after ${seconds(message.no_response.waited_ms)}; waiting up to ${seconds(message.no_response.retry_wait_ms)}.`
+                  ? ` No response after ${retrySeconds(message.no_response.waited_ms)}; waiting up to ${retrySeconds(message.no_response.retry_wait_ms)}.`
                   : "";
                 const title =
                   message.error_status === null
                     ? `Reconnecting to Claude, attempt ${message.attempt} of ${message.max_retries}.${noResponse}`
                     : `Retrying Claude, attempt ${message.attempt} of ${message.max_retries}.${noResponse}`;
-                await publishSessionFailure(kind, { title, severity: "warning" });
+                await publishSessionFailure(kind, {
+                  title,
+                  details: apiRetryDetails(message),
+                  severity: "warning",
+                });
                 break;
               }
               case "model_refusal_fallback": {

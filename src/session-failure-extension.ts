@@ -1,6 +1,7 @@
 import type { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import {
   getSessionMessages,
+  type SDKAPIRetryMessage,
   type SDKAssistantMessageError,
   USAGE_LIMIT_ERROR_PREFIXES,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -444,6 +445,46 @@ export class SessionFailureController {
     }
     return true;
   }
+}
+
+/** Formats a wait in whole seconds, at least 1s: `8000` → `"8s"`. */
+export function retrySeconds(ms: number): string {
+  return `${Math.max(1, Math.round(ms / 1000))}s`;
+}
+
+/** Plain-English names of the SDK error kinds. `unknown` has none: it adds
+ *  nothing to the HTTP status or the connection error. */
+const RETRY_ERROR_KIND_LABELS: Partial<Record<SDKAssistantMessageError, string>> = {
+  authentication_failed: "authentication failed",
+  oauth_org_not_allowed: "organization not allowed",
+  account_on_hold: "account on hold",
+  verification_required: "verification required",
+  billing_error: "billing error",
+  rate_limit: "rate limited",
+  overloaded: "overloaded",
+  invalid_request: "invalid request",
+  model_not_found: "model not found",
+  server_error: "server error",
+  max_output_tokens: "output token limit",
+  cloud_credential_error: "cloud credential error",
+};
+
+/** The `details` of an `api_retry` warning: the cause of this retry and the
+ *  wait before the next attempt, e.g. "HTTP 529 (overloaded). Next attempt in
+ *  8s." or "Connection error: no HTTP response. Next attempt in 1s." The
+ *  `no_response` wait is not repeated here: the title already says it. */
+export function apiRetryDetails(
+  message: Pick<SDKAPIRetryMessage, "error_status" | "error" | "retry_delay_ms">,
+): string {
+  const label =
+    message.error === "unknown"
+      ? undefined
+      : (RETRY_ERROR_KIND_LABELS[message.error] ?? message.error.replaceAll("_", " "));
+  const cause =
+    message.error_status === null
+      ? `Connection error: no HTTP response${label ? ` (${label})` : ""}.`
+      : `HTTP ${message.error_status}${label ? ` (${label})` : ""}.`;
+  return `${cause} Next attempt in ${retrySeconds(message.retry_delay_ms)}.`;
 }
 
 export function providerFailureCategory(

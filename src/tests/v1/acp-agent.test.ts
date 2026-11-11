@@ -82,6 +82,7 @@ import {
   PermissionUpdate,
   query,
   SDKAssistantMessage,
+  type SDKAssistantMessageError,
   type Options,
   type SDKControlGetUsageResponse,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -11930,6 +11931,7 @@ describe("stop reason propagation", () => {
         severity: "warning",
         revision: 1,
         title: "Retrying Claude, attempt 1 of 5.",
+        details: "HTTP 429 (rate limited). Next attempt in 1s.",
         actions: [],
       }),
     );
@@ -11943,6 +11945,63 @@ describe("stop reason propagation", () => {
         actions: ["retry"],
       }),
     );
+    expect(terminal).not.toHaveProperty("details");
+  });
+
+  it("replaces the cause of an api retry warning on the next retry", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => updates.push(update),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await initializeClient(agent, airSessionFailureCapabilities);
+    const retry = (
+      attempt: number,
+      error_status: number | null,
+      error: SDKAssistantMessageError,
+      retry_delay_ms: number,
+    ) => ({
+      type: "system" as const,
+      subtype: "api_retry" as const,
+      attempt,
+      max_retries: 10,
+      retry_delay_ms,
+      error_status,
+      error,
+      uuid: randomUUID(),
+      session_id: "test-session",
+    });
+    injectSession(agent, [
+      retry(1, 529, "overloaded", 8_000),
+      retry(2, null, "server_error", 2_600),
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: false,
+        result: "ok",
+      }),
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+    const warnings = updates
+      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
+      .filter(Boolean);
+
+    expect(warnings).toEqual([
+      expect.objectContaining({
+        revision: 1,
+        title: "Retrying Claude, attempt 1 of 10.",
+        details: "HTTP 529 (overloaded). Next attempt in 8s.",
+      }),
+      expect.objectContaining({
+        id: warnings[0].id,
+        revision: 2,
+        title: "Reconnecting to Claude, attempt 2 of 10.",
+        details: "Connection error: no HTTP response (server error). Next attempt in 3s.",
+      }),
+    ]);
   });
 
   it("says how long a no-response retry waited and will wait", async () => {
@@ -11987,6 +12046,7 @@ describe("stop reason propagation", () => {
         severity: "warning",
         title:
           "Reconnecting to Claude, attempt 1 of 1. No response after 180s; waiting up to 600s.",
+        details: "Connection error: no HTTP response. Next attempt in 1s.",
       }),
     );
   });
