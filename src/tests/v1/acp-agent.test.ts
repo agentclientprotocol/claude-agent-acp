@@ -28,11 +28,8 @@ import { nodeToWebWritable, nodeToWebReadable } from "../../utils.js";
 import { createPostToolUseHook, markdownEscape, toDisplayPath } from "../../tools.js";
 import { toolUpdateFromDiffToolResponse } from "../../diff.js";
 import { ToolCallFieldTracker } from "../../tool-calls/field-tracker.js";
-import {
-  ClaudeAcpAgent,
-  computeSessionFingerprint,
-  runPromptWithCancellation,
-} from "../../v1/acp-agent.js";
+import { ClaudeAcpAgent, runPromptWithCancellation } from "../../v1/acp-agent.js";
+import { computeSessionFingerprint } from "../../v1/session-fingerprint.js";
 import type { SteerRequest } from "../../v1/steering.js";
 import { buildConfigOptions, discoverCustomAgents } from "../../session-config-options.js";
 import { createFastModeConfigOption } from "../../session-fast-mode.js";
