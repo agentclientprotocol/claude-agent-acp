@@ -42,6 +42,7 @@ import { isCompactSummaryMessage, replayCompactSummary } from "../context-compac
 import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
 import { RetractedToolCalls } from "../tool-calls/retracted.js";
+import { UnansweredServerToolCalls } from "../tool-calls/server-tool-calls.js";
 import { AcpToolCallRenderer, progressToolCallId, V2_CANCELLED } from "../tool-calls/renderer.js";
 import { changedTaskPlanEntries, unregisterHookCallback, type TaskState } from "../tools.js";
 import { recordStreamedDelta, unstreamedRemainder, type StreamedBlock } from "../streamed-text.js";
@@ -104,6 +105,8 @@ export class SessionOutput {
   private readonly dispatched = new Set<string>();
   /** The tool uses of the assistant messages, for {@link closeRetracted}. */
   private readonly retracted = new RetractedToolCalls();
+  /** The server tool calls that still wait for their result, for {@link closeUnanswered}. */
+  private readonly serverToolCalls = new UnansweredServerToolCalls();
   /**
    * Whether the output comes from work that a `session/cancel` stopped, until
    * its idle. The session's streamed deltas still go out,
@@ -155,6 +158,10 @@ export class SessionOutput {
     if (message.parent_tool_use_id !== null && !this.subagent) return;
     if (message.event.type === "message_start") {
       this.streamingMessageId = message.event.message.id;
+      this.serverToolCalls.replyStarted(
+        message.parent_tool_use_id,
+        this.streamingMessageId || undefined,
+      );
       // A message that never reached its consolidated message, such as one an
       // interrupt cut short, leaves its record behind.
       this.streamedBlocks.length = 0;
@@ -177,6 +184,11 @@ export class SessionOutput {
         },
       ),
     );
+    // After the block that shows them, so a client sees the next step start
+    // before the calls it leaves behind end.
+    if (message.event.type === "content_block_start") {
+      this.closeUnanswered(message.parent_tool_use_id, message.event.content_block);
+    }
   }
 
   /**
@@ -203,6 +215,9 @@ export class SessionOutput {
         );
     if (ownText) this.streamedBlocks.length = 0;
     if (this.stoppedWork(message)) return;
+    for (const block of message.message.content) {
+      this.closeUnanswered(message.parent_tool_use_id, block, message.message.id || undefined);
+    }
     this.content(content, "assistant", message.parent_tool_use_id, { messageId });
   }
 
@@ -585,6 +600,21 @@ export class SessionOutput {
    */
   closeRetracted(message: SDKMessage): void {
     for (const toolCallId of this.retracted.retractedBy(message)) {
+      if (this.unfinished.has(toolCallId)) {
+        this.close({ toolCallId, ran: this.dispatched.has(toolCallId), retracted: true });
+      }
+    }
+  }
+
+  /**
+   * Records `block`, of a reply in the conversation of `parentToolUseId`, and
+   * ends the open server tool calls that it shows will never get a result
+   * (see `UnansweredServerToolCalls.observe`), `cancelled`: Claude Code gave
+   * up on the reply that made them and asked again, so they end as
+   * `retracted`, as in {@link closeRetracted}.
+   */
+  private closeUnanswered(parentToolUseId: string | null, block: unknown, replyId?: string): void {
+    for (const toolCallId of this.serverToolCalls.observe(parentToolUseId, block, replyId)) {
       if (this.unfinished.has(toolCallId)) {
         this.close({ toolCallId, ran: this.dispatched.has(toolCallId), retracted: true });
       }

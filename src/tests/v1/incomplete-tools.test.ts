@@ -254,6 +254,135 @@ describe("incomplete foreground tools", () => {
     expect(agent.sessions[sessionId].dispatchedToolCalls?.has(advisorId)).toBe(false);
   });
 
+  it("closes an advisor call whose reply Claude Code gave up on once the next reply's first block has reached the client, and ends the turn as usual", async () => {
+    const advisorId = "srvtoolu_cut_off";
+    const nextToolId = "toolu_next";
+    const { prompt, updates, logError, agent } = createTestSession(async function* (input) {
+      yield* echoNextPrompt(input);
+      yield messageStart("msg_cut_off");
+      yield advisorStart(advisorId);
+      yield advisorToolUse(advisorId, "msg_cut_off");
+      // No result: Claude Code gives up on the reply and asks again.
+      yield messageStart("msg_asked_again");
+      yield toolStart(nextToolId);
+      yield blockStart({ type: "text", text: "" }, 1);
+      yield {
+        ...blockStart({}),
+        event: {
+          type: "content_block_delta",
+          index: 1,
+          delta: { type: "text_delta", text: "Next." },
+        },
+      };
+      yield successfulResultMessage();
+    });
+
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+    const ends = updates.filter(
+      (update) =>
+        update.toolCallId === advisorId && ["completed", "failed"].includes(update.status),
+    );
+    expect(ends).toHaveLength(1);
+    expect(ends[0]).toMatchObject({ status: "failed" });
+    expect(ends[0].content[0].content.text).toBe(
+      "Claude Code replaced the response that made this tool call, and stopped the call. If it had started, some of its effects may have happened.",
+    );
+    const advisorEnds = updates.indexOf(ends[0]);
+    const nextToolStarts = updates.findIndex(
+      (update) => update.sessionUpdate === "tool_call" && update.toolCallId === nextToolId,
+    );
+    const nextText = updates.findIndex(
+      (update) => update.sessionUpdate === "agent_message_chunk" && update.content.text === "Next.",
+    );
+    expect(nextToolStarts).toBeGreaterThanOrEqual(0);
+    expect(advisorEnds).toBeGreaterThan(nextToolStarts);
+    expect(advisorEnds).toBeLessThan(nextText);
+    expect(agent.sessions[sessionId].emittedToolCalls.has(advisorId)).toBe(false);
+    expect(logError).not.toHaveBeenCalled();
+  });
+
+  it("closes an advisor call whose reply Claude Code gave up on when the next reply does not stream, by its message id", async () => {
+    const advisorId = "srvtoolu_cut_off";
+    const retryToolId = "toolu_retry";
+    const retry = toolUse(retryToolId);
+    const { prompt, updates, logError } = createTestSession(async function* (input) {
+      yield* echoNextPrompt(input);
+      yield messageStart("msg_cut_off");
+      yield advisorStart(advisorId);
+      yield advisorToolUse(advisorId, "msg_cut_off");
+      // Claude Code asks again without streaming, as its fallback after a
+      // streaming error does: only the consolidated message comes.
+      yield { ...retry, message: { ...retry.message, id: "msg_retry" } };
+      yield toolResult(retryToolId);
+      yield successfulResultMessage();
+    });
+
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+    const ends = updates.filter(
+      (update) =>
+        update.toolCallId === advisorId && ["completed", "failed"].includes(update.status),
+    );
+    expect(ends).toHaveLength(1);
+    expect(ends[0]).toMatchObject({ status: "failed" });
+    expect(ends[0].content[0].content.text).toBe(
+      "Claude Code replaced the response that made this tool call, and stopped the call. If it had started, some of its effects may have happened.",
+    );
+    expect(updates).toContainEqual(
+      expect.objectContaining({ toolCallId: retryToolId, status: "completed" }),
+    );
+    expect(logError).not.toHaveBeenCalled();
+  });
+
+  it("names the subagent on the close of its advisor call whose reply Claude Code gave up on", async () => {
+    const advisorId = "srvtoolu_subagent_cut_off";
+    const subagent = { parent_tool_use_id: "toolu_agent" };
+    const { prompt, updates } = createTestSession(async function* (input) {
+      yield* echoNextPrompt(input);
+      yield { ...messageStart("msg_subagent_cut_off"), ...subagent };
+      yield { ...advisorStart(advisorId), ...subagent };
+      yield { ...messageStart("msg_subagent_asked_again"), ...subagent };
+      yield { ...blockStart({ type: "text", text: "" }), ...subagent };
+      yield assistantText("Done.");
+      yield successfulResultMessage();
+    });
+
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+    const ends = updates.filter(
+      (update) =>
+        update.toolCallId === advisorId && ["completed", "failed"].includes(update.status),
+    );
+    expect(ends).toMatchObject([
+      { status: "failed", _meta: { claudeCode: { parentToolUseId: "toolu_agent" } } },
+    ]);
+    const mainText = updates.findIndex(
+      (update) => update.sessionUpdate === "agent_message_chunk" && update.content.text === "Done.",
+    );
+    expect(updates.indexOf(ends[0])).toBeLessThan(mainText);
+  });
+
+  it("leaves an advisor call that its reply left pending for the result that starts the next reply", async () => {
+    const advisorId = "srvtoolu_pending";
+    const result = { type: "advisor_result", text: "Check the edge case." };
+    const { prompt, updates, logError } = createTestSession(async function* (input) {
+      yield* echoNextPrompt(input);
+      yield messageStart("msg_paused");
+      yield advisorStart(advisorId);
+      yield advisorToolUse(advisorId, "msg_paused");
+      yield messageStart("msg_continued");
+      yield advisorResult(advisorId, result, "msg_continued");
+      yield blockStart({ type: "text", text: "" }, 1);
+      yield successfulResultMessage();
+    });
+
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+    const ends = updates.filter(
+      (update) =>
+        update.toolCallId === advisorId && ["completed", "failed"].includes(update.status),
+    );
+    expect(ends.map((update) => update.status)).toEqual(["completed"]);
+    expect(logError).not.toHaveBeenCalled();
+  });
+
   it("allows a tool explicitly handed off to a background task", async () => {
     const { prompt, updates } = createTestSession(backgroundToolMessages);
 
@@ -1288,6 +1417,31 @@ describe("a tool use whose input Claude Code rejects", () => {
   });
 });
 
+/** The stream event that starts an API reply, which carries its message id. */
+function messageStart(id: string) {
+  return {
+    type: "stream_event",
+    session_id: sessionId,
+    uuid: `stream-${id}`,
+    parent_tool_use_id: null,
+    event: {
+      type: "message_start",
+      message: { id, model: "claude-test", usage: successfulResultMessage().usage },
+    },
+  };
+}
+
+/** The stream event that starts a block of the reply streaming: `block` at `index`. */
+function blockStart(block: Record<string, unknown>, index = 0) {
+  return {
+    type: "stream_event",
+    session_id: sessionId,
+    uuid: "stream-message",
+    parent_tool_use_id: null,
+    event: { type: "content_block_start", index, content_block: block },
+  };
+}
+
 function toolStart(id = toolCallId, parent: string | null = null, name = "Bash") {
   return {
     type: "stream_event",
@@ -1333,12 +1487,13 @@ function advisorStart(id: string) {
 }
 
 /** The complete assistant message that dispatches the advisor server tool. */
-function advisorToolUse(id: string) {
+function advisorToolUse(id: string, messageId?: string) {
   return {
     type: "assistant",
     session_id: sessionId,
     parent_tool_use_id: null,
     message: {
+      ...(messageId && { id: messageId }),
       role: "assistant",
       usage: successfulResultMessage().usage,
       content: [{ type: "server_tool_use", id, name: "advisor", input: {} }],
@@ -1346,12 +1501,13 @@ function advisorToolUse(id: string) {
   };
 }
 
-function advisorResult(id: string, content: unknown) {
+function advisorResult(id: string, content: unknown, messageId?: string) {
   return {
     type: "assistant",
     session_id: sessionId,
     parent_tool_use_id: null,
     message: {
+      ...(messageId && { id: messageId }),
       role: "assistant",
       usage: successfulResultMessage().usage,
       content: [{ type: "advisor_tool_result", tool_use_id: id, content }],
