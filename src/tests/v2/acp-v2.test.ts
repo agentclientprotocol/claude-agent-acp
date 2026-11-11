@@ -1445,6 +1445,51 @@ describe("ACP v2 sessions", () => {
       });
     });
 
+    /**
+     * Scenario:
+     * 1. The client turns Fast mode on and sends a prompt.
+     * 2. Claude Code's `system`/init of that turn reports Fast mode off, reason `preference`.
+     * Expected:
+     * - One warning notice explains that the organization or gateway has not enabled it.
+     * - The `fast` option reads off, and its description ends with the explanation.
+     */
+    it("explains a Fast mode that the organization or gateway has not enabled", async () => {
+      scriptTurns(async function* (options) {
+        yield fastModeInit(options, "off", "preference");
+        yield assistantText(options, "Done.");
+        yield result(options);
+        yield idleState(options);
+      });
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.setConfigOption, {
+          sessionId,
+          configId: "fast",
+          type: "boolean",
+          value: true,
+        });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+        await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+        await client.authUpdate(1);
+      });
+
+      expect(client.updates("notice")).toEqual([
+        {
+          sessionUpdate: "notice",
+          severity: "warning",
+          title: "Fast mode turned off",
+          description: "Not enabled for your organization or API gateway.",
+        },
+      ]);
+      expect(fastOption(client.updates("config_option_update").at(-1))).toMatchObject({
+        currentValue: false,
+        description:
+          "Faster responses on supported models — not enabled for your organization or API gateway",
+      });
+    });
+
     it("reports a refusal fallback with a notice and follows the model it swapped to", async () => {
       sdk.initializationResult = async () => ({ models: [OPUS, HAIKU] });
       scriptTurns(async function* (options) {
@@ -1689,6 +1734,23 @@ function stream(options: Options, event: Record<string, unknown>) {
     uuid: randomUUID(),
     session_id: options.sessionId,
   };
+}
+
+/** Claude Code's per-turn `system`/init, reporting the Fast mode state. */
+function fastModeInit(options: Options, state: string, reason: string) {
+  return {
+    type: "system",
+    subtype: "init",
+    fast_mode_state: state,
+    fast_mode_disabled_reason: reason,
+    session_id: options.sessionId,
+    uuid: randomUUID(),
+  };
+}
+
+/** The `fast` option of a `config_option_update`. */
+function fastOption(update: { configOptions: { configId: string }[] } | undefined) {
+  return update?.configOptions.find((option) => option.configId === "fast");
 }
 
 function idleState(options: Options) {
