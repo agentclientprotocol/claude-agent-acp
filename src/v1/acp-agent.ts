@@ -339,6 +339,7 @@ import {
   type ToolCallUpdate,
 } from "../tool-calls/renderer.js";
 import { messageLoopYielder, Pushable, raceTimeoutAndAbort, unreachable } from "../utils.js";
+import { UnansweredServerToolCalls } from "../server-tool-calls.js";
 import {
   acceptedPlanToolResult,
   ExitPlanCoordinator,
@@ -3129,6 +3130,9 @@ export class ClaudeAcpAgent {
       if (!blocks) streamedBlocksByParent.set(key, (blocks = []));
       return blocks;
     };
+    // The server tool calls of each stream that still wait for their result,
+    // which a later reply can show will get none (see UnansweredServerToolCalls).
+    const serverToolCalls = new UnansweredServerToolCalls();
     // The streams, keyed like streamedBlocksByParent, that dropped a delta
     // after a cancel since their record last reset, so the record no longer
     // matches what the client got (see the stream_event case).
@@ -3913,6 +3917,17 @@ export class ClaudeAcpAgent {
       session.dispatchedToolCalls?.delete(toolCallId);
       session.toolCallParents?.delete(toolCallId);
       await sendUpdate({ sessionId: params.sessionId, update: report });
+    };
+
+    /** Closes the server tool calls that a later reply on their stream showed
+     *  to have ended without their result: Claude Code gave up on the reply
+     *  that made them, so they end as calls Claude abandoned. */
+    const closeUnansweredServerToolCalls = async (ended: string[]): Promise<void> => {
+      const renderer = new AcpToolCallRenderer(this.toolCallCapabilities);
+      for (const toolCallId of ended) {
+        if (!session.emittedToolCalls.has(toolCallId)) continue;
+        await closeToolCall(toolCallId, renderer.unfinished({ toolCallId, ran: false }));
+      }
     };
 
     /** Whether the subagent that the Agent call `agentToolUseId` started runs in
@@ -5257,6 +5272,7 @@ export class ClaudeAcpAgent {
                   // The subagent streams no more text under this parent.
                   streamedBlocksByParent.delete(message.tool_use_id);
                   droppedStreams.delete(message.tool_use_id);
+                  serverToolCalls.forget(message.tool_use_id);
                 }
                 await endBackgroundTask(message.task_id);
                 if (message.status === "stopped") {
@@ -5301,6 +5317,7 @@ export class ClaudeAcpAgent {
                   if (parentToolUseId) {
                     streamedBlocksByParent.delete(parentToolUseId);
                     droppedStreams.delete(parentToolUseId);
+                    serverToolCalls.forget(parentToolUseId);
                   }
                   await endBackgroundTask(message.task_id);
                   if (message.patch.status === "killed") {
@@ -6220,6 +6237,7 @@ export class ClaudeAcpAgent {
             // it) can all be tagged with the same, replay-stable id.
             if (message.event.type === "message_start") {
               currentStreamMessageId = message.event.message.id || undefined;
+              serverToolCalls.replyStarted(message.parent_tool_use_id, currentStreamMessageId);
               await subagents.reportModel(
                 message.parent_tool_use_id,
                 message.event.message.model,
@@ -6389,6 +6407,13 @@ export class ClaudeAcpAgent {
               // the stamped parentToolUseId meta and are excluded there.
               await sendUpdate(notification);
             }
+            // After the block that shows them, so a client sees the next step
+            // start before the calls it leaves behind end.
+            if (message.event.type === "content_block_start") {
+              await closeUnansweredServerToolCalls(
+                serverToolCalls.take(message.parent_tool_use_id, message.event.content_block),
+              );
+            }
             break;
           }
           case "user":
@@ -6403,6 +6428,14 @@ export class ClaudeAcpAgent {
               for (const block of Array.isArray(content) ? content : []) {
                 if (isToolUseBlock(block)) {
                   recordReachedToolUse(session, block.id, stoppedWorkOutput);
+                }
+              }
+              if (!stoppedWorkOutput) {
+                const replyId = message.message.id || undefined;
+                for (const block of Array.isArray(content) ? content : []) {
+                  await closeUnansweredServerToolCalls(
+                    serverToolCalls.take(message.parent_tool_use_id, block, replyId),
+                  );
                 }
               }
             }
