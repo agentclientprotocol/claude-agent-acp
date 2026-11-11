@@ -1066,12 +1066,13 @@ export type Session = {
    *  independent of user ownership: opted-in clients also apply automatic
    *  recommendations and settings-derived values. */
   appliedEffortLevel?: string;
-  /** Why the SDK currently can't serve Fast mode, when the reason is one worth
-   *  telling the user about (see {@link FAST_MODE_UNAVAILABLE_EXPLANATIONS} —
-   *  routine states like the SDK's own opt-in requirement normalize to
-   *  `undefined`). Refreshed from every `fast_mode_disabled_reason` the SDK
-   *  reports on `system`/init and user-turn `result`s; surfaced in the Fast mode
-   *  option's description so a toggle that snaps back off explains itself. */
+  /** Why the SDK currently can't serve Fast mode: the last
+   *  `fast_mode_disabled_reason` that `explainFastModeDisabledReason` explains.
+   *  {@link normalizeFastModeDisabledReason} drops the two it doesn't,
+   *  `sdk_opt_in_required` and `pending`, to `undefined`. Refreshed from every
+   *  `fast_mode_disabled_reason` the SDK reports on `system`/init and user-turn
+   *  `result`s; surfaced in the Fast mode option's description so a toggle that
+   *  snaps back off explains itself. */
   fastModeDisabledReason?: FastModeDisabledReason;
   abortController: AbortController;
   /** Signal the consumer races `query.next()` against. Aborted by cancel()
@@ -10310,7 +10311,8 @@ export class ClaudeAcpAgent {
       // `fast_mode_disabled_reason` reflects the post-switch model since SDK
       // 0.3.219 (the initialize response used to answer from the spawn-time
       // model). A fresh SDK session reports `sdk_opt_in_required` — the toggle IS
-      // the opt-in — which normalizes away, so only real blockers are retained.
+      // the opt-in — which normalizes to `undefined`, as does `pending`; every
+      // other reason is retained.
       const fastModeDisabledReason = fastModeEnabled
         ? undefined
         : normalizeFastModeDisabledReason(initializationResult.fast_mode_disabled_reason);
