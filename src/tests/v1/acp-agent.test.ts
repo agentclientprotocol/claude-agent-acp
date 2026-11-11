@@ -11901,7 +11901,7 @@ describe("stop reason propagation", () => {
         subtype: "api_retry",
         attempt: 1,
         max_retries: 5,
-        retry_delay_ms: 100,
+        retry_delay_ms: 600,
         error_status: 429,
         error: "rate_limit",
         uuid: randomUUID(),
@@ -11975,7 +11975,9 @@ describe("stop reason propagation", () => {
     });
     injectSession(agent, [
       retry(1, 529, "overloaded", 8_000),
-      retry(2, null, "server_error", 2_600),
+      // An SSE `overloaded_error` event after HTTP 200: the CLI reports
+      // `overloaded` with no status.
+      retry(2, null, "overloaded", 1_100),
       createResultMessage({
         subtype: "success",
         stop_reason: "end_turn",
@@ -11999,7 +12001,7 @@ describe("stop reason propagation", () => {
         id: warnings[0].id,
         revision: 2,
         title: "Reconnecting to Claude, attempt 2 of 10.",
-        details: "Connection error: no HTTP response (server error). Next attempt in 3s.",
+        details: "No HTTP status (overloaded). Next attempt in 1s.",
       }),
     ]);
   });
@@ -12046,7 +12048,6 @@ describe("stop reason propagation", () => {
         severity: "warning",
         title:
           "Reconnecting to Claude, attempt 1 of 1. No response after 180s; waiting up to 600s.",
-        details: "Connection error: no HTTP response. Next attempt in 1s.",
       }),
     );
   });
@@ -12066,7 +12067,7 @@ describe("stop reason propagation", () => {
         subtype: "api_retry",
         attempt: 2,
         max_retries: 5,
-        retry_delay_ms: 100,
+        retry_delay_ms: 1_100,
         error_status: null,
         error: "unknown",
         uuid: randomUUID(),
@@ -12648,7 +12649,7 @@ describe("stop reason propagation", () => {
         subtype: "api_retry",
         attempt: 1,
         max_retries: 10,
-        retry_delay_ms: 100,
+        retry_delay_ms: 600,
         error_status: 401,
         error: "authentication_failed",
         uuid: randomUUID(),

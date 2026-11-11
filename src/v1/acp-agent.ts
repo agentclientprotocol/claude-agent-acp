@@ -229,7 +229,7 @@ import { decodeClaudePermissionResponse } from "../permissions/response.js";
 import { SettingsManager } from "../settings.js";
 import {
   activeUsageLimitMessage,
-  apiRetryDetails,
+  apiRetryWarning,
   airSessionFailureCapabilityMeta,
   assistantMessageText,
   type ClaudeFailureKind,
@@ -237,7 +237,6 @@ import {
   isSyntheticUsageLimitMessage,
   type PublishedSessionFailure,
   providerFailureCategory,
-  retrySeconds,
   SessionFailureController,
   type SessionFailureState,
   sessionFailureMeta,
@@ -5591,20 +5590,8 @@ export class ClaudeAcpAgent {
                 // here would outlive the `auth_required` rejection with no
                 // action to clear it (issue #1072).
                 if (kind === "auth_required") break;
-                // `no_response` (SDK 0.3.261+): the API sent no response headers
-                // within the first-byte window, so this retry waits longer for
-                // them. Say so — "attempt 1 of 1" alone reads like a final
-                // failure, and the wait is what the user is about to sit through.
-                const noResponse = message.no_response
-                  ? ` No response after ${retrySeconds(message.no_response.waited_ms)}; waiting up to ${retrySeconds(message.no_response.retry_wait_ms)}.`
-                  : "";
-                const title =
-                  message.error_status === null
-                    ? `Reconnecting to Claude, attempt ${message.attempt} of ${message.max_retries}.${noResponse}`
-                    : `Retrying Claude, attempt ${message.attempt} of ${message.max_retries}.${noResponse}`;
                 await publishSessionFailure(kind, {
-                  title,
-                  details: apiRetryDetails(message),
+                  ...apiRetryWarning(message),
                   severity: "warning",
                 });
                 break;
