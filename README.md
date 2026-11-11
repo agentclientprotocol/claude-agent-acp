@@ -83,6 +83,9 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
     message to the parent instead, in both transcripts and linked the same way.
   - A launch whose child is never exposed is shown as a tool call after all, with its final
     status.
+- The parent's prompt turn ends at its result, also while a background child that it launched or
+  resumed still runs. The child's updates and requests, and the parent's summary when the child
+  ends, follow the prompt response, as the RFD expects of a client.
 - The message of a SendMessage call that resumes the child is a `session_message` in the child's
   transcript. The SendMessage call stays a tool call of the session that made it.
 - `session/cancel` on the parent interrupts Claude Code, which stops the foreground children that

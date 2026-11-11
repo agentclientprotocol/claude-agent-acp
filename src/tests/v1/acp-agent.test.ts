@@ -8950,7 +8950,7 @@ describe("subagent permission attribution (issue #851)", () => {
       }
     });
 
-    it("closes a background child's tool call in its session when the SDK reports the stop after the cancelled response", async () => {
+    it("closes a background child's tool call in its session when the SDK reports the stop after the prompt response", async () => {
       const log: string[] = [];
       const updates: AcpSessionNotification[] = [];
       const logError = vi.fn();
@@ -9011,9 +9011,9 @@ describe("subagent permission attribution (issue #851)", () => {
             ...rootToolUse("toolu_child", "Bash", { command: "make" }),
             parent_tool_use_id: "toolu_agent",
           };
-          // The turn's result comes while the subagent runs, so v1 holds the turn
-          // for it. The cancel settles the held turn, which leaves the subagent's
-          // command open, since the subagent runs.
+          // The turn's result comes while the subagent runs. The client declares
+          // `subagents`, so the turn ends at it, and the cancel comes while no
+          // prompt runs. The subagent's command stays open, since the subagent runs.
           yield successResult();
           await agent.cancel({ sessionId: "test-session" });
           await responded.promise;
@@ -9050,14 +9050,14 @@ describe("subagent permission attribution (issue #851)", () => {
             responded.resolve();
             return response;
           }),
-      ).resolves.toMatchObject({ stopReason: "cancelled" });
+      ).resolves.toMatchObject({ stopReason: "end_turn" });
       await agent.sessions["test-session"]?.consumer;
 
       // The command ends in the child's session, after the child reported idle.
       // The background launch's own result is not shown in the parent.
       expect(log).toEqual([
         'agent-42 {"state":"running"}',
-        "prompt cancelled",
+        "prompt end_turn",
         'agent-42 {"state":"idle","stopReason":"cancelled"}',
         "tool @agent-42 toolu_child failed",
       ]);
