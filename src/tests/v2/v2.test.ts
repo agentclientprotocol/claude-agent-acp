@@ -573,6 +573,52 @@ describe("ACP v2 core", () => {
     expect(settings).toMatchObject({ apiKeyHelper: "", env: { ANTHROPIC_BASE_URL: baseUrl } });
   });
 
+  it("starts on an older provider Sonnet when the SDK family default is absent", async () => {
+    sdk.models = [
+      {
+        value: "default",
+        resolvedModel: "claude-sonnet-5-5",
+        displayName: "Default",
+        description: "",
+      },
+      {
+        value: "sonnet",
+        resolvedModel: "claude-sonnet-5-5",
+        displayName: "Sonnet",
+        description: "",
+      },
+      { value: "haiku", resolvedModel: "claude-haiku-5-5", displayName: "Haiku", description: "" },
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({ data: [{ id: "claude-sonnet-5" }, { id: "claude-haiku-5-5" }] }),
+          ),
+      ),
+    );
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      await agent.request(v2.methods.agent.initialize, {
+        protocolVersion: v2.PROTOCOL_VERSION,
+        info: { name: "test", version: "1" },
+        capabilities: {},
+      });
+      await agent.request(v2.methods.agent.providers.set, {
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gateway.example",
+      });
+      const response = await agent.request(v2.methods.agent.session.new, { cwd });
+      expect(response.configOptions?.find((option) => option.configId === "model")).toMatchObject({
+        currentValue: "claude-sonnet-5",
+        options: [{ value: "claude-sonnet-5" }, { value: "haiku" }],
+      });
+      expect(sdk.processes[0].setModel).toHaveBeenCalledWith("claude-sonnet-5");
+    });
+  });
+
   describe("a provider change of live sessions", () => {
     const setProvider = (agent: v2.ClientContext) =>
       agent.request(v2.methods.agent.providers.set, {

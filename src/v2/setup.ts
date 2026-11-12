@@ -25,6 +25,7 @@ import {
   aliasResumedModelRow,
   applyAvailableModelsAllowlist,
   getAvailableModels,
+  type GatewayFamilyFallback,
   type SessionModelState,
   withCurrentModelInfo,
 } from "../session-model.js";
@@ -63,20 +64,22 @@ export async function sessionModels(
   query: Query,
   sdkModels: ModelInfo[],
   settings: SettingsManager,
-  narrow: (models: ModelInfo[]) => ModelInfo[],
+  narrow: (models: ModelInfo[], fallback?: GatewayFamilyFallback) => ModelInfo[],
   narrowedByProvider: boolean,
   resumed: { model?: string } | undefined,
   sessionId: string,
   logger: Logger,
-  configuredSettings?: Settings,
+  launch: {
+    env?: Record<string, string | undefined>;
+    settings?: Settings;
+  } = {},
 ): Promise<{
   models: SessionModelState;
   modelInfos: ModelInfo[];
   currentModelInfo: ModelInfo | undefined;
   allowlistedModelInfo: ModelInfo | undefined;
 }> {
-  const { availableModels, modelOverrides } =
-    settings.getModelSelectionSettings(configuredSettings);
+  const { availableModels, modelOverrides } = settings.getModelSelectionSettings(launch.settings);
   // A resumed Fable 5.2 session lists Fable 5.2 as `fable`, as a new session does.
   const listed = aliasResumedModelRow(sdkModels, resumed?.model);
   const allowed = Array.isArray(availableModels)
@@ -87,7 +90,15 @@ export async function sessionModels(
         settings.getManagedDeniedModels(),
       )
     : listed;
-  const narrowed = narrow(allowed);
+  const narrowed = narrow(allowed, {
+    settings: {
+      ...settings.getSettings(),
+      ...launch.settings,
+      env: { ...settings.getSettings().env, ...launch.settings?.env },
+    },
+    env: launch.env ?? process.env,
+    deniedModels: settings.getManagedDeniedModels(),
+  });
   const models = await getAvailableModels(
     query,
     narrowed,

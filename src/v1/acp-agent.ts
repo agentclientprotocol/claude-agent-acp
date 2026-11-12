@@ -10274,6 +10274,15 @@ export class ClaudeAcpAgent {
             settingsAllowedModels,
             resolvedProvider.listedModels,
             resolvedProvider.bedrockRegionPrefix,
+            {
+              settings: {
+                ...settingsManager.getSettings(),
+                ...configuredSettingsObject,
+                env: { ...settingsManager.getSettings().env, ...configuredSettingsObject?.env },
+              },
+              env,
+              deniedModels: settingsManager.getManagedDeniedModels(),
+            },
           )
         : settingsAllowedModels;
 

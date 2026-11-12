@@ -320,6 +320,120 @@ describe("narrowToGatewayModels", () => {
     expect(narrowed.map((m) => m.value)).toEqual(["sonnet", "sonnet[1m]"]);
   });
 
+  describe("older provider family defaults", () => {
+    const models: ModelInfo[] = [
+      {
+        value: "default",
+        resolvedModel: "claude-sonnet-5-5",
+        displayName: "Default",
+        description: "",
+      },
+      {
+        value: "sonnet",
+        resolvedModel: "claude-sonnet-5-5",
+        displayName: "Sonnet",
+        description: "Sonnet 5.5",
+        supportsFastMode: true,
+      },
+      { value: "haiku", resolvedModel: "claude-haiku-5-5", displayName: "Haiku", description: "" },
+    ];
+    const policy = { settings: {}, env: {}, deniedModels: [] };
+
+    it.each([
+      ["claude-sonnet-5", undefined],
+      ["eu.anthropic.claude-sonnet-5-v1:0", "eu"],
+      ["anthropic/claude-sonnet-5:batch", undefined],
+    ])("offers the exact older ID %s without the newer capabilities", (id, region) => {
+      const narrowed = narrowToGatewayModels(models, [id, "claude-haiku-5-5"], region, policy);
+      expect(narrowed[0]).toEqual({
+        value: id,
+        resolvedModel: id,
+        displayName: id,
+        description: "",
+      });
+    });
+
+    it.each([
+      ["a newer generation", ["claude-sonnet-6"], policy],
+      ["an unknown model", ["claude-sonnet-custom"], policy],
+      ["a misleading prefix", ["anthropic/openai/claude-sonnet-5"], policy],
+      [
+        "an explicit family env",
+        ["claude-sonnet-5"],
+        { ...policy, env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-5-5" } },
+      ],
+      [
+        "a settings env override",
+        ["claude-sonnet-5"],
+        { ...policy, settings: { env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-5-5" } } },
+      ],
+      [
+        "an explicit allowlist",
+        ["claude-sonnet-5"],
+        { ...policy, settings: { availableModels: ["sonnet"] } },
+      ],
+      ["a denied version", ["claude-sonnet-5"], { ...policy, deniedModels: ["claude-sonnet-5"] }],
+    ])("does not infer %s", (_name, ids, configured) => {
+      expect(narrowToGatewayModels(models, ids, undefined, configured)).toEqual([]);
+    });
+
+    it("chooses the highest older version independently of listing order", () => {
+      expect(
+        narrowToGatewayModels(
+          models,
+          ["claude-sonnet-4-6", "claude-sonnet-5"],
+          undefined,
+          policy,
+        )[0].value,
+      ).toBe("claude-sonnet-5");
+    });
+
+    it("keeps an existing older SDK row instead of inferring a duplicate", () => {
+      const older = {
+        value: "claude-sonnet-5",
+        resolvedModel: "claude-sonnet-5",
+        displayName: "Sonnet 5",
+        description: "",
+        supportsFastMode: true,
+      };
+      expect(
+        narrowToGatewayModels([...models, older], ["claude-sonnet-5"], undefined, policy),
+      ).toEqual([older]);
+    });
+
+    it("uses the new provider listing without retaining a previous fallback", () => {
+      expect(narrowToGatewayModels(models, ["claude-sonnet-5"], undefined, policy)[0].value).toBe(
+        "claude-sonnet-5",
+      );
+      expect(narrowToGatewayModels(models, ["claude-sonnet-4-6"], undefined, policy)[0].value).toBe(
+        "claude-sonnet-4-6",
+      );
+      expect(
+        narrowToGatewayModels(models, ["claude-haiku-5-5"], undefined, policy).map(
+          (row) => row.value,
+        ),
+      ).toEqual(["haiku"]);
+    });
+
+    it("does not move a listed resumed model to the SDK family default", async () => {
+      const narrowed = narrowToGatewayModels(models, ["claude-sonnet-5"], undefined, policy);
+      const setModel = vi.fn();
+      const state = await getAvailableModels(
+        { setModel } as unknown as Query,
+        narrowed,
+        models,
+        { getSettings: () => ({}) },
+        logger,
+        true,
+        "resumed",
+        "claude-sonnet-5",
+        true,
+      );
+      expect(state.currentModelId).toBe("claude-sonnet-5");
+      expect(setModel).not.toHaveBeenCalled();
+    });
+  });
+
   it("leaves no model when the listing matches none", () => {
     expect(narrowToGatewayModels(MODELS, ["gpt-5", "gemini-3-pro"])).toEqual([]);
     expect(narrowToGatewayModels(MODELS, [])).toEqual([]);
