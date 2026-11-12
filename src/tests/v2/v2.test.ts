@@ -48,6 +48,7 @@ type FakeClaudeCode = {
   /** Ends the stream, with `error` as a crash. */
   end(error?: Error): void;
   interrupt: ReturnType<typeof vi.fn>;
+  cancelAsyncMessage: ReturnType<typeof vi.fn>;
   setPermissionMode: ReturnType<typeof vi.fn>;
   setModel: ReturnType<typeof vi.fn>;
   stopTask: ReturnType<typeof vi.fn>;
@@ -115,6 +116,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         send: (message) => push({ value: message, done: false }),
         end: (error) => push(error ?? { value: undefined, done: true }),
         interrupt: vi.fn(async () => undefined),
+        cancelAsyncMessage: vi.fn(async (_uuid: string) => true),
         setPermissionMode: vi.fn(async () => {}),
         setModel: vi.fn(async () => {}),
         stopTask: vi.fn(async () => {}),
@@ -151,6 +153,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
           { name: "review", description: "Review a change", argumentHint: "<pull request>" },
         ],
         interrupt: fake.interrupt,
+        cancelAsyncMessage: fake.cancelAsyncMessage,
         setPermissionMode: fake.setPermissionMode,
         setModel: fake.setModel,
         stopTask: fake.stopTask,
@@ -1373,6 +1376,66 @@ describe("ACP v2 core", () => {
 
     expect(error).toMatchObject({ code });
   });
+
+  it.each([true, false])(
+    "withdraws only the queued prompt when Claude Code cancels it: %s",
+    async (cancelled) => {
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const sessionId = response.sessionId;
+        const completedSignal = new AbortController();
+        const first = agent.request(
+          v2.methods.agent.session.prompt,
+          { sessionId, prompt: PROMPT },
+          {
+            cancellationSignal: completedSignal.signal,
+          },
+        );
+        const running = await claude.prompt(0);
+        claude.send(sessionState("running"));
+        claude.send(lifecycle(running, "started"));
+        await first;
+        completedSignal.abort();
+        expect(claude.cancelAsyncMessage).not.toHaveBeenCalled();
+        const controller = new AbortController();
+        const queued = agent
+          .request(
+            v2.methods.agent.session.prompt,
+            { sessionId, prompt: PROMPT },
+            {
+              cancellationSignal: controller.signal,
+            },
+          )
+          .catch((error: unknown) => error);
+        const waiting = await claude.prompt(1);
+        claude.cancelAsyncMessage.mockResolvedValue(cancelled);
+        controller.abort();
+        await vi.waitFor(() =>
+          expect(claude.cancelAsyncMessage).toHaveBeenCalledWith(waiting.uuid),
+        );
+        if (cancelled) {
+          expect(await queued).toMatchObject({ code: -32800 });
+          claude.send(lifecycle(waiting, "cancelled"));
+        } else {
+          claude.send(lifecycle(waiting, "started"));
+          expect(await queued).toEqual({ messageId: waiting.uuid });
+        }
+        expect(claude.interrupt).not.toHaveBeenCalled();
+        expect(client.states()).toEqual(["running"]);
+        expect(
+          client.sessionUpdates.filter((update) => update.sessionUpdate === "user_message"),
+        ).toHaveLength(cancelled ? 1 : 2);
+        claude.send(result());
+        claude.send(sessionState("idle"));
+        await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+        expect(client.sessionUpdates.at(-1)).toMatchObject({
+          state: "idle",
+          stopReason: "end_turn",
+        });
+      });
+    },
+  );
 
   it("cancels the work and the prompts not inserted yet with one interrupt", async () => {
     const client = v2Client();

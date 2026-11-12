@@ -122,6 +122,8 @@ type PendingPrompt = {
   prompt: v2.ContentBlock[];
   /** Whether the prompt went to Claude Code (see {@link V2Session.prompt}). */
   pushed: boolean;
+  signal: AbortSignal;
+  withdraw: () => void;
   resolve: (response: v2.PromptResponse) => void;
   reject: (error: unknown) => void;
 };
@@ -451,11 +453,13 @@ export class V2Session implements RequestTarget {
    */
   prompt(
     params: v2.PromptRequest,
+    signal: AbortSignal,
     guard?: (query: Query) => Promise<void> | undefined,
   ): Promise<v2.PromptResponse> {
     if (this.closed) {
       return Promise.reject(RequestError.sessionNotFound(this.sessionId));
     }
+    if (signal.aborted) return Promise.reject(RequestError.requestCancelled());
     // Throws invalid params for content that Claude cannot take.
     const request: PromptRequest = v1PromptRequest(params);
     const key = params.idempotencyKey;
@@ -503,8 +507,25 @@ export class V2Session implements RequestTarget {
     // A prompt whose key the stored history may hold is new only once the lookup says so.
     if (!stored) accept();
     return new Promise((resolve, reject) => {
-      const pending: PendingPrompt = { prompt: params.prompt, pushed: false, resolve, reject };
+      const withdraw = () => {
+        void this.withdrawPrompt(uuid).catch((error: unknown) => {
+          this.connection.logger.error(
+            `Session ${this.sessionId}: could not withdraw prompt ${uuid}`,
+            error,
+          );
+        });
+      };
+      const pending: PendingPrompt = {
+        prompt: params.prompt,
+        pushed: false,
+        signal,
+        withdraw,
+        resolve,
+        reject,
+      };
       this.pending.set(uuid, pending);
+      signal.addEventListener("abort", withdraw, { once: true });
+      if (signal.aborted) withdraw();
       // A cancel or close answered it before it went out.
       const answered = () => this.pending.get(uuid) !== pending || this.closed;
       this.pushes = this.pushes
@@ -1232,9 +1253,8 @@ export class V2Session implements RequestTarget {
    * command gets none.
    */
   private inserted(uuid: string): void {
-    const prompt = this.pending.get(uuid);
+    const prompt = this.takePrompt(uuid);
     if (!prompt) return;
-    this.pending.delete(uuid);
     this.fileChanges?.promptStarted(uuid);
     this.send({ sessionUpdate: "user_message", messageId: uuid, content: prompt.prompt });
     if (this.hasHistory && promptGetsCursor(prompt.prompt)) this.send(forkCursorUpdate(uuid));
@@ -1563,11 +1583,38 @@ export class V2Session implements RequestTarget {
     this.connection.send(this.background.stamp(notification));
   }
 
+  /** Withdraws one pending prompt without interrupting the running work. */
+  private async withdrawPrompt(uuid: string): Promise<void> {
+    const prompt = this.pending.get(uuid);
+    if (!prompt) return;
+    if (!prompt.pushed) {
+      this.failPrompt(uuid, RequestError.requestCancelled());
+      return;
+    }
+    // The SDK exposes per-message cancellation without a Query declaration.
+    const query = this.query as Query & { cancelAsyncMessage?: (uuid: string) => Promise<boolean> };
+    if (!query.cancelAsyncMessage) {
+      this.connection.logger.error(
+        `Session ${this.sessionId}: Claude Code cannot withdraw queued prompt ${uuid}`,
+      );
+      return;
+    }
+    if (await query.cancelAsyncMessage(uuid))
+      this.failPrompt(uuid, RequestError.requestCancelled());
+  }
+
+  private takePrompt(uuid: string): PendingPrompt | undefined {
+    const prompt = this.pending.get(uuid);
+    if (!prompt) return undefined;
+    this.pending.delete(uuid);
+    prompt.signal.removeEventListener("abort", prompt.withdraw);
+    return prompt;
+  }
+
   /** Fails the prompt `uuid` if it is not answered yet. Returns whether it was pending. */
   private failPrompt(uuid: string, error: unknown): boolean {
-    const prompt = this.pending.get(uuid);
+    const prompt = this.takePrompt(uuid);
     if (!prompt) return false;
-    this.pending.delete(uuid);
     this.localCommands.delete(uuid);
     this.fileChanges?.promptFailed(uuid, error);
     prompt.reject(error);

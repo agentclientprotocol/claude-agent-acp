@@ -143,7 +143,9 @@ export function v2AgentApp(
       .onRequest(v2.methods.agent.session.setConfigOption, ({ params }) =>
         agent.setConfigOption(params),
       )
-      .onRequest(v2.methods.agent.session.prompt, ({ params }) => agent.prompt(params))
+      .onRequest(v2.methods.agent.session.prompt, ({ params, signal }) =>
+        agent.prompt(params, signal),
+      )
       .onRequest(v2.methods.agent.terminal.cancel, ({ params }) =>
         agent.cancelItem(params.sessionId, { terminalId: params.terminalId }),
       )
@@ -399,9 +401,9 @@ class V2Agent implements AgentHandle, SessionConnection {
    * order but the number of promise hops (v2 allows either), and the golden
    * files of the scenarios (`acp-scenarios-v2.test.ts`) hold it.
    */
-  prompt(params: v2.PromptRequest): Promise<v2.PromptResponse> {
+  prompt(params: v2.PromptRequest, signal: AbortSignal): Promise<v2.PromptResponse> {
     const prompt = () =>
-      this.session(params.sessionId, "prompt").prompt(params, (query) =>
+      this.session(params.sessionId, "prompt").prompt(params, signal, (query) =>
         this.guard.beforePrompt(params.sessionId, query),
       );
     try {
