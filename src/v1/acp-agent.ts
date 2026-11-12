@@ -3318,11 +3318,13 @@ export class ClaudeAcpAgent {
       nativeState: "completed" | "failed" | "cancelled",
       asyncState: "failed" | "stopped",
       context: string,
+      // Whether Claude Code can keep the subagents running (see `finishAll`).
+      { mayStillRun = false }: { mayStillRun?: boolean } = {},
     ): Promise<void> => {
       await compaction.interrupt();
       await Promise.all([
         subagents
-          .finishAll(nativeState, sendUpdate)
+          .finishAll(nativeState, sendUpdate, { mayStillRun })
           .catch((error) =>
             this.logger.error(
               `Session ${params.sessionId}: failed to publish terminal subagent state ${context}`,
@@ -6977,7 +6979,9 @@ export class ClaudeAcpAgent {
             // and task store are independent of the previous transcript.
             // Clear both the in-memory snapshot and the client's visible plan
             // before any follow-up prompt can republish stale tasks.
-            await finishLifecycle("failed", "failed", "during conversation reset");
+            await finishLifecycle("failed", "failed", "during conversation reset", {
+              mayStillRun: true,
+            });
             subagents.clear();
             asyncTasks.clear();
             session.resolvedToolNames?.clear();
@@ -7844,7 +7848,8 @@ export class ClaudeAcpAgent {
     // A subagent's text replays onto the root only for a client that gets it
     // there live: one without native subagent sessions that asked for the
     // flattened transcript. With native sessions the text goes to the child
-    // session, which AIR's replay restores and the RFD form leaves out for now.
+    // session, which the replay restores in both forms: AIR's draft under a
+    // replay id, the RFD form under the session id the child had live.
     const forwardSubagentText =
       !clientSupportsSubagents(this.clientCapabilities) &&
       (session?.forwardSubagentText ?? supportsSubagentTranscript(this.clientCapabilities));
@@ -8264,7 +8269,12 @@ export class ClaudeAcpAgent {
           continue;
         }
         if (rfdReplay && (await rfdReplay.toolCallUpdate(notification.update, child))) continue;
-        await this.client.sessionUpdate({ ...notification, sessionId: replayTargetSessionId });
+        const replayed = { ...notification, sessionId: replayTargetSessionId };
+        await this.client.sessionUpdate(
+          rfdReplay
+            ? asSdkSessionNotification(rfdReplay.withTarget(replayed, replayTargetSessionId))
+            : replayed,
+        );
       }
 
       // The history of each subagent is in its own transcript. The replay
@@ -9211,6 +9221,17 @@ export class ClaudeAcpAgent {
    * The work that follows a session setup response: the session's commands,
    * the current states of the subagents a load replayed, and MCP server
    * authentication.
+   *
+   * Call it in the same synchronous step as the handler's `return`: an
+   * `await` between them would let the timer run before the response. The ACP
+   * SDK (2.6.0) gives a request handler no responder and no after-response
+   * hook, so the order rests on two things that its source shows and its API
+   * does not promise. `registerAppRequest` queues the response in the
+   * microtask that follows the handler's return, with no macrotask in
+   * between, so the timer runs after it. And `Connection.sendMessage` writes
+   * in call order, so what the timer sends is written after the response. A
+   * caller that does not serve the agent through the SDK's `AgentApp` (see
+   * `v1AgentApp`) has no such order.
    */
   private afterSetupResponse(sessionId: string, mcpServers: McpServer[]): void {
     setTimeout(() => {

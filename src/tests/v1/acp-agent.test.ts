@@ -4202,7 +4202,13 @@ describe("subagent transcript replay", () => {
               ];
             }
             case "tool_call":
-              return [`${on} tool_call ${u.toolCallId}`];
+              return [
+                `${on} tool_call ${u.toolCallId}` +
+                  (u.content ?? [])
+                    .filter((item: any) => item.type === "session")
+                    .map((item: any) => ` session=${item.sessionId}`)
+                    .join(""),
+              ];
             case "config_option_update":
               return traceModels
                 ? u.configOptions.map(
@@ -4635,6 +4641,37 @@ describe("subagent transcript replay", () => {
         "aaa111 tool_call toolu_sib",
         "bbb222 session_message toolu_sib from=aaa111 Ping sibling",
       ]);
+    });
+
+    it("references a replayed child from a TaskStop call that names it by its agent id", async () => {
+      const trace = await replayRfd(
+        [
+          user("u1", "Go"),
+          // The child is not announced yet: a call that names it references nothing.
+          assistant("a1", [toolUse("toolu_early", "TaskStop", { task_id: "abc123" })]),
+          user("u2", [toolResult("toolu_early", "No such task")]),
+          assistant("a2", [
+            toolUse("toolu_agent", "Agent", { subagent_type: "Explore", prompt: "Look around" }),
+          ]),
+          user("u3", [toolResult("toolu_agent", "Async agent launched")]),
+          assistant("a3", [toolUse("toolu_stop", "TaskStop", { task_id: "abc123" })]),
+          user("u4", [toolResult("toolu_stop", "Stopped abc123")]),
+        ],
+        {
+          abc123: {
+            meta: { agentType: "Explore", toolUseId: "toolu_agent", requestShape: "background" },
+            records: [user("c1", "Look around")],
+          },
+        },
+      );
+
+      expect(trace.filter((line) => line.includes("tool_call"))).toEqual([
+        "root tool_call toolu_early",
+        "root tool_call toolu_stop session=abc123",
+      ]);
+      expect(
+        trace.findIndex((line) => line.startsWith("root subagent_update abc123")),
+      ).toBeLessThan(trace.indexOf("root tool_call toolu_stop session=abc123"));
     });
 
     it("replays a child's hand-back as its message to the parent, instead of the launch's result", async () => {
@@ -9108,6 +9145,66 @@ describe("subagent permission attribution (issue #851)", () => {
         sessionId: "agent-42",
         state: { state: "idle" },
       });
+    });
+
+    it("reports a child that still works at a conversation reset as unknown, without its cancel", async () => {
+      const updates = await run([
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },
+        {
+          type: "conversation_reset",
+          new_conversation_id: randomUUID(),
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        // The reset forgot the child: its later end changes nothing.
+        taskNotification("toolu_parent", "completed"),
+      ]);
+
+      expect(subagentTraffic(updates).at(-1)?.update).toEqual({
+        sessionUpdate: "subagent_update",
+        sessionId: "agent-42",
+        capabilities: null,
+        state: { state: "unknown" },
+      });
+    });
+
+    it("references an announced child from a TaskStop call that names it by its agent id", async () => {
+      const toolResult = (toolUseId: string, content: string) => ({
+        type: "user",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: toolUseId, content }],
+        },
+      });
+      const updates = await run([
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },
+        rootToolUse("toolu_stop", "TaskStop", { task_id: "agent-42" }),
+        toolResult("toolu_stop", "Stopped agent-42"),
+        // A task that is no child session.
+        rootToolUse("toolu_bash", "TaskStop", { task_id: "bash_1" }),
+        toolResult("toolu_bash", "Stopped bash_1"),
+      ]);
+
+      const references = (toolCallId: string) =>
+        updates.flatMap(({ sessionId, update }) =>
+          (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+          update.toolCallId === toolCallId &&
+          update.content != null
+            ? [
+                `${sessionId} ${JSON.stringify(update.content.filter((item) => item.type === "session"))}`,
+              ]
+            : [],
+        );
+      // The first report and the result both carry content, which replaces
+      // what the client holds, so both carry the reference.
+      expect(references("toolu_stop")).toEqual([
+        'test-session [{"type":"session","sessionId":"agent-42"}]',
+        'test-session [{"type":"session","sessionId":"agent-42"}]',
+      ]);
+      expect(references("toolu_bash")).toEqual(["test-session []", "test-session []"]);
     });
   });
 
