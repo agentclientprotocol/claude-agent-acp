@@ -810,6 +810,55 @@ describe("ACP v2 core", () => {
       });
     });
 
+    it("preserves an incompatible provider restart error and resumes after recovery", async () => {
+      sdk.models = [
+        {
+          value: "sonnet",
+          displayName: "Sonnet",
+          description: "",
+          resolvedModel: "claude-sonnet-5-5",
+        },
+      ];
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const { sessionId } = response;
+        vi.mocked(fetch).mockResolvedValueOnce(Response.json({ data: [{ id: "gpt-5" }] }));
+
+        await setProvider(agent);
+
+        expect(sdk.processes).toHaveLength(2);
+        expect(sdk.processes.every((process) => process.close.mock.calls.length === 1)).toBe(true);
+        await expect(
+          agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: PROMPT }),
+        ).rejects.toMatchObject({
+          code: -32603,
+          message:
+            "Internal error: The selected provider offers no compatible Claude models. Choose a different provider and try again.",
+        });
+        expect(sdk.processes.every((process) => process.prompts.length === 0)).toBe(true);
+
+        vi.mocked(fetch).mockResolvedValueOnce(
+          Response.json({ data: [{ id: "claude-sonnet-5-5" }] }),
+        );
+        await agent.request(v2.methods.agent.providers.set, {
+          providerId: "main",
+          apiType: "anthropic",
+          baseUrl: "https://recovered.example.com",
+        });
+        await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+        const recovered = sdk.processes.at(-1)!;
+        const answer = agent.request(v2.methods.agent.session.prompt, {
+          sessionId,
+          prompt: PROMPT,
+        });
+        const prompt = await recovered.prompt(0);
+        recovered.send(lifecycle(prompt, "started"));
+        expect(await answer).toEqual({ messageId: prompt.uuid });
+        expect(claude.prompts).toEqual([]);
+      });
+    });
+
     it("stops a session whose query does not start again under the new route", async () => {
       const client = v2Client();
       await client.connect(async (agent) => {
