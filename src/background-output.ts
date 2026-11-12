@@ -129,3 +129,126 @@ export class BackgroundOutputTail {
     await this.publish({ text, replaces });
   }
 }
+
+/** What Claude Code's `get_task_output` returns: the end of a shell task's output. */
+export interface TaskOutput {
+  /** At most the last 8 KiB of the output, decoded as UTF-8. */
+  output: string;
+  /** The size of the whole output in bytes. */
+  total_bytes: number;
+  /** Whether `output` holds only the end of the output. */
+  truncated: boolean;
+}
+
+/**
+ * The most bytes at the start of a truncated `output` that may not match the
+ * command's bytes: a character that the 8 KiB cut split decodes as U+FFFD.
+ */
+const CUT_CHARACTER_BYTES = 4;
+
+/**
+ * Follows the output of a command that runs in the foreground, read with
+ * `read` (Claude Code's `get_task_output`), and hands each piece of new text
+ * to `publish`, in order. Claude Code streams no output of a foreground Bash
+ * command either: its `tool_progress` carries only the elapsed time, and the
+ * output arrives in the tool result. Claude Code writes the output to its task
+ * before then, and `get_task_output` reads it, though the task's
+ * `task_started` names no output file.
+ *
+ * The new text is the output past the bytes already sent. When `output` does
+ * not hold all of it, or its bytes may not match the command's (not UTF-8),
+ * the whole `output` replaces the terminal's output, as a snapshot. A read
+ * that ends in U+FFFD may have cut a character that the command is still
+ * writing, so it is sent only at the next read. A read that fails is tried
+ * again at the next poll. Reads never overlap. `publish` must not reject.
+ */
+export class TaskOutputPoll {
+  private sentBytes = 0;
+  private sent = false;
+  private stopped = false;
+  private reading: Promise<void> = Promise.resolve();
+  private readonly timer: ReturnType<typeof setInterval>;
+
+  constructor(
+    private readonly read: () => Promise<TaskOutput>,
+    private readonly publish: (output: BackgroundOutput) => Promise<void>,
+  ) {
+    this.timer = setInterval(() => void this.poll(), BACKGROUND_OUTPUT_POLL_MS);
+    // A command that runs on must not keep the agent process alive.
+    this.timer.unref();
+  }
+
+  /**
+   * Stops, once a read in progress has published its text. Returns whether
+   * any text was published: the tool result then replaces it with the whole
+   * output, which a read in progress may have missed the end of.
+   */
+  async finish(): Promise<boolean> {
+    this.stop();
+    await this.reading;
+    return this.sent;
+  }
+
+  /**
+   * Stops now and returns whether any text was published, for a caller that
+   * cannot wait for a read in progress (the v2 tool result path is
+   * synchronous). A read in progress publishes nothing after this: `poll`
+   * checks `stopped` after its read and calls `publish` in the same
+   * synchronous step.
+   */
+  end(): boolean {
+    this.stop();
+    return this.sent;
+  }
+
+  /** Stops without waiting: the session ended. */
+  stop(): void {
+    clearInterval(this.timer);
+    this.stopped = true;
+  }
+
+  private poll(): Promise<void> {
+    this.reading = this.reading.then(async () => {
+      if (this.stopped) return;
+      let read: TaskOutput;
+      try {
+        read = await this.read();
+      } catch {
+        return;
+      }
+      const output = this.newText(read);
+      if (this.stopped || output === undefined) return;
+      this.sentBytes = read.total_bytes;
+      this.sent = true;
+      await this.publish(output);
+    });
+    return this.reading;
+  }
+
+  /** The text that `read` adds to what was sent, or undefined when it adds none yet. */
+  private newText({ output, total_bytes, truncated }: TaskOutput): BackgroundOutput | undefined {
+    if (total_bytes === this.sentBytes || output.endsWith("�")) return undefined;
+    const bytes = Buffer.from(output, "utf8");
+    const added = total_bytes - this.sentBytes;
+    const exact = truncated
+      ? added <= bytes.length - CUT_CHARACTER_BYTES
+      : bytes.length === total_bytes;
+    // `sentBytes` ends a read that ended in a whole character, so the cut is
+    // at a character boundary.
+    if (added > 0 && exact) {
+      return { text: bytes.subarray(bytes.length - added).toString("utf8"), replaces: false };
+    }
+    return { text: output, replaces: true };
+  }
+}
+
+/**
+ * Claude Code's `get_task_output` on the SDK's query. Like `mcpAuthenticate`,
+ * it is on the query object but not in the public `Query` declaration yet,
+ * though the SDK types its control request (`SDKControlGetTaskOutputRequest`).
+ */
+export type TaskOutputQuery = { getTaskOutput(taskId: string): Promise<TaskOutput> };
+
+export function supportsTaskOutput<T extends object>(query: T): query is T & TaskOutputQuery {
+  return typeof (query as Partial<TaskOutputQuery>).getTaskOutput === "function";
+}

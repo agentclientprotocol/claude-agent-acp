@@ -7,6 +7,8 @@ import {
   BACKGROUND_OUTPUT_READ_BYTES,
   type BackgroundOutput,
   BackgroundOutputTail,
+  type TaskOutput,
+  TaskOutputPoll,
 } from "../background-output.js";
 
 describe("BackgroundOutputTail", () => {
@@ -125,5 +127,86 @@ describe("BackgroundOutputTail", () => {
     await new Promise((resolve) => setTimeout(resolve, 700));
 
     expect(published).toEqual([]);
+  });
+});
+
+describe("TaskOutputPoll", () => {
+  let published: BackgroundOutput[];
+  let poll: TaskOutputPoll | undefined;
+  /** `get_task_output` returning each of `reads` in turn, then the last one again. */
+  const follow = (reads: TaskOutput[]) => {
+    let next = 0;
+    const read = async () => reads[Math.min(next++, reads.length - 1)]!;
+    poll = new TaskOutputPoll(read, async (output) => void published.push(output));
+    return () => next;
+  };
+  const whole = (output: string): TaskOutput => ({
+    output,
+    total_bytes: Buffer.byteLength(output),
+    truncated: false,
+  });
+
+  beforeEach(() => {
+    published = [];
+  });
+
+  afterEach(() => {
+    poll?.stop();
+  });
+
+  it("appends what the output adds, and reports on finish that it sent text", async () => {
+    follow([whole(""), whole("line1\n"), whole("line1\nline2 ✓\n")]);
+    await vi.waitFor(() => expect(published).toHaveLength(2), { timeout: 3000 });
+
+    expect(await poll!.finish()).toBe(true);
+    expect(published).toEqual([
+      { text: "line1\n", replaces: false },
+      { text: "line2 ✓\n", replaces: false },
+    ]);
+  });
+
+  it.each([
+    // More was added than the 8 KiB tail holds.
+    [
+      "a tail that misses text",
+      [whole("a\n"), { output: "z\n", total_bytes: 9000, truncated: true }],
+    ],
+    // A new run of the task starts its output over.
+    ["an output that shrank", [whole("abc\n"), whole("d\n")]],
+    // Bytes that are not UTF-8 decode to other bytes.
+    [
+      "an output that is not UTF-8",
+      [whole("a\n"), { output: "a\nb\n", total_bytes: 3, truncated: false }],
+    ],
+  ])("sends %s as a snapshot", async (_case, reads) => {
+    follow(reads);
+    await vi.waitFor(() => expect(published).toHaveLength(2), { timeout: 3000 });
+
+    expect(published[1]).toEqual({ text: reads[1]!.output, replaces: true });
+  });
+
+  it("appends from the end of a truncated tail that holds all the new text", async () => {
+    const tail = "x".repeat(8000);
+    follow([
+      { output: tail, total_bytes: 9000, truncated: true },
+      { output: tail.slice(3) + "end", total_bytes: 9003, truncated: true },
+    ]);
+    await vi.waitFor(() => expect(published).toHaveLength(2), { timeout: 3000 });
+
+    expect(published[1]).toEqual({ text: "end", replaces: false });
+  });
+
+  it("holds a read that ends in a cut character until the character is whole", async () => {
+    const reads = follow([whole("a\uFFFD"), whole("a✓")]);
+    await vi.waitFor(() => expect(reads()).toBeGreaterThan(2), { timeout: 3000 });
+
+    expect(published).toEqual([{ text: "a✓", replaces: false }]);
+  });
+
+  it("reports that it sent nothing when no read added text, and reads nothing after finish", async () => {
+    const reads = follow([whole("")]);
+    expect(await poll!.finish()).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    expect(reads()).toBe(0);
   });
 });

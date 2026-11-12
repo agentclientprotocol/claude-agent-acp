@@ -74,6 +74,30 @@ export function withRunningTerminal(
 }
 
 /**
+ * Makes the output of the tool result update of a command in `toolCallIds`
+ * replace its terminal's output: `terminal_output_delta` becomes
+ * `terminal_output`. The terminal showed the command's output as it ran (see
+ * `SessionBackgroundWork.followForeground`), and the result carries the whole
+ * output again, also the end that the last read missed.
+ */
+export function withStreamedTerminal(
+  notification: SessionNotification,
+  toolCallIds: ReadonlySet<string>,
+): SessionNotification {
+  const update = notification.update;
+  if (
+    update.sessionUpdate !== "tool_call_update" ||
+    !toolCallIds.has(update.toolCallId) ||
+    !update._meta ||
+    !("terminal_output_delta" in update._meta)
+  ) {
+    return notification;
+  }
+  const { terminal_output_delta: output, ...meta } = update._meta;
+  return { ...notification, update: { ...update, _meta: { ...meta, terminal_output: output } } };
+}
+
+/**
  * Keeps the tool call of a task that went on in the background running: the
  * tool result update of a tool call in `toolCallIds` reports `in_progress`
  * instead of `completed`.
