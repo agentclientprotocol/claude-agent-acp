@@ -1,15 +1,12 @@
 import {
   agent as acpAgent,
   AgentApp,
-  AgentContext,
   AuthenticateRequest,
   AuthMethod,
   AuthStatusResponse,
-  AuthStatusUpdateNotification,
   AvailableCommand,
   CancelNotification,
   ClientCapabilities,
-  CompleteElicitationNotification,
   CreateElicitationRequest,
   CreateElicitationResponse,
   DisableProviderRequest,
@@ -18,6 +15,7 @@ import {
   ForkSessionResponse,
   InitializeRequest,
   InitializeResponse,
+  InitialSessionConfigOption,
   ListProvidersRequest,
   ListProvidersResponse,
   McpServer,
@@ -36,7 +34,6 @@ import {
   RequestError,
   SetProviderRequest,
   SetProviderResponse,
-  RequestPermissionRequest,
   RequestPermissionResponse,
   ResumeSessionRequest,
   ResumeSessionResponse,
@@ -47,9 +44,15 @@ import {
   SetSessionConfigOptionResponse,
   SetSessionModeRequest,
   SetSessionModeResponse,
+  SessionOptionsRequest,
+  SessionOptionsResponse,
+  SessionStatusRequest,
+  SessionStatusResponse,
   CloseSessionRequest,
   CloseSessionResponse,
   DeleteSessionRequest,
+  SetSessionTitleRequest,
+  SetSessionTitleResponse,
   DeleteSessionResponse,
   WriteTextFileRequest,
   WriteTextFileResponse,
@@ -95,6 +98,12 @@ import {
 } from "./goal-extension.js";
 import { checklistPlanUpdate, resetPlanUpdates, type SubagentChecklists } from "../plans.js";
 import { PromptSuggestions } from "../prompt-suggestions.js";
+import { savedSessionStatus, SESSION_STATUS_CAPABILITY } from "../session-status.js";
+import {
+  applyInitialConfigOptions,
+  initialConfigOptions,
+  SESSION_OPTIONS_CAPABILITY,
+} from "../initial-config-options.js";
 import { sanitizeTitle, SessionTitles } from "../session-titles.js";
 import {
   AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
@@ -134,16 +143,16 @@ import {
   clientSupportsAirCapability,
   withAirMeta,
 } from "../air-extension.js";
-import * as sessionIndex from "./session-index/connection.js";
+import * as sessionIndex from "./session-index.js";
 import type {
   BatchGetSessionsRequest,
   RenameSessionRequest,
   SessionIdRequest,
-} from "./session-index/service.js";
+} from "../session-index/service.js";
 import type {
   ListSubscribeRequest,
   ListUnsubscribeRequest,
-} from "./session-index/list-subscriptions.js";
+} from "../session-index/list-subscriptions.js";
 import {
   AsyncTaskRuntime,
   backgroundBashTaskFromToolResult,
@@ -151,6 +160,20 @@ import {
   clientSupportsAsyncTasks,
 } from "../async-tasks.js";
 import { SessionBackgroundWork } from "./background-work.js";
+import {
+  ASYNC_TASK_STOP_METHOD,
+  parseAsyncTaskStopRequest,
+  type AsyncTaskStopRequest,
+  type AsyncTaskStopResponse,
+} from "./async-task-stop.js";
+import {
+  STEER_METHOD,
+  STEER_PRIORITY_LATER,
+  STEER_PRIORITY_NOW,
+  parseSteerRequest,
+  type SteerRequest,
+  type SteerResponse,
+} from "./steering.js";
 import {
   AUTH_STATUS_UPDATE_METHOD,
   type AuthStatus,
@@ -202,6 +225,7 @@ import {
   replaySubagentTerminalState,
 } from "../subagent-replay.js";
 import {
+  readHistoryAcrossCompactions,
   readResumedSession,
   readResumedTail,
   type ResumedSessionSnapshot,
@@ -219,6 +243,7 @@ import { decodeClaudePermissionResponse } from "../permissions/response.js";
 import { SettingsManager } from "../settings.js";
 import {
   activeUsageLimitMessage,
+  apiRetryWarning,
   airSessionFailureCapabilityMeta,
   assistantMessageText,
   type ClaudeFailureKind,
@@ -305,7 +330,7 @@ import {
 } from "../session-usage.js";
 import { previewPatchContent } from "../diff.js";
 import { backgroundedBashToolCall, withRunningTerminal } from "../tool-calls/background.js";
-import { ChangedMetaFilter } from "./tool-calls/changed-meta-filter.js";
+import { ChangedMetaClient, ClientConnection } from "./client-connection.js";
 import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
 import { ClientCapabilities as ToolCallClientCapabilities } from "../tool-calls/client-capabilities.js";
 import {
@@ -410,6 +435,7 @@ import {
   stripLocalCommandMetadata,
 } from "../message-filters.js";
 import type { NewSessionMeta, SDKMessageFilter } from "../new-session-meta.js";
+import { computeSessionFingerprint } from "./session-fingerprint.js";
 import { promptToClaude, SUPPORTED_PROMPT_CONTENT_TYPES } from "../prompt-to-claude.js";
 import { AUTONOMOUS_RESULT_ORIGINS, isAbortedResult } from "../result-end.js";
 import {
@@ -565,112 +591,6 @@ async function structuredUsageMarkdown(
 const TURN_NO_RESULT_MESSAGE =
   "The turn ended without a result: the agent went idle while this prompt was still in flight " +
   "(e.g. the model stream dropped mid-turn). Any partial output may be incomplete; please retry.";
-
-/** Custom (extension) request method a client uses to steer the turn that is
- *  currently running: the message is injected into the in-flight turn rather
- *  than queued as a separate `session/prompt`. Named `_session/steering` per the
- *  agreed ACP steering wire protocol; advertised to clients via the top-level
- *  `InitializeResponse._meta.steering.supported`. */
-const STEER_METHOD = "_session/steering";
-
-/** Stops one Claude background task without cancelling the parent prompt turn. */
-const ASYNC_TASK_STOP_METHOD = "_session/async_task/stop";
-
-type AsyncTaskStopRequest = {
-  sessionId: string;
-  asyncTaskId: string;
-};
-
-type AsyncTaskStopResponse = {
-  stopped: boolean;
-};
-
-function parseAsyncTaskStopRequest(value: unknown): AsyncTaskStopRequest {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw RequestError.invalidParams(undefined, "async task stop params must be an object");
-  }
-  const params = value as Record<string, unknown>;
-  const sessionId = typeof params.sessionId === "string" ? params.sessionId.trim() : "";
-  const asyncTaskId = typeof params.asyncTaskId === "string" ? params.asyncTaskId.trim() : "";
-  if (!sessionId) {
-    throw RequestError.invalidParams(
-      undefined,
-      "async task stop params require a non-empty sessionId",
-    );
-  }
-  if (!asyncTaskId) {
-    throw RequestError.invalidParams(
-      undefined,
-      "async task stop params require a non-empty asyncTaskId",
-    );
-  }
-  return { sessionId, asyncTaskId };
-}
-
-/** How urgently the SDK delivers a steered message relative to the running
- *  turn — an internal Claude implementation detail, not part of the wire
- *  contract. `now` pre-empts the current generation, while `later` waits for a
- *  pending permission/elicitation callback to settle instead of cancelling its
- *  ACP request and hiding the client's user-input card (IJAI-1191). */
-const STEER_PRIORITY_NOW = "now" as const;
-const STEER_PRIORITY_LATER = "later" as const;
-
-/** Request-level steering options. `promptRequired` is opt-in so existing Hosts
- *  keep the established idle fallback behavior. */
-type SteerMeta = {
-  [key: string]: unknown;
-  steering?: {
-    idleBehavior?: "promptRequired";
-  };
-};
-
-/** Params of a {@link STEER_METHOD} request. Shaped like the relevant subset of
- *  a `PromptRequest` so the same `promptToClaude` conversion applies. Delivery
- *  priority is deliberately NOT exposed here — it's an internal detail the agent
- *  chooses (see {@link STEER_PRIORITY}). */
-export type SteerRequest = {
-  sessionId: string;
-  prompt: PromptRequest["prompt"];
-  _meta?: SteerMeta | null;
-};
-
-/** Result of a {@link STEER_METHOD} request. The legacy `startedNewTurn` result
- *  remains the default idle behavior; `promptRequired` is returned only when the
- *  Host explicitly opts into the host-owned fallback in request `_meta`. */
-export type SteerResponse =
-  | { outcome: "injected" }
-  | { outcome: "startedNewTurn" }
-  | { outcome: "promptRequired"; reason: "noRunningTurn" };
-
-/** Validate raw JSON-RPC params into a {@link SteerRequest}. Kept minimal — the
- *  content blocks are handed to `promptToClaude`, which tolerates unknown block
- *  types — but `sessionId` and a non-empty `prompt` array are required. */
-function parseSteerRequest(params: unknown): SteerRequest {
-  if (!params || typeof params !== "object") {
-    throw RequestError.invalidParams(undefined, "steer params must be an object");
-  }
-  const { sessionId, prompt, _meta } = params as Record<string, unknown>;
-  if (typeof sessionId !== "string" || sessionId.length === 0) {
-    throw RequestError.invalidParams(undefined, "steer params require a non-empty sessionId");
-  }
-  if (!Array.isArray(prompt) || prompt.length === 0) {
-    throw RequestError.invalidParams(undefined, "steer params require a non-empty prompt array");
-  }
-  const steering =
-    _meta && typeof _meta === "object" ? (_meta as Record<string, unknown>).steering : undefined;
-  const idleBehavior =
-    steering && typeof steering === "object"
-      ? (steering as Record<string, unknown>).idleBehavior
-      : undefined;
-  if (idleBehavior !== undefined && idleBehavior !== "promptRequired") {
-    throw RequestError.invalidParams(undefined, "unsupported steering idleBehavior");
-  }
-  return {
-    sessionId,
-    prompt: prompt as PromptRequest["prompt"],
-    _meta: _meta as SteerMeta | null | undefined,
-  };
-}
 
 /** Who started a turn. `idleCompaction` is the adapter's own `/compact` (see
  *  `IdleCompaction`): it is not a user prompt, so it neither disarms idle
@@ -1146,12 +1066,13 @@ export type Session = {
    *  independent of user ownership: opted-in clients also apply automatic
    *  recommendations and settings-derived values. */
   appliedEffortLevel?: string;
-  /** Why the SDK currently can't serve Fast mode, when the reason is one worth
-   *  telling the user about (see {@link FAST_MODE_UNAVAILABLE_EXPLANATIONS} —
-   *  routine states like the SDK's own opt-in requirement normalize to
-   *  `undefined`). Refreshed from every `fast_mode_disabled_reason` the SDK
-   *  reports on `system`/init and user-turn `result`s; surfaced in the Fast mode
-   *  option's description so a toggle that snaps back off explains itself. */
+  /** Why the SDK currently can't serve Fast mode: the last
+   *  `fast_mode_disabled_reason` that `explainFastModeDisabledReason` explains.
+   *  {@link normalizeFastModeDisabledReason} drops the two it doesn't,
+   *  `sdk_opt_in_required` and `pending`, to `undefined`. Refreshed from every
+   *  `fast_mode_disabled_reason` the SDK reports on `system`/init and user-turn
+   *  `result`s; surfaced in the Fast mode option's description so a toggle that
+   *  snaps back off explains itself. */
   fastModeDisabledReason?: FastModeDisabledReason;
   abortController: AbortController;
   /** Signal the consumer races `query.next()` against. Aborted by cancel()
@@ -1543,149 +1464,6 @@ function disarmForceCancel(session: Session): void {
   }
 }
 
-/** Normalize skills without changing their SDK semantics. Array order and
- *  duplicates do not affect the selected skill set, so neither should rebuild
- *  the underlying Query process. */
-function normalizeSkills(skills: Options["skills"]): Options["skills"] {
-  return Array.isArray(skills) ? [...new Set(skills)].sort() : skills;
-}
-
-/** Whether a changed `_meta.claudeCode.options` key on session/load or
- *  session/resume must rebuild the Query process. Almost every option is read
- *  only when the process starts, so the default is `true`. Every key of the
- *  SDK's `Options` must be classified: an SDK bump that adds or removes an
- *  option fails to compile until it is decided here. */
-const OPTION_REBUILDS_SESSION = {
-  additionalDirectories: true,
-  agentProgressSummaries: true,
-  agents: true,
-  allowDangerouslySkipPermissions: true,
-  allowedTools: true,
-  betas: true,
-  debug: true,
-  debugFile: true,
-  disallowedTools: true,
-  effort: true,
-  enableFileCheckpointing: true,
-  env: true,
-  executableArgs: true,
-  extraArgs: true,
-  fallbackModel: true,
-  forwardSubagentText: true,
-  includeHookEvents: true,
-  managedSettings: true,
-  maxBudgetUsd: true,
-  maxThinkingTokens: true,
-  maxTurns: true,
-  mcpServers: true,
-  model: true,
-  outputFormat: true,
-  pathToClaudeCodeExecutable: true,
-  permissionPrompts: true,
-  permissionPromptToolName: true,
-  persistSession: true,
-  perTaskStopAffordance: true,
-  planModeInstructions: true,
-  pluginDelivery: true,
-  plugins: true,
-  projectConfigRoot: true,
-  promptSuggestions: true,
-  sandbox: true,
-  sessionStoreFlush: true,
-  settings: true,
-  settingSources: true,
-  skills: true,
-  strictMcpConfig: true,
-  supportedDialogKinds: true,
-  systemPrompt: true,
-  taskBudget: true,
-  thinking: true,
-  toolAliases: true,
-  toolConfig: true,
-  tools: true,
-  verbatimPrompts: true,
-  // Managed or ignored by the adapter.
-  agent: false,
-  cwd: false,
-  executable: false,
-  includePartialMessages: false,
-  permissionMode: false,
-  // Per-call controls for attaching to the stored conversation.
-  continue: false,
-  forkSession: false,
-  resume: false,
-  resumeDropsTurn: false,
-  resumeSessionAt: false,
-  sessionId: false,
-  // Callbacks and live objects: they cannot cross JSON-RPC and have no stable serialized form.
-  abortController: false,
-  canUseTool: false,
-  hooks: false,
-  onElicitation: false,
-  onUserDialog: false,
-  sessionStore: false,
-  spawnClaudeCodeProcess: false,
-  stderr: false,
-  // No effect on an already-created session.
-  loadTimeoutMs: false,
-  title: false,
-} as const satisfies Record<keyof Options, boolean>;
-
-/** A JSON value with object keys sorted, so key order never changes a
- *  fingerprint. Functions and class instances (hook callbacks, abort
- *  controllers, in-process MCP servers) cannot cross JSON-RPC and have no
- *  stable serialized form, so they are left out. */
-function canonicalJson(value: unknown): unknown {
-  if (typeof value === "function") return undefined;
-  if (value === null || typeof value !== "object") return value;
-  if (Array.isArray(value)) return value.map(canonicalJson);
-  const proto = Object.getPrototypeOf(value);
-  if (proto !== Object.prototype && proto !== null) return undefined;
-  return Object.fromEntries(
-    Object.keys(value)
-      .sort()
-      .map((key) => [key, canonicalJson((value as Record<string, unknown>)[key])])
-      .filter(([, entry]) => entry !== undefined),
-  );
-}
-
-/** Compute a stable fingerprint of the session-defining params so we can
- *  detect when a loadSession/resumeSession call requires tearing down and
- *  recreating the underlying Query process. Every option classified in
- *  {@link OPTION_REBUILDS_SESSION} is covered, so a warm resume never silently
- *  keeps stale values. MCP servers are sorted by name, and skills are
- *  normalized as a set, so ordering differences don't trigger unnecessary
- *  recreations. */
-export function computeSessionFingerprint(params: {
-  cwd: string;
-  mcpServers?: NewSessionRequest["mcpServers"];
-  additionalDirectories?: NewSessionRequest["additionalDirectories"];
-  systemPrompt?: NewSessionRequest["systemPrompt"];
-  _meta?: NewSessionRequest["_meta"];
-}): string {
-  const servers = [...(params.mcpServers ?? [])].sort((a, b) => a.name.localeCompare(b.name));
-  const meta = params._meta as (NewSessionMeta & Record<string, unknown>) | undefined;
-  const options: Record<string, unknown> = Object.fromEntries(
-    Object.entries(meta?.claudeCode?.options ?? {}).filter(
-      ([key]) => (OPTION_REBUILDS_SESSION as Record<string, boolean>)[key] === true,
-    ),
-  );
-  options.skills = normalizeSkills(options.skills as Options["skills"]);
-  return JSON.stringify(
-    canonicalJson({
-      cwd: params.cwd,
-      mcpServers: servers,
-      additionalDirectories: params.additionalDirectories,
-      additionalRoots: meta?.additionalRoots,
-      systemPrompt: meta?.systemPrompt,
-      clientSystemPrompt: params.systemPrompt ?? undefined,
-      disableBuiltInTools: meta?.disableBuiltInTools,
-      emitRawSDKMessages: meta?.claudeCode?.emitRawSDKMessages,
-      options,
-    }),
-  );
-}
-
 /** The JSON-RPC code ACP assigns to `authRequired`. Read from the SDK so it
  *  cannot drift from the errors this agent throws. */
 const AUTH_REQUIRED_CODE = RequestError.authRequired().code;
@@ -1750,116 +1528,6 @@ const LIMIT_FAILURE_CATEGORY = {
   error_max_turns: "context_exhausted",
   error_max_structured_output_retries: "provider_error",
 } as const satisfies Record<string, ClaudeFailureKind>;
-
-/**
- * Bridges {@link AcpClient} to the connection-scoped {@link AgentContext}
- * exposed by `AgentApp.connect(...)` as `connection.client`. The peer handle is
- * valid for the entire connection lifetime, so it is captured once at
- * construction.
- */
-class ClientConnection implements AcpClient {
-  constructor(private readonly ctx: AgentContext) {}
-
-  sessionUpdate(params: AcpSessionNotification): Promise<void> {
-    return this.ctx.notify(methods.client.session.update, asSdkSessionNotification(params));
-  }
-
-  requestPermission(
-    params: RequestPermissionRequest,
-    signal?: AbortSignal,
-  ): Promise<RequestPermissionResponse> {
-    return this.ctx.request(methods.client.session.requestPermission, params, {
-      cancellationSignal: signal,
-      stopWaitingOnCancel: true,
-    });
-  }
-
-  readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> {
-    return this.ctx.request(methods.client.fs.readTextFile, params);
-  }
-
-  writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse> {
-    return this.ctx.request(methods.client.fs.writeTextFile, params);
-  }
-
-  createElicitation(
-    params: CreateElicitationRequest,
-    signal?: AbortSignal,
-  ): Promise<CreateElicitationResponse> {
-    return this.ctx.request(methods.client.elicitation.create, params, {
-      cancellationSignal: signal,
-      stopWaitingOnCancel: true,
-    });
-  }
-
-  completeElicitation(params: CompleteElicitationNotification): Promise<void> {
-    return this.ctx.notify(methods.client.elicitation.complete, params);
-  }
-
-  authStatusUpdate(params: AuthStatusUpdateNotification): Promise<void> {
-    return this.ctx.notify(methods.client.auth.statusUpdate, params);
-  }
-
-  extNotification(method: string, params: Record<string, unknown>): Promise<void> {
-    return this.ctx.notify(method, params);
-  }
-}
-
-/**
- * The client that the agent talks to. For an AIR client, every session update
- * passes the {@link ChangedMetaFilter} last, after the native subagent routing,
- * so a `tool_call_update` carries only the `_meta` keys that changed. ACP
- * merges only the top-level tool call fields, not the `_meta` keys. So another
- * client gets the full `_meta` on each update.
- */
-class ChangedMetaClient implements AcpClient {
-  private readonly filter = new ChangedMetaFilter();
-
-  constructor(
-    private readonly inner: AcpClient,
-    private readonly airClient: () => boolean,
-  ) {}
-
-  async sessionUpdate(params: AcpSessionNotification): Promise<void> {
-    if (!this.airClient()) return this.inner.sessionUpdate(params);
-    const update = this.filter.apply(params.update as SessionNotification["update"]);
-    if (update) await this.inner.sessionUpdate({ ...params, update } as AcpSessionNotification);
-  }
-
-  requestPermission(
-    params: AcpPermissionRequest,
-    signal?: AbortSignal,
-  ): Promise<RequestPermissionResponse> {
-    return this.inner.requestPermission(params, signal);
-  }
-
-  readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> {
-    return this.inner.readTextFile(params);
-  }
-
-  writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse> {
-    return this.inner.writeTextFile(params);
-  }
-
-  createElicitation(
-    params: CreateElicitationRequest,
-    signal?: AbortSignal,
-  ): Promise<CreateElicitationResponse> {
-    return this.inner.createElicitation(params, signal);
-  }
-
-  completeElicitation(params: CompleteElicitationNotification): Promise<void> {
-    return this.inner.completeElicitation(params);
-  }
-
-  authStatusUpdate(params: AuthStatusUpdateNotification): Promise<void> {
-    return this.inner.authStatusUpdate(params);
-  }
-
-  extNotification(method: string, params: Record<string, unknown>): Promise<void> {
-    return this.inner.extNotification(method, params);
-  }
-}
 
 function raceWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -2133,8 +1801,13 @@ export class ClaudeAcpAgent {
       delete: {},
       fork: {},
       list: {},
+      // `session/options`, and `configOptions` on `session/new`, `load` and `resume`.
+      options: SESSION_OPTIONS_CAPABILITY,
       resume: {},
+      status: SESSION_STATUS_CAPABILITY,
       systemPrompt: SYSTEM_PROMPT_CAPABILITY,
+      // `session/set_title`.
+      title: {},
       ...(this.toolCallCapabilities.air.client ? { subagents: {} } : {}),
     };
 
@@ -2215,13 +1888,75 @@ export class ClaudeAcpAgent {
   }
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
+    // Without `configOptions`: a restart of the query restores the session's choices itself.
+    const { configOptions, ...request } = params;
+    const initial = initialConfigOptions(configOptions);
     while (this.providerUpdate) await this.providerUpdate;
-    const response = await this.createSession(params, {
+    const created = await this.createSession(request, {
       // Revisit these meta values once we support resume
       resume: (params._meta as NewSessionMeta | undefined)?.claudeCode?.options?.resume,
     });
+    const response = await this.withInitialConfigOptions(created, initial);
     this.afterSetupResponse(response.sessionId, params.mcpServers);
     return response;
+  }
+
+  /**
+   * `session/options`: the modes and config options that `session/new` with
+   * the same `cwd`, additional directories and `_meta` would answer with, or
+   * `session/load` and `session/resume` of `sessionId`.
+   *
+   * A session that this connection holds answers with what it has now.
+   * Otherwise a query starts as the session's would, without MCP servers, and
+   * closes once its options are read (`optionsOnly` in `createSession`). The
+   * query does not persist: it stores no session, and it does not write to
+   * the transcript of `sessionId`. Claude Code runs the user's `SessionStart`
+   * hooks in it, as in every query.
+   *
+   * It sends no update, and it creates, loads and changes no session. A
+   * `sessionId` without a stored conversation fails with `-32002`.
+   */
+  async sessionOptions(params: SessionOptionsRequest): Promise<SessionOptionsResponse> {
+    while (this.providerUpdate) await this.providerUpdate;
+    const held = params.sessionId != null ? this.sessions[params.sessionId] : undefined;
+    if (held) {
+      await this.validateCwd(params.cwd, params.additionalDirectories);
+      return { modes: held.modes, configOptions: held.configOptions };
+    }
+    const { modes, configOptions } = await this.createSession(
+      {
+        cwd: params.cwd,
+        mcpServers: [],
+        additionalDirectories: params.additionalDirectories,
+        _meta: params._meta,
+      },
+      { resume: params.sessionId ?? undefined, optionsOnly: true },
+    );
+    return { modes, configOptions };
+  }
+
+  /**
+   * The setup response once the request's `configOptions` are set on the
+   * session, in list order, as `session/set_config_option` sets each one. An
+   * entry that the session refuses is skipped (`applyInitialConfigOptions`).
+   * No update goes out for them: the response carries the modes and options.
+   */
+  private async withInitialConfigOptions<R extends NewSessionResponse>(
+    response: R,
+    entries: readonly InitialSessionConfigOption[],
+  ): Promise<R> {
+    if (entries.length === 0) return response;
+    const { sessionId } = response;
+    await this.serializeConfigurationChange(sessionId, () =>
+      applyInitialConfigOptions(
+        entries,
+        (entry) => this.selectSessionConfigOption({ ...entry, sessionId }, true),
+        this.logger,
+      ),
+    );
+    const session = this.sessions[sessionId];
+    if (!session) return response;
+    return { ...response, modes: session.modes, configOptions: session.configOptions };
   }
 
   /**
@@ -2329,8 +2064,12 @@ export class ClaudeAcpAgent {
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+    const initial = initialConfigOptions(params.configOptions);
     while (this.providerUpdate) await this.providerUpdate;
-    const result = await this.getOrCreateSession(params);
+    const result = await this.withInitialConfigOptions(
+      await this.getOrCreateSession(params),
+      initial,
+    );
 
     this.afterSetupResponse(params.sessionId, params.mcpServers ?? []);
     return result;
@@ -2338,6 +2077,7 @@ export class ClaudeAcpAgent {
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     const timing = new SessionTiming(this.logger, "load", params.sessionId);
+    const initial = initialConfigOptions(params.configOptions);
     while (this.providerUpdate) await this.providerUpdate;
     let result: NewSessionResponse;
     if (this.sessions[params.sessionId]) {
@@ -2349,6 +2089,7 @@ export class ClaudeAcpAgent {
       result = await this.createSessionWhileReplaying(params, timing);
     }
     timing.phase("replay");
+    result = await this.withInitialConfigOptions(result, initial);
 
     // After the replay, so the commands do not interleave with the history.
     this.afterSetupResponse(params.sessionId, params.mcpServers ?? []);
@@ -3577,11 +3318,13 @@ export class ClaudeAcpAgent {
       nativeState: "completed" | "failed" | "cancelled",
       asyncState: "failed" | "stopped",
       context: string,
+      // Whether Claude Code can keep the subagents running (see `finishAll`).
+      { mayStillRun = false }: { mayStillRun?: boolean } = {},
     ): Promise<void> => {
       await compaction.interrupt();
       await Promise.all([
         subagents
-          .finishAll(nativeState, sendUpdate)
+          .finishAll(nativeState, sendUpdate, { mayStillRun })
           .catch((error) =>
             this.logger.error(
               `Session ${params.sessionId}: failed to publish terminal subagent state ${context}`,
@@ -3632,12 +3375,17 @@ export class ClaudeAcpAgent {
       kind: ClaudeFailureKind,
       options: {
         turnScoped?: boolean;
+        /** The turn the failure belongs to, when it is not `activeTurn`. */
+        turnId?: string;
         title?: string;
         details?: string;
         severity?: "warning" | "error";
       } = {},
     ) => {
-      const turnId = options.turnScoped === false ? undefined : session.activeTurn?.promptUuid;
+      const turnId =
+        options.turnScoped === false
+          ? undefined
+          : (options.turnId ?? session.activeTurn?.promptUuid);
       await sessionFailures.publish(kind, {
         turnId,
         sessionScoped: options.turnScoped === false,
@@ -5616,19 +5364,20 @@ export class ClaudeAcpAgent {
                 // here would outlive the `auth_required` rejection with no
                 // action to clear it (issue #1072).
                 if (kind === "auth_required") break;
-                // `no_response` (SDK 0.3.261+): the API sent no response headers
-                // within the first-byte window, so this retry waits longer for
-                // them. Say so — "attempt 1 of 1" alone reads like a final
-                // failure, and the wait is what the user is about to sit through.
-                const seconds = (ms: number) => `${Math.max(1, Math.round(ms / 1000))}s`;
-                const noResponse = message.no_response
-                  ? ` No response after ${seconds(message.no_response.waited_ms)}; waiting up to ${seconds(message.no_response.retry_wait_ms)}.`
-                  : "";
-                const title =
-                  message.error_status === null
-                    ? `Reconnecting to Claude, attempt ${message.attempt} of ${message.max_retries}.${noResponse}`
-                    : `Retrying Claude, attempt ${message.attempt} of ${message.max_retries}.${noResponse}`;
-                await publishSessionFailure(kind, { title, severity: "warning" });
+                // The CLI holds the echo of a prompt back until the first
+                // assistant frame or stream event of the turn, so the retries
+                // of a request that gets no response come before the echo
+                // activates the turn. Give them the queue head, the prompt
+                // being sent: all retries and the terminal failure of one turn
+                // then share its `${turnId}:error` row.
+                const retryTurn =
+                  session.activeTurn ??
+                  (asyncTasks.autonomousTurnOpen ? undefined : firstUnsettledQueuedTurn());
+                await publishSessionFailure(kind, {
+                  turnId: retryTurn?.promptUuid,
+                  ...apiRetryWarning(message),
+                  severity: "warning",
+                });
                 break;
               }
               case "model_refusal_fallback": {
@@ -7230,7 +6979,9 @@ export class ClaudeAcpAgent {
             // and task store are independent of the previous transcript.
             // Clear both the in-memory snapshot and the client's visible plan
             // before any follow-up prompt can republish stale tasks.
-            await finishLifecycle("failed", "failed", "during conversation reset");
+            await finishLifecycle("failed", "failed", "during conversation reset", {
+              mayStillRun: true,
+            });
             subagents.clear();
             asyncTasks.clear();
             session.resolvedToolNames?.clear();
@@ -7973,6 +7724,24 @@ export class ClaudeAcpAgent {
     return {};
   }
 
+  /**
+   * `session/status`: `open` for a session that this connection holds. A held
+   * session whose query ended (`queryClosed`) is `open` too: a `session/load`
+   * with the same params returns it as it is, and its prompts fail with what
+   * happened. Every other session is `saved` or unknown by its stored
+   * transcript (see `session-status.ts`). A subagent's session is unknown,
+   * as for the other session requests.
+   */
+  async sessionStatus({ sessionId }: SessionStatusRequest): Promise<SessionStatusResponse> {
+    if (Object.hasOwn(this.sessions, sessionId)) return { status: "open" };
+    return savedSessionStatus(sessionId);
+  }
+
+  /** See {@link sessionIndex.SessionIndexConnection.setTitle}. */
+  setSessionTitle(params: SetSessionTitleRequest): Promise<SetSessionTitleResponse> {
+    return this.sessionIndex.setTitle(params);
+  }
+
   /** Per client: see {@link sessionIndex.SessionIndexConnection.deleteSession}. */
   async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
     return this.sessionIndex.deleteSession(params);
@@ -7992,8 +7761,14 @@ export class ClaudeAcpAgent {
     );
   }
 
+  /**
+   * `duringSetup`: the value is one of a setup request's `configOptions`. No
+   * mode update goes out, and the warning of an Auto mode fallback waits for
+   * the next prompt.
+   */
   private async selectSessionConfigOption(
     params: SetSessionConfigOptionRequest,
+    duringSetup = false,
   ): Promise<SetSessionConfigOptionResponse> {
     const session = this.sessions[params.sessionId];
     if (!session) {
@@ -8024,8 +7799,12 @@ export class ClaudeAcpAgent {
 
     let effectiveValue = resolvedValue;
     if (params.configId === MODE_CONFIG_ID) {
-      effectiveValue = await this.sessionModes.selectMode(params.sessionId, resolvedValue);
-      await this.sessionModes.publishCurrent(params.sessionId, effectiveValue);
+      effectiveValue = await this.sessionModes.selectMode(
+        params.sessionId,
+        resolvedValue,
+        duringSetup,
+      );
+      if (!duringSetup) await this.sessionModes.publishCurrent(params.sessionId, effectiveValue);
     } else if (params.configId === MODEL_CONFIG_ID) {
       await this.sessions[params.sessionId].query.setModel(resolvedValue);
     }
@@ -8033,7 +7812,13 @@ export class ClaudeAcpAgent {
     // effort changes and effort changes induced by a model switch go through
     // the same path.
 
-    await this.applyConfigOptionValue(params.sessionId, session, params.configId, effectiveValue);
+    await this.applyConfigOptionValue(
+      params.sessionId,
+      session,
+      params.configId,
+      effectiveValue,
+      duringSetup,
+    );
 
     return { configOptions: session.configOptions };
   }
@@ -8045,7 +7830,12 @@ export class ClaudeAcpAgent {
   ): Promise<void> {
     const replayStartedAt = performance.now();
     const toolUseCache: ToolUseCache = {};
-    const messages = resumedMessages ?? (await getSessionMessages(sessionId));
+    // A load replays the messages before each compaction too, unless reading them fails.
+    const messages = await readHistoryAcrossCompactions(
+      sessionId,
+      resumedMessages ?? (await getSessionMessages(sessionId)),
+      this.logger,
+    );
     const historyLoadedAt = performance.now();
     this.logger.log(
       `[session/replay] sessionId=${sessionId} phase=read durationMs=${Math.round(historyLoadedAt - replayStartedAt)} messages=${messages.length}`,
@@ -8058,7 +7848,8 @@ export class ClaudeAcpAgent {
     // A subagent's text replays onto the root only for a client that gets it
     // there live: one without native subagent sessions that asked for the
     // flattened transcript. With native sessions the text goes to the child
-    // session, which AIR's replay restores and the RFD form leaves out for now.
+    // session, which the replay restores in both forms: AIR's draft under a
+    // replay id, the RFD form under the session id the child had live.
     const forwardSubagentText =
       !clientSupportsSubagents(this.clientCapabilities) &&
       (session?.forwardSubagentText ?? supportsSubagentTranscript(this.clientCapabilities));
@@ -8478,7 +8269,12 @@ export class ClaudeAcpAgent {
           continue;
         }
         if (rfdReplay && (await rfdReplay.toolCallUpdate(notification.update, child))) continue;
-        await this.client.sessionUpdate({ ...notification, sessionId: replayTargetSessionId });
+        const replayed = { ...notification, sessionId: replayTargetSessionId };
+        await this.client.sessionUpdate(
+          rfdReplay
+            ? asSdkSessionNotification(rfdReplay.withTarget(replayed, replayTargetSessionId))
+            : replayed,
+        );
       }
 
       // The history of each subagent is in its own transcript. The replay
@@ -9425,6 +9221,17 @@ export class ClaudeAcpAgent {
    * The work that follows a session setup response: the session's commands,
    * the current states of the subagents a load replayed, and MCP server
    * authentication.
+   *
+   * Call it in the same synchronous step as the handler's `return`: an
+   * `await` between them would let the timer run before the response. The ACP
+   * SDK (2.6.0) gives a request handler no responder and no after-response
+   * hook, so the order rests on two things that its source shows and its API
+   * does not promise. `registerAppRequest` queues the response in the
+   * microtask that follows the handler's return, with no macrotask in
+   * between, so the timer runs after it. And `Connection.sendMessage` writes
+   * in call order, so what the timer sends is written after the response. A
+   * caller that does not serve the agent through the SDK's `AgentApp` (see
+   * `v1AgentApp`) has no such order.
    */
   private afterSetupResponse(sessionId: string, mcpServers: McpServer[]): void {
     setTimeout(() => {
@@ -9544,6 +9351,8 @@ export class ClaudeAcpAgent {
     session: Session,
     configId: string,
     value: string,
+    /** See {@link selectSessionConfigOption}. */
+    duringSetup = false,
   ): Promise<void> {
     if (configId === MODE_CONFIG_ID) {
       this.sessionModes.syncConfig(session, value);
@@ -9653,7 +9462,8 @@ export class ClaudeAcpAgent {
       // still precedes the caller's config_option_update so order-sensitive
       // clients update currentModeId before re-rendering the option list.
       if (modeDowngraded) {
-        await this.sessionModes.publishFallbackState(sessionId, session);
+        if (duringSetup) this.sessionModes.deferFallbackWarning(session);
+        else await this.sessionModes.publishFallbackState(sessionId, session);
       }
       // Last, so the switch's own control requests don't queue behind it.
       if (modelChanged) this.refreshContextWindowInBackground(sessionId, session);
@@ -9952,6 +9762,12 @@ export class ClaudeAcpAgent {
       replayState?: ReplayState;
       /** A close of this session during startup cancels registration of its replacement. */
       replacingSession?: Session;
+      /**
+       * `session/options`: the query answers with the modes and config options
+       * and closes. No session is registered, and Claude Code stores nothing
+       * of the query (`persistSession: false`).
+       */
+      optionsOnly?: boolean;
     } = {},
   ): Promise<NewSessionResponse> {
     const createStartedAt = performance.now();
@@ -10344,6 +10160,7 @@ export class ClaudeAcpAgent {
       },
       ...(creationOpts.resume !== undefined && { resume: creationOpts.resume }),
       ...(creationOpts.forkSession !== undefined && { forkSession: creationOpts.forkSession }),
+      ...(creationOpts.optionsOnly ? { persistSession: false } : {}),
       abortController,
     };
 
@@ -10427,15 +10244,15 @@ export class ClaudeAcpAgent {
         }
       }
 
-      // Apply user's `availableModels` allowlist from settings.json before any
+      // Apply the effective `availableModels` allowlist before any
       // downstream model handling. `initializationResult.models` is already
       // policy-filtered by the CLI; we rebuild the picker from the allowlist
       // so the user's exact spellings (and `modelOverrides` targets) are the
       // values passed to `setModel`, keeping configOptions, the current-model
       // resolver, and the stored modelInfos consistent with what the user
       // configured. Managed `deniedModels` drops entries the CLI would refuse.
-      const settingsAvailableModels = settingsManager.getSettings().availableModels;
-      const settingsModelOverrides = settingsManager.getSettings().modelOverrides;
+      const { availableModels: settingsAvailableModels, modelOverrides: settingsModelOverrides } =
+        settingsManager.getModelSelectionSettings(configuredSettingsObject);
       const resumedModel = await resumedModelHint;
       // A resumed Fable 5.2 session lists Fable 5.2 as `fable`, as a new
       // session does (see `aliasResumedModelRow`).
@@ -10524,7 +10341,8 @@ export class ClaudeAcpAgent {
       // `fast_mode_disabled_reason` reflects the post-switch model since SDK
       // 0.3.219 (the initialize response used to answer from the spawn-time
       // model). A fresh SDK session reports `sdk_opt_in_required` — the toggle IS
-      // the opt-in — which normalizes away, so only real blockers are retained.
+      // the opt-in — which normalizes to `undefined`, as does `pending`; every
+      // other reason is retained.
       const fastModeDisabledReason = fastModeEnabled
         ? undefined
         : normalizeFastModeDisabledReason(initializationResult.fast_mode_disabled_reason);
@@ -10572,6 +10390,10 @@ export class ClaudeAcpAgent {
         },
         ultracode,
       );
+      if (creationOpts.optionsOnly) {
+        this.discardUnregisteredQuery(q, input, settingsManager);
+        return { sessionId, modes, configOptions };
+      }
       const initialEffort = configOptions.find((option) => option.id === EFFORT_CONFIG_ID);
       if (useRecommendedValue && typeof initialEffort?.currentValue === "string") {
         await q.applyFlagSettings(effortFlagSettings(initialEffort.currentValue, ultracodeEnabled));
@@ -10690,7 +10512,8 @@ export class ClaudeAcpAgent {
             this.claudeIsWorking(sessionId, registered) ||
             (registered.openUserInputs?.size ?? 0) > 0,
           contextTokens: () => registered.contextUsedTokens,
-          settings: () => registered.settingsManager.getSettings(),
+          settings: () =>
+            registered.settingsManager.getCompactionSettings(configuredSettingsObject),
           compact: () =>
             this.prompt(
               { sessionId, prompt: [{ type: "text", text: "/compact" }] },
@@ -11255,8 +11078,11 @@ export function v1AgentApp(
     )
     .onRequest(methods.agent.session.list, (ctx) => agent.listSessions(ctx.params))
     .onRequest(methods.agent.session.delete, (ctx) => agent.deleteSession(ctx.params))
+    .onRequest(methods.agent.session.setTitle, (ctx) => agent.setSessionTitle(ctx.params))
     .onRequest(methods.agent.session.resume, (ctx) => agent.resumeSession(ctx.params))
     .onRequest(methods.agent.session.close, (ctx) => agent.closeSession(ctx.params))
+    .onRequest(methods.agent.session.status, (ctx) => agent.sessionStatus(ctx.params))
+    .onRequest(methods.agent.session.options, (ctx) => agent.sessionOptions(ctx.params))
     .onRequest(methods.agent.session.setMode, (ctx) => agent.setSessionMode(ctx.params))
     .onRequest(methods.agent.session.setConfigOption, (ctx) =>
       agent.setSessionConfigOption(ctx.params),

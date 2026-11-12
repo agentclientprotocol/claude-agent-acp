@@ -16,6 +16,14 @@ import {
   FAST_MODE_OFF,
 } from "../../session-fast-mode.js";
 import type { AcpClient } from "../../acp-client.js";
+import { Pushable } from "../../utils.js";
+import { initializeClient } from "../helpers.js";
+import {
+  mockSessionState,
+  successfulResultMessage,
+  userEcho,
+  wrapQuery,
+} from "./session-doubles.js";
 
 const MODES = {
   currentModeId: "default",
@@ -33,6 +41,8 @@ const MODEL_INFOS: ModelInfo[] = [
   { value: "claude-opus-4-8", displayName: "Claude Opus", description: "Most capable" },
 ];
 
+const FUTURE_REASON = "some_future_reason" as FastModeDisabledReason;
+
 describe("createFastModeConfigOption", () => {
   it("produces a native boolean toggle when the client opted in", () => {
     expect(createFastModeConfigOption(true, true)).toEqual({
@@ -45,20 +55,40 @@ describe("createFastModeConfigOption", () => {
     });
   });
 
-  it("explains a blocking disabled reason while the toggle reads off", () => {
-    const option = createFastModeConfigOption(false, true, "free");
-    expect(option.description).toBe(
-      "Faster responses on supported models — not available on the free plan",
-    );
-  });
+  /**
+   * Scenario:
+   * 1. Build the option with the toggle off and a disabled reason.
+   * Expected:
+   * - The description is the base text plus the reason's explanation.
+   * - A code the table lacks gets the generic text naming the code.
+   */
+  it.each([
+    ["free", "not available on the free plan"],
+    ["preference", "not enabled for your organization or API gateway"],
+    ["unknown", "currently unavailable"],
+    [FUTURE_REASON, "not available (some_future_reason)"],
+  ] as [FastModeDisabledReason, string][])(
+    "explains the disabled reason %s while the toggle reads off",
+    (reason, explanation) => {
+      const option = createFastModeConfigOption(false, true, reason);
+      expect(option.description).toBe(`Faster responses on supported models — ${explanation}`);
+    },
+  );
 
-  it("ignores routine and on-state reasons", () => {
+  /**
+   * Scenario:
+   * 1. Build the option, toggle off, with `sdk_opt_in_required` or `pending`.
+   * 2. Build the option, toggle on, with `free`.
+   * Expected:
+   * - The description stays the base text in all three cases.
+   */
+  it("ignores unexplained and on-state reasons", () => {
     // Every SDK session starts at `sdk_opt_in_required` — the toggle IS the
     // opt-in, so it must not read as a blocker.
     expect(createFastModeConfigOption(false, true, "sdk_opt_in_required").description).toBe(
       "Faster responses on supported models",
     );
-    expect(createFastModeConfigOption(false, true, "preference").description).toBe(
+    expect(createFastModeConfigOption(false, true, "pending").description).toBe(
       "Faster responses on supported models",
     );
     // A reason riding an `on` state isn't blocking anything right now.
@@ -133,25 +163,38 @@ describe("fastModeStateEnabled", () => {
 });
 
 describe("normalizeFastModeDisabledReason", () => {
-  it("retains only reasons we have an explanation for", () => {
-    expect(normalizeFastModeDisabledReason("free")).toBe("free");
-    expect(normalizeFastModeDisabledReason("extra_usage_disabled")).toBe("extra_usage_disabled");
-    expect(normalizeFastModeDisabledReason("model_not_allowed")).toBe("model_not_allowed");
-    expect(normalizeFastModeDisabledReason("not_first_party")).toBe("not_first_party");
-    expect(normalizeFastModeDisabledReason("disabled_by_env")).toBe("disabled_by_env");
-    expect(normalizeFastModeDisabledReason("network_error")).toBe("network_error");
+  /**
+   * Scenario:
+   * 1. Normalize each explained reason, including `preference`, `unknown` and a future code.
+   * Expected:
+   * - Each reason is returned unchanged.
+   */
+  it.each([
+    "free",
+    "extra_usage_disabled",
+    "model_not_allowed",
+    "not_first_party",
+    "disabled_by_env",
+    "network_error",
+    "preference",
+    "unknown",
+    FUTURE_REASON,
+  ] as FastModeDisabledReason[])("retains the explained reason %s", (reason) => {
+    expect(normalizeFastModeDisabledReason(reason)).toBe(reason);
   });
 
-  it("drops routine states and unknown values", () => {
-    expect(normalizeFastModeDisabledReason("sdk_opt_in_required")).toBeUndefined();
-    expect(normalizeFastModeDisabledReason("preference")).toBeUndefined();
-    expect(normalizeFastModeDisabledReason("pending")).toBeUndefined();
-    expect(normalizeFastModeDisabledReason("unknown")).toBeUndefined();
-    expect(normalizeFastModeDisabledReason(undefined)).toBeUndefined();
-    expect(
-      normalizeFastModeDisabledReason("some_future_reason" as FastModeDisabledReason),
-    ).toBeUndefined();
-  });
+  /**
+   * Scenario:
+   * 1. Normalize `sdk_opt_in_required`, `pending` and `undefined`.
+   * Expected:
+   * - Each normalizes to `undefined`.
+   */
+  it.each(["sdk_opt_in_required", "pending", undefined] as (FastModeDisabledReason | undefined)[])(
+    "drops the unexplained reason %s",
+    (reason) => {
+      expect(normalizeFastModeDisabledReason(reason)).toBeUndefined();
+    },
+  );
 });
 
 describe("buildConfigOptions Fast mode", () => {
@@ -403,29 +446,61 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
     expect(sessionUpdates).toHaveLength(0);
   });
 
-  it("explains a blocking reason once when the SDK refuses a toggle the user turned on", async () => {
+  /**
+   * Scenario:
+   * 1. The toggle is on and the SDK reports `off` with a reason.
+   * 2. The SDK reports the same `off` and reason again.
+   * Expected:
+   * - The toggle is cleared and the reason retained.
+   * - One transcript line carries the explanation, then one `config_option_update`.
+   * - The repeat report sends nothing.
+   */
+  it.each([
+    ["extra_usage_disabled", "requires extra usage to be enabled for this account"],
+    ["preference", "not enabled for your organization or API gateway"],
+    ["unknown", "currently unavailable"],
+    [FUTURE_REASON, "not available (some_future_reason)"],
+  ] as [FastModeDisabledReason, string][])(
+    "explains the blocking reason %s once when the SDK refuses a toggle the user turned on",
+    async (reason, explanation) => {
+      const { sync, session, sessionUpdates } = setup({ fastModeEnabled: true, withOption: true });
+
+      await sync(SESSION_ID, session, "off", reason);
+
+      expect(session.fastModeEnabled).toBe(false);
+      expect(session.fastModeDisabledReason).toBe(reason);
+      expect(sessionUpdates).toHaveLength(2);
+      expect(sessionUpdates[0].update).toEqual({
+        sessionUpdate: "agent_message_chunk",
+        content: {
+          type: "text",
+          text: `\n\n> **Fast mode turned off:** ${explanation}.\n\n`,
+        },
+      });
+      expect(sessionUpdates[1].update).toMatchObject({ sessionUpdate: "config_option_update" });
+      expect(session.configOptions).toContainEqual(createFastModeConfigOption(false, true, reason));
+
+      // The same report again changes nothing the user can see: no repeat notice.
+      await sync(SESSION_ID, session, "off", reason);
+      expect(sessionUpdates).toHaveLength(2);
+    },
+  );
+
+  /**
+   * Scenario:
+   * 1. The toggle is on and the SDK reports `off` with `sdk_opt_in_required`.
+   * Expected:
+   * - The toggle is cleared and no reason is retained.
+   * - Only a `config_option_update` is sent: no notice or transcript line.
+   */
+  it("clears the toggle quietly when the SDK reports off with sdk_opt_in_required", async () => {
     const { sync, session, sessionUpdates } = setup({ fastModeEnabled: true, withOption: true });
 
-    await sync(SESSION_ID, session, "off", "extra_usage_disabled");
+    await sync(SESSION_ID, session, "off", "sdk_opt_in_required");
 
     expect(session.fastModeEnabled).toBe(false);
-    expect(session.fastModeDisabledReason).toBe("extra_usage_disabled");
-    expect(sessionUpdates).toHaveLength(2);
-    expect(sessionUpdates[0].update).toEqual({
-      sessionUpdate: "agent_message_chunk",
-      content: {
-        type: "text",
-        text: "\n\n> **Fast mode turned off:** requires extra usage to be enabled for this account.\n\n",
-      },
-    });
-    expect(sessionUpdates[1].update).toMatchObject({ sessionUpdate: "config_option_update" });
-    expect(session.configOptions).toContainEqual(
-      createFastModeConfigOption(false, true, "extra_usage_disabled"),
-    );
-
-    // The same report again changes nothing the user can see: no repeat notice.
-    await sync(SESSION_ID, session, "off", "extra_usage_disabled");
-    expect(sessionUpdates).toHaveLength(2);
+    expect(session.fastModeDisabledReason).toBeUndefined();
+    expect(sessionUpdates.map((n) => n.update.sessionUpdate)).toEqual(["config_option_update"]);
   });
 
   it("explains the flip as a live notice to a client on the notice contract", async () => {
@@ -491,5 +566,91 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
     await disabledCase.sync(SESSION_ID, disabledCase.session, "on");
     expect(disabledCase.session.fastModeEnabled).toBe(false);
     expect(disabledCase.sessionUpdates).toHaveLength(0);
+  });
+});
+
+describe("Fast mode that Claude Code refuses during a turn", () => {
+  const SESSION_ID = "test-session";
+
+  /** A session whose Claude Code answers the first prompt with a `system`/init
+   *  that reports Fast mode off with `reason`, as it does on every turn. */
+  async function setupTurn(reason: FastModeDisabledReason) {
+    const updates: SessionNotification[] = [];
+    const client = {
+      sessionUpdate: async (n: SessionNotification) => {
+        updates.push(n);
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    await initializeClient(agent, { session: { configOptions: { boolean: {} } } });
+
+    const input = new Pushable<any>();
+    async function* messages() {
+      const { value: prompt } = await input[Symbol.asyncIterator]().next();
+      yield userEcho(prompt);
+      yield {
+        type: "system",
+        subtype: "init",
+        fast_mode_state: "off",
+        fast_mode_disabled_reason: reason,
+        session_id: SESSION_ID,
+      };
+      yield successfulResultMessage();
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+    const query = Object.assign(wrapQuery(messages()), { applyFlagSettings: async () => {} });
+    agent.sessions[SESSION_ID] = mockSessionState({
+      query,
+      input,
+      fastModeEnabled: false,
+      configOptions: [createFastModeConfigOption(false, true)],
+    });
+    return { agent, updates };
+  }
+
+  /**
+   * Scenario:
+   * 1. The client, without the notices capability, turns Fast mode on.
+   * 2. It sends a prompt, and Claude Code's init reports Fast mode off, reason `preference`.
+   * Expected:
+   * - The transcript gets one line that explains the organization or gateway has not enabled it.
+   * - Then one `config_option_update` where `fast` reads off, with the explanation in its description.
+   */
+  it("explains a Fast mode that the organization or gateway has not enabled", async () => {
+    const { agent, updates } = await setupTurn("preference");
+
+    await agent.setSessionConfigOption({
+      sessionId: SESSION_ID,
+      configId: "fast",
+      type: "boolean",
+      value: true,
+    });
+    updates.length = 0;
+    await agent.prompt({ sessionId: SESSION_ID, prompt: [{ type: "text", text: "hi" }] });
+
+    const explained = updates
+      .map((n) => n.update)
+      .filter((u) => u.sessionUpdate !== "usage_update");
+    expect(explained).toEqual([
+      {
+        sessionUpdate: "agent_message_chunk",
+        content: {
+          type: "text",
+          text: "\n\n> **Fast mode turned off:** not enabled for your organization or API gateway.\n\n",
+        },
+      },
+      {
+        sessionUpdate: "config_option_update",
+        configOptions: [
+          expect.objectContaining({
+            id: "fast",
+            currentValue: false,
+            description: expect.stringMatching(
+              / — not enabled for your organization or API gateway$/,
+            ),
+          }),
+        ],
+      },
+    ]);
   });
 });

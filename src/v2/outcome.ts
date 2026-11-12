@@ -17,7 +17,7 @@ import type {
 import { AUTONOMOUS_RESULT_ORIGINS } from "../result-end.js";
 import { isSyntheticLoginMessage } from "../message-filters.js";
 import { resultEnd } from "../result-end.js";
-import { providerFailureCategory } from "../session-failure-extension.js";
+import { assistantMessageText, providerFailureCategory } from "../session-failure-extension.js";
 import {
   getMatchingModelUsage,
   modelUsageIncrement,
@@ -91,7 +91,11 @@ export function idleOutcome(
       providerFailureCategory(kind) === "auth_required");
   return failed(
     authFailure
-      ? RequestError.authRequired()
+      ? // Claude Code's `/login` instruction is for its terminal, so that text
+        // is left out. Any other says why the login failed, e.g. "Failed to
+        // authenticate: this login reached its time limit and cannot be
+        // renewed."
+        RequestError.authRequired(undefined, ended.loginRequired ? undefined : ended.error)
       : RequestError.internalError(kind ? { errorKind: kind } : undefined, ended.error),
   );
 }
@@ -109,8 +113,8 @@ function failed(error: RequestError): IdleOutcome {
 
 /**
  * What the assistant messages of the open turn reported about its end: the
- * error kind of a failed API request, Claude Code's sign-in message, and a
- * refusal's explanation. Read from the main conversation's messages.
+ * error kind and text of a failed API request, Claude Code's sign-in message,
+ * and a refusal's explanation. Read from the main conversation's messages.
  */
 export class TurnReport {
   errorKind: SDKAssistantMessageError | undefined;
@@ -118,12 +122,23 @@ export class TurnReport {
   loginRequired = false;
   /** The explanation of the turn's refusal. */
   refusalExplanation: string | undefined;
+  /**
+   * The text of the message that Claude Code wrote for a failed API request,
+   * e.g. "API Error: Connection lost mid-response. The response above may be
+   * incomplete.", until {@link takeApiError} reads it.
+   */
+  private apiError: string | undefined;
 
   /**
-   * An assistant message of the main conversation. Returns whether it is
-   * Claude Code's sign-in message, which the client is not shown: its
-   * `/login` instruction is for Claude Code's terminal, and the turn's idle
-   * fails with `authRequired` instead.
+   * An assistant message of the main conversation. Returns whether the
+   * client is not shown it as Claude's text:
+   *
+   * - Claude Code's sign-in message. Its `/login` instruction is for Claude
+   *   Code's terminal, and the turn's idle fails with `authRequired` instead.
+   * - The message that Claude Code wrote for a failed API request (`error` on
+   *   a `<synthetic>` message). A notice carries it where the turn goes on
+   *   past it. At the turn's end, the idle carries it when the turn fails,
+   *   and a notice otherwise (see {@link takeApiError}).
    */
   assistant(message: SDKAssistantMessage): boolean {
     if (message.error) this.errorKind = message.error;
@@ -131,9 +146,22 @@ export class TurnReport {
       this.refusalExplanation =
         message.message.stop_details?.explanation ?? this.refusalExplanation;
     }
-    if (!isSyntheticLoginMessage(message.message)) return false;
-    this.loginRequired = true;
+    if (isSyntheticLoginMessage(message.message)) {
+      this.loginRequired = true;
+      return true;
+    }
+    if (!message.error || message.message.model !== "<synthetic>") return false;
+    const text = assistantMessageText(message.message);
+    if (!text) return false;
+    this.apiError = text;
     return true;
+  }
+
+  /** The text of the turn's failed API request that no notice or idle reported yet. */
+  takeApiError(): string | undefined {
+    const text = this.apiError;
+    this.apiError = undefined;
+    return text;
   }
 
   /**
@@ -155,6 +183,7 @@ export class TurnReport {
     this.errorKind = undefined;
     this.loginRequired = false;
     this.refusalExplanation = undefined;
+    this.apiError = undefined;
   }
 }
 

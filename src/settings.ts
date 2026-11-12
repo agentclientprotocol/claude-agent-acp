@@ -37,6 +37,15 @@ export interface SettingsManagerOptions {
   logger?: { log: (...args: any[]) => void; error: (...args: any[]) => void };
 }
 
+type ModelSelectionSettings = Pick<Settings, "availableModels" | "modelOverrides">;
+
+/** The settings that decide whether Claude Code compacts (see `idle-compaction.ts`). */
+export type CompactionSettings = {
+  idleCompaction?: boolean;
+  autoCompactEnabled?: boolean;
+  env?: Record<string, string>;
+};
+
 /**
  * Manages Claude Code settings using the SDK's `resolveSettings` merge engine
  * so the values we see match what `query()` would observe.
@@ -50,7 +59,9 @@ export class SettingsManager {
   private cwd: string;
   private effective: Settings = {};
   private managedDeniedModels: string[] = [];
+  private managedModelSettings: ModelSelectionSettings = {};
   private managedApiKeyHelper?: string;
+  private managedCompactionSettings: CompactionSettings = {};
   private watchers: fs.FSWatcher[] = [];
   private onChange?: () => void;
   private logger: { log: (...args: any[]) => void; error: (...args: any[]) => void };
@@ -112,15 +123,36 @@ export class SettingsManager {
       this.managedDeniedModels = resolved.sources
         .filter((entry) => entry.source === "managed")
         .flatMap((entry) => entry.settings.deniedModels ?? []);
+      this.managedModelSettings = Object.assign(
+        {},
+        ...resolved.sources
+          .filter((entry) => entry.source === "managed")
+          .map((entry) => ({
+            availableModels: entry.settings.availableModels,
+            modelOverrides: entry.settings.modelOverrides,
+          })),
+      );
       this.managedApiKeyHelper =
         resolved.provenance.apiKeyHelper?.source === "managed"
           ? resolved.effective.apiKeyHelper
           : undefined;
+      const managed = resolved.sources
+        .filter((entry) => entry.source === "managed")
+        .map((entry) => entry.settings);
+      this.managedCompactionSettings = {
+        idleCompaction: managed.findLast((tier) => tier.idleCompaction !== undefined)
+          ?.idleCompaction,
+        autoCompactEnabled: managed.findLast((tier) => tier.autoCompactEnabled !== undefined)
+          ?.autoCompactEnabled,
+        env: Object.assign({}, ...managed.map((tier) => tier.env)),
+      };
     } catch (error) {
       this.logger.error("Failed to resolve settings:", error);
       this.effective = {};
       this.managedDeniedModels = [];
+      this.managedModelSettings = {};
       this.managedApiKeyHelper = undefined;
+      this.managedCompactionSettings = {};
     }
   }
 
@@ -191,6 +223,51 @@ export class SettingsManager {
     return (
       this.managedApiKeyHelper ?? settingsOverride?.apiKeyHelper ?? this.effective.apiKeyHelper
     );
+  }
+
+  /** Model selection settings including the inline SDK settings tier. */
+  getModelSelectionSettings(override?: Settings): ModelSelectionSettings {
+    // The SDK unions non-managed allowlists, but a managed list owns the
+    // whole allowlist. Keep that policy when adding
+    // models the SDK did not include in its initialization result.
+    const lists = [this.effective.availableModels, override?.availableModels].filter(
+      (list): list is string[] => Array.isArray(list),
+    );
+    const managed = this.managedModelSettings;
+    return {
+      availableModels:
+        managed.availableModels ?? (lists.length > 0 ? [...new Set(lists.flat())] : undefined),
+      modelOverrides: {
+        ...this.effective.modelOverrides,
+        ...override?.modelOverrides,
+        ...managed.modelOverrides,
+      },
+    };
+  }
+
+  /**
+   * `idleCompaction`, `autoCompactEnabled` and `env` as the CLI resolves them:
+   * managed settings outrank the `--settings` override, which outranks the
+   * user/project/local files. `env` merges entry by entry in the same order. A
+   * key whose value is `undefined` in the override does not hide the files' value.
+   */
+  getCompactionSettings(settingsOverride?: Settings): CompactionSettings {
+    const managed = this.managedCompactionSettings;
+    const env: Record<string, string> = {};
+    for (const tier of [this.effective.env, settingsOverride?.env, managed.env]) {
+      for (const [name, value] of Object.entries(tier ?? {})) {
+        if (value !== undefined) env[name] = value;
+      }
+    }
+    return {
+      idleCompaction:
+        managed.idleCompaction ?? settingsOverride?.idleCompaction ?? this.effective.idleCompaction,
+      autoCompactEnabled:
+        managed.autoCompactEnabled ??
+        settingsOverride?.autoCompactEnabled ??
+        this.effective.autoCompactEnabled,
+      env,
+    };
   }
 
   /**

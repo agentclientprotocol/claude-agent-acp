@@ -21,6 +21,7 @@ import type {
   SDKMessage,
   SDKPartialAssistantMessage,
   SDKResultMessage,
+  Settings,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "../logger.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
@@ -41,6 +42,7 @@ import {
   mcpServerStartupNotice,
   normalizeNoticeText,
   noticeUpdate,
+  splitNoticeText,
 } from "../session-notices.js";
 import {
   DEFAULT_CONTEXT_WINDOW,
@@ -52,6 +54,7 @@ import {
   type UsageSnapshot,
 } from "../session-usage.js";
 import { SessionTitles, type TitledSession } from "../session-titles.js";
+import type { RetitledSession } from "../session-index/rename.js";
 import type { SettingsManager } from "../settings.js";
 import { createTaskHook } from "../tools.js";
 import type { SessionOutput } from "./stream.js";
@@ -76,7 +79,9 @@ export interface ReportsHost {
 /** What the session's query was started with (see {@link SessionReports.configure}). */
 export interface ReportsSetup {
   /** The session's live Claude Code settings, disposed with the reports. */
-  settings: Pick<SettingsManager, "getSettings" | "dispose">;
+  settings: Pick<SettingsManager, "getCompactionSettings" | "dispose">;
+  /** The client's `settings` option, which the query got as `--settings`. */
+  configuredSettings: Settings | undefined;
   /** The query's environment. */
   env: Record<string, string | undefined>;
   /** The names of the client's MCP servers. */
@@ -170,7 +175,7 @@ export class SessionReports {
       {
         isBusy: () => this.host.isBusy(),
         contextTokens: () => this.contextUsed,
-        settings: () => setup.settings.getSettings(),
+        settings: () => setup.settings.getCompactionSettings(setup.configuredSettings),
         compact: () => this.host.compact(),
         // The logger has no debug level.
         log: (message) => this.host.logger.log(message),
@@ -224,6 +229,24 @@ export class SessionReports {
   }
 
   /**
+   * A notice of the message that Claude Code wrote for a failed API request
+   * (see `TurnReport.takeApiError`). It is a turn's notice, so a result that
+   * repeats its text is not shown again.
+   */
+  apiError(text: string): void {
+    this.host.emit([
+      {
+        sessionId: this.host.sessionId,
+        update: noticeUpdate({
+          severity: "error",
+          ...splitNoticeText(text, "Claude reported an API error"),
+        }),
+      },
+    ]);
+    this.noticeTexts.push(normalizeNoticeText(text));
+  }
+
+  /**
    * Claude Code's session state went `idle`: the idle compaction may arm, and
    * the title may have landed (see {@link SessionTitles.onTurnEnd}).
    */
@@ -261,6 +284,13 @@ export class SessionReports {
   /** A live agent text chunk of the root session, for the title. */
   agentText(content: ContentBlock): void {
     this.titles.onAssistantText(content);
+  }
+
+  /** The session and its title state, as a client rename sets it
+   *  (`session/set_title`); undefined until it starts and once it ends. */
+  retitled(): RetitledSession | undefined {
+    const session = this.host.titledSession();
+    return session && { session, titles: this.titles };
   }
 
   /** Sends the session's current title and `updatedAt`, as `session/resume` asks. */

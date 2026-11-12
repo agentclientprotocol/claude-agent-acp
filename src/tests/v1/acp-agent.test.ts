@@ -28,12 +28,9 @@ import { nodeToWebWritable, nodeToWebReadable } from "../../utils.js";
 import { createPostToolUseHook, markdownEscape, toDisplayPath } from "../../tools.js";
 import { toolUpdateFromDiffToolResponse } from "../../diff.js";
 import { ToolCallFieldTracker } from "../../tool-calls/field-tracker.js";
-import {
-  ClaudeAcpAgent,
-  computeSessionFingerprint,
-  runPromptWithCancellation,
-  type SteerRequest,
-} from "../../v1/acp-agent.js";
+import { ClaudeAcpAgent, runPromptWithCancellation } from "../../v1/acp-agent.js";
+import { computeSessionFingerprint } from "../../v1/session-fingerprint.js";
+import type { SteerRequest } from "../../v1/steering.js";
 import { buildConfigOptions, discoverCustomAgents } from "../../session-config-options.js";
 import { createFastModeConfigOption } from "../../session-fast-mode.js";
 import {
@@ -58,7 +55,16 @@ import {
   parseUsageResponse,
 } from "../../usage-markdown.js";
 import { Pushable } from "../../utils.js";
-import { heldRequest, initializeClient, makeMockQuery } from "../helpers.js";
+import {
+  heldRequest,
+  initializeClient,
+  makeMockQuery,
+  transcriptAssistant,
+  transcriptCompactBoundary,
+  transcriptCompactSummary,
+  transcriptUser,
+  writeTranscript,
+} from "../helpers.js";
 import { acpProtocolRouter } from "../../serve.js";
 import * as agentSdk from "@anthropic-ai/claude-agent-sdk";
 import {
@@ -73,11 +79,12 @@ import {
   PermissionUpdate,
   query,
   SDKAssistantMessage,
+  type SDKAssistantMessageError,
   type Options,
   type SDKControlGetUsageResponse,
 } from "@anthropic-ai/claude-agent-sdk";
 import { createHash, randomUUID } from "crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -3629,6 +3636,63 @@ describe("usage-limit failure replay", () => {
   });
 });
 
+describe("compacted session replay", () => {
+  it("replays the messages before the compaction, then the compaction", async () => {
+    const configDir = await mkdtemp(path.join(os.tmpdir(), "claude-acp-compacted-replay-"));
+    const originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = configDir;
+    try {
+      const sessionId = "44444444-4444-4444-8444-444444444444";
+      // The records of `/compact` between two prompts, as Claude Code writes
+      // them: the boundary has no parent and links "Hello" logically.
+      await writeTranscript(path.join(configDir, "projects", "-tmp-proj"), sessionId, [
+        transcriptUser("u1", "hi"),
+        transcriptAssistant("a1", "Hello"),
+        transcriptCompactBoundary("b1", "a1"),
+        transcriptCompactSummary("s1"),
+        transcriptUser("u2", "identify yourself"),
+        transcriptAssistant("a2", "Claude"),
+      ]);
+      const updates: SessionNotification[] = [];
+      const client = {
+        sessionUpdate: async (update: SessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient;
+      const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+      await initializeClient(agent, { session: { compaction: {} } } as ClientCapabilities);
+
+      await (
+        agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+      ).replaySessionHistory(sessionId);
+
+      expect(
+        updates.flatMap(({ update }) => {
+          if (update.sessionUpdate === "compaction_update") return [["compaction", update.status]];
+          if (
+            (update.sessionUpdate === "user_message_chunk" ||
+              update.sessionUpdate === "agent_message_chunk") &&
+            update.content.type === "text"
+          ) {
+            return [[update.sessionUpdate, update.content.text]];
+          }
+          return [];
+        }),
+      ).toEqual([
+        ["user_message_chunk", "hi"],
+        ["agent_message_chunk", "Hello"],
+        ["compaction", "completed"],
+        ["user_message_chunk", "identify yourself"],
+        ["agent_message_chunk", "Claude"],
+      ]);
+    } finally {
+      if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
+      await rm(configDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("session/list", () => {
   const sdkSession = (index: number) => ({
     sessionId: `session-${index}`,
@@ -4138,7 +4202,13 @@ describe("subagent transcript replay", () => {
               ];
             }
             case "tool_call":
-              return [`${on} tool_call ${u.toolCallId}`];
+              return [
+                `${on} tool_call ${u.toolCallId}` +
+                  (u.content ?? [])
+                    .filter((item: any) => item.type === "session")
+                    .map((item: any) => ` session=${item.sessionId}`)
+                    .join(""),
+              ];
             case "config_option_update":
               return traceModels
                 ? u.configOptions.map(
@@ -4571,6 +4641,37 @@ describe("subagent transcript replay", () => {
         "aaa111 tool_call toolu_sib",
         "bbb222 session_message toolu_sib from=aaa111 Ping sibling",
       ]);
+    });
+
+    it("references a replayed child from a TaskStop call that names it by its agent id", async () => {
+      const trace = await replayRfd(
+        [
+          user("u1", "Go"),
+          // The child is not announced yet: a call that names it references nothing.
+          assistant("a1", [toolUse("toolu_early", "TaskStop", { task_id: "abc123" })]),
+          user("u2", [toolResult("toolu_early", "No such task")]),
+          assistant("a2", [
+            toolUse("toolu_agent", "Agent", { subagent_type: "Explore", prompt: "Look around" }),
+          ]),
+          user("u3", [toolResult("toolu_agent", "Async agent launched")]),
+          assistant("a3", [toolUse("toolu_stop", "TaskStop", { task_id: "abc123" })]),
+          user("u4", [toolResult("toolu_stop", "Stopped abc123")]),
+        ],
+        {
+          abc123: {
+            meta: { agentType: "Explore", toolUseId: "toolu_agent", requestShape: "background" },
+            records: [user("c1", "Look around")],
+          },
+        },
+      );
+
+      expect(trace.filter((line) => line.includes("tool_call"))).toEqual([
+        "root tool_call toolu_early",
+        "root tool_call toolu_stop session=abc123",
+      ]);
+      expect(
+        trace.findIndex((line) => line.startsWith("root subagent_update abc123")),
+      ).toBeLessThan(trace.indexOf("root tool_call toolu_stop session=abc123"));
     });
 
     it("replays a child's hand-back as its message to the parent, instead of the launch's result", async () => {
@@ -9045,6 +9146,66 @@ describe("subagent permission attribution (issue #851)", () => {
         state: { state: "idle" },
       });
     });
+
+    it("reports a child that still works at a conversation reset as unknown, without its cancel", async () => {
+      const updates = await run([
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },
+        {
+          type: "conversation_reset",
+          new_conversation_id: randomUUID(),
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        // The reset forgot the child: its later end changes nothing.
+        taskNotification("toolu_parent", "completed"),
+      ]);
+
+      expect(subagentTraffic(updates).at(-1)?.update).toEqual({
+        sessionUpdate: "subagent_update",
+        sessionId: "agent-42",
+        capabilities: null,
+        state: { state: "unknown" },
+      });
+    });
+
+    it("references an announced child from a TaskStop call that names it by its agent id", async () => {
+      const toolResult = (toolUseId: string, content: string) => ({
+        type: "user",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: toolUseId, content }],
+        },
+      });
+      const updates = await run([
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },
+        rootToolUse("toolu_stop", "TaskStop", { task_id: "agent-42" }),
+        toolResult("toolu_stop", "Stopped agent-42"),
+        // A task that is no child session.
+        rootToolUse("toolu_bash", "TaskStop", { task_id: "bash_1" }),
+        toolResult("toolu_bash", "Stopped bash_1"),
+      ]);
+
+      const references = (toolCallId: string) =>
+        updates.flatMap(({ sessionId, update }) =>
+          (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+          update.toolCallId === toolCallId &&
+          update.content != null
+            ? [
+                `${sessionId} ${JSON.stringify(update.content.filter((item) => item.type === "session"))}`,
+              ]
+            : [],
+        );
+      // The first report and the result both carry content, which replaces
+      // what the client holds, so both carry the reference.
+      expect(references("toolu_stop")).toEqual([
+        'test-session [{"type":"session","sessionId":"agent-42"}]',
+        'test-session [{"type":"session","sessionId":"agent-42"}]',
+      ]);
+      expect(references("toolu_bash")).toEqual(["test-session []", "test-session []"]);
+    });
   });
 
   it("ends the root's tool calls at a cancel, and sends nothing to a child that the cancel ended (AIR)", async () => {
@@ -11834,7 +11995,7 @@ describe("stop reason propagation", () => {
         subtype: "api_retry",
         attempt: 1,
         max_retries: 5,
-        retry_delay_ms: 100,
+        retry_delay_ms: 600,
         error_status: 429,
         error: "rate_limit",
         uuid: randomUUID(),
@@ -11864,6 +12025,7 @@ describe("stop reason propagation", () => {
         severity: "warning",
         revision: 1,
         title: "Retrying Claude, attempt 1 of 5.",
+        details: "HTTP 429 (rate limited). Next attempt in 1s.",
         actions: [],
       }),
     );
@@ -11877,6 +12039,144 @@ describe("stop reason propagation", () => {
         actions: ["retry"],
       }),
     );
+    expect(terminal).not.toHaveProperty("details");
+  });
+
+  it("keeps the api retries of one turn and its failure in one row before the echo", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => updates.push(update),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await initializeClient(agent, airSessionFailureCapabilities);
+    const retry = (attempt: number) => ({
+      type: "system" as const,
+      subtype: "api_retry" as const,
+      attempt,
+      max_retries: 10,
+      retry_delay_ms: 1_000,
+      error_status: 503,
+      error: "server_error" as const,
+      uuid: randomUUID(),
+      session_id: "test-session",
+    });
+    const input = new Pushable<any>();
+    async function* cli() {
+      const iter = input[Symbol.asyncIterator]();
+      for (const turn of [1, 2]) {
+        const { value: userMessage } = await iter.next();
+        const echo = {
+          type: "user",
+          message: userMessage.message,
+          parent_tool_use_id: null,
+          uuid: userMessage.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+        // The CLI holds the echo back until the first assistant frame or
+        // stream event of the turn. A request that gets a 503 has neither, so
+        // its retries come before the echo.
+        if (turn === 1) {
+          yield retry(1);
+          yield retry(2);
+          yield echo;
+          yield createAssistantError("server_error", "API Error: 503");
+          yield createResultMessage({
+            subtype: "success",
+            stop_reason: "end_turn",
+            is_error: true,
+            result: "API Error: 503",
+          });
+        } else {
+          yield retry(1);
+          yield echo;
+          yield createResultMessage({
+            subtype: "success",
+            stop_reason: "end_turn",
+            is_error: false,
+            result: "ok",
+          });
+        }
+      }
+    }
+    agent.sessions["test-session"] = mockSessionState({ query: wrapQuery(cli()), input });
+
+    const first = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "second" }] });
+    const warnings = updates
+      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
+      .filter((failure) => failure?.severity === "warning");
+
+    expect(warnings.map((warning) => warning.revision)).toEqual([1, 2, 1]);
+    expect(warnings[1].id).toBe(warnings[0].id);
+    expect(warnings[0].id).toMatch(/:error$/);
+    expect(sessionFailureFromResponse(first)).toEqual(
+      expect.objectContaining({ id: warnings[0].id, revision: 3, severity: "error" }),
+    );
+    expect(warnings[2].id).not.toBe(warnings[0].id);
+  });
+
+  it("replaces the cause of an api retry warning on the next retry", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => updates.push(update),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await initializeClient(agent, airSessionFailureCapabilities);
+    const retry = (
+      attempt: number,
+      error_status: number | null,
+      error: SDKAssistantMessageError,
+      retry_delay_ms: number,
+    ) => ({
+      type: "system" as const,
+      subtype: "api_retry" as const,
+      attempt,
+      max_retries: 10,
+      retry_delay_ms,
+      error_status,
+      error,
+      uuid: randomUUID(),
+      session_id: "test-session",
+    });
+    injectSession(agent, [
+      retry(1, 529, "overloaded", 8_000),
+      // An SSE `overloaded_error` event after HTTP 200: the CLI reports
+      // `overloaded` with no status.
+      retry(2, null, "overloaded", 1_100),
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: false,
+        result: "ok",
+      }),
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+    const warnings = updates
+      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
+      .filter(Boolean);
+
+    expect(warnings).toEqual([
+      expect.objectContaining({
+        revision: 1,
+        title: "Retrying Claude, attempt 1 of 10.",
+        details: "HTTP 529 (overloaded). Next attempt in 8s.",
+      }),
+      expect.objectContaining({
+        id: warnings[0].id,
+        revision: 2,
+        title: "Reconnecting to Claude, attempt 2 of 10.",
+        details: "No HTTP status (overloaded). Next attempt in 1s.",
+      }),
+    ]);
   });
 
   it("says how long a no-response retry waited and will wait", async () => {
@@ -11940,7 +12240,7 @@ describe("stop reason propagation", () => {
         subtype: "api_retry",
         attempt: 2,
         max_retries: 5,
-        retry_delay_ms: 100,
+        retry_delay_ms: 1_100,
         error_status: null,
         error: "unknown",
         uuid: randomUUID(),
@@ -12522,7 +12822,7 @@ describe("stop reason propagation", () => {
         subtype: "api_retry",
         attempt: 1,
         max_retries: 10,
-        retry_delay_ms: 100,
+        retry_delay_ms: 600,
         error_status: 401,
         error: "authentication_failed",
         uuid: randomUUID(),
@@ -14951,6 +15251,79 @@ describe("session/fork", () => {
       upToMessageId: "inactive-assistant-uuid",
     });
   });
+});
+
+describe("session/status", () => {
+  it("answers open for the sessions it holds, and the others from their stored transcripts", async () => {
+    const configDir = await mkdtemp(path.join(os.tmpdir(), "session-status-"));
+    vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
+    try {
+      const agent = new ClaudeAcpAgent({ sessionUpdate: async () => {} } as unknown as AcpClient, {
+        log: () => {},
+        error: () => {},
+      });
+      const { agentCapabilities } = await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {},
+      });
+      expect(agentCapabilities?.sessionCapabilities?.status).toEqual({});
+      const status = (sessionId: string) => agent.sessionStatus({ sessionId });
+      const unknown = (sessionId: string) => ({ code: -32002, data: { sessionId } });
+
+      const sessionId = randomUUID();
+      agent.sessions[sessionId] = {} as ClaudeAcpAgent["sessions"][string];
+      await expect(status(sessionId)).resolves.toEqual({ status: "open" });
+      // A held session whose query ended stays open: a load returns it as it is.
+      agent.sessions[sessionId]!.queryClosed = true;
+      await expect(status(sessionId)).resolves.toEqual({ status: "open" });
+      // A subagent's session id, and a name that every object inherits.
+      await expect(status("agent-1")).rejects.toMatchObject(unknown("agent-1"));
+      await expect(status("constructor")).rejects.toMatchObject(unknown("constructor"));
+
+      // Closed, and never prompted: no projects directory exists yet.
+      delete agent.sessions[sessionId];
+      await expect(status(sessionId)).rejects.toMatchObject(unknown(sessionId));
+      // A transcript of any project counts, next to a project without one.
+      await mkdir(path.join(configDir, "projects", "-other"), { recursive: true });
+      const project = path.join(configDir, "projects", "-project");
+      // A directory of that name is no transcript.
+      await mkdir(path.join(project, `${sessionId}.jsonl`), { recursive: true });
+      await expect(status(sessionId)).rejects.toMatchObject(unknown(sessionId));
+      await rm(path.join(project, `${sessionId}.jsonl`), { recursive: true });
+      await writeFile(path.join(project, `${sessionId}.jsonl`), "{}\n");
+      await expect(status(sessionId)).resolves.toEqual({ status: "saved" });
+      // The request loaded nothing.
+      expect(agent.sessions[sessionId]).toBeUndefined();
+    } finally {
+      vi.unstubAllEnvs();
+      await rm(configDir, { recursive: true, force: true });
+    }
+  });
+
+  // Not on Windows, where `chmod` does not take the read permission away.
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "fails, not -32002, when a project directory cannot be read",
+    async () => {
+      const configDir = await mkdtemp(path.join(os.tmpdir(), "session-status-"));
+      vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
+      const project = path.join(configDir, "projects", "-project");
+      await mkdir(project, { recursive: true });
+      await chmod(project, 0o000);
+      try {
+        const agent = new ClaudeAcpAgent(
+          { sessionUpdate: async () => {} } as unknown as AcpClient,
+          { log: () => {}, error: () => {} },
+        );
+        await expect(agent.sessionStatus({ sessionId: randomUUID() })).rejects.toMatchObject({
+          code: "EACCES",
+        });
+      } finally {
+        await chmod(project, 0o700);
+        vi.unstubAllEnvs();
+        await rm(configDir, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 describe("session/close", () => {

@@ -1,9 +1,20 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { SessionMessage } from "@anthropic-ai/claude-agent-sdk";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { getSessionMessages, type SessionMessage } from "@anthropic-ai/claude-agent-sdk";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  transcriptAssistant,
+  transcriptCompactBoundary,
+  transcriptCompactSummary,
+  transcriptUser,
+  writeTranscript,
+} from "./helpers.js";
 import os from "node:os";
 import path from "node:path";
-import { readResumedTail, resumedModelFromTranscript } from "../resumed-session.js";
+import {
+  readHistoryAcrossCompactions,
+  readResumedTail,
+  resumedModelFromTranscript,
+} from "../resumed-session.js";
 
 function assistant(
   model: unknown,
@@ -201,5 +212,189 @@ describe("readResumedTail", () => {
     await transcript("no-mode", [userLine("hello"), record("claude-opus-5")]);
 
     expect(await readResumedTail("no-mode")).toEqual({ model: "claude-opus-5" });
+  });
+});
+
+describe("readHistoryAcrossCompactions", () => {
+  const sessionId = "33333333-3333-4333-8333-333333333333";
+  let configDir: string;
+  let originalConfigDir: string | undefined;
+
+  beforeEach(async () => {
+    configDir = await mkdtemp(path.join(os.tmpdir(), "claude-acp-compacted-"));
+    originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = configDir;
+  });
+
+  afterEach(async () => {
+    if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
+    await rm(configDir, { recursive: true, force: true });
+  });
+
+  const transcript = (records: Record<string, unknown>[], project = "-workspace") =>
+    writeTranscript(path.join(configDir, "projects", project), sessionId, records);
+  const user = transcriptUser;
+  const assistant = transcriptAssistant;
+  const boundary = transcriptCompactBoundary;
+  const summary = (uuid: string) => transcriptCompactSummary(uuid, `Summary ${uuid}`);
+
+  const texts = (messages: SessionMessage[]) =>
+    messages.map((message) => {
+      const content = (message.message as { content: unknown }).content;
+      return typeof content === "string" ? content : (content as { text: string }[])[0]!.text;
+    });
+
+  it("reads the messages before each compaction", async () => {
+    await transcript([
+      user("u1", "hi"),
+      assistant("a1", "Hello"),
+      boundary("b1", "a1"),
+      summary("s1"),
+      user("u2", "next"),
+      assistant("a2", "Next"),
+      boundary("b2", "a2"),
+      summary("s2"),
+      user("u3", "identify yourself"),
+      assistant("a3", "Claude"),
+    ]);
+
+    // getSessionMessages stops at the last boundary.
+    const chain = await getSessionMessages(sessionId);
+    expect(texts(chain)).toEqual(["Summary s2", "identify yourself", "Claude"]);
+    expect(texts(await readHistoryAcrossCompactions(sessionId, chain))).toEqual([
+      "hi",
+      "Hello",
+      "Summary s1",
+      "next",
+      "Next",
+      "Summary s2",
+      "identify yourself",
+      "Claude",
+    ]);
+  });
+
+  it("keeps the messages that a compaction preserved where they were said", async () => {
+    // Claude Code 2.1.293 keeps u2 and a2 in the context after the summary,
+    // and records them in both forms of preserved-message metadata.
+    await transcript([
+      user("u1", "hi"),
+      assistant("a1", "Hello"),
+      user("u2", "keep this"),
+      assistant("a2", "Kept"),
+      boundary("b1", "a2", {
+        preservedSegment: { headUuid: "u2", anchorUuid: "s1", tailUuid: "a2" },
+        preservedMessages: { anchorUuid: "s1", uuids: ["u2", "a2"] },
+      }),
+      summary("s1"),
+      user("u3", "after"),
+      assistant("a3", "After"),
+    ]);
+
+    // getSessionMessages moves the preserved messages after the summary.
+    const chain = await getSessionMessages(sessionId);
+    expect(texts(chain)).toEqual(["Summary s1", "keep this", "Kept", "after", "After"]);
+    expect(texts(await readHistoryAcrossCompactions(sessionId, chain))).toEqual([
+      "hi",
+      "Hello",
+      "keep this",
+      "Kept",
+      "Summary s1",
+      "after",
+      "After",
+    ]);
+  });
+
+  it("returns the chain of a session without a compaction as it is", async () => {
+    await transcript([user("u1", "hi"), assistant("a1", "Hello")]);
+
+    const chain = await getSessionMessages(sessionId);
+    expect(await readHistoryAcrossCompactions(sessionId, chain)).toBe(chain);
+  });
+
+  it("ends at the last message of the chain it was given", async () => {
+    await transcript([
+      user("u1", "hi"),
+      assistant("a1", "Hello"),
+      boundary("b1", "a1"),
+      summary("s1"),
+      user("u2", "identify yourself"),
+    ]);
+    const chain = await getSessionMessages(sessionId);
+    // Claude Code appends a response after the first read.
+    await transcript([
+      user("u1", "hi"),
+      assistant("a1", "Hello"),
+      boundary("b1", "a1"),
+      summary("s1"),
+      user("u2", "identify yourself"),
+      assistant("a2", "Claude"),
+    ]);
+
+    expect(texts(await readHistoryAcrossCompactions(sessionId, chain))).toEqual([
+      "hi",
+      "Hello",
+      "Summary s1",
+      "identify yourself",
+    ]);
+  });
+
+  it.each([
+    ["the transcript is gone", async () => rm(configDir, { recursive: true, force: true })],
+    [
+      "the transcript no longer has the last message",
+      () =>
+        transcript([
+          user("u1", "hi"),
+          assistant("a1", "Hello"),
+          boundary("b1", "a1"),
+          summary("s1"),
+          user("u9", "other"),
+        ]),
+    ],
+  ])("returns the chain and logs when %s", async (_case, change) => {
+    await transcript([
+      user("u1", "hi"),
+      assistant("a1", "Hello"),
+      boundary("b1", "a1"),
+      summary("s1"),
+      user("u2", "identify yourself"),
+    ]);
+    const chain = await getSessionMessages(sessionId);
+    await change();
+    const error = vi.fn();
+
+    expect(await readHistoryAcrossCompactions(sessionId, chain, { log: () => {}, error })).toBe(
+      chain,
+    );
+    expect(error).toHaveBeenCalledOnce();
+  });
+
+  it("reads the transcript in the project directory it is given", async () => {
+    await transcript(
+      [
+        user("u1", "elsewhere"),
+        assistant("a1", "Elsewhere"),
+        boundary("b1", "a1"),
+        summary("s1"),
+        user("u2", "identify yourself"),
+      ],
+      "-a-other",
+    );
+    await transcript(
+      [
+        user("u1", "hi"),
+        assistant("a1", "Hello"),
+        boundary("b1", "a1"),
+        summary("s1"),
+        user("u2", "identify yourself"),
+      ],
+      "-z-workspace",
+    );
+    const chain = await getSessionMessages(sessionId, { dir: "/z/workspace" });
+
+    expect(
+      texts(await readHistoryAcrossCompactions(sessionId, chain, undefined, "/z/workspace")),
+    ).toEqual(["hi", "Hello", "Summary s1", "identify yourself"]);
   });
 });

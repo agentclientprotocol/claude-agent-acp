@@ -5,7 +5,7 @@
  */
 
 import type { SessionInfo } from "@agentclientprotocol/sdk/unstable";
-import { withAirMeta } from "../../air-extension.js";
+import { withAirMeta } from "../air-extension.js";
 import { deriveActivity, selectCost, type OwnSessionState } from "./activity.js";
 import type { LiveRecord } from "./live-registry.js";
 import type { IndexRow } from "./session-index.js";

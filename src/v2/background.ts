@@ -104,6 +104,17 @@ export class V2Background {
   }
 
   /**
+   * `state` as the current work state of the session `sessionId`, with its
+   * list when it reports one: what {@link stamp} makes of the session's
+   * `state_update`. Unlike `stamp`, it does not count as a state that carried
+   * the list, so a later change of the list is reported as before.
+   */
+  snapshot(sessionId: string, state: WorkStateName): v2.StateUpdate {
+    const session = this.sessions.get(sessionId);
+    return session ? withBackground(currentState(state), session.items) : currentState(state);
+  }
+
+  /**
    * Records the new list of a session, and returns the updates that report it:
    *
    * - For each terminal or tool call that the list adds, a `terminal_update`

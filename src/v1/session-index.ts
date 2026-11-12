@@ -15,11 +15,12 @@ import {
   type InitializeRequest,
   type ListSessionsRequest,
   type ListSessionsResponse,
+  type SetSessionTitleRequest,
+  type SetSessionTitleResponse,
 } from "@agentclientprotocol/sdk/unstable";
-import type { Query } from "@anthropic-ai/claude-agent-sdk";
-import type { Session } from "../acp-agent.js";
-import type { AcpClient } from "../../acp-client.js";
-import type { Logger } from "../../logger.js";
+import type { Session } from "./acp-agent.js";
+import type { AcpClient } from "../acp-client.js";
+import type { Logger } from "../logger.js";
 import {
   AIR_SESSION_ARCHIVE_CAPABILITY,
   AIR_SESSION_BATCH_GET_CAPABILITY,
@@ -29,9 +30,10 @@ import {
   AIR_SESSION_WORKTREES_CAPABILITY,
   clientSupportsAirCapability,
   withAirMeta,
-} from "../../air-extension.js";
-import type { OwnSessionState } from "./activity.js";
-import { isArchivedTitle, storedTitle, visibleTitle } from "./archive-title.js";
+} from "../air-extension.js";
+import type { OwnSessionState } from "../session-index/activity.js";
+import { isArchivedTitle, visibleTitle } from "../session-index/archive-title.js";
+import { renameSession, retitleSession, type RetitledSession } from "../session-index/rename.js";
 import {
   LIST_CHANGES_METHOD,
   LIST_SUBSCRIBE_METHOD,
@@ -41,12 +43,11 @@ import {
   type ListSubscribeRequest,
   type ListSubscribeResponse,
   type ListUnsubscribeRequest,
-} from "./list-subscriptions.js";
+} from "../session-index/list-subscriptions.js";
 import {
   archiveInsteadOfDelete,
   deleteSessionIfStored,
   archiveTo,
-  renameTo,
   parseRenameSessionRequest,
   parseSessionIdRequest,
   parseBatchGetSessionsRequest,
@@ -55,13 +56,12 @@ import {
   SESSION_RENAME_METHOD,
   SESSION_UNARCHIVE_METHOD,
   SessionIndexService,
+  transcriptWriter,
   type RenameSessionRequest,
-  type RetitleOptions,
   type SessionIdRequest,
-  type TitleChange,
   type BatchGetSessionsRequest,
   type BatchGetSessionsResponse,
-} from "./service.js";
+} from "../session-index/service.js";
 
 /** What the session index keeps on each `Session`. */
 export type SessionIndexFields = {
@@ -115,9 +115,9 @@ export class SessionIndexConnection {
    * exactly as before.
    */
   service?: SessionIndexService;
-  /** The archive behind `session/delete` of an AIR client without
-   *  `sessionIndex`: the same writes, without a list or a watcher. */
-  private archiver?: SessionIndexService;
+  /** The transcript writes of a client without `sessionIndex` (see
+   *  {@link transcriptWriter}). */
+  private transcripts?: SessionIndexService;
   /** When the query of a session failed here, by session id. */
   private readonly failedQueries = new Map<string, number>();
 
@@ -250,22 +250,32 @@ export class SessionIndexConnection {
     return sessions.filter((session) => !isArchivedTitle(session.customTitle));
   }
 
-  /** `_session/rename`: names a session; no generated title replaces it.
-   *  An archived session stays archived. */
+  /** `_session/rename` of a `sessionIndex` client (see {@link renameSession}). */
   async rename(request: RenameSessionRequest): Promise<EmptyResponse> {
-    const index = this.requireService(SESSION_RENAME_METHOD);
-    const { sessionId } = request;
-    // As the CLI keeps it, and never with the archive prefix: a rename does
-    // not change the archive state.
-    const title = storedTitle(request.title, false, sessionId);
-    // The title as stored: an archived one is cut with its prefix.
-    const shown = (stored: string | undefined) =>
-      stored === undefined ? title : visibleTitle(stored);
-    await this.retitle(index, sessionId, renameTo(title), shown, {
-      mayBeUnwritten: true,
-      sidecar: "always",
-    });
+    await this.renameWith(this.requireService(SESSION_RENAME_METHOD), request);
     return {};
+  }
+
+  /** `session/set_title`, for every client: the rename of `_session/rename`,
+   *  without the session index of a client that did not ask for it. */
+  async setTitle(request: SetSessionTitleRequest): Promise<SetSessionTitleResponse> {
+    const title = await this.renameWith(
+      this.service ?? this.writer(),
+      parseRenameSessionRequest(request),
+    );
+    return { title };
+  }
+
+  private renameWith(index: SessionIndexService, request: RenameSessionRequest): Promise<string> {
+    return renameSession(index, request, this.loaded(request.sessionId), (stored) =>
+      this.clientTitle(stored),
+    );
+  }
+
+  /** The session loaded here, as a rename reaches it. */
+  private loaded(sessionId: string): RetitledSession | undefined {
+    const session = this.host.agent.sessions[sessionId];
+    return session && { session, titles: session.titles };
   }
 
   /** `_session/archive`: hides a session from the default list and stops
@@ -279,7 +289,7 @@ export class SessionIndexConnection {
     // No turn goes on after the archive: the interrupt goes to the CLI ahead
     // of the rename.
     if (loaded) await this.host.interruptSession(sessionId);
-    await this.retitle(index, sessionId, archiveTo(true), undefined, {
+    await retitleSession(index, sessionId, archiveTo(true), undefined, this.loaded(sessionId), {
       mayBeUnwritten: this.isUnwrittenSession(sessionId),
       sidecar: "existing",
     });
@@ -308,64 +318,12 @@ export class SessionIndexConnection {
   async unarchive(params: SessionIdRequest): Promise<EmptyResponse> {
     const index = this.requireService(SESSION_UNARCHIVE_METHOD);
     const { sessionId } = params;
-    await this.retitle(index, sessionId, archiveTo(false), undefined, {
+    await retitleSession(index, sessionId, archiveTo(false), undefined, this.loaded(sessionId), {
       mayBeUnwritten: this.isUnwrittenSession(sessionId),
       sidecar: "existing",
     });
     await this.reportArchived(sessionId, false, this.host.agent.sessions[sessionId] !== undefined);
     return {};
-  }
-
-  /**
-   * Retitles a session (see {@link SessionIndexService.retitle}). A session
-   * this connection runs is titled through its CLI (`rename_session`). A
-   * loaded session's title state takes the change as a client title, so no
-   * generated title replaces it; `publish` is the title it then publishes.
-   */
-  private async retitle(
-    index: SessionIndexService,
-    sessionId: string,
-    change: TitleChange,
-    publish: Parameters<Session["titles"]["setExplicitTitle"]>[0],
-    options: Pick<RetitleOptions, "mayBeUnwritten" | "sidecar">,
-  ): Promise<void> {
-    const session = this.host.agent.sessions[sessionId];
-    // Decided once a title generation in flight has ended: the query may
-    // have closed meanwhile.
-    const persist = () => {
-      const query = session?.query as
-        | (Query & { renameSession?: (title: string, sessionId?: string) => Promise<void> })
-        | undefined;
-      // A closed session's CLI is gone here: only a running query titles it.
-      const running = session !== undefined && !session.queryClosed;
-      if (running && typeof query?.renameSession !== "function") {
-        // Its CLI holds the title and would write it back over ours.
-        throw RequestError.invalidRequest(
-          { sessionId },
-          "The Claude Code CLI of this session cannot change its title while it runs.",
-        );
-      }
-      const live = running
-        ? {
-            cwd: session.cwd,
-            rename: (title: string) => query!.renameSession!(title, sessionId),
-            stored: () => session.titles.storedTitle,
-            remember: (title: string) => session.titles.rememberStoredTitle(title),
-            shown: session.titles.shownTitle,
-          }
-        : undefined;
-      return index.retitle(sessionId, change, {
-        ...options,
-        // Without its CLI, a session needs its transcript.
-        mayBeUnwritten: live !== undefined && options.mayBeUnwritten,
-        live,
-      });
-    };
-    if (session) {
-      await session.titles.setExplicitTitle(publish, persist);
-    } else {
-      await persist();
-    }
   }
 
   /**
@@ -388,19 +346,19 @@ export class SessionIndexConnection {
     if (this.service) {
       await this.service.delete(params.sessionId, loaded);
     } else if (this.host.isAirClient()) {
-      await archiveInsteadOfDelete(params.sessionId, this.airArchiver());
+      await archiveInsteadOfDelete(params.sessionId, this.writer());
     } else {
-      await deleteSessionIfStored(params.sessionId);
+      // After a `session/set_title` of the session in flight.
+      await this.writer().exclusive(params.sessionId, () =>
+        deleteSessionIfStored(params.sessionId),
+      );
     }
     return {};
   }
 
-  private airArchiver(): SessionIndexService {
-    this.archiver ??= new SessionIndexService({
-      logError: (message, error) =>
-        this.host.agent.logger.error(`[session-index] ${message}:`, error),
-    });
-    return this.archiver;
+  private writer(): SessionIndexService {
+    this.transcripts ??= transcriptWriter(this.host.agent.logger);
+    return this.transcripts;
   }
 
   private requireService(method: string): SessionIndexService {

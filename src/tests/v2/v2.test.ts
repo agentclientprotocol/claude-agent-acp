@@ -9,7 +9,7 @@
  * `session_state_changed`.
  */
 import { randomUUID } from "node:crypto";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -24,6 +24,13 @@ import { acpProtocolRouter } from "../../serve.js";
 import { SettingsManager } from "../../settings.js";
 import type { AgentHandle } from "../../v2/agent.js";
 import { StoppedWork } from "../../v2/stopped-work.js";
+import {
+  transcriptAssistant,
+  transcriptCompactBoundary,
+  transcriptCompactSummary,
+  transcriptUser,
+  writeTranscript,
+} from "../helpers.js";
 
 /** One Claude Code process: the prompts it reads and the messages it sends. */
 type FakeClaudeCode = {
@@ -489,11 +496,57 @@ describe("ACP v2 core", () => {
 
     expect(response.protocolVersion).toBe(2);
     expect(response.capabilities?.session?.fork).toEqual({});
+    expect(response.capabilities?.session?.options).toEqual({});
     expect(response.capabilities?.session?.prompt).toEqual({ image: {}, embeddedContext: {} });
     expect((response.authMethods ?? []).map((method) => method.methodId)).toContain(
       "console-login",
     );
   });
+
+  it.each(["environment", "caller object", "caller file"])(
+    "includes configured models omitted by the SDK from %s settings",
+    async (source) => {
+      const configured = {
+        availableModels: ["claude-haiku-4-5", "claude-haiku-5-5"],
+        modelOverrides: {
+          "claude-haiku-4-5": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+          "claude-haiku-5-5": "global.anthropic.claude-haiku-5-5",
+        },
+      };
+      let settings: typeof configured | string | undefined;
+      if (source === "environment") {
+        vi.stubEnv("CLAUDE_MODEL_CONFIG", JSON.stringify(configured));
+      } else if (source === "caller file") {
+        settings = "caller-settings.json";
+        await writeFile(path.join(cwd, settings), JSON.stringify(configured));
+      } else {
+        settings = configured;
+      }
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        await agent.request(v2.methods.agent.initialize, {
+          protocolVersion: v2.PROTOCOL_VERSION,
+          info: { name: "v2-test-client", version: "1" },
+        });
+        const response = await agent.request(v2.methods.agent.session.new, {
+          cwd,
+          _meta: { claudeCode: { options: { settings } } },
+        });
+        const ids = ["default", ...Object.values(configured.modelOverrides)];
+        const model = response.configOptions?.find((option) => option.configId === "model");
+        expect(model).toMatchObject({
+          options: ids.map((value) => expect.objectContaining({ value })),
+        });
+        await agent.request(v2.methods.agent.session.setConfigOption, {
+          sessionId: response.sessionId,
+          configId: "model",
+          type: "id",
+          value: ids[2],
+        } as v2.SetSessionConfigOptionRequest);
+        expect(sdk.processes[0].setModel).toHaveBeenLastCalledWith(ids[2]);
+      });
+    },
+  );
 
   it("routes the sessions started after a gateway login through the gateway", async () => {
     const client = v2Client();
@@ -1055,6 +1108,30 @@ describe("ACP v2 core", () => {
     expect(client.sessionUpdates).toContainEqual({
       sessionUpdate: "config_option_update",
       configOptions,
+    });
+  });
+
+  it("stays idle at the echo of a model change's local command output", async () => {
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      const { claude } = await openSession(agent);
+      // As the bundled CLI sends it after `setModel`, with no turn: no
+      // `command_lifecycle` frame, result or `session_state_changed` follows.
+      claude.send({
+        type: "user",
+        message: {
+          role: "user",
+          content:
+            "<local-command-stdout>Set model to `haiku (claude-haiku-5-5)`</local-command-stdout>",
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "session",
+        timestamp: new Date().toISOString(),
+        isReplay: true,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(client.states()).toEqual([]);
     });
   });
 
@@ -1782,6 +1859,234 @@ describe("ACP v2 core", () => {
     expect(error).toMatchObject({ code: -32602 });
   });
 
+  describe("session options", () => {
+    const STORED = "7f1c5b0e-3c53-4c0c-9d0a-0d6c1f0a2b11";
+    const values = (options: v2.SessionConfigOption[] | undefined) =>
+      Object.fromEntries((options ?? []).map((o) => [o.configId, o.currentValue]));
+    const initialize = (agent: v2.ClientContext) =>
+      agent.request(v2.methods.agent.initialize, {
+        protocolVersion: v2.PROTOCOL_VERSION,
+        info: { name: "v2-test-client", version: "1.0.0" },
+        capabilities: {},
+      });
+
+    beforeEach(() => {
+      sdk.models = [
+        {
+          value: "default",
+          displayName: "Default",
+          description: "Recommended",
+          supportsAutoMode: true,
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high"],
+        },
+        {
+          value: "haiku",
+          displayName: "Haiku",
+          description: "Fast",
+          supportsAutoMode: false,
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium"],
+        },
+      ];
+    });
+
+    it("answers session/options with what session/new returns, from a query that it closes", async () => {
+      const client = v2Client();
+      const { options, created } = await client.connect(async (agent) => {
+        await initialize(agent);
+        const options = await agent.request(v2.methods.agent.session.options, {
+          cwd,
+          additionalDirectories: ["/extra"],
+        });
+        const created = await agent.request(v2.methods.agent.session.new, { cwd });
+        return { options, created };
+      });
+
+      const [probe, session] = sdk.processes;
+      expect(probe.options).toMatchObject({
+        cwd,
+        additionalDirectories: ["/extra"],
+        mcpServers: {},
+        persistSession: false,
+      });
+      expect(probe.close).toHaveBeenCalledTimes(1);
+      expect(session.options.persistSession).toBeUndefined();
+      const { sessionId, ...fields } = created;
+      expect(sessionId).not.toBe(probe.options.sessionId);
+      expect(options).toEqual(fields);
+      expect(options.availableCommands?.map((command) => command.name)).toContain("review");
+      expect(client.notifications).toEqual([]);
+    });
+
+    it("answers session/options of an active session with its current options, without a query", async () => {
+      const client = v2Client();
+      const { options, configOptions, wrongCwd } = await client.connect(async (agent) => {
+        const { response } = await openSession(agent);
+        const { sessionId } = response;
+        const { configOptions } = await agent.request(v2.methods.agent.session.setConfigOption, {
+          sessionId,
+          configId: "model",
+          type: "id",
+          value: "haiku",
+        });
+        const options = await agent.request(v2.methods.agent.session.options, { cwd, sessionId });
+        const wrongCwd = await agent
+          .request(v2.methods.agent.session.options, { cwd: tempDir, sessionId })
+          .catch((error: unknown) => error);
+        return { options, configOptions, wrongCwd };
+      });
+
+      expect(sdk.processes).toHaveLength(1);
+      expect(options.configOptions).toEqual(configOptions);
+      expect(values(options.configOptions).model).toBe("haiku");
+      expect(wrongCwd).toMatchObject({ code: -32602 });
+    });
+
+    it("answers session/options of a stored session from a query that resumes it", async () => {
+      const client = v2Client();
+      const status = await client.connect(async (agent) => {
+        await initialize(agent);
+        await agent.request(v2.methods.agent.session.options, { cwd, sessionId: STORED });
+        return agent
+          .request(v2.methods.agent.session.status, { sessionId: STORED })
+          .catch((error: unknown) => error);
+      });
+
+      const [probe] = sdk.processes;
+      expect(probe.options).toMatchObject({ resume: STORED, persistSession: false });
+      expect(probe.options.sessionId).toBeUndefined();
+      expect(probe.close).toHaveBeenCalledTimes(1);
+      // The session is not active: it has no transcript in this test.
+      expect(status).toMatchObject({ code: -32002 });
+    });
+
+    it("fails session/options of an unknown session with -32002", async () => {
+      sdk.startFailure = new Error(`No conversation found with session ID: ${STORED}`);
+      const client = v2Client();
+      const error = await client.connect(async (agent) => {
+        await initialize(agent);
+        return agent
+          .request(v2.methods.agent.session.options, { cwd, sessionId: STORED })
+          .catch((error: unknown) => error);
+      });
+
+      expect(error).toMatchObject({ code: -32002, data: { sessionId: STORED } });
+      expect(sdk.processes[0].close).toHaveBeenCalled();
+    });
+
+    it("starts a new session with the request's configOptions, in list order, without an update", async () => {
+      const client = v2Client();
+      const response = await client.connect(async (agent) => {
+        await initialize(agent);
+        return agent.request(v2.methods.agent.session.new, {
+          cwd,
+          configOptions: [
+            // Skipped: an unknown option, a boolean for a select, and a value not offered.
+            { configId: "nope", type: "id", value: "x" },
+            { configId: "ultracode", type: "boolean", value: true },
+            { configId: "model", type: "id", value: "haiku" },
+            // Haiku offers no "high": the entry is checked against the options the model left.
+            { configId: "effort", type: "id", value: "high" },
+            { configId: "mode", type: "id", value: "plan" },
+          ],
+        });
+      });
+
+      const [claude] = sdk.processes;
+      expect(claude.setModel).toHaveBeenCalledWith("haiku");
+      expect(claude.setPermissionMode).toHaveBeenCalledWith("plan");
+      expect(values(response.configOptions)).toMatchObject({ model: "haiku", mode: "plan" });
+      expect(values(response.configOptions).effort).not.toBe("high");
+      expect(client.notifications).toEqual([]);
+    });
+
+    it.each<[string, v2.InitialSessionConfigOption[]]>([
+      [
+        "two entries of one configId",
+        [
+          { configId: "mode", type: "id", value: "plan" },
+          { configId: "mode", type: "id", value: "default" },
+        ],
+      ],
+      ["a value type it does not take", [{ configId: "mode", type: "_custom", value: 1 }]],
+    ])("rejects %s before it starts a query", async (_name, configOptions) => {
+      const client = v2Client();
+      const errors = await client.connect(async (agent) => {
+        await initialize(agent);
+        return Promise.all(
+          [
+            agent.request(v2.methods.agent.session.new, { cwd, configOptions }),
+            agent.request(v2.methods.agent.session.resume, {
+              sessionId: STORED,
+              cwd,
+              configOptions,
+            }),
+          ].map((request) => request.catch((error: unknown) => error)),
+        );
+      });
+
+      expect(errors).toEqual([
+        expect.objectContaining({ code: -32602 }),
+        expect.objectContaining({ code: -32602 }),
+      ]);
+      expect(sdk.processes).toHaveLength(0);
+    });
+
+    it("sets the configOptions of a session/resume on the session, an active one too", async () => {
+      const client = v2Client();
+      const { started, active } = await client.connect(async (agent) => {
+        await initialize(agent);
+        const resume = (configOptions: v2.InitialSessionConfigOption[]) =>
+          agent.request(v2.methods.agent.session.resume, { sessionId: STORED, cwd, configOptions });
+        const started = await resume([{ configId: "mode", type: "id", value: "plan" }]);
+        const active = await resume([{ configId: "model", type: "id", value: "haiku" }]);
+        return { started, active };
+      });
+
+      expect(sdk.processes).toHaveLength(1);
+      expect(values(started.configOptions).mode).toBe("plan");
+      expect(values(active.configOptions)).toMatchObject({ mode: "plan", model: "haiku" });
+      expect(client.sessionUpdates.map((update) => update.sessionUpdate)).not.toContain(
+        "config_option_update",
+      );
+    });
+
+    it("leaves the notice of an Auto mode fallback for the first prompt", async () => {
+      const client = v2Client();
+      const { response, before } = await client.connect(async (agent) => {
+        await initialize(agent);
+        const response = await agent.request(v2.methods.agent.session.new, {
+          cwd,
+          configOptions: [
+            { configId: "mode", type: "id", value: "auto" },
+            // Haiku cannot serve Auto.
+            { configId: "model", type: "id", value: "haiku" },
+          ],
+        });
+        const before = [...client.sessionUpdates];
+        const claude = sdk.processes[0];
+        const prompted = agent.request(v2.methods.agent.session.prompt, {
+          sessionId: response.sessionId,
+          prompt: PROMPT,
+        });
+        const prompt = await claude.prompt(0);
+        claude.send(lifecycle(prompt, "started"));
+        claude.send(echo(prompt));
+        claude.send(result());
+        claude.send(sessionState("idle"));
+        await prompted;
+        return { response, before };
+      });
+
+      expect(values(response.configOptions)).toMatchObject({ mode: "acceptEdits", model: "haiku" });
+      expect(before).toEqual([]);
+      expect(client.sessionUpdates.filter((update) => update.sessionUpdate === "notice")).toEqual([
+        expect.objectContaining({ title: "Auto mode unavailable" }),
+      ]);
+    });
+  });
+
   it("rejects additional directories that are not absolute", async () => {
     const client = v2Client();
     const error = await client.connect(async (agent) => {
@@ -1939,6 +2244,49 @@ describe("ACP v2 core", () => {
       },
       { sessionUpdate: "user_message", messageId: "u2", content: [] },
     ]);
+  });
+
+  it("replays the messages before a compaction from the transcript", async () => {
+    const sessionId = randomUUID();
+    // The records of `/compact` between two prompts, as Claude Code writes
+    // them: the boundary has no parent and links "Hello" logically. The SDK
+    // looks the project up by the real path of `cwd` (`/private/var` on macOS).
+    const project = (await realpath(cwd)).replace(/[^a-zA-Z0-9]/g, "-");
+    await writeTranscript(path.join(tempDir, "claude", "projects", project), sessionId, [
+      transcriptUser("u1", "hi"),
+      transcriptAssistant("a1", "Hello"),
+      transcriptCompactBoundary("b1", "a1"),
+      transcriptCompactSummary("s1"),
+      transcriptUser("u2", "identify yourself"),
+    ]);
+    // The transcript read and the read across the compaction both go to disk.
+    const actual = await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
+      "@anthropic-ai/claude-agent-sdk",
+    );
+    vi.mocked(getSessionMessages)
+      .mockImplementationOnce(actual.getSessionMessages)
+      .mockImplementationOnce(actual.getSessionMessages);
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      await agent.request(v2.methods.agent.initialize, {
+        protocolVersion: v2.PROTOCOL_VERSION,
+        info: { name: "v2-test-client", version: "1.0.0" },
+        capabilities: {},
+      });
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+    });
+
+    expect(
+      client.sessionUpdates.flatMap((update) =>
+        update.sessionUpdate === "user_message" || update.sessionUpdate === "compaction_update"
+          ? [update.sessionUpdate]
+          : [],
+      ),
+    ).toEqual(["user_message", "compaction_update", "user_message"]);
   });
 
   it.each([
@@ -2131,7 +2479,7 @@ describe("ACP v2 core", () => {
     expect(client.sessionUpdates.at(-1)).toMatchObject({
       state: "idle",
       stopReason: "error",
-      error: { code: -32000 },
+      error: { code: -32000, message: "Authentication required" },
     });
   });
 
@@ -2140,7 +2488,7 @@ describe("ACP v2 core", () => {
       "an authentication failure as authRequired",
       "authentication_failed",
       "Failed to authenticate. API Error: 401",
-      { code: -32000 },
+      { code: -32000, message: "Authentication required: Failed to authenticate. API Error: 401" },
     ],
     [
       "another failure with its error kind",
@@ -2163,6 +2511,91 @@ describe("ACP v2 core", () => {
       stopReason: "error",
       error,
     });
+  });
+
+  it.each([
+    ["a notice when the turn goes on to end", { result: "" }, "end_turn", 1],
+    ["a notice once when the result repeats its text", {}, "end_turn", 1],
+    ["the idle's error when the turn fails", { is_error: true }, "error", 0],
+  ])(
+    "reports Claude Code's message for a failed API request as %s, not as Claude's text",
+    async (_, fields, stopReason, notices) => {
+      const text = "API Error: Connection lost mid-response. The response above may be incomplete.";
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { claude } = await openSession(agent);
+        claude.send(cycleStart());
+        claude.send({
+          ...assistant("msg_api_error", [{ type: "text", text }]),
+          message: {
+            id: "msg_api_error",
+            type: "message",
+            role: "assistant",
+            model: "<synthetic>",
+            content: [{ type: "text", text }],
+            usage: {},
+          },
+          error: "server_error",
+        });
+        claude.send(result({ result: text, ...fields }));
+        await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+      });
+
+      expect(
+        client.sessionUpdates.filter((update) => update.sessionUpdate === "agent_message_chunk"),
+      ).toEqual([]);
+      expect(client.sessionUpdates.filter((update) => update.sessionUpdate === "notice")).toEqual(
+        Array(notices).fill({ sessionUpdate: "notice", severity: "error", title: text }),
+      );
+      expect(client.sessionUpdates.at(-1)).toMatchObject({ state: "idle", stopReason });
+    },
+  );
+
+  it("reports a failed API request that the turn goes on past where it failed", async () => {
+    const text = "API Error: Connection lost mid-response. The response above may be incomplete.";
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      const { claude } = await openSession(agent);
+      claude.send(cycleStart());
+      // Claude Code keeps the tool call of the response that broke off, and runs it.
+      claude.send(
+        assistant("msg_partial", [
+          { type: "tool_use", id: "toolu_kept", name: "Bash", input: { command: "ls" } },
+        ]),
+      );
+      claude.send({
+        ...assistant("msg_api_error", [{ type: "text", text }]),
+        message: {
+          id: "msg_api_error",
+          type: "message",
+          role: "assistant",
+          model: "<synthetic>",
+          content: [{ type: "text", text }],
+          usage: {},
+        },
+        error: "server_error",
+      });
+      claude.send({
+        type: "user",
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "toolu_kept", content: "src" }],
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+      });
+      claude.send(assistant("msg_after", [{ type: "text", text: "Done." }]));
+      claude.send(result({ result: "Done." }));
+      await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+    });
+
+    const notice = { sessionUpdate: "notice", severity: "error", title: text };
+    const shown = client.sessionUpdates.filter(
+      (update) =>
+        update.sessionUpdate === "notice" || update.sessionUpdate === "agent_message_chunk",
+    );
+    expect(shown).toMatchObject([notice, { sessionUpdate: "agent_message_chunk" }]);
+    expect(shown[0]).toEqual(notice);
   });
 
   it.each([

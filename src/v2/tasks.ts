@@ -70,7 +70,9 @@ import {
   rfdLabels,
   sendMessageResume,
   subagentIdentity,
+  targetAgentId,
   unexposedControlFallback,
+  withSessionReference,
   type HistoricalSubagent,
   type SubagentIdentity,
   type SubagentModels,
@@ -133,7 +135,7 @@ export interface RequestTarget {
   openRequest<T>(signal: AbortSignal, send: (signal: AbortSignal) => Promise<T>): Promise<T>;
 }
 
-type ChildState = "idle" | "running" | "requires_action";
+type ChildState = "idle" | "running" | "requires_action" | "unknown";
 
 type IdleOutcome =
   | { stopReason: "end_turn" }
@@ -178,6 +180,11 @@ type Child = {
   description: string | undefined;
   /** Whether a run of it is going on: its foreground work. */
   working: boolean;
+  /**
+   * Whether the adapter stopped following it while a run of it went on (see
+   * `conversationReset`): its state is `unknown`.
+   */
+  unobservable: boolean;
   /** The state its stream was told last. */
   reportedState: ChildState | undefined;
   /** How its last run ended. */
@@ -316,6 +323,11 @@ export class SessionTasks {
     string,
     { initial: AcpSessionNotification; message?: string; delegationId?: string }
   >();
+  /**
+   * The agent that each TaskStop or SendMessage call names (`targetAgentId`),
+   * until the call's final update.
+   */
+  private readonly targetByToolCall = new Map<string, string>();
   /** The restore of a subagent from the session's history, while it reads it (see {@link restore}). */
   private restoring: Promise<void> | undefined;
 
@@ -831,18 +843,24 @@ export class SessionTasks {
   }
 
   /**
-   * Claude Code mounted a fresh conversation (`conversation_reset`). Its
-   * subagents end, deeper ones first, as on v1 (`finishAll`): each
-   * child that works goes `idle` with no stop reason, since nothing says how
-   * its run ended, after its unfinished tool calls end `failed`. Then every
-   * child is forgotten: a later event of one
-   * changes nothing, and a child not announced yet stays unexposed. Claude
-   * Code's tasks (the live subagents, background commands and other tasks)
-   * stay as its task events report them.
+   * Claude Code mounted a fresh conversation (`conversation_reset`). Every
+   * child is forgotten: a later event of one changes nothing, and a child not
+   * announced yet stays unexposed. Claude Code's tasks (the live subagents,
+   * background commands and other tasks) stay as its task events report them,
+   * so a child that works may go on working, unobserved. As on v1
+   * (`finishAll`), each such child, deeper ones first, goes `unknown`, as the
+   * RFD requires when a child can no longer be observed, on its stream and in
+   * its parent's mirror, and loses its `cancel` capability: a forgotten child
+   * cannot be stopped. Nothing says that its run or its tool calls ended, so
+   * its unfinished tool calls keep their status. A child that is idle keeps
+   * its state.
    */
   conversationReset(): void {
     for (const child of [...this.parentsFirst()].reverse()) {
-      if (child.working) this.endRun(child, undefined);
+      if (!child.working) continue;
+      child.working = false;
+      child.unobservable = true;
+      this.sendChildState(child, "unknown", { capabilities: null });
     }
     this.publish();
     for (const child of this.children.values()) this.configs.forget(child.sessionId);
@@ -857,6 +875,7 @@ export class SessionTasks {
     this.hiddenSendMessages.clear();
     this.shownSendMessages.clear();
     this.handbacks.clear();
+    this.targetByToolCall.clear();
   }
 
   /**
@@ -1137,6 +1156,7 @@ export class SessionTasks {
       title: undefined,
       description: undefined,
       working: true,
+      unobservable: false,
       reportedState: undefined,
       outcome: undefined,
       openRequests: 0,
@@ -1373,9 +1393,45 @@ export class SessionTasks {
    * Rewrites an update of `output`, the output of the root or of `child`: an
    * update of an Agent or Task call goes out as {@link launchUpdate} says,
    * and Claude Code's late result of a call that the child's stop ended
-   * goes nowhere.
+   * goes nowhere. A tool call that the client is shown and that operates on
+   * an announced child of another session gets the RFD's `session` reference
+   * (see {@link withTarget}).
    */
   private route(
+    output: SessionOutput,
+    notification: AcpSessionNotification,
+    child: Child | undefined,
+  ): AcpSessionNotification[] {
+    return this.routed(output, notification, child).map((shown) =>
+      this.withTarget(shown, output.sessionId),
+    );
+  }
+
+  /**
+   * `notification`, an update that the client is shown on the session
+   * `shownOn`, with a `session` reference when it is of a TaskStop or
+   * SendMessage call that names an announced child by its agent id, or of a
+   * SendMessage call that resumed one and stays shown (see
+   * {@link requestShows}), as on v1 (`NativeSubagentRuntime.withTarget`).
+   */
+  private withTarget(
+    notification: AcpSessionNotification,
+    shownOn: string,
+  ): AcpSessionNotification {
+    const { update } = notification;
+    if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") {
+      return notification;
+    }
+    const agentId = this.targetByToolCall.get(update.toolCallId);
+    if (FINAL_STATUSES.has(update.status)) this.targetByToolCall.delete(update.toolCallId);
+    const child =
+      this.childByToolUse.get(update.toolCallId) ??
+      (agentId !== undefined ? this.children.get(agentId) : undefined);
+    if (!child?.announced || child.sessionId === shownOn) return notification;
+    return withSessionReference(notification, child.sessionId);
+  }
+
+  private routed(
     output: SessionOutput,
     notification: AcpSessionNotification,
     child: Child | undefined,
@@ -1386,6 +1442,8 @@ export class SessionTasks {
     }
     if (child?.stopped.has(update.toolCallId)) return [];
     const toolName = (update._meta?.claudeCode as { toolName?: unknown } | undefined)?.toolName;
+    const agentId = targetAgentId(toolName, update.rawInput);
+    if (agentId !== undefined) this.targetByToolCall.set(update.toolCallId, agentId);
     if (toolName === "SendMessage") this.senderByToolUse.set(update.toolCallId, output.sessionId);
     const message =
       this.sendMessageUpdate(output, notification, toolName) ??
@@ -1594,16 +1652,15 @@ export class SessionTasks {
   /**
    * A run of `child` ended: its unfinished tool calls get their final status,
    * except its background work, then its idle goes out, as v2 asks. A stopped
-   * run's end `cancelled`, and a failed run's or an unexplained end's
-   * (`undefined`, an idle with no stop reason) `failed`. At a completed end, a
+   * run's end `cancelled`, and a failed run's `failed`. At a completed end, a
    * tool call that Claude dropped before it ran ends `cancelled`, as on the
    * root (see `SessionOutput.closeUnfinished`).
    */
-  private endRun(child: Child, outcome: IdleOutcome | undefined): void {
+  private endRun(child: Child, outcome: IdleOutcome): void {
     if (!child.working) {
       // A later report of the same failure can give its error text.
       if (
-        outcome?.stopReason === "error" &&
+        outcome.stopReason === "error" &&
         outcome.error &&
         child.outcome?.stopReason === "error" &&
         !child.outcome.error
@@ -1614,10 +1671,10 @@ export class SessionTasks {
       return;
     }
     const keep = this.backgroundWork(child.sessionId);
-    if (outcome?.stopReason === "end_turn") {
+    if (outcome.stopReason === "end_turn") {
       child.output!.closeUnfinished(false, keep);
     } else {
-      const status = outcome?.stopReason === "cancelled" ? "cancelled" : "failed";
+      const status = outcome.stopReason === "cancelled" ? "cancelled" : "failed";
       const ended = child.output!.finishUnfinished(status, keep, { exitTerminals: true });
       for (const toolCallId of ended) child.stopped.add(toolCallId);
     }
@@ -1659,6 +1716,7 @@ export class SessionTasks {
   }
 
   private childState(child: Child): ChildState {
+    if (child.unobservable) return "unknown";
     if (!child.working) return "idle";
     return child.openRequests > 0 ? "requires_action" : "running";
   }
@@ -1679,12 +1737,21 @@ export class SessionTasks {
     this.sendChildState(child, state);
   }
 
-  private sendChildState(child: Child, state: ChildState): void {
+  private sendChildState(
+    child: Child,
+    state: ChildState,
+    capabilities?: { capabilities: null },
+  ): void {
     child.reportedState = state;
     const snapshot = stateObject(state, state === "idle" ? child.outcome : undefined);
     this.host.send({
       sessionId: child.parentSessionId,
-      update: { sessionUpdate: "subagent_update", sessionId: child.sessionId, state: snapshot },
+      update: {
+        sessionUpdate: "subagent_update",
+        sessionId: child.sessionId,
+        ...capabilities,
+        state: snapshot,
+      },
     });
     this.host.send({
       sessionId: child.sessionId,
@@ -2044,6 +2111,8 @@ function stateObject(state: ChildState, outcome: IdleOutcome | undefined): v2.St
       return { state: "running" };
     case "requires_action":
       return { state: "requires_action" };
+    case "unknown":
+      return { state: "unknown" };
     default:
       return { state: "idle", ...(outcome ?? {}) } as v2.StateUpdate;
   }

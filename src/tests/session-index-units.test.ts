@@ -2,28 +2,28 @@ import { describe, expect, it } from "vitest";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { deriveActivity, selectCost, type ActivityState } from "../../v1/session-index/activity.js";
-import { LiveSessionRegistry, type LiveRecord } from "../../v1/session-index/live-registry.js";
+import { deriveActivity, selectCost, type ActivityState } from "../session-index/activity.js";
+import { LiveSessionRegistry, type LiveRecord } from "../session-index/live-registry.js";
+import { isSessionId } from "../paths.js";
 import {
   encodeProjectPath,
-  isSessionId,
   pathAndAncestors,
   projectDirMatches,
-} from "../../v1/session-index/project-dirs.js";
+} from "../session-index/project-dirs.js";
 import {
   decodeListCursor,
   encodeListCursor,
   parseListOptions,
   parseRenameSessionRequest,
   type ListScope,
-} from "../../v1/session-index/service.js";
+} from "../session-index/service.js";
 import {
   effectiveTitle,
   isArchivedTitle,
   storedTitle,
   titleRecords,
   visibleTitle,
-} from "../../v1/session-index/archive-title.js";
+} from "../session-index/archive-title.js";
 import {
   agentWorktreeOf,
   continuedInSessionId,
@@ -33,11 +33,11 @@ import {
   sdkTitles,
   transcriptAgentName,
   type TranscriptFacts,
-} from "../../v1/session-index/transcript-scan.js";
-import { firstPrompt } from "../../v1/session-index/first-prompt.js";
-import { DirListings, statFiles } from "../../v1/session-index/dir-listing.js";
-import { SessionIndex, type IndexRow } from "../../v1/session-index/session-index.js";
-import { changeSignature, sessionInfoOf } from "../../v1/session-index/session-info.js";
+} from "../session-index/transcript-scan.js";
+import { firstPrompt } from "../session-index/first-prompt.js";
+import { DirListings, statFiles } from "../session-index/dir-listing.js";
+import { SessionIndex, type IndexRow } from "../session-index/session-index.js";
+import { changeSignature, sessionInfoOf } from "../session-index/session-info.js";
 
 const SESSION = "11111111-1111-4111-8111-111111111111";
 const lines = (...entries: object[]) => entries.map((entry) => JSON.stringify(entry)).join("\n");

@@ -28,16 +28,9 @@ export function fastModeStateEnabled(state: FastModeState): boolean {
   return state !== "off";
 }
 
-/** User-facing explanations for the SDK's `fast_mode_disabled_reason` values
- *  that a user can act on (or at least wants to know about). Deliberately
- *  partial — the omitted reasons are not worth surfacing:
- *   - `sdk_opt_in_required`: every SDK session starts here (the toggle IS the
- *     opt-in), so it describes the default, not a problem.
- *   - `preference`: the user turned Fast mode off themselves.
- *   - `pending`: eligibility is still resolving; the next report supersedes it.
- *   - `unknown`: nothing meaningful to say.
- *  Unknown future reasons fall through the same way (open set — the SDK's docs
- *  say to ignore values you don't handle). */
+/** User-facing explanations for the SDK's `fast_mode_disabled_reason` values.
+ *  Every reason is explained except the two in {@link FAST_MODE_UNEXPLAINED_REASONS};
+ *  a code missing here gets the generic text from {@link explainFastModeDisabledReason}. */
 const FAST_MODE_UNAVAILABLE_EXPLANATIONS: Partial<Record<FastModeDisabledReason, string>> = {
   free: "not available on the free plan",
   extra_usage_disabled: "requires extra usage to be enabled for this account",
@@ -45,17 +38,38 @@ const FAST_MODE_UNAVAILABLE_EXPLANATIONS: Partial<Record<FastModeDisabledReason,
   not_first_party: "not available on this API provider",
   disabled_by_env: "disabled by environment configuration",
   network_error: "eligibility could not be verified (network error)",
+  preference: "not enabled for your organization or API gateway",
+  unknown: "currently unavailable",
 };
 
+/** Reasons that are never explained:
+ *   - `sdk_opt_in_required`: every SDK session starts here (the toggle IS the
+ *     opt-in), so it describes the default, not a problem.
+ *   - `pending`: eligibility is still resolving; the next report supersedes it. */
+const FAST_MODE_UNEXPLAINED_REASONS: ReadonlySet<FastModeDisabledReason> = new Set([
+  "sdk_opt_in_required",
+  "pending",
+]);
+
+/** The user-facing explanation of a `fast_mode_disabled_reason`: `undefined`
+ *  for no reason, `sdk_opt_in_required` or `pending`; the table text when there
+ *  is one; else a generic text naming the code (a reason a newer SDK added). */
+export function explainFastModeDisabledReason(
+  reason: FastModeDisabledReason | undefined,
+): string | undefined {
+  if (reason === undefined || FAST_MODE_UNEXPLAINED_REASONS.has(reason)) return undefined;
+  return FAST_MODE_UNAVAILABLE_EXPLANATIONS[reason] ?? `not available (${reason})`;
+}
+
 /** Normalize an SDK-reported `fast_mode_disabled_reason` to the one we retain:
- *  a reason we have an explanation for, else `undefined`. Keeping only
- *  explainable reasons means state comparisons (see `fastModeStateChange`) track
- *  exactly what the user can see, so routine reports like
- *  `sdk_opt_in_required` never churn the config option. */
+ *  a reason {@link explainFastModeDisabledReason} explains (including codes a
+ *  newer SDK adds), else `undefined`. State comparisons (see
+ *  `fastModeStateChange`) then track exactly what the user can see, so
+ *  `sdk_opt_in_required` and `pending` never churn the config option. */
 export function normalizeFastModeDisabledReason(
   reason: FastModeDisabledReason | undefined,
 ): FastModeDisabledReason | undefined {
-  return reason && FAST_MODE_UNAVAILABLE_EXPLANATIONS[reason] ? reason : undefined;
+  return explainFastModeDisabledReason(reason) !== undefined ? reason : undefined;
 }
 
 /** Build the Fast mode config option. When the Client supports boolean config
@@ -73,9 +87,7 @@ export function createFastModeConfigOption(
   useBooleanOption: boolean,
   disabledReason?: FastModeDisabledReason,
 ): SessionConfigOption {
-  const explanation = enabled
-    ? undefined
-    : disabledReason && FAST_MODE_UNAVAILABLE_EXPLANATIONS[disabledReason];
+  const explanation = enabled ? undefined : explainFastModeDisabledReason(disabledReason);
   const base = {
     id: FAST_MODE_CONFIG_ID,
     name: "Fast mode",
@@ -141,15 +153,17 @@ export type FastModeOptionState = {
  *  off), or the same state with the same explainable reason.
  *
  *  `reason` is the SDK's `fast_mode_disabled_reason`, reported alongside the
- *  state. Only explainable reasons are retained (see
- *  {@link normalizeFastModeDisabledReason}), so a routine
- *  `sdk_opt_in_required` report on every turn's result can't churn the
- *  option, while a real blocker updates the description even when the
+ *  state. Every reason except `sdk_opt_in_required` and `pending` is retained
+ *  (see {@link normalizeFastModeDisabledReason}; unknown future codes get the
+ *  generic text), so `sdk_opt_in_required` on every turn's result can't churn
+ *  the option, while a real blocker updates the description even when the
  *  toggle's own value is unchanged.
  *
  *  `notice` is set when the user had Fast mode on and the SDK turned it off
- *  for an explainable reason: the description carries the same explanation,
- *  but a toggle silently snapping back is worth saying out loud once. */
+ *  with a retained reason: the description carries the same explanation, but a
+ *  toggle silently snapping back is worth saying out loud once. Off with no
+ *  reason, `sdk_opt_in_required` or `pending` stays quiet: a `result` can carry
+ *  the turn-start snapshot, so a notice there would falsely say "turned off". */
 export function fastModeStateChange(
   current: { enabled: boolean; disabledReason?: FastModeDisabledReason },
   state: FastModeState | undefined,
@@ -163,8 +177,7 @@ export function fastModeStateChange(
   // so it can't decorate the option the next time fast mode goes off.
   const disabledReason = enabled ? undefined : normalizeFastModeDisabledReason(reason);
   if (enabled === current.enabled && disabledReason === current.disabledReason) return undefined;
-  const explanation =
-    disabledReason !== undefined ? FAST_MODE_UNAVAILABLE_EXPLANATIONS[disabledReason] : undefined;
+  const explanation = explainFastModeDisabledReason(disabledReason);
   if (!current.enabled || enabled || explanation === undefined) {
     return { enabled, disabledReason };
   }

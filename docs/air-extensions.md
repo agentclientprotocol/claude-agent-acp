@@ -228,7 +228,7 @@ The adapter keeps them where they are.
 
 ## Auth source display
 
-The connection-scoped `_auth/status_update` continues to report agent-owned authentication, not client-owned `providers/set` routing. The adapter also reports the same identity through the ACP `auth/status` method and `auth/status_update` notification (advertised as `auth.status`), with `kind`, `detail` and `plan` under the account's `_meta.claudeCode`. The account's `label` also carries a `detail` in parentheses, e.g. `Anthropic API key (ANTHROPIC_API_KEY)`. Each notification is sent when its own payload changed. `auth/status` answers with the identity last reported and starts a new read, whose change arrives as a notification. When the active key source is `apiKeyHelper`, the adapter reads the effective helper command through SDK `resolveSettings` / the session's `SettingsManager`, including programmatic settings overrides.
+The connection-scoped `_auth/status_update` continues to report agent-owned authentication, not client-owned `providers/set` routing. The adapter also reports the same identity through the ACP `auth/status` method and `auth/status_update` notification (advertised as `auth.status`), with `kind`, `detail` and `plan` under the account's `_meta.claudeCode`. The account's `description` carries the `detail` too, e.g. `label: "Anthropic API key"` with `description: "ANTHROPIC_API_KEY"`. Each notification is sent when its own payload changed. `auth/status` answers with the identity last reported and starts a new read, whose change arrives as a notification. When the active key source is `apiKeyHelper`, the adapter reads the effective helper command through SDK `resolveSettings` / the session's `SettingsManager`, including programmatic settings overrides.
 
 A command containing the whole word `central` and the word sequence `proxy start` is displayed as:
 
@@ -1407,6 +1407,8 @@ Each row carries `_meta.jetbrains.air` with flat row fields of the RFDs. `archiv
 ### Rename
 
 `_session/rename { "sessionId": "…", "title": "…" }` returns `{}`.
+
+ACP's `session/set_title` renames the same way for every client, on v1 and v2, without `sessionIndex`, and returns `{ "title": "…" }`: the title as `session/list` shows it to the client. On v1 an AIR client gets it without the archive prefix, and every other client, and every v2 client, with it.
 
 - A blank title is `-32602`. The adapter collapses whitespace and keeps the first 200 characters, trimmed, as the CLI does. An `[archived] ` prefix of the requested title is dropped: a rename never changes the archive state.
 - The title is stored as the title records of [Archive](#archive): a `custom-title` and an `agent-name` record. An archived session keeps its `[archived] ` prefix (and the title is cut to 200 characters with it), so a rename does not unarchive it.

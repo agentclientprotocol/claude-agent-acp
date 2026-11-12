@@ -23,7 +23,7 @@ import { execFile } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { claudeConfigDir } from "../../paths.js";
+import { claudeConfigDir } from "../paths.js";
 import { errorCode } from "./project-dirs.js";
 
 const SNAPSHOT_TTL_MS = 5_000;

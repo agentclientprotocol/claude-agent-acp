@@ -60,6 +60,7 @@ import { Pushable } from "../utils.js";
 import { v1PromptRequest } from "./prompt.js";
 import { V2Background, stateUpdate as currentStateUpdate } from "./background.js";
 import type { V2UpdateTranslator } from "./update-translator.js";
+import { isLocalCommandOutput } from "../message-filters.js";
 import { MODEL_CONFIG_ID } from "../session-model.js";
 import { modelRefusalFallback, noticeUpdate } from "../session-notices.js";
 import { planModeUpdate } from "../exit-plan.js";
@@ -363,6 +364,15 @@ export class V2Session implements RequestTarget {
   }
 
   /**
+   * The `state` of `session/status`: the foreground state now, with the
+   * session's list and without a stop reason. It sends nothing and changes
+   * nothing.
+   */
+  statusState(): v2.StateUpdate {
+    return this.background.snapshot(this.sessionId, this.foregroundState());
+  }
+
+  /**
    * Replaces the session's MCP servers, as a resume of the active session
    * asks. The same servers stay as they are, connected.
    */
@@ -609,6 +619,22 @@ export class V2Session implements RequestTarget {
     // The subagents that the work waits on stop with it. Background ones go on.
     this.tasks.cancelForeground();
     if (heldTurn) this.closeTurn();
+  }
+
+  /**
+   * Sets the initial values of a setup request's `configOptions` (see
+   * `SessionConfig.setInitial`), and has the reports follow the model they
+   * leave. It sends nothing, on a session that a `session/resume` found
+   * active too: the setup response carries the options to the connection
+   * that asked, and a session is active on one connection only.
+   */
+  async setInitialConfigOptions(
+    entries: readonly v2.SetSessionConfigOptionRequest[],
+  ): Promise<void> {
+    if (entries.length === 0) return;
+    await this.config.setInitial(entries);
+    // Nothing changes for the same model.
+    this.modelChangedReports();
   }
 
   async setConfigOption(
@@ -877,6 +903,7 @@ export class V2Session implements RequestTarget {
       this.tasks.toolResults(this.output, message);
       return;
     }
+    this.wentOnPastApiError();
     // The rewrite applies to the updates of this message only.
     this.output.rewrite = this.clearContext.toolResults(message);
     try {
@@ -909,6 +936,7 @@ export class V2Session implements RequestTarget {
         if (this.stopped.drops(message)) return;
         if (message.parent_tool_use_id === null) {
           this.outputStarts();
+          this.wentOnPastApiError();
           this.reports.streamEvent(message);
         }
         this.output.streamEvent(message);
@@ -917,9 +945,11 @@ export class V2Session implements RequestTarget {
         if (message.parent_tool_use_id === null) this.usage.assistant(message.message.model);
         if (this.stopped.drops(message)) return;
         if (message.parent_tool_use_id === null) {
-          // Claude Code's sign-in message is not shown (see `TurnReport`).
+          // Claude Code's sign-in message and its message for a failed API
+          // request are not shown as Claude's text (see `TurnReport`).
           if (this.turnReport.assistant(message)) return;
           this.outputStarts();
+          this.wentOnPastApiError();
           this.reports.assistant(message);
         }
         this.output.assistant(message);
@@ -929,6 +959,12 @@ export class V2Session implements RequestTarget {
         // in. A prompt Claude Code reported `started` for is inserted already.
         if ("isReplay" in message && message.isReplay) {
           if (message.uuid && message.parent_tool_use_id === null) {
+            // The output of a local command that Claude Code ran outside a
+            // turn, such as the "Set model to …" of a model change, is no
+            // prompt: no result or `command_lifecycle` frame would end its turn.
+            if (!this.pending.has(message.uuid) && isLocalCommandOutput(message.message.content)) {
+              return;
+            }
             // A message typed in another client of the session.
             const remote = this.remoteControl.remoteMessage(message);
             if (remote !== undefined) this.output.userMessage(remote, message.uuid);
@@ -1121,6 +1157,8 @@ export class V2Session implements RequestTarget {
       this.fastModeReported(message);
     }
     this.reports.result(message);
+    // Before the result's text below, which can repeat the failed request's.
+    this.reportApiError(end);
     // The turn goes on in a fresh context (see `ClearContext`).
     if (this.clearContext.holdsResult(message, end)) {
       this.turnReport.reset();
@@ -1170,6 +1208,30 @@ export class V2Session implements RequestTarget {
     const reporting = this.fileChanges?.turnEnding(stopReason, this.query);
     if (!reporting) return this.closeTurn();
     return reporting.then(() => this.closeTurn());
+  }
+
+  /**
+   * The turn went on past a failed API request: Claude Code kept the tool
+   * calls of a response that broke off ("Connection lost mid-response. The
+   * response above may be incomplete.") and ran them. Its notice goes out
+   * here, after the output it is about, and not at the turn's end.
+   */
+  private wentOnPastApiError(): void {
+    const text = this.turnReport.takeApiError();
+    if (text) this.reports.apiError(text);
+  }
+
+  /**
+   * At the turn's end, sends the text of a failed API request that Claude
+   * Code wrote into the conversation (see `TurnReport.assistant`) as a
+   * notice. A turn whose idle fails sends none: its error carries the
+   * failure. `end` is the turn's result, if it has one.
+   */
+  private reportApiError(end: TurnEnd | undefined): void {
+    const text = this.turnReport.takeApiError();
+    if (!text) return;
+    if (idleOutcome(end, this.cancelledWork, this.turnReport).stopReason === "error") return;
+    this.reports.apiError(text);
   }
 
   /**
@@ -1281,6 +1343,8 @@ export class V2Session implements RequestTarget {
         if (request.coveredByCancel) request.abort.abort();
       }
     }
+    // A turn that ends without a result, such as an interrupted one.
+    this.reportApiError(this.lastEnd);
     this.reports.turnEnded();
     this.elicitations.turnEnded();
     this.fileChanges?.turnClosed(cancelled);

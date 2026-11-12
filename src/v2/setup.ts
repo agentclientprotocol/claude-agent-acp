@@ -79,7 +79,7 @@ export async function sessionModels(
   currentModelInfo: ModelInfo | undefined;
   allowlistedModelInfo: ModelInfo | undefined;
 }> {
-  const { availableModels, modelOverrides } = settings.getSettings();
+  const { availableModels, modelOverrides } = settings.getModelSelectionSettings(launch.settings);
   // A resumed Fable 5.2 session lists Fable 5.2 as `fable`, as a new session does.
   const listed = aliasResumedModelRow(sdkModels, resumed?.model);
   const allowed = Array.isArray(availableModels)

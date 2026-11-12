@@ -6,6 +6,8 @@
 import type { AuthMethod } from "@agentclientprotocol/sdk/unstable";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import { SYSTEM_PROMPT_CAPABILITY } from "../client-system-prompt.js";
+import { SESSION_OPTIONS_CAPABILITY } from "../initial-config-options.js";
+import { SESSION_STATUS_CAPABILITY } from "../session-status.js";
 
 /**
  * The session capabilities that the v2 core serves.
@@ -17,6 +19,9 @@ import { SYSTEM_PROMPT_CAPABILITY } from "../client-system-prompt.js";
  * - The prompt content and MCP transports that the v1 `initialize` lists too:
  *   images, embedded context, and HTTP servers. v2 has no SSE transport.
  * - `systemPrompt`, in `append` and `override` mode.
+ * - `session/status` (unstable), with the foreground state of an open session.
+ * - `session/options` (unstable), and `configOptions` on `session/new` and
+ *   `session/resume`.
  */
 export const V2_SESSION_CAPABILITIES: v2.SessionCapabilities = {
   prompt: { image: {}, embeddedContext: {} },
@@ -25,6 +30,10 @@ export const V2_SESSION_CAPABILITIES: v2.SessionCapabilities = {
   fork: {},
   additionalDirectories: {},
   systemPrompt: SYSTEM_PROMPT_CAPABILITY,
+  status: SESSION_STATUS_CAPABILITY,
+  options: SESSION_OPTIONS_CAPABILITY,
+  // `session/set_title`.
+  title: {},
 };
 
 /** v2 names the id of a method `methodId`, requires `type`, and lists `env` as name and value pairs. */
