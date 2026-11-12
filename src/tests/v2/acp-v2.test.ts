@@ -10029,6 +10029,38 @@ describe("ACP v2 session translation", () => {
     );
   });
 
+  it.each([
+    {
+      option: {
+        configId: "model",
+        type: "id" as const,
+        value: "sonnet",
+        _meta: { source: "client" },
+      },
+      expected: { configId: "model", value: "sonnet", _meta: { source: "client" } },
+    },
+    {
+      option: { configId: "fast", type: "boolean" as const, value: true },
+      expected: { configId: "fast", type: "boolean", value: true },
+    },
+  ])(
+    "converts an initial $option.type config value for the shared setup",
+    ({ option, expected }) => {
+      expect(
+        v1NewSessionRequest({ cwd: "/workspace", configOptions: [option] }).configOptions,
+      ).toEqual([expected]);
+    },
+  );
+
+  it("rejects an initial config value that the shared setup cannot express", () => {
+    expect(() =>
+      v1NewSessionRequest({
+        cwd: "/workspace",
+        configOptions: [{ configId: "range", type: "_range", value: 3 }],
+      }),
+    ).toThrow("Config option values of type _range are not supported");
+  });
+
   it("rejects a config option value type that v1 cannot express", () => {
     expect(() =>
       v1SetSessionConfigOptionRequest({
