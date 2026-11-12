@@ -448,10 +448,16 @@ class V2Agent implements AgentHandle, SessionConnection {
     const response = await this.setupFields(session);
     this.afterSetup(session, params);
     // The response ends the replay, and the replayed children's states before
-    // it are history: their current states follow it. Nothing enforces that
-    // the timer runs after the response goes out; it relies on the response
-    // being written when this handler returns, as the v1 core's
-    // `afterSetupResponse` does.
+    // it are history: their current states follow it. The ACP SDK (2.6.0)
+    // gives a request handler no responder and no after-response hook, so the
+    // order rests on two things that its source shows and its API does not
+    // promise. `registerAppRequest` queues the response in the microtask that
+    // follows this handler's return, with no macrotask in between, so the
+    // timer runs after it. And `Connection.sendMessage` writes in call order,
+    // so what the timer sends is written after the response. The timer is
+    // set in the same synchronous step as the `return`: an `await` between
+    // them would let it run first. The v1 core's `afterSetupResponse` relies
+    // on the same.
     if (subagents) setTimeout(() => subagents.afterResponse(), 0);
     return response;
   }

@@ -6229,6 +6229,62 @@ describe("ACP v2 requests that subagents make", () => {
       expect(models).toEqual(["claude-sonnet-4-6 Claude Sonnet 4.6", "response"]);
     });
 
+    it("references a replayed child from a TaskStop call that names it by its agent id", async () => {
+      scriptTurns();
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.close, { sessionId });
+        await writeSubagentHistory(
+          sessionId,
+          [transcriptRecord(sessionId, "r1", null, { role: "user", content: "hi" })],
+          "agent-1",
+          { agentType: "Explore", toolUseId: "toolu_agent-1" },
+          [transcriptRecord(sessionId, "c1", null, { role: "user", content: "Look around" })],
+        );
+        const toolUse = (id: string, name: string, input: Record<string, unknown>) =>
+          transcriptEntry("assistant", randomUUID(), {
+            id: `msg_${id}`,
+            role: "assistant",
+            content: [{ type: "tool_use", id, name, input }],
+          });
+        const toolResult = (id: string, content: string) =>
+          transcriptEntry("user", randomUUID(), {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: id, content }],
+          });
+        vi.mocked(getSessionMessages).mockResolvedValueOnce([
+          // The child is not announced yet: a call that names it references nothing.
+          toolUse("toolu_early", "TaskStop", { task_id: "agent-1" }),
+          toolResult("toolu_early", "No such task"),
+          toolUse("toolu_agent-1", "Agent", { subagent_type: "Explore", prompt: "Look around" }),
+          toolResult("toolu_agent-1", "Done."),
+          toolUse("toolu_stop", "TaskStop", { task_id: "agent-1" }),
+          toolResult("toolu_stop", "Stopped agent-1"),
+        ] as unknown as Awaited<ReturnType<typeof getSessionMessages>>);
+        client.sessionUpdates.length = 0;
+        await agent.request(v2.methods.agent.session.resume, {
+          sessionId,
+          cwd,
+          replayFrom: { type: "start" },
+        });
+        await client.authUpdate(1);
+      });
+
+      const references = (toolCallId: string) =>
+        client.updates("tool_call_update").flatMap((update) => {
+          const call = update as { toolCallId: string; content?: Array<{ type: string }> | null };
+          if (call.toolCallId !== toolCallId || call.content == null) return [];
+          return [call.content.filter((item) => item.type === "session")];
+        });
+      expect(references("toolu_stop").length).toBeGreaterThan(0);
+      for (const reference of references("toolu_stop")) {
+        expect(reference).toEqual([{ type: "session", sessionId: "agent-1" }]);
+      }
+      expect(references("toolu_early").flat()).toEqual([]);
+    });
+
     it("drops a foreground child's consolidated messages after the root's cancel, except the results of its shown tool calls", async () => {
       const interrupted = Promise.withResolvers<void>();
       sdk.interrupt = async () => interrupted.resolve();
@@ -6346,7 +6402,7 @@ describe("ACP v2 requests that subagents make", () => {
       ).toMatchObject({ status: "cancelled" });
     });
 
-    it("ends the subagents that work when Claude Code starts a fresh conversation", async () => {
+    it("reports the subagents that work as unknown when Claude Code starts a fresh conversation", async () => {
       scriptTurns(
         async function* (options) {
           yield toolUseMessage(options, "toolu_agent-1", "Agent", {
@@ -6402,7 +6458,10 @@ describe("ACP v2 requests that subagents make", () => {
         switch (update.sessionUpdate) {
           case "subagent_update":
             return update.state
-              ? [`${on} subagent ${update.sessionId} ${state(update.state)}`]
+              ? [
+                  `${on} subagent ${update.sessionId} ${state(update.state)}` +
+                    (update.capabilities === null ? ", no capabilities" : ""),
+                ]
               : [];
           case "state_update": {
             const listed = (
@@ -6420,13 +6479,13 @@ describe("ACP v2 requests that subagents make", () => {
             return [];
         }
       });
-      // The child's run ends with no stop reason: nothing says how. Its tool
-      // call ends first, as v2 asks.
+      // The child may go on working, and the adapter no longer follows it: it
+      // is `unknown`, not idle, and it cannot be cancelled. Nothing says that
+      // its tool call ended, so the call keeps its status.
       expect(trace).toEqual([
         "root running []",
-        "agent-1 toolu_ls failed",
-        "root subagent agent-1 idle",
-        "agent-1 idle []",
+        "root subagent agent-1 unknown, no capabilities",
+        "agent-1 unknown []",
         "root idle end_turn []",
       ]);
     });
@@ -6568,18 +6627,77 @@ describe("ACP v2 requests that subagents make", () => {
         )!.sessionId;
 
         expect(client.permissionRequests).toHaveLength(1);
-        expect(
-          client.sessionUpdates.filter(
-            ({ sessionId, update }) =>
-              sessionId === root &&
-              update.sessionUpdate === "tool_call_update" &&
-              (update as { toolCallId: string }).toolCallId === "toolu_send" &&
-              (update as { status?: string }).status === "completed",
-          ),
-        ).toHaveLength(completedUpdates);
+        const completed = client.sessionUpdates.filter(
+          ({ sessionId, update }) =>
+            sessionId === root &&
+            update.sessionUpdate === "tool_call_update" &&
+            (update as { toolCallId: string }).toolCallId === "toolu_send" &&
+            (update as { status?: string }).status === "completed",
+        );
+        expect(completed).toHaveLength(completedUpdates);
+        // The call that stays shown references the child that it resumed.
+        for (const { update } of completed) {
+          expect((update as { content?: unknown[] }).content?.at(-1)).toEqual({
+            type: "session",
+            sessionId: "agent-1",
+          });
+        }
         expect(sessionMessages(client, root).slice(3)).toEqual(delivery);
       },
     );
+
+    it("references an announced child from a TaskStop call that names it by its agent id", async () => {
+      scriptTurns(async function* (options) {
+        // No child is announced yet: a call that names one references nothing.
+        yield toolUseMessage(options, "toolu_early", "TaskStop", { task_id: "agent-1" });
+        yield toolResultMessage(options, "toolu_early", { content: "No such task" });
+        yield toolUseMessage(options, "toolu_agent-1", "Agent", {
+          description: "Explore the project",
+          prompt: "Look around",
+          run_in_background: true,
+        });
+        yield taskStarted(options, "agent-1", { prompt: "Look around", is_backgrounded: true });
+        yield toolResultMessage(options, "toolu_agent-1", { content: "Launched." });
+        yield toolUseMessage(options, "toolu_stop", "TaskStop", { task_id: "agent-1" });
+        yield toolResultMessage(options, "toolu_stop", { content: "Stopped agent-1" });
+        yield taskNotification(options, "agent-1", { status: "stopped" });
+        // A task that is no child session.
+        yield toolUseMessage(options, "toolu_bash", "TaskStop", { task_id: "bash_1" });
+        yield toolResultMessage(options, "toolu_bash", { content: "Stopped bash_1" });
+        yield result(options);
+        yield idleState(options);
+      });
+      const client = await promptToIdle(v2Client());
+
+      const references = (toolCallId: string) =>
+        client.updates("tool_call_update").flatMap((update) => {
+          const call = update as { toolCallId: string; content?: Array<{ type: string }> | null };
+          if (call.toolCallId !== toolCallId || call.content == null) return [];
+          return [call.content.filter((item) => item.type === "session")];
+        });
+      // Every report of the call that carries content carries the reference:
+      // a report's content replaces what the client holds.
+      expect(references("toolu_stop").length).toBeGreaterThan(0);
+      for (const reference of references("toolu_stop")) {
+        expect(reference).toEqual([{ type: "session", sessionId: "agent-1" }]);
+      }
+      expect(references("toolu_early").flat()).toEqual([]);
+      expect(references("toolu_bash").flat()).toEqual([]);
+      // The announcement comes before the first reference, as the RFD requires.
+      const index = (matches: (update: v2.SessionUpdate) => boolean) =>
+        client.sessionUpdates.findIndex(({ update }) => matches(update));
+      expect(
+        index(
+          (update) => update.sessionUpdate === "subagent_update" && update.sessionId === "agent-1",
+        ),
+      ).toBeLessThan(
+        index(
+          (update) =>
+            update.sessionUpdate === "tool_call_update" &&
+            (update as { toolCallId: string }).toolCallId === "toolu_stop",
+        ),
+      );
+    });
 
     it.each(["its task_started", "the resumedAgentId of its result alone"])(
       "restores a subagent that a SendMessage call resumes from the session's subagent history, at %s",

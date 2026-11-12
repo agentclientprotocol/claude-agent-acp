@@ -20,7 +20,10 @@
  * reached the call is that message too: the sender's outgoing view, at the
  * call, and the child's incoming one, in the child's history. A child's
  * history follows its launch, so a call to a child from its parent is always
- * delivered first. Any other SendMessage call stays a tool call.
+ * delivered first. Any other SendMessage call stays a tool call. As live, a
+ * TaskStop or SendMessage call that the client is shown and that names a
+ * replayed child by its agent id carries the RFD's `session` reference to it
+ * (`ReplayTranscript.withTarget`).
  *
  * Right after its announcement, each child gets its `model` option: the model
  * of its first response, in its transcript. A later response with another
@@ -50,6 +53,8 @@ import {
   rfdLabels,
   sameDirectory,
   type SubagentModels,
+  targetAgentId,
+  withSessionReference,
   type WorkState,
 } from "./native-subagents.js";
 import { noticeUpdate } from "./session-notices.js";
@@ -116,8 +121,28 @@ export class ReplayTranscript<Child extends ReplayChild = ReplayChild> {
   readonly omitted = new Set<string>();
   /** The SubagentHandback calls, by tool use id. */
   readonly handbacks = new Map<string, ReplayHandback>();
+  /** The agent that each TaskStop or SendMessage call names (see `targetAgentId`), by tool use id. */
+  private readonly targets = new Map<string, string>();
 
   constructor(private readonly history: SubagentHistory) {}
+
+  /**
+   * `notification`, a replayed tool call update that the client is shown on
+   * the session `shownOn`, with the RFD's `session` reference when the call
+   * names a child of another session by its agent id, as live
+   * (`NativeSubagentRuntime.withTarget`). Only a child that the replay
+   * announced before the update is referenced.
+   */
+  withTarget(notification: AcpSessionNotification, shownOn: string): AcpSessionNotification {
+    const { update } = notification;
+    if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") {
+      return notification;
+    }
+    const agentId = this.targets.get(update.toolCallId);
+    const child = agentId !== undefined ? this.byAgentId.get(agentId) : undefined;
+    if (!child?.announced || child.sessionId === shownOn) return notification;
+    return withSessionReference(notification, child.sessionId);
+  }
 
   /**
    * Registers the launches, the launch results, and the SendMessage calls in
@@ -127,6 +152,8 @@ export class ReplayTranscript<Child extends ReplayChild = ReplayChild> {
     for (const message of messages) {
       for (const block of contentBlocks(message)) {
         if (block.type === "tool_use" && typeof block.id === "string") {
+          const agentId = targetAgentId(block.name, block.input);
+          if (agentId !== undefined) this.targets.set(block.id, agentId);
           if (isNativeSubagentControlTool(block.name)) {
             this.registerLaunch(block.id, inputOf(block), ownerSessionId);
           } else if (block.name === HANDBACK_TOOL) {
@@ -214,6 +241,11 @@ export class RfdSubagentReplay {
   }
 
   /** The child that the tool use `toolUseId` launched, when the replay shows it. */
+  /** See {@link ReplayTranscript.withTarget}. */
+  withTarget(notification: AcpSessionNotification, shownOn: string): AcpSessionNotification {
+    return this.transcript.withTarget(notification, shownOn);
+  }
+
   childOfLaunch(toolUseId: string): ReplayChild | undefined {
     return this.transcript.children.get(toolUseId);
   }

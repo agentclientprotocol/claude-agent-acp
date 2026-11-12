@@ -259,7 +259,7 @@ export class SubagentReplay {
     if (sendMessage) {
       if (sendMessage.recipientSessionId === undefined) {
         sendMessage.shownAsToolCall = true;
-        return [notification];
+        return [this.transcript.withTarget(notification, output.sessionId)];
       }
       if (sendMessage.outgoingSent) return [];
       sendMessage.outgoingSent = true;
@@ -288,7 +288,7 @@ export class SubagentReplay {
       return [];
     }
     const child = this.transcript.children.get(update.toolCallId);
-    if (!child) return [notification];
+    if (!child) return [this.transcript.withTarget(notification, output.sessionId)];
     if (
       update.status === "completed" &&
       child.announced &&
