@@ -539,17 +539,31 @@ class V2Agent implements AgentHandle, SessionConnection {
       // session's.
       const request = await validatedSetup(params);
       assertCwdOf(session, request.cwd, "resume it");
-      const served = await this.sdkMcpServers(sessionId, request.mcpServers);
-      await session.setMcpServers(
-        { ...clientOptions(params._meta)?.mcpServers, ...served.configs },
-        served.unserved,
-      );
       if (!sameDirectories(request.additionalDirectories ?? [], session.additionalDirectories)) {
-        // The SDK cannot change them on a running query: it restarts with
-        // them at its next turn boundary (see `restarts.ts`).
-        this.restarts.rootsChanged(sessionId, params);
+        // Claude Code cannot replace launch roots while work or requests remain.
+        if (!session.atTurnBoundary(true)) {
+          throw RequestError.invalidParams(
+            { additionalDirectories: request.additionalDirectories ?? [] },
+            "Workspace roots cannot change while work or input requests remain. Resume with the current roots, or try again after work ends.",
+          );
+        }
+        await this.restarts.rootsChanged(sessionId, params);
+        session = this.sessions.get(sessionId);
+        if (
+          !session ||
+          !sameDirectories(request.additionalDirectories ?? [], session.additionalDirectories)
+        ) {
+          throw RequestError.internalError(
+            { sessionId },
+            "The session could not activate the workspace roots. Try resuming it again.",
+          );
+        }
       } else {
-        // A restart of its query starts with these servers.
+        const served = await this.sdkMcpServers(sessionId, request.mcpServers);
+        await session.setMcpServers(
+          { ...clientOptions(params._meta)?.mcpServers, ...served.configs },
+          served.unserved,
+        );
         this.restarts.track(sessionId, params);
       }
     } else {

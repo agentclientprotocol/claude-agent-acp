@@ -18,9 +18,8 @@
  *   `session_state_changed` stays `running` while background subagents work,
  *   which v2 lists as background work instead (`background`), so its `idle`
  *   only ends a turn that ended without a result.
- * - `requires_action` is this session's own: a turn is open, and a
- *   permission request or elicitation of this session is open, or, while
- *   the turn waits on subagents, each of them waits on one.
+ * - `requires_action` means that the open turn cannot progress without user
+ *   input. Another running foreground tool or subagent keeps it `running`.
  * - Subagents are child sessions, and background work is listed on every
  *   state (see {@link SessionTasks}).
  * - `session/cancel` answers the prompts that are not inserted yet with
@@ -41,7 +40,7 @@ import {
   type PromptRequest,
   type ToolCallUpdate,
 } from "@agentclientprotocol/sdk/unstable";
-import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
+import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type {
   FastModeDisabledReason,
   FastModeState,
@@ -90,7 +89,7 @@ import { SessionReports } from "./reports.js";
 import { SessionElicitations } from "./elicitation.js";
 import { SessionOutput } from "./stream.js";
 import { SessionRemoteControl } from "./remote-control.js";
-import { SessionTasks, type RequestTarget } from "./tasks.js";
+import { SessionTasks, type RequestTarget, type RequestContext } from "./tasks.js";
 
 /** What a session needs of its connection. */
 export interface SessionConnection {
@@ -135,6 +134,7 @@ type OpenRequest = {
   abort: AbortController;
   /** Whether a cancel came while it was open: its work is being stopped. */
   coveredByCancel: boolean;
+  context: RequestContext;
 };
 
 type McpServers = Parameters<Query["setMcpServers"]>[0];
@@ -314,7 +314,10 @@ export class V2Session implements RequestTarget {
         send: (notification) => this.sendNotification(notification),
         rootState: () => this.foregroundState(),
         // A cancel withdraws the requests of the subagents that the work waits on.
-        foregroundRequestsChanged: () => this.reportState(this.cancelledWork),
+        foregroundRequestsChanged: () => {
+          this.reportState(this.cancelledWork);
+          this.checkBoundary();
+        },
         models: () => this.config.subagentModels(),
         modes: () => this.config.availableModes(),
         stopTask: async (taskId) => {
@@ -553,15 +556,15 @@ export class V2Session implements RequestTarget {
    * Whether no turn is open and no prompt waits in Claude Code's queue. With
    * `restart`, for a restart of the query (see `restarts.ts`), also no
    * prompt of the session waits to go to Claude Code, which the restart would
-   * answer with -32800, and no subagent runs. Without it, for the adapter's
-   * `/remote-control`, whose own prompt waits for the boundary.
+   * answer with -32800. No task or input request remains. Without it, for
+   * the adapter's `/remote-control`, whose own prompt waits for the boundary.
    */
   atTurnBoundary(restart: boolean): boolean {
     return (
       !this.closed &&
       !this.foreground &&
       ![...this.pending.values()].some((prompt) => restart || prompt.pushed) &&
-      !(restart && this.tasks.hasLiveSubagents())
+      !(restart && (this.tasks.hasLiveWork() || this.requests.size > 0))
     );
   }
 
@@ -808,26 +811,35 @@ export class V2Session implements RequestTarget {
     request: v2.RequestPermissionRequest,
     toolSignal: AbortSignal,
   ): Promise<v2.RequestPermissionResponse> {
-    return this.openRequest(toolSignal, async (signal) => {
-      try {
-        // The subject is an upsert of the tool call: the client may see the
-        // request before the tool use streams.
-        return await unlessWithdrawn(signal, () =>
-          this.connection.requestPermission(request, signal),
-        );
-      } catch (error) {
-        if (signal.aborted) return { outcome: { outcome: "cancelled" } };
-        throw error;
-      }
-    });
+    const context: RequestContext =
+      request.subject != null && v2.RequestPermissionSubject.isToolCall(request.subject)
+        ? { type: "tool_call", toolCallId: request.subject.toolCall.toolCallId }
+        : { type: "session" };
+    return this.openRequest(
+      toolSignal,
+      async (signal) => {
+        try {
+          // The subject is an upsert of the tool call: the client may see the
+          // request before the tool use streams.
+          return await unlessWithdrawn(signal, () =>
+            this.connection.requestPermission(request, signal),
+          );
+        } catch (error) {
+          if (signal.aborted) return { outcome: { outcome: "cancelled" } };
+          throw error;
+        }
+      },
+      context,
+    );
   }
 
   /** Runs `send` as an open request of this session (see {@link RequestTarget.openRequest}). */
   async openRequest<T>(
     toolSignal: AbortSignal,
     send: (signal: AbortSignal) => Promise<T>,
+    context: RequestContext = { type: "session" },
   ): Promise<T> {
-    const open: OpenRequest = { abort: new AbortController(), coveredByCancel: false };
+    const open: OpenRequest = { abort: new AbortController(), coveredByCancel: false, context };
     // After `session/close` nothing of the session goes out: the request is
     // withdrawn before it is sent.
     if (this.closed) open.abort.abort();
@@ -843,6 +855,7 @@ export class V2Session implements RequestTarget {
       // `running` comes first. One that the user answers, or that Claude Code
       // withdraws without a cancel (a hook answered it), lets the work go on.
       this.reportState(open.coveredByCancel && signal.aborted);
+      this.checkBoundary();
     }
   }
 
@@ -964,6 +977,7 @@ export class V2Session implements RequestTarget {
         if (this.closed) break;
         try {
           await this.handle(message);
+          this.reportState(this.cancelledWork);
         } catch (error) {
           this.connection.logger.error(
             `Session ${this.sessionId}: failed to handle a ${message.type} message`,
@@ -1481,15 +1495,21 @@ export class V2Session implements RequestTarget {
     this.checkBoundary();
   }
 
-  /**
-   * While the turn waits on subagents, it is blocked when each of them is
-   * (see `SessionTasks.foregroundBlocked`). Otherwise by the session's own
-   * open requests.
-   */
+  /** Reports waiting only when no foreground tool or subagent can progress. */
   private foregroundState(): ForegroundState {
     if (!this.foreground) return "idle";
-    const blocked = this.tasks.foregroundBlocked() ?? this.requests.size > 0;
-    return blocked ? "requires_action" : "running";
+    const subagentsBlocked = this.tasks.foregroundBlocked();
+    if (subagentsBlocked === false || this.foregroundToolsCanProgress()) return "running";
+    return subagentsBlocked === true || this.requests.size > 0 ? "requires_action" : "running";
+  }
+
+  private foregroundToolsCanProgress(): boolean {
+    const waiting = new Set<string>();
+    for (const { context } of this.requests) {
+      if (context.type === "session") return false;
+      waiting.add(context.toolCallId);
+    }
+    return this.tasks.foregroundToolsCanProgress(waiting);
   }
 
   /**
