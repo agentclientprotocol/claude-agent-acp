@@ -1026,6 +1026,86 @@ describe("ACP v2 sessions", () => {
     expect(setModel).not.toHaveBeenCalled();
   });
 
+  it("preserves a pending request when changed-root resume is refused, and accepts an MCP update", async () => {
+    const answer = Promise.withResolvers<v2.RequestPermissionResponse>();
+    const client = v2Client({
+      answerPermission: () => answer.promise as unknown as v2.RequestPermissionResponse,
+    });
+    scriptTurns(
+      async function* (options) {
+        yield toolUseMessage(options, "toolu_wait", "Bash", { command: "ls" });
+        await options.canUseTool!(
+          "Bash",
+          { command: "ls" },
+          {
+            signal: new AbortController().signal,
+            suggestions: [],
+            toolUseID: "toolu_wait",
+            requestId: randomUUID(),
+          },
+        );
+        yield toolResultMessage(options, "toolu_wait", {});
+        yield result(options);
+      },
+      async function* (options) {
+        yield result(options);
+      },
+    );
+    sdk.setMcpServers = vi.fn(sdkDefaults.setMcpServers);
+    const extra = await mkdtemp(path.join(tempDir, "extra-"));
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("work") });
+      await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(1));
+      const session = v2Session(sessionId);
+      const request = client.permissionRequests[0];
+      await expect(
+        agent.request(v2.methods.agent.session.resume, {
+          sessionId,
+          cwd,
+          additionalDirectories: [extra],
+        }),
+      ).rejects.toMatchObject({ code: -32602 });
+      expect(v2Session(sessionId)).toBe(session);
+      expect(sdk.queryOptions).toHaveLength(1);
+      expect(client.cancelledRequests).toEqual([]);
+      const before = client.sessionUpdates.length;
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+        mcpServers: [{ type: "http", name: "github", url: "https://github.dev/mcp" }],
+      });
+      expect(client.sessionUpdates.slice(before).at(-1)).toMatchObject({
+        sessionId,
+        update: { sessionUpdate: "state_update", state: "requires_action", background: [] },
+      });
+      expect(sdk.setMcpServers).toHaveBeenCalledExactlyOnceWith({
+        github: expect.objectContaining({ type: "http" }),
+      });
+      expect(client.permissionRequests).toEqual([request]);
+      answer.resolve({
+        outcome: {
+          outcome: "selected",
+          optionId: request!.options.find((option) => option.kind === "allow_once")!.optionId,
+        },
+      });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates).at(-1)).toBe("idle end_turn"));
+      const states = client.updates("state_update").length;
+      await agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("follow up"),
+      });
+      await vi.waitFor(() =>
+        expect(client.updates("state_update").slice(states).at(-1)).toMatchObject({
+          state: "idle",
+          stopReason: "end_turn",
+        }),
+      );
+    });
+  });
+
   it("keeps the running turn of the active session that a resume gives other MCP servers", async () => {
     const release = Promise.withResolvers<void>();
     scriptTurns(async function* (options) {
@@ -7974,6 +8054,49 @@ describe("ACP v2 requests that subagents make", () => {
     ]);
   });
 
+  it.each(["root", "child"])(
+    "keeps running while a tool can progress beside a blocked %s request",
+    async (owner) => {
+      const answer = Promise.withResolvers<v2.RequestPermissionResponse>();
+      const client = v2Client({
+        answerPermission: () => answer.promise as unknown as v2.RequestPermissionResponse,
+      });
+      let whileRunning: string | undefined;
+      scriptTurns(async function* (options) {
+        yield toolUseMessage(options, "toolu_running", "Bash", { command: "sleep 10" });
+        if (owner === "child") {
+          yield taskStarted(options, "agent-1", { is_backgrounded: false });
+        } else {
+          yield toolUseMessage(options, "toolu_wait", "Bash", { command: "ls" });
+        }
+        const asking =
+          owner === "child"
+            ? askFor(options, "agent-1")
+            : options.canUseTool!(
+                "Bash",
+                { command: "ls" },
+                {
+                  signal: new AbortController().signal,
+                  suggestions: [],
+                  toolUseID: "toolu_wait",
+                  requestId: randomUUID(),
+                },
+              );
+        await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(1));
+        whileRunning = turnTrace(client.sessionUpdates).at(-1);
+        yield toolResultMessage(options, "toolu_running", {});
+        await vi.waitFor(() =>
+          expect(turnTrace(client.sessionUpdates).at(-1)).toBe("requires_action"),
+        );
+        answer.resolve({ outcome: { outcome: "cancelled" } });
+        await asking;
+        yield result(options);
+      });
+      await promptToIdle(client);
+      expect(whileRunning).toBe("running");
+    },
+  );
+
   it("reports requires_action while a foreground subagent's request is open", async () => {
     turnWithRequest([["agent-1", { is_backgrounded: false }]], "agent-1");
     const client = await promptToIdle(v2Client());
@@ -8034,6 +8157,73 @@ describe("ACP v2 requests that subagents make", () => {
 
     expect(beforeTaskStarted).toEqual(["user_message", "running", "agent_message_chunk"]);
     expect(atAnswer).toEqual(["user_message", "running", "agent_message_chunk", "requires_action"]);
+  });
+
+  it("preserves an ended child's pending request when changed-root resume is refused", async () => {
+    const answer = Promise.withResolvers<v2.RequestPermissionResponse>();
+    const client = v2Client({
+      answerPermission: () => answer.promise as unknown as v2.RequestPermissionResponse,
+    });
+    let answered: unknown;
+    scriptTurns(async function* (options) {
+      yield toolUseMessage(options, "toolu_agent-1", "Agent", {
+        description: "Explore the project",
+        prompt: "Look around",
+        run_in_background: true,
+      });
+      yield taskStarted(options, "agent-1", { is_backgrounded: true });
+      const asking = askFor(options, "agent-1").then((result) => {
+        answered = result;
+      });
+      await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(1));
+      yield {
+        type: "system",
+        subtype: "task_updated",
+        task_id: "agent-1",
+        patch: { status: "completed" },
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield result(options);
+      await asking;
+    });
+    const extra = await mkdtemp(path.join(tempDir, "extra-"));
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("work") });
+      await vi.waitFor(() =>
+        expect(
+          turnTrace(client.sessionUpdates.filter((update) => update.sessionId === sessionId)).at(
+            -1,
+          ),
+        ).toBe("idle end_turn"),
+      );
+      const session = v2Session(sessionId);
+      expect(session.atTurnBoundary(true)).toBe(false);
+      await expect(
+        agent.request(v2.methods.agent.session.resume, {
+          sessionId,
+          cwd,
+          additionalDirectories: [extra],
+        }),
+      ).rejects.toMatchObject({ code: -32602 });
+      await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+      expect(v2Session(sessionId)).toBe(session);
+      expect(sdk.queryOptions).toHaveLength(1);
+      expect(client.cancelledRequests).toEqual([]);
+      expect(client.permissionRequests[0]?.sessionId).toBe("agent-1");
+      answer.resolve({
+        outcome: {
+          outcome: "selected",
+          optionId: client.permissionRequests[0]!.options.find(
+            (option) => option.kind === "allow_once",
+          )!.optionId,
+        },
+      });
+      await vi.waitFor(() => expect(answered).toMatchObject({ behavior: "allow" }));
+      await vi.waitFor(() => expect(session.atTurnBoundary(true)).toBe(true));
+    });
   });
 
   it("stops waiting for a request once its foreground subagent settles", async () => {
@@ -9720,6 +9910,89 @@ describe("ACP v2 terminal of a command in the background", () => {
 
       expect(rejected).toMatchObject({ code: -32602 });
     });
+
+    it.each(["terminal", "tool_call"])(
+      "preserves an idle %s when a resume changes roots, then activates roots after completion",
+      async (kind) => {
+        const finish = Promise.withResolvers<void>();
+        const workflow = { task_id: "wf1", task_type: "local_workflow", description: "Review" };
+        const item =
+          kind === "terminal"
+            ? { type: "terminal", terminalId: "toolu_bg" }
+            : { type: "tool_call", toolCallId: "task_wf1" };
+        scriptTurns(async function* (options) {
+          if (kind === "terminal") {
+            yield level(options, [{}]);
+            yield taskStarted(options);
+            yield bashUse(options);
+            yield backgrounded(options);
+          } else {
+            yield level(options, [workflow]);
+            yield taskEvent(options, "task_started", workflow);
+          }
+          yield result(options);
+          yield idleState(options);
+          await finish.promise;
+          if (kind === "terminal") yield* taskEnded(options);
+          else
+            yield taskEvent(options, "task_updated", {
+              task_id: "wf1",
+              patch: { status: "completed" },
+            });
+          yield level(options, []);
+        });
+        const extra = await mkdtemp(path.join(tempDir, "extra-"));
+        sdk.setMcpServers = vi.fn(sdkDefaults.setMcpServers);
+        sdk.close = vi.fn();
+        await promptUntil(
+          `idle end_turn [${kind === "terminal" ? "toolu_bg" : "task_wf1"}]`,
+          async (agent, sessionId, client) => {
+            const original = v2Session(sessionId);
+            await expect(
+              agent.request(v2.methods.agent.session.resume, {
+                sessionId,
+                cwd,
+                additionalDirectories: [extra],
+                mcpServers: [{ type: "http", name: "github", url: "https://github.dev/mcp" }],
+              }),
+            ).rejects.toMatchObject({ code: -32602 });
+            expect(sdk.queryOptions).toHaveLength(1);
+            expect(sdk.close).not.toHaveBeenCalled();
+            expect(sdk.setMcpServers).not.toHaveBeenCalled();
+            expect(v2Session(sessionId)).toBe(original);
+            expect(original.atTurnBoundary(true)).toBe(false);
+            await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+            expect(client.updates("state_update").at(-1)).toMatchObject({
+              state: "idle",
+              background: [item],
+            });
+            finish.resolve();
+            await vi.waitFor(() => expect(backgroundTrace(client)).toContain("idle []"));
+            scriptTurns(async function* (options) {
+              yield result(options);
+            });
+            await agent.request(v2.methods.agent.session.resume, {
+              sessionId,
+              cwd,
+              additionalDirectories: [extra],
+            });
+            expect(sdk.queryOptions).toHaveLength(2);
+            expect(v2Session(sessionId).additionalDirectories).toEqual([extra]);
+            const before = client.updates("state_update").length;
+            await agent.request(v2.methods.agent.session.prompt, {
+              sessionId,
+              prompt: text("follow up"),
+            });
+            await vi.waitFor(() =>
+              expect(client.updates("state_update").slice(before).at(-1)).toMatchObject({
+                state: "idle",
+                stopReason: "end_turn",
+              }),
+            );
+          },
+        );
+      },
+    );
 
     it("sends each listed terminal's current state before the state snapshot of session/resume", async () => {
       scriptTurns(async function* (options) {

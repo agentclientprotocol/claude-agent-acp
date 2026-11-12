@@ -42,7 +42,7 @@ import {
   type ElicitationSupport,
 } from "../elicitation.js";
 import { startMcpServerAuthentication } from "../mcp-oauth.js";
-import type { RequestTarget } from "./tasks.js";
+import type { RequestContext, RequestTarget } from "./tasks.js";
 
 /**
  * The v2 form of an elicitation that the shared module built in v1 types.
@@ -225,28 +225,37 @@ export class SessionElicitations {
    * module doc).
    */
   private elicit(target: RequestTarget, toolSignal: AbortSignal, holdAcceptedUrl = false): Elicit {
-    return (request) =>
-      target.openRequest(toolSignal, async (signal) => {
-        const outcome = await elicitUnlessWithdrawn(signal, (signal) =>
-          this.host.createElicitation(request, signal),
-        );
-        const elicitationId = (request as { elicitationId?: unknown }).elicitationId;
-        if (
-          holdAcceptedUrl &&
-          request.mode === "url" &&
-          typeof elicitationId === "string" &&
-          "response" in outcome &&
-          outcome.response.action === "accept"
-        ) {
-          // Opened before this request settles, so the state stays
-          // `requires_action`. Claude Code gets the answer at once: the MCP
-          // server waits for the user's interaction itself.
-          void target.openRequest(toolSignal, (signal) =>
-            this.untilCompleted(elicitationId, signal),
+    return (request) => {
+      const toolCallId = "sessionId" in request ? request.toolCallId : undefined;
+      const context: RequestContext =
+        typeof toolCallId === "string" ? { type: "tool_call", toolCallId } : { type: "session" };
+      return target.openRequest(
+        toolSignal,
+        async (signal) => {
+          const outcome = await elicitUnlessWithdrawn(signal, (signal) =>
+            this.host.createElicitation(request, signal),
           );
-        }
-        return outcome;
-      });
+          const elicitationId = (request as { elicitationId?: unknown }).elicitationId;
+          if (
+            holdAcceptedUrl &&
+            request.mode === "url" &&
+            typeof elicitationId === "string" &&
+            "response" in outcome &&
+            outcome.response.action === "accept"
+          ) {
+            // Keep the request open after consent. Claude Code gets the answer
+            // at once; the MCP server still waits for the user's interaction.
+            void target.openRequest(
+              toolSignal,
+              (signal) => this.untilCompleted(elicitationId, signal),
+              context,
+            );
+          }
+          return outcome;
+        },
+        context,
+      );
+    };
   }
 
   /**

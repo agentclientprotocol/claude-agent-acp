@@ -127,7 +127,7 @@ export interface TaskHost {
   send(notification: v2.UpdateSessionNotification): void;
   /** The root session's foreground state now. */
   rootState(): WorkStateName;
-  /** A subagent's open requests changed, which can block the root's foreground work. */
+  /** Task work or requests changed, which can affect foreground state and restart admission. */
   foregroundRequestsChanged(): void;
   /** The entries of the root session's `model` option, for a child's `model`. */
   models(): SubagentModels;
@@ -140,6 +140,9 @@ export interface TaskHost {
    */
   taskOutput(): ((taskId: string) => Promise<TaskOutput>) | undefined;
 }
+
+/** The work that waits for an input request. */
+export type RequestContext = { type: "session" } | { type: "tool_call"; toolCallId: string };
 
 /** Where a permission request or elicitation goes: the root session or a child. */
 export interface RequestTarget {
@@ -160,7 +163,11 @@ export interface RequestTarget {
    * settles. Its signal aborts with `signal`, or when a cancel or close
    * withdraws the target's requests.
    */
-  openRequest<T>(signal: AbortSignal, send: (signal: AbortSignal) => Promise<T>): Promise<T>;
+  openRequest<T>(
+    signal: AbortSignal,
+    send: (signal: AbortSignal) => Promise<T>,
+    context?: RequestContext,
+  ): Promise<T>;
 }
 
 type ChildState = "idle" | "running" | "requires_action" | "unknown";
@@ -589,9 +596,27 @@ export class SessionTasks {
     });
   }
 
-  /** Whether a subagent task runs, announced or not, in the foreground or the background. */
-  hasLiveSubagents(): boolean {
-    return this.agents.size > 0;
+  /** Whether a child, terminal, tool task, or child request remains. */
+  hasLiveWork(): boolean {
+    return (
+      this.agents.size > 0 ||
+      this.terminals.size > 0 ||
+      this.toolCalls.size > 0 ||
+      this.agentRequests.size > 0
+    );
+  }
+
+  /** Whether a root tool can progress independently of the waiting requests and delegated work. */
+  foregroundToolsCanProgress(waiting: ReadonlySet<string>): boolean {
+    const excluded = this.backgroundCalls(this.host.sessionId);
+    for (const [toolCallId, child] of this.childByToolUse) {
+      if (child.parentSessionId === this.host.sessionId) excluded.add(toolCallId);
+    }
+    for (const agentId of this.agents.keys()) {
+      const toolCallId = this.started.get(agentId)?.toolUseId;
+      if (toolCallId) excluded.add(toolCallId);
+    }
+    return this.rootOutput.hasProgressingTool(waiting, excluded);
   }
 
   /**
@@ -1029,6 +1054,7 @@ export class SessionTasks {
         state: this.host.rootState(),
       }),
     );
+    this.host.foregroundRequestsChanged();
   }
 
   // --- Task events ----------------------------------------------------------------
