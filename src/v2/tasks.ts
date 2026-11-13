@@ -476,7 +476,11 @@ export class SessionTasks {
         (TASK_TOOLS.has(toolUse.name) ? structuredTaskId : undefined) ??
         [...this.started].find(([, task]) => task.toolUseId === toolCallId)?.[0];
       const task = taskId === undefined ? undefined : this.level.get(taskId);
-      if (!task || task.taskType === "local_bash" || task.taskType === "local_agent") continue;
+      if (!task || task.taskType === "local_agent") continue;
+      // Claude Code reports a Monitor's task as `local_bash`, like a shell
+      // command's. A command is its display terminal; the call of a tool that
+      // starts a task is the entity of that task, so it is kept.
+      if (task.taskType === "local_bash" && !TASK_TOOLS.has(toolUse.name)) continue;
       this.toolCalls.set(taskId!, {
         toolCallId,
         output,

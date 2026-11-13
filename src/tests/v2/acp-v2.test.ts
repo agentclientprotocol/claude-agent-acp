@@ -8527,7 +8527,12 @@ describe("ACP v2 terminal of a command in the background", () => {
     describe("a task that a tool call started", () => {
       // Claude Code marks every live-update watcher ambient, a requested
       // Monitor's task included.
-      const monitor = {
+      const monitor: {
+        task_id: string;
+        task_type: string;
+        description: string;
+        ambient?: boolean;
+      } = {
         task_id: "mon1",
         task_type: "local_monitor",
         description: "Watch the logs",
@@ -8537,10 +8542,10 @@ describe("ACP v2 terminal of a command in the background", () => {
       /** A Monitor call whose task `mon1` runs on after the call returns. The
        *  tool starts the task, which joins the level before its
        *  `task_started`, and returns. */
-      async function* monitorStarts(options: Options) {
+      async function* monitorStarts(options: Options, task: typeof monitor = monitor) {
         yield toolUseMessage(options, "toolu_mon", "Monitor", { command: "tail -f app.log" });
-        yield level(options, [monitor]);
-        yield taskEvent(options, "task_started", { ...monitor, tool_use_id: "toolu_mon" });
+        yield level(options, [task]);
+        yield taskEvent(options, "task_started", { ...task, tool_use_id: "toolu_mon" });
         yield {
           ...toolResultMessage(options, "toolu_mon", { content: "Monitor started (task mon1)." }),
           tool_use_result: { taskId: "mon1", timeoutMs: 0, persistent: true },
@@ -8599,6 +8604,43 @@ describe("ACP v2 terminal of a command in the background", () => {
           "idle end_turn [toolu_mon]",
           "paused",
           "in_progress",
+          "completed",
+          "no cancel",
+          "idle []",
+        ]);
+      });
+
+      it("keeps the call in_progress and listed when Claude Code reports the Monitor's task as local_bash, not ambient", async () => {
+        // What Claude Code sends for a requested Monitor in practice: the task
+        // type of a shell command and no `ambient` flag. The call, not a
+        // terminal, is the task's entity, as `Monitor` is in TASK_TOOLS.
+        const localBashMonitor = {
+          task_id: "mon1",
+          task_type: "local_bash",
+          description: "Watch the logs",
+        };
+        scriptTurns(async function* (options) {
+          yield* monitorStarts(options, localBashMonitor);
+          yield result(options);
+          yield idleState(options);
+          yield monitorEvent(options, "task_notification", {
+            tool_use_id: "toolu_mon",
+            status: "completed",
+            output_file: "/tmp/tasks/mon1.output",
+            summary: "Done",
+          });
+          yield level(options, []);
+        });
+        const client = await promptUntil("idle end_turn [toolu_mon]");
+        await vi.waitFor(() => expect(toolCallTrace(client)).toContain("idle []"));
+
+        expect(toolCallTrace(client)).toEqual([
+          "running []",
+          "pending",
+          "in_progress",
+          "cancel",
+          "running [toolu_mon]",
+          "idle end_turn [toolu_mon]",
           "completed",
           "no cancel",
           "idle []",
