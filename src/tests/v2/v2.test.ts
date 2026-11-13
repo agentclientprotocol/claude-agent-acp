@@ -1706,6 +1706,62 @@ describe("ACP v2 core", () => {
     });
   });
 
+  it.each([
+    ["the turn of another prompt", true],
+    ["a cycle that Claude Code started on its own", false],
+  ])("ends the work once, at its result, when a prompt is folded into %s", async (_, prompted) => {
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      const { response, claude } = await openSession(agent);
+      const ask = () =>
+        agent.request(v2.methods.agent.session.prompt, {
+          sessionId: response.sessionId,
+          prompt: PROMPT,
+        });
+      let opener: SDKUserMessage | undefined;
+      if (prompted) {
+        const first = ask();
+        opener = await claude.prompt(0);
+        claude.send(lifecycle(opener, "started"));
+        await first;
+      }
+      claude.send(cycleStart());
+      await vi.waitFor(() => expect(client.states()).toEqual(["running"]));
+      // As the bundled CLI sends it: a folded prompt's echo comes before its
+      // `started`, and its `completed` before the result of the work.
+      const second = ask();
+      const folded = await claude.prompt(prompted ? 1 : 0);
+      claude.send(echo(folded));
+      claude.send(lifecycle(folded, "started"));
+      await second;
+      for (const event of textDelta("msg_pong", "pong")) claude.send(event);
+      claude.send(assistant("msg_pong", [{ type: "text", text: "pong" }]));
+      claude.send(lifecycle(folded, "completed"));
+      claude.send(
+        result({
+          result: "pong",
+          origin: { kind: prompted ? "human" : "task-notification" },
+          user_message_uuids: [...(opener ? [opener.uuid] : []), folded.uuid],
+        }),
+      );
+      if (opener) claude.send(lifecycle(opener, "completed"));
+      claude.send(sessionState("idle"));
+      await vi.waitFor(() => expect(client.states()).toContain("idle"));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+
+    expect(client.states()).toEqual(["running", "idle"]);
+    expect(
+      client.sessionUpdates.filter((update) => update.sessionUpdate === "agent_message_chunk"),
+    ).toMatchObject([{ messageId: "msg_pong" }]);
+    // The idle carries the result's usage: the result ended the work.
+    expect(client.sessionUpdates.at(-1)).toMatchObject({
+      state: "idle",
+      stopReason: "end_turn",
+      usage: { totalTokens: 6 },
+    });
+  });
+
   it("reports a tool call that Claude dropped before it ran as cancelled at the turn's end", async () => {
     const client = v2Client();
     await client.connect(async (agent) => {
