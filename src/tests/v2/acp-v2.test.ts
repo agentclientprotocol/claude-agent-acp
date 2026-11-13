@@ -10008,7 +10008,7 @@ describe("ACP v2 subscription guard (--hide-claude-auth)", () => {
   });
 
   /** Each query caches the next of `accounts` at its start, and the last one after them. */
-  function accountsAtStart(...accounts: Array<Record<string, unknown>>) {
+  function accountsAtStart(...accounts: Array<Record<string, unknown> | undefined>) {
     let started = 0;
     sdk.initializationResult = async () => ({
       ...(await sdkDefaults.initializationResult()),
@@ -10019,6 +10019,12 @@ describe("ACP v2 subscription guard (--hide-claude-auth)", () => {
   it.each([
     ["a subscription would pay", SUBSCRIPTION, NOT_SUPPORTED],
     ["the account holds no credential", {}, { code: -32000, data: undefined }],
+    [
+      "the SDK reports no token",
+      { tokenSource: "none", apiProvider: "firstParty" },
+      { code: -32000, data: undefined },
+    ],
+    ["a subscription has no token", { ...SUBSCRIPTION, tokenSource: "none" }, NOT_SUPPORTED],
   ])("refuses session/new when %s", async (_case, account, refusal) => {
     accountsAtStart(account);
     const client = v2Client();
@@ -10030,16 +10036,45 @@ describe("ACP v2 subscription guard (--hide-claude-auth)", () => {
     });
   });
 
-  it("refuses a prompt before insertion when the cached account bills a subscription", async () => {
+  it.each([
+    ["an API key", { ...API_KEY, tokenSource: "none" }],
+    ["an API key helper", { apiKeySource: "apiKeyHelper", tokenSource: "none" }],
+    ["a Console key", { apiKeySource: "/login managed key", tokenSource: "none" }],
+    ["a bearer token", { tokenSource: "ANTHROPIC_AUTH_TOKEN" }],
+    ["a setup token", { tokenSource: "CLAUDE_CODE_OAUTH_TOKEN" }],
+    ["external credentials", { apiProvider: "bedrock", tokenSource: "none" }],
+    ["an unavailable account", undefined],
+  ])("allows session/new with %s", async (_case, account) => {
+    accountsAtStart(account);
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      await expect(agent.request(v2.methods.agent.session.new, { cwd })).resolves.toMatchObject({
+        sessionId: expect.any(String),
+      });
+    });
+  });
+
+  it.each([
+    [SUBSCRIPTION, NOT_SUPPORTED],
+    [
+      { tokenSource: "none", apiProvider: "firstParty" },
+      { code: -32000, data: undefined },
+    ],
+    [{ ...SUBSCRIPTION, tokenSource: "none" }, NOT_SUPPORTED],
+  ])("refuses a prompt before insertion for account %j", async (account, refusal) => {
     accountsAtStart(API_KEY);
+    scriptTurns(async function* (options) {
+      yield result(options);
+    });
     const client = v2Client();
     await client.app.connectWith(connectRouter(), async (agent) => {
       await initializeV2(agent);
       const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
-      sdk.accountInfo = async () => SUBSCRIPTION;
+      sdk.accountInfo = async () => account;
       await expect(
         agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") }),
-      ).rejects.toMatchObject(NOT_SUPPORTED);
+      ).rejects.toMatchObject(refusal);
       await client.authUpdate(1);
     });
 
