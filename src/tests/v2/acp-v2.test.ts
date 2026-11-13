@@ -4492,6 +4492,37 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
     });
   });
 
+  // The result of a cycle that a scheduler fire started has no `origin`. v2
+  // ends every cycle at its result, so unlike v1 it has no task left open.
+  it("ends a cycle that a scheduler fire started at its result, which has no origin", async () => {
+    scriptTurns(async function* (options) {
+      yield assistantText(options, "Started the build in the background.");
+      yield result(options);
+      // The overdue ScheduleWakeup fires before the prompt's idle.
+      yield {
+        type: "command_lifecycle",
+        command_uuid: "scheduler-fire",
+        state: "started",
+        wakeup_source: "loop_wakeup",
+        scheduled_for: 1_790_000_000_000,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield assistantText(options, "That wakeup was stale.", "msg_wakeup");
+      yield result(options);
+      // One idle covers both results.
+      yield idleState(options);
+    });
+    const client = await promptAndWait(2);
+
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      ...endedTurn,
+      "running",
+      "agent_message_chunk",
+      "idle end_turn",
+    ]);
+  });
+
   it("closes a tool call that Claude dropped before it ran in a cycle as cancelled, before the cycle's idle", async () => {
     scriptTurns(async function* (options) {
       yield assistantText(options, "Started the build in the background.");

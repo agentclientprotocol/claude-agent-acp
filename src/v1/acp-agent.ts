@@ -3766,6 +3766,13 @@ export class ClaudeAcpAgent {
      *  the autonomous stretch-close guard. */
     const firstUnsettledQueuedTurn = () => (session.turnQueue ?? []).find((t) => !t.settled);
 
+    /** Whether no turn can own what the stream carries now: nothing is
+     *  cancelled, active or queued. Output then belongs to a cycle that Claude
+     *  Code started on its own, such as a scheduler fire, and so does its
+     *  result, whatever its origin says. */
+    const noTurnOwnsCycle = () =>
+      !session.cancelled && !session.activeTurn && !firstUnsettledQueuedTurn();
+
     /** Claim the structured replacement for the turn currently producing a
      * local-command output. Undefined means this is not a structured
      * local-command turn (or its request failed), null means another SDK
@@ -4544,13 +4551,7 @@ export class ClaudeAcpAgent {
               // open, it starts an autonomous turn: name the fire as its cause,
               // whether `session_state_changed` already opened the task or not.
               const cause = scheduledFireCause(frame);
-              if (
-                cause &&
-                asyncTasks.enabled &&
-                !session.cancelled &&
-                !session.activeTurn &&
-                !firstUnsettledQueuedTurn()
-              ) {
+              if (cause && asyncTasks.enabled && noTurnOwnsCycle()) {
                 await asyncTasks.autonomousTurnStarted(cause);
               }
               // Remember dispatch on the live turn so a cancel() that orphans
@@ -4664,9 +4665,7 @@ export class ClaudeAcpAgent {
           !asyncTasks.autonomousTurnOpen &&
           (message.type === "assistant" || message.type === "stream_event") &&
           message.parent_tool_use_id === null &&
-          !session.cancelled &&
-          !session.activeTurn &&
-          !firstUnsettledQueuedTurn()
+          noTurnOwnsCycle()
         ) {
           await asyncTasks.autonomousTurnStarted();
         }
@@ -5536,10 +5535,20 @@ export class ClaudeAcpAgent {
             const startedByClaudeCode =
               message.origin != null && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind);
             const isAutonomousResult = startedByClaudeCode && !answersPendingPrompt(message);
+            // A result with no turn to claim it also ends the cycle that
+            // Claude Code started on its own, whatever its origin says. A
+            // scheduler fire (a ScheduleWakeup or cron prompt) is one: its
+            // result has no origin, so it takes the user lane, where it owes a
+            // trailing idle. That idle is absorbed before the idle check for an
+            // autonomous cycle sees a zero debt, so only this result can end
+            // the task. The user lane is otherwise unchanged: the owed idle
+            // and the #825 detector, which needs an unsettled turn, work as
+            // before.
+            const endsOwnCycle = isAutonomousResult || noTurnOwnsCycle();
             // A placeholder result (`num_turns: 0`, see below) comes before
             // the followup that answers it, so the autonomous turn goes on.
             if (
-              isAutonomousResult &&
+              endsOwnCycle &&
               asyncTasks.autonomousTurnOpen &&
               (message.num_turns > 0 || message.is_error)
             ) {
