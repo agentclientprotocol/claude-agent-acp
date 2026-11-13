@@ -10221,7 +10221,7 @@ export class ClaudeAcpAgent {
         creationOpts.resume !== undefined ? resumedModel : undefined,
       );
       const settingsAllowedModels = Array.isArray(settingsAvailableModels)
-        ? applyAvailableModelsAllowlist(
+        ? await applyAvailableModelsAllowlist(
             sdkModels,
             settingsAvailableModels,
             settingsModelOverrides,

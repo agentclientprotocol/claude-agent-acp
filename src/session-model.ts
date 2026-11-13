@@ -1,5 +1,11 @@
 import type { SessionConfigOption } from "@agentclientprotocol/sdk/unstable";
-import type { ModelInfo, Query, Settings } from "@anthropic-ai/claude-agent-sdk";
+// matchDeniedModels is marked @alpha in the SDK; API may shift in a future release.
+import {
+  matchDeniedModels,
+  type ModelInfo,
+  type Query,
+  type Settings,
+} from "@anthropic-ai/claude-agent-sdk";
 import { AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY, withAirMeta } from "./air-extension.js";
 import { bedrockRegionPrefix } from "./gateway-models.js";
 
@@ -105,7 +111,7 @@ function containsWords(haystack: string, needle: string): boolean {
 }
 
 /** `id` without the gateway spellings that `normalizeModelId` keeps for
- *  `deniedModels` and gateway listings: path segments before `claude-`
+ *  gateway listings: path segments before `claude-`
  *  (`vertex_ai/`, `openrouter/anthropic/`, `publishers/anthropic/models/`)
  *  and the Anthropic API's `-latest` suffix (`claude-3-5-haiku-latest`). */
 function withoutGatewaySpelling(id: string): string {
@@ -376,8 +382,8 @@ export function aliasResumedModelRow(
 
 /** A model id without the spellings that name the same model: provider
  *  prefixes, dates, version suffixes, `:variant` suffixes, dotted versions,
- *  `-fast` and context hints. `deniedModels` and gateway listings both match on
- *  it. OpenRouter lists `anthropic/claude-opus-5.5:batch[1m]`, which normalizes
+ *  `-fast` and context hints. Gateway listings match on it. OpenRouter lists
+ *  `anthropic/claude-opus-5.5:batch[1m]`, which normalizes
  *  to `claude-opus-5-5`; `anthropic/openai/gpt-5` keeps its `openai/` prefix and
  *  matches no Claude id. */
 function normalizeModelId(value: string): string {
@@ -401,24 +407,56 @@ function normalizeModelId(value: string): string {
   );
 }
 
+/** A path that no model id starts with. Nothing enforces that no
+ *  `deniedModels` entry names it (see {@link deniedModelSpellings}). */
+const VERSION_SPELLING_PATH = "version-of/";
+
 /**
- * Whether managed `deniedModels` blocks a model id, following the CLI's rules
- * closely enough for the picker: a family alias blocks the whole family, and a
- * model id blocks that version in every spelling plus the later minor versions
- * it prefixes (`claude-opus-5` also blocks `claude-opus-5-5`). Entries share
- * `normalizeModelId`, so `claude-opus-4.5` or `anthropic/claude-opus-4.5` also
- * blocks `claude-opus-4-5`, which the CLI may still allow. The CLI stays the
- * enforcer; this only keeps the picker from offering a refused row.
+ * The spellings of `id` to ask the SDK's `matchDeniedModels` about. That
+ * function compares an id with the entries alone. The CLI blocks more
+ * (`setModel` against CLI 2.1.323):
+ * - a last path segment that an exact-name entry names: `my-model` blocks
+ *   `gateway/my-model`;
+ * - a version behind a `:variant` suffix or written with a dot:
+ *   `claude-opus-5-5` blocks `claude-opus-5-5:free` and
+ *   `anthropic/claude-opus-5.5`.
+ *
+ * An exact-name entry does not block a `:variant`: `my-model` leaves
+ * `my-model:free` allowed. So the version spelling goes behind a path, which
+ * the SDK ignores for a versioned id and which keeps the spelling from
+ * equalling an exact name.
  */
-export function isDeniedModel(modelId: string, deniedModels: readonly string[]): boolean {
-  const id = normalizeModelId(modelId);
-  if (!id) return false;
-  return deniedModels.some((entry) => {
-    const denied = normalizeModelId(entry);
-    if (!denied) return false;
-    if (MODEL_FAMILY_ALIASES.has(denied)) return id === denied || id.includes(`-${denied}`);
-    return id === denied || id.startsWith(`${denied}-`);
-  });
+function deniedModelSpellings(id: string): string[] {
+  const lastSegment = id.slice(id.lastIndexOf("/") + 1);
+  const version = lastSegment.replace(/:.*$/, "").replace(/(?<=\d)\.(?=\d)/g, "-");
+  return [id, lastSegment, `${VERSION_SPELLING_PATH}${version}`];
+}
+
+/**
+ * Which of `ids` a managed `deniedModels` list blocks, by the CLI's own entry
+ * rules: the SDK's `matchDeniedModels`, asked about each of the
+ * {@link deniedModelSpellings} of an id.
+ * - A family alias (`opus`) blocks the family.
+ * - A model id blocks that version in every spelling, and the later minor
+ *   versions when it names none (`claude-opus-5` also blocks `claude-opus-5-5`).
+ * - Any other entry (`claude-opus-4.5`, `my-model`) blocks only that name,
+ *   alone or as the last path segment (`gateway/my-model`).
+ * - `default`, `best` and `opusplan` block nothing.
+ *
+ * The CLI stays the enforcer; this only keeps the picker from offering a row
+ * that `setModel` would refuse.
+ */
+export async function deniedModelIds(
+  ids: readonly string[],
+  deniedModels: readonly string[],
+): Promise<Set<string>> {
+  if (ids.length === 0 || deniedModels.length === 0) return new Set();
+  const asked = ids.flatMap((id) => deniedModelSpellings(id).map((spelling) => ({ id, spelling })));
+  const { denied } = await matchDeniedModels(
+    asked.map(({ spelling }) => spelling),
+    deniedModels,
+  );
+  return new Set(asked.filter((_, index) => denied[index]).map(({ id }) => id));
 }
 
 /**
@@ -436,15 +474,16 @@ export function isDeniedModel(modelId: string, deniedModels: readonly string[]):
  * - `undefined` is handled by the caller (no allowlist applied).
  * - The Default option is unaffected by `availableModels` — it always remains
  *   available, even when the allowlist is `[]`.
- * - Managed `deniedModels` wins over the allowlist, so a denied entry is
- *   dropped even though the CLI would otherwise leave it unmatched.
+ * - Managed `deniedModels` wins over the allowlist: an entry is dropped when
+ *   the list blocks its name, its `modelOverrides` target, or the model of the
+ *   row it resolves to (see {@link deniedModelIds}).
  */
-export function applyAvailableModelsAllowlist(
+export async function applyAvailableModelsAllowlist(
   sdkModels: ModelInfo[],
   allowlist: string[],
   settingsModelOverrides?: Record<string, string>,
   deniedModels: readonly string[] = [],
-): ModelInfo[] {
+): Promise<ModelInfo[]> {
   // Default is always preserved per the docs. Synthesize one if the SDK
   // didn't surface it so downstream code (e.g. `getAvailableModels` picking
   // `models[0]` as a fallback) still has something to work with.
@@ -465,22 +504,21 @@ export function applyAvailableModelsAllowlist(
   // opaque provider IDs) often won't textually resemble anything in
   // `sdkModelsWithoutDefault`. Only the entry's surfaced `value` becomes the
   // override target, so it's what `setModel` ends up passing to the API.
-  for (const entry of allowlist) {
+  const entries = allowlist.flatMap((entry) => {
     const trimmed = entry.trim();
-    if (!trimmed || seen.has(trimmed)) continue;
-
-    const overridden = settingsModelOverrides?.[trimmed];
-    const effective = overridden ?? trimmed;
-    if (seen.has(effective)) continue;
-
+    if (!trimmed) return [];
+    const effective = settingsModelOverrides?.[trimmed] ?? trimmed;
     const sdkMatch = resolveModelPreference(sdkModelsWithoutDefault, trimmed);
-    if (
-      [trimmed, effective, sdkMatch?.resolvedModel].some(
-        (id) => id != null && isDeniedModel(id, deniedModels),
-      )
-    ) {
-      continue;
-    }
+    const ids = [trimmed, effective, ...(sdkMatch?.resolvedModel ? [sdkMatch.resolvedModel] : [])];
+    return [{ trimmed, effective, sdkMatch, ids }];
+  });
+  const denied = await deniedModelIds(
+    entries.flatMap(({ ids }) => ids),
+    deniedModels,
+  );
+  for (const { trimmed, effective, sdkMatch, ids } of entries) {
+    if (seen.has(trimmed) || seen.has(effective)) continue;
+    if (ids.some((id) => denied.has(id))) continue;
     if (sdkMatch) {
       result.push({ ...sdkMatch, value: effective });
     } else {
