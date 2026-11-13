@@ -32,6 +32,7 @@ import { v2SessionUpdate } from "../../v2/session-update.js";
 import type { AgentHandle } from "../../v2/agent.js";
 import {
   v1ForkSessionRequest,
+  initialConfigRequests,
   v1NewSessionRequest,
   v1SetSessionConfigOptionRequest,
   v2ConfigOptions,
@@ -10317,20 +10318,21 @@ describe("ACP v2 session translation", () => {
       expected: { configId: "fast", type: "boolean", value: true },
     },
   ])(
-    "converts an initial $option.type config value for the shared setup",
+    "applies an initial $option.type config value after the session starts",
     ({ option, expected }) => {
       expect(
         v1NewSessionRequest({ cwd: "/workspace", configOptions: [option] }).configOptions,
-      ).toEqual([expected]);
+      ).toBeUndefined();
+      const requests = initialConfigRequests("s", [option]);
+      expect(requests.map(v1SetSessionConfigOptionRequest)).toEqual([
+        { sessionId: "s", ...expected },
+      ]);
     },
   );
 
   it("rejects an initial config value that the shared setup cannot express", () => {
     expect(() =>
-      v1NewSessionRequest({
-        cwd: "/workspace",
-        configOptions: [{ configId: "range", type: "_range", value: 3 }],
-      }),
+      initialConfigRequests("s", [{ configId: "range", type: "_range", value: 3 }]),
     ).toThrow("Config option values of type _range are not supported");
   });
 
