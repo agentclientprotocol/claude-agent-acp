@@ -245,20 +245,26 @@ export class SettingsManager {
     };
   }
 
-  /**
-   * `idleCompaction`, `autoCompactEnabled` and `env` as the CLI resolves them:
-   * managed settings outrank the `--settings` override, which outranks the
-   * user/project/local files. `env` merges entry by entry in the same order. A
-   * key whose value is `undefined` in the override does not hide the files' value.
-   */
-  getCompactionSettings(settingsOverride?: Settings): CompactionSettings {
-    const managed = this.managedCompactionSettings;
+  /** Settings env as the CLI resolves it: files, then `--settings`, then
+   *  managed policy. Undefined entries do not hide a lower tier's value. */
+  getEnvironment(settingsOverride?: Settings): Record<string, string> {
     const env: Record<string, string> = {};
-    for (const tier of [this.effective.env, settingsOverride?.env, managed.env]) {
+    for (const tier of [
+      this.effective.env,
+      settingsOverride?.env,
+      this.managedCompactionSettings.env,
+    ]) {
       for (const [name, value] of Object.entries(tier ?? {})) {
         if (value !== undefined) env[name] = value;
       }
     }
+    return env;
+  }
+
+  /** `idleCompaction`, `autoCompactEnabled` and `env` as the CLI resolves them:
+   *  managed settings outrank `--settings`, then user/project/local files. */
+  getCompactionSettings(settingsOverride?: Settings): CompactionSettings {
+    const managed = this.managedCompactionSettings;
     return {
       idleCompaction:
         managed.idleCompaction ?? settingsOverride?.idleCompaction ?? this.effective.idleCompaction,
@@ -266,7 +272,7 @@ export class SettingsManager {
         managed.autoCompactEnabled ??
         settingsOverride?.autoCompactEnabled ??
         this.effective.autoCompactEnabled,
-      env,
+      env: this.getEnvironment(settingsOverride),
     };
   }
 

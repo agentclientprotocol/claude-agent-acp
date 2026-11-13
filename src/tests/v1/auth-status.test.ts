@@ -333,7 +333,7 @@ describe("auth status mappers", () => {
     expect(fromAccountInfo({ apiProvider: "firstParty" })).toBeUndefined();
     expect(fromAccountInfo({})).toBeUndefined();
     expect(fromAccountInfo(undefined)).toBeUndefined();
-    // `tokenSource` names the OAuth token's origin, never a key source.
+    // A setup-token origin carries no plan; keep the CLI's subscription report.
     expect(
       fromAccountInfo({ apiProvider: "firstParty", tokenSource: "CLAUDE_CODE_OAUTH_TOKEN" }),
     ).toBeUndefined();
@@ -363,6 +363,60 @@ describe("auth status mappers", () => {
       ),
     ).toEqual({ kind: "account", label: "Claude subscription", detail: "OAuth token" });
   });
+
+  it("reports the SDK's accepted bearer token as a non-subscription credential", () => {
+    expect(
+      fromAccountInfo({ tokenSource: "ANTHROPIC_AUTH_TOKEN", apiProvider: "firstParty" }),
+    ).toEqual({
+      kind: "api_key",
+      label: "Anthropic API key",
+      detail: "ANTHROPIC_AUTH_TOKEN",
+    });
+  });
+
+  it.each([
+    [
+      { apiKeySource: "ANTHROPIC_API_KEY" },
+      { kind: "api_key", label: "Anthropic API key", detail: "ANTHROPIC_API_KEY" },
+    ],
+    [{ apiProvider: "bedrock" }, { kind: "external", label: "AWS Bedrock" }],
+    [{ apiProvider: "gateway" }, { kind: "gateway", label: "Custom model gateway" }],
+    [
+      { subscriptionType: "max" },
+      { kind: "api_key", label: "Anthropic API key", detail: "ANTHROPIC_AUTH_TOKEN" },
+    ],
+  ] as const)("preserves bearer-token credential precedence for %j", (fields, expected) => {
+    expect(
+      fromAccountInfo({
+        tokenSource: "ANTHROPIC_AUTH_TOKEN",
+        apiProvider: "firstParty",
+        ...fields,
+      }),
+    ).toEqual(expected);
+  });
+
+  it.each([
+    [
+      { loggedIn: true, authMethod: "oauth_token" },
+      { kind: "api_key", label: "Anthropic API key", detail: "ANTHROPIC_AUTH_TOKEN" },
+    ],
+    [{ loggedIn: false }, { kind: "none", label: "Not logged in" }],
+    [
+      { loggedIn: true, apiKeySource: "ANTHROPIC_API_KEY" },
+      { kind: "api_key", label: "Anthropic API key", detail: "ANTHROPIC_API_KEY" },
+    ],
+    [
+      { loggedIn: false, apiProvider: "bedrock" },
+      { kind: "external", label: "AWS Bedrock" },
+    ],
+  ])(
+    "uses effective bearer-token context only for the ambiguous CLI login %j",
+    (fields, expected) => {
+      expect(
+        fromCliStatus(JSON.stringify({ apiProvider: "firstParty", ...fields }), undefined, true),
+      ).toEqual(expected);
+    },
+  );
 
   it.each([
     ["max", "max_20x", "Claude Ultra"],
@@ -655,6 +709,73 @@ describe("auth status over ACP", () => {
     expect(JSON.stringify(updates())).not.toContain("return-key");
   });
 
+  it.each(["process", "settings", "launch", "inline"])(
+    "reports the accepted %s bearer token through probes and session reads, then clears it",
+    async (source) => {
+      const env = {
+        ANTHROPIC_AUTH_TOKEN: "synthetic-bearer-token",
+        ANTHROPIC_BASE_URL: "http://127.0.0.1:8788/test-proxy",
+      };
+      const expected = {
+        kind: "api_key",
+        label: "Anthropic API key",
+        detail: "ANTHROPIC_AUTH_TOKEN",
+      };
+      vi.stubEnv("ANTHROPIC_AUTH_TOKEN", source === "process" ? env.ANTHROPIC_AUTH_TOKEN : "");
+      vi.stubEnv("ANTHROPIC_BASE_URL", source === "process" ? env.ANTHROPIC_BASE_URL : "");
+      const argv = process.argv;
+      process.argv = [...argv, "--hide-claude-auth"];
+      try {
+        if (source === "settings") {
+          await fs.writeFile(path.join(configDir, "settings.json"), JSON.stringify({ env }));
+        }
+        statusStdout = JSON.stringify({
+          loggedIn: true,
+          authMethod: "oauth_token",
+          apiProvider: "firstParty",
+        });
+        await initialize();
+        if (source === "settings" || source === "process") {
+          await vi.waitFor(() => expect(lastPush()).toEqual(expected));
+        }
+        mockQuery.mockImplementation((args: any) =>
+          scriptedTurnQuery(args, {
+            tokenSource: "ANTHROPIC_AUTH_TOKEN",
+            apiProvider: "firstParty",
+          }),
+        );
+        const { sessionId } = await agent.newSession({
+          cwd: process.cwd(),
+          mcpServers: [],
+          _meta: {
+            claudeCode: {
+              options:
+                source === "launch" ? { env } : source === "inline" ? { settings: { env } } : {},
+            },
+          },
+        });
+        await promptOnce(sessionId);
+        await vi.waitFor(() => expect(lastPush()).toEqual(expected));
+        expect(await agent.authStatusResponse()).toMatchObject({
+          state: "authenticated",
+          accounts: [{ _meta: { claudeCode: { kind: "api_key" } } }],
+        });
+        expect(JSON.stringify(updates())).not.toContain(env.ANTHROPIC_AUTH_TOKEN);
+        expect(JSON.stringify(updates())).not.toContain("test-proxy");
+
+        statusStdout = CLI_LOGGED_OUT;
+        statusFails = true;
+        await agent.authStatusResponse();
+        await vi.waitFor(() =>
+          expect(lastPush()).toEqual({ kind: "none", label: "Not logged in" }),
+        );
+      } finally {
+        process.argv = argv;
+        vi.unstubAllEnvs();
+      }
+    },
+  );
+
   it("discards a late probe when programmatic settings replace the active helper", async () => {
     await fs.writeFile(
       path.join(configDir, "settings.json"),
@@ -694,6 +815,40 @@ describe("auth status over ACP", () => {
     ]);
     await promptOnce(sessionId);
     await flushStatus();
+    expect(updates()).toHaveLength(1);
+  });
+
+  it("discards a late bearer-token probe when inline settings clear the token", async () => {
+    await fs.writeFile(
+      path.join(configDir, "settings.json"),
+      JSON.stringify({ env: { ANTHROPIC_AUTH_TOKEN: "synthetic-bearer-token" } }),
+    );
+    statusStdout = JSON.stringify({
+      loggedIn: true,
+      authMethod: "oauth_token",
+      apiProvider: "firstParty",
+    });
+    deferStatus = true;
+    await initialize();
+    mockQuery.mockImplementation((args: any) =>
+      scriptedTurnQuery(args, {
+        tokenSource: "CLAUDE_CODE_OAUTH_TOKEN",
+        apiProvider: "firstParty",
+      }),
+    );
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: { claudeCode: { options: { settings: { env: { ANTHROPIC_AUTH_TOKEN: "" } } } } },
+    });
+    await flushStatus();
+    await vi.waitFor(() =>
+      expect(lastPush()).toEqual({
+        kind: "account",
+        label: "Claude subscription",
+        detail: "OAuth token",
+      }),
+    );
     expect(updates()).toHaveLength(1);
   });
 

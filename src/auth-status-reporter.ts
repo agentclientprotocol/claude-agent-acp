@@ -34,7 +34,10 @@ const execFileAsync = promisify(execFile);
 type ReporterLogger = { log: (...args: any[]) => void; error: (...args: any[]) => void };
 
 /** The settings a probe runs under: a session's cwd, its key helper, and its launch env. */
-export type AuthStatusSettings = Pick<SettingsManager, "getCwd" | "getApiKeyHelper">;
+export type AuthStatusSettings = Pick<
+  SettingsManager,
+  "getCwd" | "getApiKeyHelper" | "getEnvironment"
+>;
 
 export interface AuthStatusReporterOptions {
   /** Sends `_auth/status_update`. */
@@ -65,6 +68,7 @@ export class AuthStatusReporter {
     env?: Options["env"];
   };
   private helper?: string;
+  private settingsEnv: Record<string, string> = {};
   /** In-flight `claude auth status --json` probe, shared by every caller so
    *  a concurrent `initialize` and start-of-prompt read never spawn two CLI
    *  processes. */
@@ -170,12 +174,15 @@ export class AuthStatusReporter {
     launchEnv?: Options["env"],
   ) {
     const helper = manager.getApiKeyHelper(settingsOverride);
+    const settingsEnv = manager.getEnvironment(settingsOverride);
     const changed =
       manager.getCwd() !== (this.settings?.manager.getCwd() ?? process.cwd()) ||
       helper !== this.helper ||
+      JSON.stringify(settingsEnv) !== JSON.stringify(this.settingsEnv) ||
       JSON.stringify(launchEnv) !== JSON.stringify(this.settings?.env);
     this.settings = { manager, override: settingsOverride, env: launchEnv };
     this.helper = helper;
+    this.settingsEnv = settingsEnv;
     if (changed) {
       // The epoch bump discards any probe that read the old context, and the
       // session account may carry no identity signal (an apiKeyHelper), so
@@ -263,6 +270,7 @@ export class AuthStatusReporter {
     const run = ++this.probeRuns;
     const context = this.settings;
     const apiKeyHelper = context?.manager.getApiKeyHelper(context.override);
+    const launchEnv = context?.env ? { ...process.env, ...context.env } : process.env;
     // ACP gateway auth bypasses the CLI credential store entirely, so the
     // probe would report an identity that is not the one being used. A mere
     // client provider override (`providers/set`) does NOT skip the probe: it
@@ -281,7 +289,7 @@ export class AuthStatusReporter {
       ({ stdout } = await execFileAsync(cliPath, args, {
         timeout: AUTH_STATUS_PROBE_TIMEOUT_MS,
         cwd: context?.manager.getCwd() ?? process.cwd(),
-        env: context?.env ? { ...process.env, ...context.env } : process.env,
+        env: launchEnv,
       }));
     } catch (error) {
       const failed = error as { stdout?: unknown; killed?: boolean; signal?: unknown } | null;
@@ -309,13 +317,31 @@ export class AuthStatusReporter {
       stdout = failed.stdout;
     }
     let status = fromCliStatus(stdout, apiKeyHelper);
-    if (!context && status?.kind === "api_key" && status.detail === "API key helper") {
+    const oauthToken = status?.kind === "account" && status.detail === "OAuth token";
+    if (
+      !context &&
+      ((status?.kind === "api_key" && status.detail === "API key helper") || oauthToken)
+    ) {
       try {
         const resolved = await resolveSettings({ cwd: process.cwd() });
-        status = fromCliStatus(stdout, filterEscalatingDefaultMode(resolved).apiKeyHelper);
+        const settings = filterEscalatingDefaultMode(resolved);
+        status = fromCliStatus(
+          stdout,
+          settings.apiKeyHelper,
+          Boolean({ ...launchEnv, ...settings.env }.ANTHROPIC_AUTH_TOKEN),
+        );
       } catch {
         logger.error("Could not resolve auth source settings");
       }
+    } else if (context && oauthToken) {
+      status = fromCliStatus(
+        stdout,
+        apiKeyHelper,
+        Boolean(
+          { ...launchEnv, ...context.manager.getEnvironment(context.override) }
+            .ANTHROPIC_AUTH_TOKEN,
+        ),
+      );
     }
     if (!status) {
       logger.error("claude auth status returned unparseable output");
