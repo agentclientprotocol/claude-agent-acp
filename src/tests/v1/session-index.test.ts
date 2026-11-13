@@ -5025,12 +5025,74 @@ describe("the pages of one list", () => {
 });
 
 describe("titles by the SDK's rule", () => {
-  it("finds a custom title whose record starts before the tail window", async () => {
+  /** The title that the SDK itself reports for the transcript `id`. */
+  const sdkSummary = async (id: string) =>
+    (
+      await vi
+        .importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
+          "@anthropic-ai/claude-agent-sdk",
+        )
+        .then((module) => module.getSessionInfo(id, { dir: workspace }))
+    )?.summary;
+
+  /** A tool result record with `toolUseResult`, as a Read of a transcript leaves it. */
+  const toolResult = (id: string, toolUseResult: object) =>
+    JSON.stringify({
+      type: "user",
+      sessionId: id,
+      uuid: randomUUID(),
+      message: {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }],
+      },
+      toolUseResult,
+    });
+
+  it.each<[string, (id: string) => string, string]>([
+    [
+      "a customTitle inside a message is no title",
+      (id) => toolResult(id, { type: "custom-title", customTitle: "Inside a message" }),
+      "First prompt",
+    ],
+    [
+      "a lastPrompt inside a message is no title",
+      (id) => toolResult(id, { lastPrompt: "Inside a message" }),
+      "First prompt",
+    ],
+    [
+      "a custom-title record appended to a line whose write was cut off is the title",
+      (id) =>
+        '{"type":"assistant","message":{"role":"assist' +
+        JSON.stringify({
+          type: "custom-title",
+          customTitle: "After a cut-off write",
+          sessionId: id,
+        }),
+      "After a cut-off write",
+    ],
+    [
+      "an empty custom title hides the one before it",
+      (id) =>
+        [{ customTitle: "Before" }, { customTitle: "" }]
+          .map((title) => JSON.stringify({ type: "custom-title", ...title, sessionId: id }))
+          .join("\n"),
+      "First prompt",
+    ],
+  ])("%s", async (_name, appended, expected) => {
+    const session = await writeTranscript({ prompt: "First prompt", trailer: [] });
+    await fs.appendFile(session.file, `${appended(session.id)}\n`);
+    expect(await sdkSummary(session.id)).toBe(expected);
+    const { agent } = await indexAgent();
+    const page = await agent.listSessions({ cwd: workspace });
+    expect(page.sessions.map((s) => s.title)).toEqual([expected]);
+  });
+
+  it("does not read a custom title whose record the start of the tail window cuts", async () => {
     const id = randomUUID();
     // Past the head window.
     let filler = assistantRecord(id, null);
     while (filler.length < 70_000) filler += "\n" + assistantRecord(id, null);
-    // The cut line of the last 64 KB, which the SDK still searches.
+    // The cut line of the last 64 KB: the SDK reads whole records only.
     const title = JSON.stringify({
       type: "custom-title",
       padding: "p".repeat(10_000),
@@ -5052,14 +5114,9 @@ describe("titles by the SDK's rule", () => {
     expect(start).toBeLessThan(window);
     expect(start + title.indexOf('"customTitle"')).toBeGreaterThan(window);
     expect(start).toBeGreaterThan(64 * 1024);
-    const sdk = await vi
-      .importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
-        "@anthropic-ai/claude-agent-sdk",
-      )
-      .then((module) => module.getSessionInfo(id, { dir: workspace }));
-    expect(sdk!.summary).toBe("Across the boundary");
+    expect(await sdkSummary(id)).toBe("First prompt");
     const { agent } = await indexAgent();
     const page = await agent.listSessions({ cwd: workspace });
-    expect(page.sessions.map((s) => s.title)).toEqual(["Across the boundary"]);
+    expect(page.sessions.map((s) => s.title)).toEqual(["First prompt"]);
   });
 });

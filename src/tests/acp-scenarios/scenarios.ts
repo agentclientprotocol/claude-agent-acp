@@ -16,6 +16,22 @@ import {
 
 const bashInput = { command: "ls -la", description: "List files" };
 
+/**
+ * The heartbeat of a PreToolUse or PostToolUse hook that runs long, as Claude
+ * Code sends it every 30 seconds since 2.1.323: `tool_name` is the hook
+ * event, and `parent_tool_use_id` is the tool call the hook runs for.
+ */
+const hookHeartbeat = (event: "PreToolUse" | "PostToolUse", toolUseId: string, uuid: string) => ({
+  type: "tool_progress",
+  tool_use_id: `hook-${event}-${toolUseId}-heartbeat-0`,
+  tool_name: event,
+  parent_tool_use_id: toolUseId,
+  elapsed_time_seconds: 30,
+  heartbeat: true,
+  uuid,
+  session_id: activeSdkSessionId(),
+});
+
 export const SCENARIOS: Scenario[] = [
   {
     name: "session-setup",
@@ -1118,6 +1134,9 @@ export const SCENARIOS: Scenario[] = [
         yield* assistantTurn("msg_progress", [
           { type: "tool_use", id: "toolu_slow", name: "Bash", input: { command: "make" } },
         ]);
+        // The heartbeats of its hooks report no progress of the tool: the
+        // client gets nothing for them.
+        yield hookHeartbeat("PreToolUse", "toolu_slow", "00000000-0000-4000-8000-00000000b004");
         for (const seconds of [1, 2, 3]) {
           yield {
             type: "tool_progress",
@@ -1129,6 +1148,7 @@ export const SCENARIOS: Scenario[] = [
             session_id: activeSdkSessionId(),
           };
         }
+        yield hookHeartbeat("PostToolUse", "toolu_slow", "00000000-0000-4000-8000-00000000b005");
         yield toolResult("toolu_slow", "built", {
           structured: { stdout: "built", stderr: "", interrupted: false, isImage: false },
         });

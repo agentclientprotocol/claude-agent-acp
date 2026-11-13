@@ -40,7 +40,7 @@ import type { AcpSessionNotification } from "../acp-subagents.js";
 import { isCompactSummaryMessage, replayCompactSummary } from "../context-compaction.js";
 import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
-import { AcpToolCallRenderer, V2_CANCELLED } from "../tool-calls/renderer.js";
+import { AcpToolCallRenderer, progressToolCallId, V2_CANCELLED } from "../tool-calls/renderer.js";
 import { changedTaskPlanEntries, unregisterHookCallback, type TaskState } from "../tools.js";
 import { recordStreamedDelta, unstreamedRemainder, type StreamedBlock } from "../streamed-text.js";
 import { replayClear, type V2UpdateTranslator } from "./update-translator.js";
@@ -269,16 +269,12 @@ export class SessionOutput {
   }
 
   /**
-   * A tool's progress beat, on its tool call: the beat's own `tool_use_id`
-   * when the client holds that call, else the call it runs in
-   * (`parent_tool_use_id`), such as the Agent call of a subagent's tool or
-   * a heartbeat's derived id. A beat for a call that returned is dropped.
+   * A tool's progress beat, on the tool call it reports on (see
+   * {@link progressToolCallId}, which also says which beats are dropped).
    */
   toolProgress(message: SDKToolProgressMessage): void {
-    const toolCallId = this.emittedToolCalls.has(message.tool_use_id)
-      ? message.tool_use_id
-      : message.parent_tool_use_id;
-    if (toolCallId === null || !this.emittedToolCalls.has(toolCallId)) return;
+    const toolCallId = progressToolCallId(message, this.emittedToolCalls);
+    if (toolCallId === undefined) return;
     // A subagent's beat, on its own session, names the Agent call that runs
     // it. A tool call is never its own parent.
     const parentToolUseId =
