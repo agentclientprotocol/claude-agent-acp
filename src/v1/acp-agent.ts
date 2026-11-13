@@ -76,6 +76,7 @@ import {
   Query,
   query,
   SDKAssistantMessageError,
+  SDKRateLimitInfo,
   SDKActiveGoalMessage,
   SDKMessage,
   SDKMessageOrigin,
@@ -421,7 +422,7 @@ import {
   providerCacheKeyFor,
   readContextWindow,
 } from "../context-window.js";
-import { isLoginRequiredText, resultEnd } from "../result-end.js";
+import { isLoginRequiredText, resultEnd, turnErrorData } from "../result-end.js";
 import { STARTUP_FAILURE_RESULTS_ENV, startupFailureError } from "../startup-failure.js";
 import { recordStreamedDelta, unstreamedRemainder, type StreamedBlock } from "../streamed-text.js";
 import { subagentHookOptions } from "../subagent-configuration.js";
@@ -3091,6 +3092,8 @@ export class ClaudeAcpAgent {
     let lastAssistantModel: string | null = null;
     // A rate_limit_event that came before the turn had any usage to report.
     let pendingRateLimit: unknown = null;
+    // The turn's latest rate_limit_event info, for its failure (see `turnErrorData`).
+    let turnRateLimit: SDKRateLimitInfo | undefined;
     // When the Claude SDK classifies a turn as failed (e.g. rate limit, auth
     // problem, billing), it sets a categorical `error` field on the
     // `SDKAssistantMessage` that precedes the final `result` message. We capture
@@ -3458,6 +3461,7 @@ export class ClaudeAcpAgent {
       lastAssistantUsage = null;
       lastAssistantModel = null;
       lastAssistantError = undefined;
+      turnRateLimit = undefined;
       lastAssistantWasUsageLimit = false;
       lastAssistantFailureTitle = undefined;
       lastRefusalExplanation = null;
@@ -6063,7 +6067,10 @@ export class ClaudeAcpAgent {
                     }
                     await failActiveWithSessionFailure(
                       providerFailureCategory(lastAssistantError, lastAssistantWasUsageLimit),
-                      internalErrorForClient(errorKindData(lastAssistantError), ended.error),
+                      internalErrorForClient(
+                        turnErrorData(lastAssistantError, turnRateLimit),
+                        ended.error,
+                      ),
                       lastAssistantFailureTitle ?? ended.error,
                     );
                     break;
@@ -6123,7 +6130,10 @@ export class ClaudeAcpAgent {
                   if ("error" in ended) {
                     await failActiveWithSessionFailure(
                       providerFailureCategory(lastAssistantError, lastAssistantWasUsageLimit),
-                      internalErrorForClient(errorKindData(lastAssistantError), ended.error),
+                      internalErrorForClient(
+                        turnErrorData(lastAssistantError, turnRateLimit),
+                        ended.error,
+                      ),
                       lastAssistantFailureTitle ?? ended.error,
                     );
                     break;
@@ -6136,7 +6146,10 @@ export class ClaudeAcpAgent {
                   if ("error" in ended) {
                     await failActiveWithSessionFailure(
                       LIMIT_FAILURE_CATEGORY[message.subtype],
-                      internalErrorForClient(errorKindData(lastAssistantError), ended.error),
+                      internalErrorForClient(
+                        turnErrorData(lastAssistantError, turnRateLimit),
+                        ended.error,
+                      ),
                       ended.error,
                     );
                     break;
@@ -6957,6 +6970,7 @@ export class ClaudeAcpAgent {
           }
           case "rate_limit_event": {
             session.idleCompaction?.noteRateLimit(message.rate_limit_info);
+            turnRateLimit = message.rate_limit_info;
             // With partial messages on, the SDK sends this before the turn's
             // first assistant frame, while there is no usage yet to send it with.
             if (lastAssistantTotalUsage === null) {
