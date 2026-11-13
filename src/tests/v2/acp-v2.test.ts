@@ -1377,6 +1377,7 @@ describe("ACP v2 sessions", () => {
           await agent.request(v2.methods.agent.session.setConfigOption, { sessionId, ...request });
         }
         sdk.flagSettings = [];
+        vi.mocked(fetch).mockResolvedValueOnce(Response.json({ data: [] }));
         await agent.request(v2.methods.agent.providers.set, {
           providerId: "main",
           apiType: "anthropic",

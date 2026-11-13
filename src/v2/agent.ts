@@ -152,7 +152,7 @@ class V2Agent implements AgentHandle, SessionConnection {
    * connection ends, so its requests fail with what happened, not -32002,
    * until a resume starts it again.
    */
-  private readonly stopped = new Map<string, string>();
+  private readonly stopped = new Map<string, string | RequestError>();
   /**
    * The query starts that run, by session id, until each settles (see
    * {@link startSession}). A resume, close or dispose of a session waits for
@@ -195,12 +195,14 @@ class V2Agent implements AgentHandle, SessionConnection {
       logger,
       active: (sessionId) => this.sessions.get(sessionId),
       start: (sessionId, params) => this.restartSession(sessionId, params),
-      lost: async (sessionId, previous) => {
+      lost: async (sessionId, previous, error) => {
         await previous.retire();
         if (this.sessions.get(sessionId) === previous) {
           this.stop(
             sessionId,
-            "Claude Code could not start again. Resume the session to continue.",
+            error instanceof RequestError
+              ? error
+              : "Claude Code could not start again. Resume the session to continue.",
           );
         }
       },
@@ -252,9 +254,9 @@ class V2Agent implements AgentHandle, SessionConnection {
   }
 
   /** The session's query ended: a later `session/resume` starts it again from its transcript. */
-  private stop(sessionId: string, message: string): void {
+  private stop(sessionId: string, reason: string | RequestError): void {
     this.sessions.delete(sessionId);
-    this.stopped.set(sessionId, message);
+    this.stopped.set(sessionId, reason);
     this.translator.forget(sessionId);
     this.auth.sessionEnded(sessionId);
     this.guard.sessionEnded(sessionId);
@@ -658,6 +660,7 @@ class V2Agent implements AgentHandle, SessionConnection {
   /** The error of a request of `sessionId`, which is not running. */
   private inactive(sessionId: string): RequestError {
     const stopped = this.stopped.get(sessionId);
+    if (stopped instanceof RequestError) return stopped;
     return stopped !== undefined
       ? RequestError.internalError({ sessionId }, stopped)
       : RequestError.sessionNotFound(sessionId);

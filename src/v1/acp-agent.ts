@@ -360,6 +360,7 @@ import {
 import {
   aliasResumedModelRow,
   applyAvailableModelsAllowlist,
+  requireCompatibleProviderModels,
   getAvailableModels,
   MODEL_CONFIG_ID,
   modelDisplayName,
@@ -10260,6 +10261,12 @@ export class ClaudeAcpAgent {
             resolvedProvider.bedrockRegionPrefix,
           )
         : settingsAllowedModels;
+      requireCompatibleProviderModels(
+        initializationResult.models,
+        settingsAllowedModels,
+        allowedModels,
+        resolvedProvider?.listedModels !== undefined,
+      );
 
       const models = await getAvailableModels(
         q,
