@@ -3065,7 +3065,8 @@ export class ClaudeAcpAgent {
   }
 
   /** Lazily start the per-session consumer that drains the SDK query stream for
-   *  the session's whole life. Idempotent: only the first `prompt()` starts it. */
+   *  the session's whole life. Idempotent: the first caller starts it, a
+   *  session setup (see `afterSetupResponse`) or a `prompt()`. */
   private ensureConsumer(session: Session, sessionId: string): void {
     if (session.consumer) {
       return;
@@ -9216,9 +9217,9 @@ export class ClaudeAcpAgent {
   }
 
   /**
-   * The work that follows a session setup response: the session's commands,
-   * the current states of the subagents a load replayed, and MCP server
-   * authentication.
+   * The work that follows a session setup response: reading the session's
+   * query, the session's commands, the current states of the subagents a load
+   * replayed, and MCP server authentication.
    *
    * Call it in the same synchronous step as the handler's `return`: an
    * `await` between them would let the timer run before the response. The ACP
@@ -9233,6 +9234,14 @@ export class ClaudeAcpAgent {
    */
   private afterSetupResponse(sessionId: string, mcpServers: McpServer[]): void {
     setTimeout(() => {
+      // Claude Code can run cycles of its own before the first prompt, for
+      // example a cron prompt or a finished background task of a session that a
+      // bridge restart resumed. Output that nothing reads waits in the stream,
+      // and the first prompt would take the first result in it as its answer.
+      // After the load's replay, so live output does not interleave with the
+      // replayed history.
+      const session = this.sessions[sessionId];
+      if (session && !session.queryClosed) this.ensureConsumer(session, sessionId);
       this.sendAvailableCommandsUpdate(sessionId);
       void this.publishCurrentSubagentStates(sessionId);
       startMcpAuthentication(this, sessionId, mcpServers);
