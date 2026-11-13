@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.107.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.107.0...v0.107.1) (2026-11-13)
+
+
+### Bug Fixes
+
+* end a v2 turn once when Claude Code folds a prompt into it ([#1618](https://github.com/agentclientprotocol/claude-agent-acp/issues/1618)) ([7e857d5](https://github.com/agentclientprotocol/claude-agent-acp/commit/7e857d59ec777356969ab615af83eef02ac43e59))
+
 ## [0.107.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.106.0...v0.107.0) (2026-11-13)
 
 
