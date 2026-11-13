@@ -4032,8 +4032,9 @@ describe("ACP v2 prompts", () => {
     }
 
     it("reports the window that Claude Code reads for the model", async () => {
-      sdk.contextUsage = async () => ({ totalTokens: 0, rawMaxTokens: 1_000_000 });
-      expect(await firstTurnSizes()).toEqual([1_000_000]);
+      // Neither the default (1M) nor what the base double reports (200K).
+      sdk.contextUsage = async () => ({ totalTokens: 0, rawMaxTokens: 967_000 });
+      expect(await firstTurnSizes()).toEqual([967_000]);
     });
 
     it("reports a window that another session's result reported for the model", async () => {

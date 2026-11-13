@@ -5,7 +5,7 @@
  * `getContextUsage`, and learned from each result's `modelUsage`.
  */
 import type { ModelInfo, Query } from "@anthropic-ai/claude-agent-sdk";
-import { DEFAULT_CONTEXT_WINDOW, inferContextWindowFromModel } from "./session-usage.js";
+import { DEFAULT_CONTEXT_WINDOW } from "./session-usage.js";
 
 /** Cross-session cache of authoritative context windows, keyed by
  *  `${providerCacheKey}\0${modelId}` (see {@link contextWindowCacheKey}).
@@ -61,8 +61,8 @@ const PROVIDER_ROUTING_ENV_VARS = [
  *  Header/credential values can be secrets; the key only ever lives as an
  *  in-memory Map key and is never logged or surfaced. Over-keying is the safe
  *  side: a var change that didn't really change the backend costs one cache
- *  miss (heuristic seed until the next result), while under-keying would serve
- *  one backend's window for another's. */
+ *  miss (the default window until Claude Code reports it), while under-keying
+ *  would serve one backend's window for another's. */
 export function providerCacheKeyFor(env: Record<string, string | undefined>): string {
   return PROVIDER_ROUTING_ENV_VARS.map((name) => env[name] ?? "").join("\0");
 }
@@ -107,31 +107,24 @@ export function cacheResultContextWindow(
 /** The context window to report *right now* for a model, with NO IPC on the
  *  critical path: the cached authoritative value if we've learned it (from a
  *  prior turn's `result.modelUsage`, this or any session on the same backend),
- *  else the text heuristic over the model row's identity strings, else the
- *  default. Derives the cache key itself — `modelInfo?.resolvedModel ?? modelId`,
- *  the same rule at every seed site — so read keys can't drift from the write
- *  site's spelling. `authoritative` reports whether the value came from the
- *  cache: an authoritative window can legitimately equal
- *  DEFAULT_CONTEXT_WINDOW, so the value alone can't tell the caller. */
+ *  else DEFAULT_CONTEXT_WINDOW. The model's names do not give the window:
+ *  Claude Code 2.1.323 reports 1M for `sonnet`, and 200K for it under
+ *  `CLAUDE_CODE_DISABLE_1M_CONTEXT=1`. Derives the cache key itself —
+ *  `modelInfo?.resolvedModel ?? modelId`, the same rule at every seed site — so
+ *  read keys can't drift from the write site's spelling. `authoritative`
+ *  reports whether the value came from the cache: an authoritative window can
+ *  legitimately equal DEFAULT_CONTEXT_WINDOW, so the value alone can't tell the
+ *  caller. */
 export function immediateContextWindow(
   providerCacheKey: string,
   modelId: string,
-  modelInfo?: Pick<ModelInfo, "resolvedModel" | "displayName" | "description">,
+  modelInfo?: Pick<ModelInfo, "resolvedModel">,
 ): { size: number; authoritative: boolean } {
   const cached = contextWindowCache.get(
     contextWindowCacheKey(providerCacheKey, modelInfo?.resolvedModel ?? modelId),
   );
   if (cached !== undefined) return { size: cached, authoritative: true };
-  return {
-    size:
-      inferContextWindowFromModel(
-        modelId,
-        modelInfo?.resolvedModel,
-        modelInfo?.displayName,
-        modelInfo?.description,
-      ) ?? DEFAULT_CONTEXT_WINDOW,
-    authoritative: false,
-  };
+  return { size: DEFAULT_CONTEXT_WINDOW, authoritative: false };
 }
 
 /** Forgets the learned windows, as a logout asks: 1M-context entitlement is

@@ -313,9 +313,7 @@ import {
 } from "../tools.js";
 import {
   addModelUsage,
-  DEFAULT_CONTEXT_WINDOW,
   getMatchingModelUsage,
-  inferContextWindowFromModel,
   modelUsageIncrement,
   normalizeModelUsage,
   quotaMeta,
@@ -1098,9 +1096,9 @@ export type Session = {
   /** Context window size of the session's current model, carried across
    *  prompts so mid-stream usage_update notifications report a correct `size`
    *  before the turn's first result message arrives. Seeded synchronously at
-   *  session creation and on model switches from the per-model cache or the
-   *  text heuristic (DEFAULT_CONTEXT_WINDOW when both miss), refined by a
-   *  background `getContextUsage` when that seed was a guess (see
+   *  session creation and on model switches from the per-model cache
+   *  (DEFAULT_CONTEXT_WINDOW on a miss), refined by a background
+   *  `getContextUsage` when that seed was the default (see
    *  `refreshContextWindowInBackground`), then confirmed — and the cache
    *  populated — by each result's modelUsage. No awaited IPC is on these
    *  paths (see the seeding call sites and `contextWindowCache`). */
@@ -1108,10 +1106,9 @@ export type Session = {
   contextUsedTokens?: number;
   /** Whether `contextWindowSize` came from an authoritative source (the
    *  cross-session cache, a `result.modelUsage`, or the background
-   *  `getContextUsage`) rather than the text heuristic / default. Guards the
-   *  mid-stream `message_start` heuristic upgrade: an authoritative window that
-   *  happens to equal DEFAULT_CONTEXT_WINDOW must not be mistaken for "unseeded"
-   *  and clobbered by a "1m" text match. */
+   *  `getContextUsage`) rather than the default. The background read runs only
+   *  while it is false: the flag, not the value, tells, because an
+   *  authoritative window can equal DEFAULT_CONTEXT_WINDOW. */
   contextWindowAuthoritative: boolean;
   /** Stable identifier of the LLM backend this session's query was created
    *  against, derived from the routing-relevant vars of the exact `env` handed
@@ -6261,23 +6258,6 @@ export class ClaudeAcpAgent {
                     message.event.message.usage,
                     message.event.message.id || undefined,
                   );
-                  // Only upgrade from the heuristic default — once we have an
-                  // authoritative window (cache-seeded at session creation or
-                  // on a model switch, read from the resumed session on
-                  // session/load, confirmed by each `result`), trust it over
-                  // the heuristic. The flag, not the value, is the sentinel: an
-                  // authoritative window can legitimately equal
-                  // DEFAULT_CONTEXT_WINDOW (e.g. a backend serving a 200k lane
-                  // under a "[1m]"-spelled id) and must not be clobbered.
-                  if (
-                    !session.contextWindowAuthoritative &&
-                    session.contextWindowSize === DEFAULT_CONTEXT_WINDOW
-                  ) {
-                    const inferred = inferContextWindowFromModel(model);
-                    if (inferred !== null) {
-                      session.contextWindowSize = inferred;
-                    }
-                  }
                 }
               } else {
                 const usage = message.event.usage;
@@ -9299,12 +9279,11 @@ export class ClaudeAcpAgent {
   }
 
   /**
-   * Refine a heuristic context window with `getContextUsage().rawMaxTokens`
-   * (`readContextWindow`), without blocking the caller. The text heuristic
-   * misses natively-1M models whose picker rows carry no "1m" token (e.g.
-   * `sonnet`, and since CLI 2.1.283 `opus`/`default`), so those would
-   * otherwise show 200k until the first result's modelUsage arrives. A later
-   * result still overwrites this.
+   * Replace the default context window with `getContextUsage().rawMaxTokens`
+   * (`readContextWindow`), without blocking the caller. Without it, a model
+   * with a 200K window (`claude-sonnet-4-5`, or any model under
+   * `CLAUDE_CODE_DISABLE_1M_CONTEXT=1`) would show the 1M default until the
+   * first result's modelUsage arrives. A later result still overwrites this.
    */
   private refreshContextWindowInBackground(sessionId: string, session: Session): void {
     if (session.contextWindowAuthoritative) return;
@@ -9342,21 +9321,18 @@ export class ClaudeAcpAgent {
       this.sessionModes.syncConfig(session, value);
     } else if (configId === MODEL_CONFIG_ID) {
       // `ModelInfo.supportsAutoMode` is the canonical SDK signal for applying
-      // the Auto fallback below; its `displayName`/`description` also let us infer the
-      // context window for semantic aliases (e.g. `default`) whose ID alone
-      // carries no "1m" token.
+      // the Auto fallback below.
       const newModelInfo = session.modelInfos.find((m) => m.value === value);
       const modelChanged = session.models.currentModelId !== value;
       if (modelChanged) {
         session.idleCompaction?.disarm("model change");
         // Seed the new model's context window WITHOUT awaited IPC on the
         // switch path: cached authoritative value if we've already learned it
-        // (from a prior turn's `result.modelUsage`), else the text heuristic,
-        // else the default. SDK control requests are serialized over one
-        // channel, so an awaited `getContextUsage` here would delay the rest
-        // of the switch (issues #886/#880); a guessed seed is instead refined
-        // in the background once the switch is done
-        // (`refreshContextWindowInBackground`).
+        // (from a prior turn's `result.modelUsage`), else the default. SDK
+        // control requests are serialized over one channel, so an awaited
+        // `getContextUsage` here would delay the rest of the switch (issues
+        // #886/#880); the default is instead replaced in the background once
+        // the switch is done (`refreshContextWindowInBackground`).
         const seeded = immediateContextWindow(session.providerCacheKey, value, newModelInfo);
         session.contextWindowSize = seeded.size;
         session.contextWindowAuthoritative = seeded.authoritative;
@@ -10375,21 +10351,16 @@ export class ClaudeAcpAgent {
       }
       // Seed the context window without awaited IPC. The cached authoritative
       // window from a prior turn wins (`result.modelUsage`, cross-session),
-      // then the text heuristic, then the default. A guessed seed is refined
-      // by a background getContextUsage once the session is registered
-      // (`refreshContextWindowInBackground`); the authoritative window then
-      // arrives on the first `result.modelUsage` and is cached from there.
+      // then the default. The default is replaced by a background
+      // getContextUsage once the session is registered
+      // (`refreshContextWindowInBackground`, issue #596); the authoritative
+      // window then arrives on the first `result.modelUsage` and is cached
+      // from there.
       //
-      // Text inference alone misses aliases that resolve to extended-context
-      // models with no "1m" token anywhere in their id or description (e.g.
-      // `sonnet` → claude-sonnet-5, and `opus`/`default` since CLI 2.1.283,
-      // all natively ~1M) — the background refresh covers those (issue #596).
-      //
-      // The inference fallback is deliberately keyed to the allowlisted entry: a
-      // fallback-resolved sibling's resolvedModel/displayName/description can
-      // describe a different context lane than the verbatim live id (e.g. an
-      // "opus[1m]" row matched for a bare 200k id), so on the fallback path only
-      // the id itself is a trustworthy window signal.
+      // The cache lookup is deliberately keyed to the allowlisted entry: a
+      // fallback-resolved sibling's resolvedModel can name a different context
+      // lane than the verbatim live id (e.g. an "opus[1m]" row matched for a
+      // bare 200k id), so on the fallback path the lookup uses the id itself.
       const seededWindow = immediateContextWindow(
         providerCacheKey,
         models.currentModelId,

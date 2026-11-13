@@ -568,10 +568,10 @@ export function narrowToGatewayModels(
  * capability flag (current and future); the identity fields are overridden
  * because the fuzzy-matched sibling's resolvedModel/displayName/description
  * can describe a different context lane and would poison later resolvedModel
- * matching (a model switch that the adapter did not make) and context-window
- * inference if they traveled under this id. `allowlistedModelInfo` is the
- * allowlisted entry alone, the only one whose identity strings are a
- * trustworthy window signal.
+ * matching (a model switch that the adapter did not make) and the lookup of
+ * the learned context window (`immediateContextWindow`) if they traveled under
+ * this id. `allowlistedModelInfo` is the allowlisted entry alone, the only one
+ * whose `resolvedModel` that lookup may use.
  */
 export function withCurrentModelInfo(
   allowedModels: ModelInfo[],

@@ -12,9 +12,10 @@ import {
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-/** The context-usage report the base mock query returns. `rawMaxTokens`
- *  matches the agent's DEFAULT_CONTEXT_WINDOW so window-related assertions
- *  don't shift in tests that don't care about context usage. */
+/** The context-usage report the base mock query returns: a 200K window, as
+ *  Claude Code reports for `claude-sonnet-4-5`. It differs from the agent's
+ *  DEFAULT_CONTEXT_WINDOW, so a test can tell a window that was read from the
+ *  default. */
 export const DEFAULT_CONTEXT_USAGE = { totalTokens: 0, rawMaxTokens: 200000 };
 
 /**
