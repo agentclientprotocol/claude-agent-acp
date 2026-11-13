@@ -222,8 +222,8 @@ describe("matchResumedModel", () => {
   it("prefers an exact named-row resolvedModel match over the hint-stripped Default tier", () => {
     // "claude-sonnet-5[1m]" differs from Default's "claude-sonnet-5" only by
     // the context hint; stripping both would misreport the explicit 1M row as
-    // Default (and infer the wrong context window downstream). Both hint
-    // spellings must land on the row regardless of which one it uses.
+    // Default. Both hint spellings must land on the row regardless of which
+    // one it uses.
     expect(matchResumedModel(SONNET_DEFAULT_MODELS, "claude-sonnet-5[1m]").value).toBe(
       "sonnet[1m]",
     );

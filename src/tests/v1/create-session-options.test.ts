@@ -1793,14 +1793,11 @@ describe("createSession options merging", () => {
       const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
       expect(ctxSpy).toHaveBeenCalledOnce();
-      expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);
+      expect(sessionFor(response.sessionId).contextWindowSize).toBe(1_000_000);
       expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(false);
     });
 
-    it("refines a guessed window from getContextUsage in the background", async () => {
-      // The mock model ("claude-sonnet-4-6" / "Claude Sonnet" / "Fast") carries
-      // no "1m" token anywhere, so inference misses and the seed is the default
-      // until the background getContextUsage answers.
+    it("replaces the default window with the one getContextUsage reports, in the background", async () => {
       contextUsageResult = async () => ({ rawMaxTokens: 967000 });
 
       const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
@@ -1818,7 +1815,7 @@ describe("createSession options merging", () => {
       await vi.waitFor(() => expect(contextUsageCalls).toEqual([{ detail: "summary" }]));
     });
 
-    it("keeps the guessed window when getContextUsage reports a non-positive size", async () => {
+    it("keeps the default window when getContextUsage reports a non-positive size", async () => {
       const ctxSpy = vi.fn(async () => ({ rawMaxTokens: 0 }));
       contextUsageResult = ctxSpy;
 
@@ -1826,7 +1823,7 @@ describe("createSession options merging", () => {
       await vi.waitFor(() => expect(ctxSpy).toHaveBeenCalled());
       await new Promise((resolve) => setImmediate(resolve));
 
-      expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);
+      expect(sessionFor(response.sessionId).contextWindowSize).toBe(1_000_000);
       expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(false);
     });
 

@@ -2756,7 +2756,8 @@ describe("ACP v2 core", () => {
       claude.send(echo(await claude.prompt(0)));
       await prompted;
       const planned = assistant("msg_1", [{ type: "text", text: "Planned." }]);
-      planned.message.usage = { input_tokens: 100_000, output_tokens: 0 };
+      // Half of the default 1M window.
+      planned.message.usage = { input_tokens: 500_000, output_tokens: 0 };
       claude.send(planned);
       await vi.waitFor(() =>
         expect(client.sessionUpdates.at(-1)?.sessionUpdate).toBe("agent_message_chunk"),

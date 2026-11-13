@@ -47,7 +47,6 @@ import {
 import {
   DEFAULT_CONTEXT_WINDOW,
   getMatchingModelUsage,
-  inferContextWindowFromModel,
   snapshotFromUsage,
   totalTokens,
   ZERO_USAGE,
@@ -389,9 +388,6 @@ export class SessionReports {
       if (model && model !== "<synthetic>") {
         this.lastModel = model;
         this.idleCompaction?.noteRequest(event.message.usage, event.message.id || undefined);
-        if (!this.contextWindowAuthoritative && this.contextWindow === DEFAULT_CONTEXT_WINDOW) {
-          this.contextWindow = inferContextWindowFromModel(model) ?? this.contextWindow;
-        }
       }
     } else if (event.type === "message_delta") {
       const usage = event.usage;
@@ -540,8 +536,8 @@ export class SessionReports {
 
   /**
    * The window of model `id` without IPC: one learned from a result of this
-   * or another session on the same backend, else a guess from the model's
-   * names. A guess is then read from Claude Code in the background
+   * or another session on the same backend, else the default. The default is
+   * then replaced by what Claude Code reports in the background
    * (`readContextWindow`), until a result reports the window.
    */
   private seedContextWindow(id: string, info: ModelInfo | undefined): void {

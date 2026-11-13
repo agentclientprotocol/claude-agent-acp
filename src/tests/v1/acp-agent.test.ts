@@ -5394,7 +5394,7 @@ describe("permission request cancellation", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       forwardSubagentText: false,
-      contextWindowSize: 200000,
+      contextWindowSize: 1_000_000,
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
@@ -12420,7 +12420,7 @@ describe("stop reason propagation", () => {
     expect(JSON.stringify(updates)).not.toContain("agent_message_chunk");
     const usageUpdates = updates.filter((update) => update.update.sessionUpdate === "usage_update");
     expect(usageUpdates.at(-1)?.update).toEqual(
-      expect.objectContaining({ used: 170910, size: 200000 }),
+      expect.objectContaining({ used: 170910, size: 1_000_000 }),
     );
   });
 
@@ -15372,7 +15372,7 @@ describe("session/close", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       forwardSubagentText: false,
-      contextWindowSize: 200000,
+      contextWindowSize: 1_000_000,
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
@@ -15496,7 +15496,7 @@ describe("session/delete", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       forwardSubagentText: false,
-      contextWindowSize: 200000,
+      contextWindowSize: 1_000_000,
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
@@ -15661,7 +15661,7 @@ describe("getOrCreateSession param change detection", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       forwardSubagentText: false,
-      contextWindowSize: 200000,
+      contextWindowSize: 1_000_000,
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
@@ -16220,7 +16220,7 @@ describe("usage_update computation", () => {
             cacheCreationInputTokens: 100,
             webSearchRequests: 0,
             costUSD: 0.01,
-            contextWindow: 1000000,
+            contextWindow: 200000,
             maxOutputTokens: 16384,
           },
         },
@@ -16235,10 +16235,10 @@ describe("usage_update computation", () => {
     expect(usageUpdates[0].update.used).toBe(1800);
     // First prompt of a session has no prior result to learn the window from,
     // so the mid-stream update falls back to the default context window.
-    expect(usageUpdates[0].update.size).toBe(200000);
+    expect(usageUpdates[0].update.size).toBe(1_000_000);
     expect(usageUpdates[0].update.cost).toBeUndefined();
     expect(usageUpdates[1].update.used).toBe(1800);
-    expect(usageUpdates[1].update.size).toBe(1000000);
+    expect(usageUpdates[1].update.size).toBe(200000);
     expect(usageUpdates[1].update.cost).toBeDefined();
   });
 
@@ -16328,46 +16328,6 @@ describe("usage_update computation", () => {
     expect(usageUpdates[2].update.cost).toBeDefined();
   });
 
-  it("mid-stream size is inferred from a 1M model name before the first result", async () => {
-    // On the very first prompt there is no learned context window yet, so the
-    // mid-stream update would otherwise fall back to 200k. A "-1m" suffix in
-    // the SDK model ID is enough signal to emit 1_000_000 up front.
-    const { agent, updates } = createMockAgentWithCapture();
-    injectSession(agent, [
-      createStreamEvent("message_start", {
-        model: "claude-opus-4-6-1m",
-        usage: {
-          input_tokens: 2000,
-          output_tokens: 1000,
-          cache_read_input_tokens: 0,
-          cache_creation_input_tokens: 0,
-        },
-      }),
-      createResultMessageWithModel({
-        modelUsage: {
-          "claude-opus-4-6-1m": {
-            inputTokens: 2000,
-            outputTokens: 1000,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0.02,
-            contextWindow: 1000000,
-            maxOutputTokens: 16384,
-          },
-        },
-      }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
-    ]);
-
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
-
-    const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
-    expect(usageUpdates).toHaveLength(2);
-    expect(usageUpdates[0].update.size).toBe(1000000);
-    expect(usageUpdates[1].update.size).toBe(1000000);
-  });
-
   it("duplicate stream_event totals do not re-emit usage_update", async () => {
     // A message_delta whose cumulative totals match the prior snapshot should
     // not trigger a duplicate usage_update — only the result adds cost on top.
@@ -16415,11 +16375,11 @@ describe("usage_update computation", () => {
   it("mid-stream size uses the session's learned context window", async () => {
     // Session state persists the model's context window across prompts, so a
     // mid-stream update in a later prompt reports the real size immediately
-    // instead of snapping back to the 200k default before the result arrives.
+    // instead of snapping back to the 1M default before the result arrives.
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
       createStreamEvent("message_start", {
-        model: "claude-opus-4-20250514",
+        model: "claude-sonnet-4-5",
         usage: {
           input_tokens: 2000,
           output_tokens: 1000,
@@ -16429,106 +16389,36 @@ describe("usage_update computation", () => {
       }),
       createResultMessageWithModel({
         modelUsage: {
-          "claude-opus-4-20250514": {
+          "claude-sonnet-4-5": {
             inputTokens: 2000,
             outputTokens: 1000,
             cacheReadInputTokens: 0,
             cacheCreationInputTokens: 0,
             webSearchRequests: 0,
             costUSD: 0.02,
-            contextWindow: 1000000,
+            contextWindow: 200000,
             maxOutputTokens: 16384,
           },
         },
       }),
       { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
-    // Simulate a prior prompt having learned the 1M window for this model.
-    agent.sessions["test-session"].contextWindowSize = 1000000;
+    // Simulate a prior prompt having learned the 200K window for this model.
+    agent.sessions["test-session"].contextWindowSize = 200000;
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
     const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdates).toHaveLength(2);
-    expect(usageUpdates[0].update.size).toBe(1000000);
-    expect(usageUpdates[1].update.size).toBe(1000000);
-  });
-
-  it("switching to a 1M model seeds the context window from the heuristic", async () => {
-    // The heuristic runs at config-change time so mid-stream updates in the
-    // next prompt already report 1M — without waiting for message_start or
-    // the next `result` to correct us.
-    const { agent, updates } = createMockAgentWithCapture();
-    injectSession(agent, [
-      createStreamEvent("message_start", {
-        model: "claude-opus-4-6-1m",
-        usage: {
-          input_tokens: 2000,
-          output_tokens: 1000,
-          cache_read_input_tokens: 0,
-          cache_creation_input_tokens: 0,
-        },
-      }),
-      createResultMessageWithModel({
-        modelUsage: {
-          "claude-opus-4-6-1m": {
-            inputTokens: 2000,
-            outputTokens: 1000,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0.02,
-            contextWindow: 1000000,
-            maxOutputTokens: 16384,
-          },
-        },
-      }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
-    ]);
-    const session = agent.sessions["test-session"];
-    expect(session.contextWindowSize).toBe(200000);
-
-    await (agent as any).applyConfigOptionValue(
-      "test-session",
-      session,
-      "model",
-      "claude-opus-4-6-1m",
-    );
-    expect(session.contextWindowSize).toBe(1000000);
-
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
-
-    const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
-    expect(usageUpdates).toHaveLength(2);
-    expect(usageUpdates[0].update.size).toBe(1000000);
-    expect(usageUpdates[1].update.size).toBe(1000000);
-  });
-
-  it("infers the 1M window from a model's description when the ID lacks a 1m token (issue #596)", async () => {
-    // Semantic aliases like `default` resolve to a 1M-context model but carry
-    // no "1m" token in the modelId — the SDK signals 1M only via the
-    // human-facing displayName/description (e.g. "Opus 4.7 with 1M context").
-    // Inference must read those so the session reports the correct window from
-    // the first mid-stream update instead of the 200k placeholder.
-    const { agent } = createMockAgentWithCapture();
-    injectSession(agent, [{ type: "system", subtype: "session_state_changed", state: "idle" }]);
-    const session = agent.sessions["test-session"];
-    session.models = { currentModelId: "claude-sonnet-4-6", availableModels: [] };
-    session.modelInfos = [
-      { value: "default", displayName: "Default", description: "Opus 4.7 with 1M context" },
-    ] as any;
-    expect(session.contextWindowSize).toBe(200000);
-
-    await (agent as any).applyConfigOptionValue("test-session", session, "model", "default");
-
-    expect(session.contextWindowSize).toBe(1000000);
+    expect(usageUpdates[0].update.size).toBe(200000);
+    expect(usageUpdates[1].update.size).toBe(200000);
   });
 
   it("result with no matching modelUsage preserves the learned window", async () => {
     // A turn whose `result.modelUsage` doesn't contain the current top-level
     // model (e.g. no top-level assistant message, or only a subagent ran) must
-    // not clobber the window learned on a prior turn — otherwise the next
-    // prompt's mid-stream updates regress to the 200k default.
+    // not clobber the window learned on a prior turn: the next prompt's
+    // mid-stream updates would report the other model's window, or the default.
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
       createResultMessageWithModel({
@@ -16548,11 +16438,11 @@ describe("usage_update computation", () => {
       { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
     const session = agent.sessions["test-session"];
-    session.contextWindowSize = 1000000;
+    session.contextWindowSize = 500000;
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
-    expect(session.contextWindowSize).toBe(1000000);
+    expect(session.contextWindowSize).toBe(500000);
     // The emit itself falls back to session.contextWindowSize, which is
     // unchanged from the learned value.
     const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
@@ -16565,11 +16455,11 @@ describe("usage_update computation", () => {
     // When the user switches models mid-session, the window learned for the
     // previous model would otherwise persist into the next prompt's first
     // mid-stream update. applyConfigOptionValue should reset it so the next
-    // turn's first update falls back to the heuristic (here: 200k default).
+    // turn's first update falls back to the default window.
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
       createStreamEvent("message_start", {
-        model: "claude-sonnet-4-6",
+        model: "claude-opus-5-5",
         usage: {
           input_tokens: 1000,
           output_tokens: 500,
@@ -16579,14 +16469,14 @@ describe("usage_update computation", () => {
       }),
       createResultMessageWithModel({
         modelUsage: {
-          "claude-sonnet-4-6": {
+          "claude-opus-5-5": {
             inputTokens: 1000,
             outputTokens: 500,
             cacheReadInputTokens: 0,
             cacheCreationInputTokens: 0,
             webSearchRequests: 0,
             costUSD: 0.01,
-            contextWindow: 200000,
+            contextWindow: 967000,
             maxOutputTokens: 16384,
           },
         },
@@ -16594,23 +16484,23 @@ describe("usage_update computation", () => {
       { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
     const session = agent.sessions["test-session"];
-    session.contextWindowSize = 1000000;
-    session.models = { ...session.models, currentModelId: "claude-opus-4-6-1m" };
+    // The window learned for the previous model.
+    session.contextWindowSize = 200000;
+    session.models = { ...session.models, currentModelId: "claude-sonnet-4-5" };
 
-    // User flips the selector to a 200k model.
     await (agent as any).applyConfigOptionValue(
       "test-session",
       session,
       "model",
-      "claude-sonnet-4-6",
+      "claude-opus-5-5",
     );
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
     const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdates).toHaveLength(2);
-    expect(usageUpdates[0].update.size).toBe(200000);
-    expect(usageUpdates[1].update.size).toBe(200000);
+    expect(usageUpdates[0].update.size).toBe(1_000_000);
+    expect(usageUpdates[1].update.size).toBe(967000);
   });
 
   it("non-usage stream events do not re-emit usage_update", async () => {
@@ -17097,9 +16987,8 @@ describe("usage_update computation", () => {
     //    ModelInfo.resolvedModel — otherwise a later read never hits.
     //  - READ: switching to a picker value whose resolvedModel is that key seeds
     //    the window synchronously from the cache, with NO getContextUsage.
-    // 777_000 is chosen so it can only come from the cache: text inference on the
-    // resolved id "…-9[1m]" would yield 1_000_000 (the "1m" token), the default
-    // is 200_000, and the pre-switch sentinel is 123_456.
+    // 777_000 is chosen so it can only come from the cache: the default is
+    // 1_000_000, and the pre-switch sentinel is 123_456.
     //
     // The `contextWindowCache` is module-global and this file does not
     // vi.resetModules() per test, so it persists across tests. This test stays
@@ -17136,7 +17025,7 @@ describe("usage_update computation", () => {
 
     // Now switch to a picker value that resolves to the cached id. Seed a
     // sentinel and a getContextUsage spy first: a cache miss would surface as
-    // 1_000_000 (inference on the "1m" id), and any IPC as a spy call.
+    // the 1_000_000 default, and any IPC as a spy call.
     const getContextUsage = vi.fn(async () => ({ rawMaxTokens: 200000 }));
     (session.query as any).getContextUsage = getContextUsage;
     session.contextWindowSize = 123_456;
@@ -17173,9 +17062,8 @@ describe("usage_update computation", () => {
   it("scopes the window cache per provider: a switch on a different provider does not read another provider's window", async () => {
     // The window is a property of (model id, provider). A turn on provider-A
     // learns 500_000 for RESOLVED_ID; a switch to the SAME resolved id on
-    // provider-B must NOT read it (falls to inference → 1_000_000 for the "1m"
-    // id), while a switch on provider-A DOES read it (500_000). All three
-    // outcomes are distinct: cached 500_000 vs inference 1_000_000 vs default.
+    // provider-B must NOT read it (falls to the 1_000_000 default), while a
+    // switch on provider-A DOES read it (500_000).
     // Uses a unique resolved id ("claude-provkey-probe[1m]") so the module-global
     // cache (not reset per test in this file) can't cross this test with others.
     const RESOLVED_ID = "claude-provkey-probe[1m]";
@@ -17225,7 +17113,7 @@ describe("usage_update computation", () => {
     ];
 
     // A DIFFERENT provider seeing the same resolved id must not inherit A's
-    // window — it falls to inference (1_000_000), not the cached 500_000.
+    // window — it falls to the default (1_000_000), not the cached 500_000.
     agent.sessions["session-B"] = mockSessionState({
       providerCacheKey: "apiType-B https://b.example",
       models: { currentModelId: "default", availableModels: [] },
@@ -17292,8 +17180,8 @@ describe("usage_update computation", () => {
     // The bad window was ignored — the prior window is preserved.
     expect(session.contextWindowSize).toBe(900_000);
 
-    // And it never reached the cache: a switch to that id falls to inference
-    // (1_000_000 for the "1m" id), not the bad 0.
+    // And it never reached the cache: a switch to that id falls to the
+    // default (1_000_000), not the bad 0.
     session.contextWindowSize = 123_456; // sentinel
     session.models = { currentModelId: "default", availableModels: [] };
     session.modelInfos = [
@@ -17317,69 +17205,6 @@ describe("usage_update computation", () => {
     expect(session.contextWindowSize).toBe(1_000_000);
   });
 
-  it("does not let the message_start heuristic clobber an authoritative 200k window", async () => {
-    // An authoritative window can legitimately equal DEFAULT_CONTEXT_WINDOW
-    // (e.g. a third-party backend serving a 200k lane under a "[1m]"-spelled
-    // id). The message_start upgrade must key off the authoritative flag, not
-    // the value — otherwise the "1m" text match overwrites the cache-seeded
-    // 200k with 1M mid-stream on every turn.
-    const { agent, updates } = createMockAgentWithCapture();
-    injectSession(agent, [
-      createStreamEvent("message_start", {
-        model: "claude-authprobe-1[1m]",
-        usage: {
-          input_tokens: 100,
-          output_tokens: 10,
-          cache_read_input_tokens: 0,
-          cache_creation_input_tokens: 0,
-        },
-      }),
-      // Empty modelUsage: the result settles the turn without supplying a
-      // window of its own, so the assertion isolates the message_start path.
-      createResultMessageWithModel({ modelUsage: {} }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
-    ]);
-    const session = agent.sessions["test-session"]!;
-    // Simulate a cache-seeded authoritative window that equals the default.
-    session.contextWindowSize = 200000;
-    session.contextWindowAuthoritative = true;
-
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
-
-    expect(session.contextWindowSize).toBe(200000);
-    const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
-    for (const u of usageUpdates) {
-      expect(u.update.size).toBe(200000);
-    }
-  });
-
-  it("still upgrades a heuristic default window from the message_start model id", async () => {
-    // Companion to the authoritative-200k test: with no authoritative seed the
-    // old behavior stands — a "1m"-carrying live model id upgrades the default
-    // mid-stream so usage_update reports the right size before the result.
-    const { agent } = createMockAgentWithCapture();
-    injectSession(agent, [
-      createStreamEvent("message_start", {
-        model: "claude-authprobe-2[1m]",
-        usage: {
-          input_tokens: 100,
-          output_tokens: 10,
-          cache_read_input_tokens: 0,
-          cache_creation_input_tokens: 0,
-        },
-      }),
-      // Empty modelUsage: settles the turn without a window of its own.
-      createResultMessageWithModel({ modelUsage: {} }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
-    ]);
-    const session = agent.sessions["test-session"]!;
-    expect(session.contextWindowAuthoritative).toBe(false);
-
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
-
-    expect(session.contextWindowSize).toBe(1_000_000);
-  });
-
   it("caches the turn's window under the bare assistant-message id too, so resolvedModel-less rows can hit", async () => {
     // Seed-time reads fall back to the picker value / verbatim live id when a
     // model row carries no resolvedModel (the synthesized out-of-allowlist
@@ -17387,8 +17212,7 @@ describe("usage_update computation", () => {
     // assistant message's bare `.model`, not the "[1m]"-decorated modelUsage
     // key, so the result handler must write both spellings — otherwise such
     // rows silently never hit the cache. 555_000 can only come from the cache:
-    // inference on the bare id (no "1m" token) yields the 200_000 default, and
-    // the pre-switch sentinel is 123_456.
+    // the default is 1_000_000, and the pre-switch sentinel is 123_456.
     const BARE_ID = "claude-bareprobe-7";
     const { agent } = createMockAgentWithCapture();
     injectSession(agent, [
@@ -20199,7 +20023,7 @@ describe("post-error recovery", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       forwardSubagentText: false,
-      contextWindowSize: 200000,
+      contextWindowSize: 1_000_000,
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
@@ -28505,7 +28329,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       forwardSubagentText: false,
-      contextWindowSize: 200000,
+      contextWindowSize: 1_000_000,
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
@@ -30415,7 +30239,7 @@ describe("agent selection config option", () => {
         abortController: new AbortController(),
         emitRawSDKMessages: false,
         forwardSubagentText: false,
-        contextWindowSize: 200000,
+        contextWindowSize: 1_000_000,
         contextWindowAuthoritative: false,
         providerCacheKey: "default",
         taskState: new Map(),
