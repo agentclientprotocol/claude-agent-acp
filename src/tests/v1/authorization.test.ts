@@ -1033,7 +1033,7 @@ describe("authorization", () => {
         await expect(agent.prompt(promptParams(sessionId))).rejects.toMatchObject({
           code: AUTH_REQUIRED_CODE,
         });
-        expect(agent.sessions[sessionId].needsSignOutRespawn).toBe(true);
+        expect(agent.sessions[sessionId].needsQueryRespawn).toBe(true);
         expect(agent.sessions[sessionId].queryClosed).toBe(true);
         return sessionId;
       }
@@ -1070,7 +1070,7 @@ describe("authorization", () => {
         });
         expect(mockQuery).toHaveBeenCalledTimes(2);
         const respawned = agent.sessions[sessionId];
-        expect(respawned.needsSignOutRespawn).toBeUndefined();
+        expect(respawned.needsQueryRespawn).toBeUndefined();
         expect(respawned.queryClosed).toBeUndefined();
         // The recreated session starts with no active failure: the sign-out
         // row belonged to the query that is gone.
@@ -1207,7 +1207,7 @@ describe("authorization", () => {
         const sessionId = await signOutDuringTurn(agent);
 
         await expect(agent.cancel({ sessionId })).resolves.toBeUndefined();
-        expect(agent.sessions[sessionId].needsSignOutRespawn).toBe(true);
+        expect(agent.sessions[sessionId].needsQueryRespawn).toBe(true);
       });
 
       it("leaves the session alone without the flag", async () => {
@@ -1218,7 +1218,7 @@ describe("authorization", () => {
         await expect(agent.prompt(promptParams(sessionId))).rejects.toMatchObject({
           code: AUTH_REQUIRED_CODE,
         });
-        expect(agent.sessions[sessionId].needsSignOutRespawn).toBeUndefined();
+        expect(agent.sessions[sessionId].needsQueryRespawn).toBeUndefined();
         expect(mockQuery).toHaveBeenCalledTimes(1);
       });
 
@@ -1421,7 +1421,7 @@ describe("authorization", () => {
           await settleProbe();
 
           // Marked mid-turn, but the query is untouched and no respawn ran.
-          expect(agent.sessions[sessionId].needsSignOutRespawn).toBe(true);
+          expect(agent.sessions[sessionId].needsQueryRespawn).toBe(true);
           expect(agent.sessions[sessionId].queryClosed).toBeFalsy();
           expect(mockQuery).toHaveBeenCalledTimes(1);
 
@@ -1451,7 +1451,7 @@ describe("authorization", () => {
             stopReason: "end_turn",
           });
           await settleProbe();
-          expect(agent.sessions[sessionId].needsSignOutRespawn).toBe(true);
+          expect(agent.sessions[sessionId].needsQueryRespawn).toBe(true);
 
           // The probe refuses nothing itself: the next prompt recreates the
           // query, and the creation guard judges the account it reports.
@@ -1474,7 +1474,7 @@ describe("authorization", () => {
             stopReason: "end_turn",
           });
           await settleProbe();
-          expect(agent.sessions[sessionId].needsSignOutRespawn).toBeUndefined();
+          expect(agent.sessions[sessionId].needsQueryRespawn).toBeUndefined();
 
           await expect(agent.prompt(promptParams(sessionId))).resolves.toMatchObject({
             stopReason: "end_turn",
@@ -1496,7 +1496,7 @@ describe("authorization", () => {
           });
           await settleProbe();
 
-          expect(agent.sessions[sessionId].needsSignOutRespawn).toBeUndefined();
+          expect(agent.sessions[sessionId].needsQueryRespawn).toBeUndefined();
           await expect(agent.prompt(promptParams(sessionId))).resolves.toMatchObject({
             stopReason: "end_turn",
           });
@@ -1520,7 +1520,7 @@ describe("authorization", () => {
 
           // Nothing to compare: an absent kind is not a mismatch.
           expect(agent.sessions[sessionId].accountKind).toBeUndefined();
-          expect(agent.sessions[sessionId].needsSignOutRespawn).toBeUndefined();
+          expect(agent.sessions[sessionId].needsQueryRespawn).toBeUndefined();
           await expect(agent.prompt(promptParams(sessionId))).resolves.toMatchObject({
             stopReason: "end_turn",
           });

@@ -360,6 +360,7 @@ describe("ExitPlanCoordinator", () => {
       supportsPlanOperations: () => true,
       isAirClient: () => false,
       destroyReplacement,
+      restartFailed: vi.fn(),
       settleCancelledTurn,
       settleFailedTurn: vi.fn(),
     };
@@ -376,6 +377,7 @@ describe("ExitPlanCoordinator", () => {
     await restart;
 
     expect(destroyReplacement).toHaveBeenCalledWith("public-session", freshSession);
+    expect(host.restartFailed).not.toHaveBeenCalled();
     expect(settleCancelledTurn).toHaveBeenCalledWith(oldSession, oldSession, turn);
     expect(oldSession.activeTurn).toBeNull();
     expect(oldSession.turnQueue).toEqual([]);
@@ -406,6 +408,7 @@ describe("ExitPlanCoordinator", () => {
       supportsPlanOperations: () => true,
       isAirClient: () => false,
       destroyReplacement: vi.fn(),
+      restartFailed: vi.fn(),
       settleCancelledTurn: vi.fn(),
       settleFailedTurn,
     };
@@ -416,6 +419,8 @@ describe("ExitPlanCoordinator", () => {
     // The plan was never carried out, so it does not become the session's plan.
     expect(host.sessionUpdate).not.toHaveBeenCalled();
     expect(settleFailedTurn).toHaveBeenCalledWith(oldSession, turn, error);
+    expect(host.restartFailed).toHaveBeenCalledTimes(1);
+    expect(host.restartFailed).toHaveBeenCalledWith("public-session", oldSession);
     expect(turn.carriedUsage).toBeUndefined();
     expect(turn.carriedModelUsage).toBeUndefined();
     expect(oldSession.pendingExitPlanContextReset).toBeUndefined();
@@ -452,6 +457,7 @@ describe("ExitPlanCoordinator", () => {
       supportsPlanOperations: () => supportsPlanOperations,
       isAirClient: () => airClient,
       destroyReplacement: vi.fn(),
+      restartFailed: vi.fn(),
       settleCancelledTurn: vi.fn(),
       settleFailedTurn: vi.fn(),
     };

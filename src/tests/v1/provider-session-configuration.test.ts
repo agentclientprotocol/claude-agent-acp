@@ -669,7 +669,7 @@ describe("provider updates preserve session configuration", { timeout: 10_000 },
     const { sessionId } = await newSession();
     await select(sessionId, "model", "opus");
     await select(sessionId, "effort", "high");
-    agent.sessions[sessionId].needsSignOutRespawn = true;
+    agent.sessions[sessionId].needsQueryRespawn = true;
     const held = deferred();
     initializationGate = held.promise;
     const turn = prompt(sessionId);
@@ -694,7 +694,7 @@ describe("provider updates preserve session configuration", { timeout: 10_000 },
     const { sessionId } = await newSession();
     await select(sessionId, "model", "opus");
     await select(sessionId, "effort", "high");
-    agent.sessions[sessionId].needsSignOutRespawn = true;
+    agent.sessions[sessionId].needsQueryRespawn = true;
     const signOutHeld = deferred();
     const providerHeld = deferred();
     initializationGate = signOutHeld.promise;

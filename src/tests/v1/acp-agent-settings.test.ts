@@ -622,7 +622,7 @@ describe("ClaudeAcpAgent settings", () => {
       };
 
       const husk = (agent as any).sessions[sessionId];
-      await (agent as any).recreateSignedOutQuery(sessionId, husk);
+      await (agent as any).recreateClosedQuery(sessionId, husk);
 
       expect(creations).toEqual([
         { resume: sessionId, permissionMode: "default", replacingSession: husk },

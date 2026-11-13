@@ -187,6 +187,9 @@ export type ExitPlanRestartHost<
   supportsPlanOperations(): boolean;
   isAirClient(): boolean;
   destroyReplacement(sessionId: string, session: Session): void;
+  /** The restart failed and the turn was rejected, after the old query was
+   *  closed. The host makes the old session usable again. */
+  restartFailed(sessionId: string, oldSession: Session): void;
   settleCancelledTurn(oldSession: Session, turnSession: Session, turn: Turn): void;
   settleFailedTurn(turnSession: Session, turn: Turn, error: unknown): void;
 };
@@ -283,6 +286,7 @@ export class ExitPlanCoordinator<
         }
       }
       oldSession.pendingExitPlanContextReset = undefined;
+      if (!controller.signal.aborted) this.host.restartFailed(sessionId, oldSession);
     } finally {
       if (this.restarts.get(sessionId) === controller) {
         this.restarts.delete(sessionId);
