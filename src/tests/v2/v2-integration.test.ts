@@ -143,6 +143,32 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("v2 core with Claude Code", 
     ]);
   }, 180_000);
 
+  it("ends the work once when Claude Code folds a prompt into it", async () => {
+    const sessionId = await newSession("bypassPermissions");
+    await prompt(
+      sessionId,
+      "Use the Bash tool in the foreground (not run_in_background) to run exactly: ping -c 8 127.0.0.1 > /dev/null . Then reply with just: woke",
+    );
+    await until(() =>
+      updates.some(
+        ({ update }) =>
+          update.sessionUpdate === "terminal_update" &&
+          /ping/.test((update as v2.TerminalUpdate).command ?? ""),
+      ),
+    );
+    // Claude Code takes this prompt in after the command, into the same work.
+    // It sends the prompt's `completed` frame before the work's result.
+    await prompt(sessionId, "Reply with exactly the single word: pong");
+    await until(() => states(sessionId).some((update) => update.state === "idle"));
+    // A turn that the result opened would follow the idle at once.
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    expect(states(sessionId).map((update) => update.state)).toEqual(["running", "idle"]);
+    // The idle is the result's: it carries what the work spent.
+    const idle = states(sessionId).at(-1) as { stopReason?: string; usage?: v2.Usage };
+    expect(idle.stopReason).toBe("end_turn");
+    expect(idle.usage?.totalTokens).toBeGreaterThan(0);
+  }, 240_000);
+
   it("fails a queued prompt with -32800 at a cancel and goes idle with cancelled", async () => {
     const sessionId = await newSession("bypassPermissions");
     await prompt(
