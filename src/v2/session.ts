@@ -1008,6 +1008,7 @@ export class V2Session implements RequestTarget {
             return;
           case "model_refusal_fallback": {
             // Claude Code retried a refused turn on the fallback model.
+            this.output.closeRetracted(message);
             const fallback = modelRefusalFallback(message);
             this.output.emitV1([
               { sessionId: this.sessionId, update: noticeUpdate(fallback.notice) },

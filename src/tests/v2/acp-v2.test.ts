@@ -1493,20 +1493,7 @@ describe("ACP v2 sessions", () => {
     it("reports a refusal fallback with a notice and follows the model it swapped to", async () => {
       sdk.initializationResult = async () => ({ models: [OPUS, HAIKU] });
       scriptTurns(async function* (options) {
-        yield {
-          type: "system",
-          subtype: "model_refusal_fallback",
-          trigger: "refusal",
-          direction: "retry",
-          scope: "session",
-          original_model: "claude-opus-4-8",
-          fallback_model: "claude-haiku-4-5",
-          request_id: "req_1",
-          api_refusal_category: "cyber",
-          content: "banner",
-          uuid: randomUUID(),
-          session_id: options.sessionId,
-        };
+        yield refusalFallback(options);
         yield assistantText(options, "Done.");
         yield result(options);
         yield idleState(options);
@@ -1758,6 +1745,28 @@ function idleState(options: Options) {
     type: "system",
     subtype: "session_state_changed",
     state: "idle",
+    uuid: randomUUID(),
+    session_id: options.sessionId,
+  };
+}
+
+/**
+ * Claude Code's notice that it retried a refused response on the fallback
+ * model. `retracted` names the messages of that response, which it took back.
+ */
+function refusalFallback(options: Options, retracted?: string[]) {
+  return {
+    type: "system",
+    subtype: "model_refusal_fallback",
+    trigger: "refusal",
+    direction: "retry",
+    scope: "session",
+    original_model: "claude-opus-4-8",
+    fallback_model: "claude-haiku-4-5",
+    request_id: "req_1",
+    api_refusal_category: "cyber",
+    ...(retracted && { retracted_message_uuids: retracted }),
+    content: "banner",
     uuid: randomUUID(),
     session_id: options.sessionId,
   };
@@ -3830,6 +3839,57 @@ describe("ACP v2 prompts", () => {
     // It is not a failure of the turn.
     expect(turnTrace(client.sessionUpdates).at(-1)).toBe("idle end_turn");
   });
+
+  /**
+   * Scenario:
+   * 1. Claude's response calls Read, and the model then refuses.
+   * 2. Claude Code takes the response back, stops the call without a result,
+   *    and retries on the fallback model. Its notice, or the first message of
+   *    the retry, names the message that it took back.
+   * Expected:
+   * - The call ends `cancelled` when it is named, before the retry's answer.
+   *   Nothing else ends a call that ran: it would stay open past the idle.
+   */
+  it.each<[string, { notice: boolean; retry: boolean }]>([
+    ["the fallback notice", { notice: true, retry: false }],
+    ["the first message of the retry", { notice: false, retry: true }],
+  ])(
+    "ends the tool call of a response that Claude Code took back, named by %s",
+    async (_name, names) => {
+      scriptTurns(async function* (options) {
+        const refused = toolUseMessage(options, "toolu_refused", "Read", { file_path: "/a.log" });
+        yield refused;
+        yield refusalFallback(options, names.notice ? [refused.uuid] : undefined);
+        yield {
+          ...assistantText(options, "The logs are clean."),
+          ...(names.retry && { supersedes: [refused.uuid] }),
+        };
+        yield result(options);
+      });
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+        await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+        await client.authUpdate(1);
+      });
+
+      const updates = client.sessionUpdates.map(({ update }) => update);
+      const closed = updates.findIndex(
+        (update) =>
+          update.sessionUpdate === "tool_call_update" &&
+          update.toolCallId === "toolu_refused" &&
+          update.status === "cancelled",
+      );
+      expect(JSON.stringify(updates[closed])).toContain(
+        "Claude Code replaced the response that made this tool call",
+      );
+      expect(closed).toBeLessThan(
+        updates.findIndex((update) => update.sessionUpdate === "agent_message_chunk"),
+      );
+    },
+  );
 
   it("reports a turn that fails after it was taken in as idle with the error stop reason", async () => {
     scriptTurns(async function* (options) {
