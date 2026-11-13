@@ -686,21 +686,31 @@ export class AcpToolCallRenderer {
    * client `failed`, since v1 has no `cancelled`. If Claude Code ran it but
    * returned no result, it failed, unless a `session/cancel` ended the turn
    * (`cancelled`): the cancel stopped the run, so a v2 client gets `cancelled`
-   * for it too. The report does not end the call's terminal: see {@link terminalExit}.
+   * for it too. The same goes for a call that Claude Code stopped when it took
+   * back the message that made it (`retracted`, see `RetractedToolCalls`),
+   * which closes when that is known, before the turn ends. The report does not
+   * end the call's terminal: see {@link terminalExit}.
    */
-  unfinished(call: { toolCallId: string; ran: boolean; cancelled?: boolean }): ToolCallUpdate {
-    const stopped = !call.ran || call.cancelled === true;
+  unfinished(call: {
+    toolCallId: string;
+    ran: boolean;
+    cancelled?: boolean;
+    retracted?: boolean;
+  }): ToolCallUpdate {
+    const stopped = !call.ran || call.cancelled === true || call.retracted === true;
     return {
       sessionUpdate: "tool_call_update",
       toolCallId: call.toolCallId,
       status: stopped && this.capabilities.v2 ? V2_CANCELLED : "failed",
       content: [
         textContent(
-          !call.ran
-            ? "Claude stopped this tool call before it ran."
-            : call.cancelled
-              ? "The turn was cancelled before this tool call returned a result."
-              : "Claude ended the turn without returning a result for this tool.",
+          call.retracted
+            ? "Claude Code replaced the response that made this tool call, and stopped the call. If it had started, some of its effects may have happened."
+            : !call.ran
+              ? "Claude stopped this tool call before it ran."
+              : call.cancelled
+                ? "The turn was cancelled before this tool call returned a result."
+                : "Claude ended the turn without returning a result for this tool.",
         ),
       ],
     };

@@ -16,6 +16,7 @@ import type { ContentBlock } from "@agentclientprotocol/sdk/unstable";
 import type {
   SDKAssistantMessage,
   SDKMemoryRecallMessage,
+  SDKMessage,
   SDKPartialAssistantMessage,
   SDKPermissionDeniedMessage,
   SDKToolProgressMessage,
@@ -40,6 +41,7 @@ import type { AcpSessionNotification } from "../acp-subagents.js";
 import { isCompactSummaryMessage, replayCompactSummary } from "../context-compaction.js";
 import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
+import { RetractedToolCalls } from "../tool-calls/retracted.js";
 import { AcpToolCallRenderer, progressToolCallId, V2_CANCELLED } from "../tool-calls/renderer.js";
 import { changedTaskPlanEntries, unregisterHookCallback, type TaskState } from "../tools.js";
 import { recordStreamedDelta, unstreamedRemainder, type StreamedBlock } from "../streamed-text.js";
@@ -100,6 +102,8 @@ export class SessionOutput {
   private replayCleared: Set<string> | undefined;
   /** The open tool calls whose tool use reached a complete assistant message: Claude Code runs them. */
   private readonly dispatched = new Set<string>();
+  /** The tool uses of the assistant messages, for {@link closeRetracted}. */
+  private readonly retracted = new RetractedToolCalls();
   /**
    * Whether the output comes from work that a `session/cancel` stopped, until
    * its idle. The session's streamed deltas still go out,
@@ -185,6 +189,8 @@ export class SessionOutput {
    * cancel, the stopped work's message is dropped (see {@link cancelled}).
    */
   assistant(message: SDKAssistantMessage): void {
+    this.closeRetracted(message);
+    this.retracted.sent(message);
     const messageId = messageIdForGrouping(message);
     for (const block of message.message.content) {
       if (block.type === "tool_use") this.dispatched.add(block.id);
@@ -564,20 +570,42 @@ export class SessionOutput {
    * The calls in `keep` stay open, such as one whose task runs in the background.
    */
   closeUnfinished(stopped: boolean, keep: ReadonlySet<string> = new Set()): void {
-    const renderer = new AcpToolCallRenderer(V2_TOOL_CALL_CAPABILITIES);
     for (const toolCallId of [...this.unfinished]) {
       if (keep.has(toolCallId)) continue;
       const ran = this.dispatched.has(toolCallId);
       if (ran && !stopped) continue;
-      const report = renderer.unfinished({ toolCallId, ran, cancelled: stopped });
-      const toolUse = this.toolUseCache[toolCallId];
-      const terminalExit = toolUse && renderer.terminalExit(toolUse);
-      if (terminalExit) report._meta = { ...report._meta, ...terminalExit };
-      this.emittedToolCalls.delete(toolCallId);
-      delete this.toolUseCache[toolCallId];
-      this.toolCallFields.delete(toolCallId);
-      this.emit([{ sessionId: this.sessionId, update: report }]);
+      this.close({ toolCallId, ran, cancelled: stopped });
     }
+  }
+
+  /**
+   * Ends the open tool calls of the messages that `message` says Claude Code
+   * took back (see `RetractedToolCalls`), `cancelled`: no result comes for
+   * them, and a call that ran stays open at the end of the work otherwise.
+   */
+  closeRetracted(message: SDKMessage): void {
+    for (const toolCallId of this.retracted.retractedBy(message)) {
+      if (this.unfinished.has(toolCallId)) {
+        this.close({ toolCallId, ran: this.dispatched.has(toolCallId), retracted: true });
+      }
+    }
+  }
+
+  /**
+   * Ends the open tool call of `call` without its result, with the report of
+   * `AcpToolCallRenderer.unfinished`. A command's report also ends its
+   * terminal. The call is forgotten, so a late result changes nothing.
+   */
+  private close(call: Parameters<AcpToolCallRenderer["unfinished"]>[0]): void {
+    const renderer = new AcpToolCallRenderer(V2_TOOL_CALL_CAPABILITIES);
+    const report = renderer.unfinished(call);
+    const toolUse = this.toolUseCache[call.toolCallId];
+    const terminalExit = toolUse && renderer.terminalExit(toolUse);
+    if (terminalExit) report._meta = { ...report._meta, ...terminalExit };
+    this.emittedToolCalls.delete(call.toolCallId);
+    delete this.toolUseCache[call.toolCallId];
+    this.toolCallFields.delete(call.toolCallId);
+    this.emit([{ sessionId: this.sessionId, update: report }]);
   }
 
   /** The tool calls that the client holds without a final status. */

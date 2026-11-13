@@ -332,6 +332,7 @@ import { previewPatchContent } from "../diff.js";
 import { backgroundedBashToolCall, withRunningTerminal } from "../tool-calls/background.js";
 import { ChangedMetaClient, ClientConnection } from "./client-connection.js";
 import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
+import { RetractedToolCalls } from "../tool-calls/retracted.js";
 import { ClientCapabilities as ToolCallClientCapabilities } from "../tool-calls/client-capabilities.js";
 import {
   AcpToolCallRenderer,
@@ -1175,6 +1176,10 @@ export type Session = {
    *  `tool_call_update` resends only the fields that changed. Created lazily
    *  by {@link toolCallFieldsOf}. */
   toolCallFields?: ToolCallFieldTracker;
+  /** The tool uses of the assistant messages, to end the tool calls of a
+   *  message that Claude Code takes back. Created lazily by
+   *  {@link retractedToolCallsOf}. */
+  retractedToolCalls?: RetractedToolCalls;
   /** ACP session affinity for calls emitted eagerly by permission handling. */
   eagerToolCallSessions?: Map<string, string>;
   /** ExitPlanMode denial that intentionally interrupts the current Claude
@@ -3942,25 +3947,37 @@ export class ClaudeAcpAgent {
       parentToolUseId !== null && runsInBackground(parentToolUseId);
 
     /** Ends the open tool calls that `include` accepts, with the report of a call
-     *  that a cancel stopped and sent no result for. `include` gets the Agent/Task
-     *  call of the subagent that made the tool call, if a subagent did. */
+     *  that was stopped and sent no result: by a cancel, or (`stoppedBy`
+     *  `retracted`) by Claude Code when it took back the message that made the
+     *  call. `include` gets the Agent/Task call of the subagent that made the
+     *  tool call, if a subagent did, and the tool call. */
     const closeOpenToolCalls = async (
-      include: (parentToolUseId: string | undefined) => boolean,
+      include: (parentToolUseId: string | undefined, toolCallId: string) => boolean,
+      stoppedBy: "cancelled" | "retracted" = "cancelled",
     ): Promise<void> => {
       const renderer = new AcpToolCallRenderer(this.toolCallCapabilities);
       for (const toolCallId of [...session.emittedToolCalls]) {
         const parentToolUseId = session.toolCallParents?.get(toolCallId);
-        if (!include(parentToolUseId)) continue;
+        if (!include(parentToolUseId, toolCallId)) continue;
         const report = renderer.unfinished({
           toolCallId,
           ran: session.dispatchedToolCalls?.has(toolCallId) === true,
-          cancelled: true,
+          cancelled: stoppedBy === "cancelled",
+          retracted: stoppedBy === "retracted",
         });
         // Named as the call's other updates are: the subagent runtime routes the
         // report with them, to the child session, or to none that has ended.
         if (parentToolUseId !== undefined) stampParentToolUseId(report, parentToolUseId);
         await closeToolCall(toolCallId, report);
       }
+    };
+
+    /** Ends the open tool calls of the messages that `message` says Claude
+     *  Code took back (see `RetractedToolCalls`). No result comes for them. */
+    const closeRetractedToolCalls = async (message: SDKMessage): Promise<void> => {
+      const retracted = new Set(retractedToolCallsOf(session).retractedBy(message));
+      if (retracted.size === 0) return;
+      await closeOpenToolCalls((_parent, toolCallId) => retracted.has(toolCallId), "retracted");
     };
 
     /** Whether the closing at the end of the work a cancel stopped takes a tool
@@ -5387,6 +5404,7 @@ export class ClaudeAcpAgent {
                 // state sync the client's model picker (and the model-dependent
                 // options rebuilt from it) keeps advertising a model the
                 // session is no longer running (see `modelRefusalFallback`).
+                await closeRetractedToolCalls(message);
                 const fallback = modelRefusalFallback(message);
                 const { summary: fallbackSummary, explanation } = fallback;
                 // A silent model swap is a session-level advisory, not something the model said.
@@ -6397,6 +6415,8 @@ export class ClaudeAcpAgent {
           case "user":
           case "assistant": {
             if (message.type === "assistant") {
+              await closeRetractedToolCalls(message);
+              retractedToolCallsOf(session).sent(message);
               recordDispatchedToolUses(session, message.message.content);
               // A tool use that did not stream is reached here first.
               const content = message.message.content;
@@ -10970,6 +10990,13 @@ function toolCallFieldsOf(session: {
   toolCallFields?: ToolCallFieldTracker;
 }): ToolCallFieldTracker {
   return (session.toolCallFields ??= new ToolCallFieldTracker());
+}
+
+/** The record of a session's assistant tool uses, created on first use. */
+function retractedToolCallsOf(session: {
+  retractedToolCalls?: RetractedToolCalls;
+}): RetractedToolCalls {
+  return (session.retractedToolCalls ??= new RetractedToolCalls());
 }
 
 const MAX_RESOLVED_TOOL_NAMES = 1000;

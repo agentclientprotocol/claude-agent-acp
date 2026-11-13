@@ -14033,6 +14033,74 @@ describe("model refusal fallback handling", () => {
       ),
     ).toBe(false);
   });
+
+  // Claude Code takes the response of a model that refuses back, stops its
+  // tool call without a result, and retries on the fallback model. Its notice,
+  // or the first message of the retry, names the message that it took back.
+  // Nothing else ends the call: the prompt used to fail with
+  // `incomplete_tool_call` at the turn's end, although the retry answered.
+  it.each<[string, { notice: boolean; retry: boolean }]>([
+    ["the fallback notice", { notice: true, retry: false }],
+    ["the first message of the retry", { notice: false, retry: true }],
+  ])(
+    "ends the tool call of a response that Claude Code took back, named by %s",
+    async (_name, names) => {
+      const { agent, sessionUpdate } = createCapturingAgent();
+      const assistant = (id: string, block: Record<string, unknown>) => ({
+        type: "assistant",
+        message: {
+          id,
+          type: "message",
+          role: "assistant",
+          model: "claude-fable-5",
+          content: [block],
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+      });
+      const refused = assistant("msg_refused", {
+        type: "tool_use",
+        id: "toolu_refused",
+        name: "Read",
+        input: { file_path: "/a.log" },
+      });
+      injectGeneratorSession(
+        agent,
+        makeGenerator([
+          refused,
+          refusalFallbackMessage(names.notice ? { retracted_message_uuids: [refused.uuid] } : {}),
+          {
+            ...assistant("msg_retry", { type: "text", text: "The logs are clean." }),
+            ...(names.retry && { supersedes: [refused.uuid] }),
+          },
+          successResult(),
+        ]),
+        modelStateOverrides,
+      );
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "test" }],
+      });
+      expect(response.stopReason).toBe("end_turn");
+
+      const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
+      const closed = updates.findIndex(
+        (u) => u.toolCallId === "toolu_refused" && u.status === "failed",
+      );
+      expect(JSON.stringify(updates[closed])).toContain(
+        "Claude Code replaced the response that made this tool call",
+      );
+      // Before the retry's answer.
+      expect(closed).toBeLessThan(
+        updates.findIndex((u) => u.content?.text === "The logs are clean."),
+      );
+    },
+  );
 });
 
 describe("MCP server startup failures", () => {
