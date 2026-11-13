@@ -43,9 +43,19 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
     ...actual,
     query: (args: { prompt: unknown; options: Options }) => {
       capturedOptions = args.options;
+      // Like Claude Code's, the stream stays open until the query is closed.
+      let streamClosed = () => {};
+      const closed = new Promise<void>((resolve) => (streamClosed = resolve));
       return makeMockQuery({
         interrupt: () => (interruptImpl ? interruptImpl() : Promise.resolve(undefined)),
-        close: () => closeSpy(),
+        close: () => {
+          closeSpy();
+          streamClosed();
+        },
+        next: async () => {
+          await closed;
+          return { done: true as const, value: undefined };
+        },
         initializationResult: async () => {
           await initGate;
           if (initError) throw initError;

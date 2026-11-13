@@ -4530,6 +4530,69 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
     expect(turnTrace(client.sessionUpdates).at(-1)).toBe("idle end_turn");
   });
 
+  // A resumed session can run cycles before its first prompt, for example a
+  // cron prompt. v2 reads the query from the start of the session, so that
+  // output is reported as it comes and does not answer the prompt.
+  it("reports a cycle that a resumed session runs before the first prompt, apart from the prompt's turn", async () => {
+    sdk.run = async function* (prompts, options) {
+      const input = prompts[Symbol.asyncIterator]();
+      if (!options.resume) {
+        while (!(await input.next()).done);
+        return;
+      }
+      // A cron prompt: its result has no origin.
+      yield assistantText(options, "Checked the build.", "msg_cron");
+      yield result(options, { usage: { ...result(options).usage, input_tokens: 111 } });
+      yield idleState(options);
+      const { value } = await input.next();
+      yield {
+        type: "user",
+        message: value!.message,
+        parent_tool_use_id: null,
+        uuid: value!.uuid,
+        session_id: options.sessionId,
+        isReplay: true,
+      };
+      yield assistantText(options, "Here is the answer.");
+      yield result(options, { usage: { ...result(options).usage, input_tokens: 7 } });
+      yield idleState(options);
+      while (!(await input.next()).done);
+    };
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.close, { sessionId });
+      await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates)).toContain("agent_message_chunk"),
+      );
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() =>
+        expect(
+          turnTrace(client.sessionUpdates).filter((state) => state.startsWith("idle end")),
+        ).toHaveLength(2),
+      );
+      await client.authUpdate(1);
+    });
+    // Without the `idle` that the resume reports.
+    expect(turnTrace(client.sessionUpdates).filter((state) => state !== "idle")).toEqual([
+      "running",
+      "agent_message_chunk",
+      "idle end_turn",
+      "user_message",
+      "running",
+      "agent_message_chunk",
+      "idle end_turn",
+    ]);
+    expect(
+      client
+        .updates("state_update")
+        .filter((update: any) => update.stopReason)
+        .map((update: any) => update.usage.inputTokens),
+    ).toEqual([111, 7]);
+  });
+
   it("ends the tool call that a cancelled cycle runs with Claude Code's result, before idle cancelled", async () => {
     const interrupted = Promise.withResolvers<void>();
     sdk.interrupt = async () => interrupted.resolve();
