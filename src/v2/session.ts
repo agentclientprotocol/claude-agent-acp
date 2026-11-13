@@ -1044,6 +1044,7 @@ export class V2Session implements RequestTarget {
    * output (see {@link SessionReports}).
    */
   private report(message: SDKMessage): void {
+    if (message.type === "rate_limit_event") this.turnReport.rateLimit = message.rate_limit_info;
     if (message.type === "tool_progress") {
       this.output.toolProgress(message);
       return;

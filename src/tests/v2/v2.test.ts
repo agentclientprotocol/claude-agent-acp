@@ -2467,6 +2467,29 @@ describe("ACP v2 core", () => {
     });
   });
 
+  it("adds the turn's rate limit to a rate-limit failure's error data", async () => {
+    const rateLimit = { status: "rejected", resetsAt: 1700000000, rateLimitType: "five_hour" };
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      const { claude } = await openSession(agent);
+      claude.send(cycleStart());
+      claude.send({
+        type: "rate_limit_event",
+        rate_limit_info: rateLimit,
+        uuid: "00000000-0000-4000-8000-00000000e002",
+        session_id: "session",
+      });
+      claude.send({ ...assistant("msg_limited", []), error: "rate_limit" });
+      claude.send(result({ is_error: true, result: "You've hit your 5-hour limit" }));
+      await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+    });
+
+    expect(client.sessionUpdates.at(-1)).toMatchObject({
+      stopReason: "error",
+      error: { data: { errorKind: "rate_limit", rateLimit } },
+    });
+  });
+
   it.each([
     ["a notice when the turn goes on to end", { result: "" }, "end_turn", 1],
     ["a notice once when the result repeats its text", {}, "end_turn", 1],
