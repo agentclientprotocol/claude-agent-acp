@@ -34,6 +34,11 @@ let mcpAuthenticateImpl: (serverName: string) => Promise<{
   requiresUserAction: boolean;
   callbackExpected: boolean;
 }>;
+/** `remote_control_auto_enable` of the `initialize` result; left out when unset. */
+let remoteControlAutoEnable: boolean | undefined;
+/** The query's `enableRemoteControl`; left off the query when unset. */
+let enableRemoteControlImpl:
+  ((enabled: boolean, name?: string) => Promise<{ session_url?: string }>) | undefined;
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   const actual = await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
     "@anthropic-ai/claude-agent-sdk",
@@ -58,6 +63,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         },
         mcpServerStatus: () => mcpServerStatusResult(),
         mcpAuthenticate: (serverName: string) => mcpAuthenticateImpl(serverName),
+        ...(enableRemoteControlImpl ? { enableRemoteControl: enableRemoteControlImpl } : {}),
       });
     },
     getSessionMessages: vi.fn(() => sessionMessagesResult()),
@@ -74,6 +80,9 @@ function initializationResponse() {
         supportsAutoMode: true,
       },
     ],
+    ...(remoteControlAutoEnable === undefined
+      ? {}
+      : { remote_control_auto_enable: remoteControlAutoEnable }),
   };
 }
 
@@ -116,6 +125,8 @@ describe("createSession options merging", () => {
       requiresUserAction: false,
       callbackExpected: false,
     });
+    remoteControlAutoEnable = undefined;
+    enableRemoteControlImpl = undefined;
 
     vi.resetModules();
     const acpAgent = await import("../../v1/acp-agent.js");
@@ -1775,6 +1786,23 @@ describe("createSession options merging", () => {
 
       expect(closed).toBe("closed");
       expect(closeSpy).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe("Remote Control at session start", () => {
+    it("starts after the session/new response when Claude Code asks for it", async () => {
+      remoteControlAutoEnable = true;
+      const enableRemoteControl = vi.fn(async () => ({
+        session_url: "https://claude.ai/code/session_123",
+      }));
+      enableRemoteControlImpl = enableRemoteControl;
+
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      const startedAtResponse = enableRemoteControl.mock.calls.length;
+      await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalled());
+
+      expect(startedAtResponse).toBe(0);
+      expect(enableRemoteControl).toHaveBeenCalledExactlyOnceWith(true);
     });
   });
 
