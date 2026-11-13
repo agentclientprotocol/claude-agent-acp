@@ -1487,13 +1487,14 @@ export type Session = {
    *  cached account was swapped. Undefined when the account carried no
    *  identity signal, which is "nothing to compare", not a match. */
   accountKind?: AuthStatusKind;
-  /** Set under `--hide-claude-auth` when the CLI reported a sign-out during
-   *  this session. The query is closed and the account it cached at
-   *  `initialize` now describes a credential that no longer works, so the next
-   *  turn recreates the query before it runs. */
-  needsSignOutRespawn?: boolean;
+  /** The query is closed, or about to be, and the next turn recreates it
+   *  before it runs. Two causes: under `--hide-claude-auth`, the CLI reported
+   *  a sign-out, so the account cached at `initialize` describes a credential
+   *  that no longer works; or an accepted plan's fresh-context restart failed
+   *  after the old query was closed. */
+  needsQueryRespawn?: boolean;
   /** The in-flight recreation, so turns that arrive together share one. */
-  signOutRespawn?: Promise<void>;
+  queryRespawn?: Promise<void>;
 } & sessionIndex.SessionIndexFields;
 
 /** The foreground work of a session: a prompt's turn, from its insertion
@@ -1943,6 +1944,19 @@ export class ClaudeAcpAgent {
       isAirClient: () => this.toolCallCapabilities.air.client,
       ensureConsumer: (session, id) => this.ensureConsumer(session, id),
       logError: (message, error) => this.logger.error(message, error),
+      restartFailed: (id, oldSession) => {
+        // destroyReplacement may have removed the entry. Put the old session
+        // back so the next prompt recreates its query instead of "session not found".
+        if (!this.sessions[id] && !oldSession.tornDown) this.sessions[id] = oldSession;
+        // A restart refused before closing the old query leaves it usable.
+        if (this.sessions[id] === oldSession && oldSession.queryClosed) {
+          this.markSessionForQueryRespawn(
+            id,
+            oldSession,
+            "the fresh-context restart of an accepted plan failed after the old query was closed",
+          );
+        }
+      },
       destroyReplacement: (id, session) => {
         disarmForceCancel(session);
         session.cancelController?.abort();
@@ -2454,7 +2468,7 @@ export class ClaudeAcpAgent {
     for (const [sessionId, session] of Object.entries(this.sessions)) {
       // No kind: the account said nothing about the identity, so there is
       // nothing this read can contradict.
-      if (!session.accountKind || session.queryClosed || session.needsSignOutRespawn) {
+      if (!session.accountKind || session.queryClosed || session.needsQueryRespawn) {
         continue;
       }
       if (kind !== session.accountKind) {
@@ -2653,9 +2667,9 @@ export class ClaudeAcpAgent {
       (session.creationParams?._meta as NewSessionMeta | undefined)?.claudeCode?.options?.env,
     );
     void this.authStatus.probe();
-    const signOutRespawn = this.respawnSignedOutSession(params.sessionId, session);
-    if (signOutRespawn) {
-      await signOutRespawn;
+    const queryRespawn = this.respawnClosedQuery(params.sessionId, session);
+    if (queryRespawn) {
+      await queryRespawn;
       // A provider update can queue its replacement behind the sign-out respawn.
       // Wait for that replacement too before a prompt starts on the old route.
       while (this.providerUpdate) await this.providerUpdate;
@@ -2857,7 +2871,7 @@ export class ClaudeAcpAgent {
    *  the turn, so its stream is closed at once. A probe has killed nothing: it
    *  runs beside a turn that is still producing output, and closing there would
    *  abort a turn the user is watching. It therefore leaves the stream alone
-   *  and lets the recreation at the next prompt close it (`recreateSignedOutQuery`
+   *  and lets the recreation at the next prompt close it (`recreateClosedQuery`
    *  closes it too, and both are idempotent).
    *
    *  Idempotent: one sign-out reaches this twice (the synthetic login message
@@ -2869,25 +2883,44 @@ export class ClaudeAcpAgent {
     session: Session,
     options?: { endQuery?: boolean },
   ): void {
-    if (!shouldHideClaudeAuth() || session.needsSignOutRespawn) {
+    if (!shouldHideClaudeAuth()) {
+      return;
+    }
+    this.markSessionForQueryRespawn(
+      sessionId,
+      session,
+      "the identity behind the cached account changed (sign-out, or a probe that found a different login)",
+      options,
+    );
+  }
+
+  /** Flags the session so the next turn recreates its query, and closes the
+   *  query now unless `endQuery` is false. `reason` goes into the log. Without
+   *  creation params the query cannot be recreated, so nothing is marked. */
+  private markSessionForQueryRespawn(
+    sessionId: string,
+    session: Session,
+    reason: string,
+    options?: { endQuery?: boolean },
+  ): void {
+    if (session.needsQueryRespawn) {
       return;
     }
     if (!session.creationParams) {
       this.logger.error(
-        `Session ${sessionId}: the identity behind the cached account changed, but the creation params are missing; cannot recreate the query`,
+        `Session ${sessionId}: ${reason}, but the creation params are missing; cannot recreate the query`,
       );
       return;
     }
-    session.needsSignOutRespawn = true;
-    this.logger.log(
-      `Session ${sessionId}: the identity behind the cached account changed (sign-out, or a probe that found a different login); the query is recreated on the next turn`,
-    );
+    session.needsQueryRespawn = true;
+    this.logger.log(`Session ${sessionId}: ${reason}; the query is recreated on the next turn`);
     if (options?.endQuery !== false) {
       this.closeQueryStream(session);
     }
   }
 
-  /** Recreate the query of a signed-out session, keeping the ACP session id and
+  /** Recreate the query of a session whose query was closed (a sign-out, or a
+   *  failed plan restart), keeping the ACP session id and
    *  resuming the Claude session so the history survives. Returns the session
    *  the caller must go on with: the new one, or the argument when no
    *  recreation is due.
@@ -2912,26 +2945,22 @@ export class ClaudeAcpAgent {
    *  under the turn and kill output the user is watching, so the flag waits for
    *  the next turn boundary. A sign-out is not affected: it closed the stream
    *  when it marked the session, and a closed stream recreates immediately. */
-  private respawnSignedOutSession(
-    sessionId: string,
-    session: Session,
-  ): Promise<Session> | undefined {
-    if (!session.needsSignOutRespawn) {
+  private respawnClosedQuery(sessionId: string, session: Session): Promise<Session> | undefined {
+    if (!session.needsQueryRespawn) {
       return undefined;
     }
     if (!session.queryClosed && (session.turnQueue ?? []).some((turn) => !turn.settled)) {
       return undefined;
     }
-    return this.awaitSignOutRespawn(sessionId, session);
+    return this.awaitQueryRespawn(sessionId, session);
   }
 
-  private async awaitSignOutRespawn(sessionId: string, session: Session): Promise<Session> {
-    const respawn = (session.signOutRespawn ??= this.recreateSignedOutQuery(
-      sessionId,
-      session,
-    ).finally(() => {
-      session.signOutRespawn = undefined;
-    }));
+  private async awaitQueryRespawn(sessionId: string, session: Session): Promise<Session> {
+    const respawn = (session.queryRespawn ??= this.recreateClosedQuery(sessionId, session).finally(
+      () => {
+        session.queryRespawn = undefined;
+      },
+    ));
     await respawn;
     const respawned = this.sessions[sessionId];
     if (!respawned) {
@@ -2977,7 +3006,7 @@ export class ClaudeAcpAgent {
   }
 
   /** Queued per session, so a choice sent during the respawn lands on the new query. */
-  private recreateSignedOutQuery(sessionId: string, session: Session): Promise<void> {
+  private recreateClosedQuery(sessionId: string, session: Session): Promise<void> {
     return this.serializeConfigurationChange(sessionId, async () => {
       const creationParams = session.creationParams;
       if (!creationParams) {
@@ -2985,7 +3014,7 @@ export class ClaudeAcpAgent {
       }
       // Already replaced by a provider restart, or closed.
       if (this.sessions[sessionId] !== session) return;
-      this.logger.log(`Recreating Claude session ${sessionId} after a sign-out`);
+      this.logger.log(`Recreating Claude session ${sessionId} after its query was closed`);
       try {
         // The signed-out turn may be the first, so the conversation may not be saved yet.
         await this.replaceSessionQuery(sessionId, session, creationParams);
@@ -3195,8 +3224,8 @@ export class ClaudeAcpAgent {
     if (!session) {
       throw RequestError.sessionNotFound(sessionId);
     }
-    const signOutRespawn = this.respawnSignedOutSession(sessionId, session);
-    if (signOutRespawn) session = await signOutRespawn;
+    const queryRespawn = this.respawnClosedQuery(sessionId, session);
+    if (queryRespawn) session = await queryRespawn;
     if (session.queryClosed) {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }

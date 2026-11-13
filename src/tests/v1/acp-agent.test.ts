@@ -6014,6 +6014,93 @@ describe("permission request cancellation", () => {
     });
   });
 
+  describe("after a failed ExitPlanMode clear-context restart", () => {
+    const reset = { toolUseId: "tool-plan", plan: "Implement it", mode: "auto" as const };
+
+    /** The restart's createSession fails once; later ones start a scripted session. */
+    function failedRestart(laterFailure?: Error) {
+      const agent = new ClaudeAcpAgent({ sessionUpdate: async () => {} } as unknown as AcpClient, {
+        log: () => {},
+        error: () => {},
+      });
+      const session = injectSession(agent, "session-1");
+      session.creationParams = { cwd: "/test", mcpServers: [] };
+      const turn = {
+        settled: false,
+        promptUuid: randomUUID(),
+        resolve: () => {},
+        reject: () => {},
+      } as any;
+      session.activeTurn = turn;
+      session.turnQueue = [turn];
+      session.modes = {
+        currentModeId: "plan",
+        availableModes: ["default", "plan"].map((id) => ({ id, name: id })),
+      };
+      const createSession = vi
+        .spyOn(agent as any, "createSession")
+        .mockRejectedValueOnce(new Error("Claude Code did not start"))
+        .mockImplementation(async (params: any, options: any) => {
+          if (laterFailure) throw laterFailure;
+          const input = new Pushable<any>();
+          async function* answer() {
+            for await (const prompt of input) {
+              yield userEcho(prompt);
+              yield successfulResultMessage({ session_id: "session-1" });
+              yield {
+                type: "system",
+                subtype: "session_state_changed",
+                state: "idle",
+                session_id: "session-1",
+              };
+            }
+          }
+          agent.sessions["session-1"] = mockSessionState(
+            {
+              query: Object.assign(wrapQuery(answer()), { supportedCommands: async () => [] }),
+              input,
+              modes: session.modes,
+              sessionFingerprint: computeSessionFingerprint(params),
+            },
+            agent,
+            "session-1",
+          );
+          return { sessionId: options.resume, modes: session.modes, configOptions: [] };
+        });
+      const prompt = () =>
+        agent.prompt({ sessionId: "session-1", prompt: [{ type: "text", text: "why?" }] });
+      return { agent, session, createSession, prompt };
+    }
+
+    it("recreates the query on the next prompt, resuming the same Claude session", async () => {
+      const { agent, session, createSession, prompt } = failedRestart();
+      session.pendingExitPlanContextReset = reset;
+
+      await (agent as any).exitPlan.restart("session-1", session, reset);
+
+      expect(agent.sessions["session-1"]).toBe(session);
+      expect(session.needsQueryRespawn).toBe(true);
+      await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+      expect(createSession).toHaveBeenCalledTimes(2);
+      expect(createSession).toHaveBeenLastCalledWith(
+        expect.objectContaining({ cwd: "/test" }),
+        expect.objectContaining({ resume: "session-1", permissionMode: "plan" }),
+      );
+    });
+
+    it("reports the real error, not 'session has ended', when recreation fails too", async () => {
+      const { agent, session, prompt } = failedRestart(new Error("Claude Code still missing"));
+      session.pendingExitPlanContextReset = reset;
+
+      await (agent as any).exitPlan.restart("session-1", session, reset);
+
+      await expect(prompt()).rejects.toThrow("Claude Code still missing");
+      // The husk stays, so the client can retry on the same session.
+      expect(agent.sessions["session-1"]).toBe(session);
+      await expect(prompt()).rejects.toThrow("Claude Code still missing");
+    });
+  });
+
   it("maps Claude presentation fields without reconstructing provider text or changing input", async () => {
     let request: RequestPermissionRequest | undefined;
     const mockClient = {
