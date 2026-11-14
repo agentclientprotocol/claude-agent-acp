@@ -2032,10 +2032,13 @@ export class ClaudeAcpAgent {
    * Copies the session's transcript into a new session, then starts that
    * session, so the client can prompt it as soon as the response arrives, as
    * the schema requires of a fork. It starts like a resumed session: from the
-   * copied transcript, with the model and the permission mode it records. A
-   * later load or resume with the same settings reuses it.
+   * copied transcript, with the model and the permission mode it records,
+   * and then the request's `configOptions`. A later load or resume with the
+   * same settings reuses it.
    */
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
+    // Before the copy: two entries with the same `configId` fork nothing.
+    const initial = initialConfigOptions(params.configOptions);
     while (this.providerUpdate) await this.providerUpdate;
     // Reject a bad `cwd` or prompt before copying the transcript.
     await this.validateCwd(params.cwd, params.additionalDirectories);
@@ -2048,14 +2051,17 @@ export class ClaudeAcpAgent {
     // The fork row can lack `forkedFrom`: the scan reads it from the first
     // 64 KB of the transcript only. So the fork is held back by its id too.
     this.sessionIndex.onForkCreated(params.sessionId, sessionId);
-    const { modes, configOptions } = await this.getOrCreateSession({
-      sessionId,
-      cwd: params.cwd,
-      mcpServers: params.mcpServers,
-      additionalDirectories: params.additionalDirectories,
-      systemPrompt: params.systemPrompt,
-      _meta: params._meta,
-    });
+    const { modes, configOptions } = await this.withInitialConfigOptions(
+      await this.getOrCreateSession({
+        sessionId,
+        cwd: params.cwd,
+        mcpServers: params.mcpServers,
+        additionalDirectories: params.additionalDirectories,
+        systemPrompt: params.systemPrompt,
+        _meta: params._meta,
+      }),
+      initial,
+    );
     this.afterSetupResponse(sessionId, params.mcpServers ?? []);
     return { sessionId, modes, configOptions };
   }
@@ -9222,7 +9228,7 @@ export class ClaudeAcpAgent {
    *
    * Call it in the same synchronous step as the handler's `return`: an
    * `await` between them would let the timer run before the response. The ACP
-   * SDK (2.6.0) gives a request handler no responder and no after-response
+   * SDK (2.7.0) gives a request handler no responder and no after-response
    * hook, so the order rests on two things that its source shows and its API
    * does not promise. `registerAppRequest` queues the response in the
    * microtask that follows the handler's return, with no macrotask in

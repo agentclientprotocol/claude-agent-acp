@@ -110,6 +110,9 @@ export function buildEffortConfigOption(
   useRecommendedValue: boolean,
 ): SessionConfigOption | undefined {
   const currentModelInfo = modelInfos.find((model) => model.value === currentModelId);
+  // In Claude Code's order, which lists the levels from lowest to highest
+  // ("low" to "max"), as ACP v2 asks of a `thought_level` select. Nothing
+  // here sorts them.
   const supportedLevels = currentModelInfo?.supportsEffort
     ? (currentModelInfo.supportedEffortLevels ?? [])
     : [];

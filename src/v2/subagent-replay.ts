@@ -20,10 +20,12 @@
  * history follows its launch, so a call to a child from its parent is always
  * delivered first. Any other SendMessage call stays a tool call.
  *
- * Every child's end goes out on its parent at the end of the replay, and once
- * on the child's own stream: v2 forbids replaying a child's past `running` as
- * current activity. These states are history to the client, so each child's
- * current state goes out again after the response ({@link afterResponse}).
+ * Every child's end goes out on its parent at the end of the replay. Each
+ * announced child then gets its own `replay_complete`, as v2 requires, and
+ * its end once on its own stream: v2 forbids replaying a child's past
+ * `running` as current activity. These states are history to the client, so
+ * each child's current state goes out again after the response
+ * ({@link afterResponse}).
  * A child that the live session still tracks, on a resume of the active
  * session, gets its current state from the resume snapshot instead
  * (`SessionTasks.currentState`). After the response, a child whose
@@ -32,8 +34,8 @@
  *
  * A launch without metadata has no known id, so it is not announced: the RFD
  * forbids inventing one. Its Agent call stays an ordinary tool call of the
- * parent, and a notice at the end says that subagent history is missing, as
- * it does for a child whose transcript cannot be read.
+ * parent, and a notice after the root's `replay_complete` says that subagent
+ * history is missing, as it does for a child whose transcript cannot be read.
  */
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk/unstable";
@@ -68,6 +70,7 @@ import {
 } from "../subagent-replay.js";
 import { taskNotificationsOf } from "../task-notifications.js";
 import type { V2UpdateTranslator } from "./update-translator.js";
+import { REPLAY_COMPLETE } from "./setup.js";
 import { SessionOutput, type ReplayHooks } from "./stream.js";
 import { sameDirectory } from "./tasks.js";
 
@@ -144,8 +147,11 @@ export class SubagentReplay {
   }
 
   /**
-   * Ends the replay: every child's end, on its parent, then once on its own
-   * stream, and the notice when subagent history is missing.
+   * Ends the replay of the children. Every child's end goes out on its
+   * parent, whose history it is. Then each announced child gets its
+   * `replay_complete`, also one without history, and its end once on its own
+   * stream. A `state_update` is not history, so it follows the child's
+   * `replay_complete`.
    */
   finish(): void {
     const announced = [...this.transcript.children.values()].filter((child) => child.announced);
@@ -160,11 +166,19 @@ export class SubagentReplay {
       });
     }
     for (const child of announced) {
+      this.host.send({ sessionId: child.sessionId, update: REPLAY_COMPLETE });
       this.host.send({
         sessionId: child.sessionId,
         update: { sessionUpdate: "state_update", ...replayEndState(child) } as v2.SessionUpdate,
       });
     }
+  }
+
+  /**
+   * The notice when subagent history is missing, on the root session. It is
+   * no history, so the caller sends the root's `replay_complete` first.
+   */
+  reportMissingHistory(): void {
     const missing = this.transcript.omitted.size + this.withoutHistory;
     if (missing > 0) {
       this.rootOutput?.emitV1([

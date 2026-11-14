@@ -64,9 +64,9 @@ for v2 is negotiated down to v1. With `v2`, the adapter rejects the `initialize`
 `auto`, the default, serves both.
 
 On v2 the adapter serves the session baseline (`session/new`, `session/list`, `session/resume`
-with replay, `session/close`, `session/prompt`, `session/cancel`), `session/delete`,
-`session/fork`, `session/status`, `session/options` (with initial `configOptions` on `session/new` and
-`session/resume`), `session/set_title`, additional directories, config options (the mode is one), plans, notices,
+with replay, which `replay_complete` ends, `session/close`, `session/prompt`, `session/cancel`), `session/delete`,
+`session/fork`, `session/status`, `session/options` (with initial `configOptions` on `session/new`,
+`session/resume` and `session/fork`), `session/set_title`, additional directories, config options (the mode is one), plans, notices,
 compaction, display terminals for commands, permission requests, elicitation, providers, auth, and
 [subagents](docs/subagent-sessions.md). Steering is v1 only for now.
 

@@ -2360,8 +2360,9 @@ describe("ACP v2 prompts", () => {
       sessionId === "abc123" || sessionId === "response" ? [update] : [],
     );
     // The child's past `running` does not replay; its last state goes once,
-    // after the replay. That state is history to the client, so the child's
-    // current state follows the response: its process is gone, so it is idle.
+    // after the child's own `replay_complete`. That state is history to the
+    // client, so the child's current state follows the response: its process
+    // is gone, so it is idle.
     // The child's model, from its transcript, goes right after its
     // announcement. It does not go again after the response: it is unchanged.
     const model = expect.objectContaining({
@@ -2380,6 +2381,7 @@ describe("ACP v2 prompts", () => {
         messageId: "msg_child",
         content: text("Child report.")[0],
       }),
+      { sessionUpdate: "replay_complete" },
       { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn", background: [] },
       { sessionUpdate: "response" },
       { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn", background: [] },
@@ -2520,7 +2522,7 @@ describe("ACP v2 prompts", () => {
     ]);
   });
 
-  it("ends a resume with replay with one end event for a client with loadReplayEnd", async () => {
+  it("ends a resume with replay with one end event after replay_complete for a client with loadReplayEnd", async () => {
     const client = v2Client();
     const isEnd = (notification: v2.UpdateSessionNotification) =>
       (notification.update._meta as any)?.jetbrains?.air?.loadReplayEnd === true;
@@ -2552,13 +2554,15 @@ describe("ACP v2 prompts", () => {
       await client.authUpdate(1);
     });
 
-    // The end event closes the replay. v2 then requires the state snapshot
-    // after the replay and before the response.
+    // `replay_complete` closes the replay, and AIR's end event follows it:
+    // it is not history. v2 then requires the state snapshot after the replay
+    // and before the response.
     expect(atResponse.map(({ update }) => update.sessionUpdate)).toEqual([
       "user_message",
       "user_message_chunk",
       "agent_message",
       "agent_message_chunk",
+      "replay_complete",
       "session_info_update",
       "state_update",
     ]);
@@ -2759,6 +2763,7 @@ describe("ACP v2 prompts", () => {
           summary: text("1. Primary Request and Intent:\n   Count upward."),
         },
         { sessionUpdate: "agent_message", messageId: "msg_after", content: [] },
+        { sessionUpdate: "replay_complete" },
         { sessionUpdate: "state_update", state: "idle", background: [] },
       ]);
       await client.authUpdate(1);
@@ -2812,6 +2817,7 @@ describe("ACP v2 prompts", () => {
           messageId: "msg_answer",
           content: text("Hello!")[0],
         },
+        { sessionUpdate: "replay_complete" },
         // The current foreground state, after the replay and before the response.
         { sessionUpdate: "state_update", state: "idle", background: [] },
       ]);
@@ -2876,7 +2882,13 @@ describe("ACP v2 prompts", () => {
         replayFrom: { type: "start" },
       });
       expect(client.sessionUpdates.slice(before).map(({ update }) => update.sessionUpdate)).toEqual(
-        ["agent_message", "agent_message_chunk", "session_info_update", "state_update"],
+        [
+          "agent_message",
+          "agent_message_chunk",
+          "replay_complete",
+          "session_info_update",
+          "state_update",
+        ],
       );
       await client.authUpdate(1);
     });

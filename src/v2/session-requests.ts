@@ -35,9 +35,13 @@ export function v1NewSessionRequest(params: v2.NewSessionRequest): NewSessionReq
   };
 }
 
-/** The v1 request of a v2 `session/fork`. */
+/**
+ * The v1 request of a v2 `session/fork`. Without `configOptions`: the fork
+ * applies them once it started (see {@link initialConfigRequests}).
+ */
 export function v1ForkSessionRequest(params: v2.ForkSessionRequest): ForkSessionRequest {
-  const { mcpServers, systemPrompt, ...request } = params;
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { mcpServers, systemPrompt, configOptions, ...request } = params;
   return {
     ...request,
     ...(mcpServers ? { mcpServers: v1McpServers(mcpServers) } : {}),

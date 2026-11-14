@@ -5,7 +5,7 @@ import {
   SessionNotification,
 } from "@agentclientprotocol/sdk/unstable";
 import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
-import { getSessionMessages, type Options } from "@anthropic-ai/claude-agent-sdk";
+import { forkSession, getSessionMessages, type Options } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../../v1/acp-agent.js";
 import type { AcpClient } from "../../acp-client.js";
 import type { AcpSessionNotification } from "../../acp-subagents.js";
@@ -15,6 +15,9 @@ import { startupFailure } from "../helpers.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+
+/** The session that the mocked SDK `forkSession` makes. */
+const FORK_ID = "3d0f7a52-9b1e-4c7d-8e2a-6f4b5c1d0e9a";
 
 let capturedOptions: Options | undefined;
 let contextUsageResult: (() => Promise<{ rawMaxTokens: number; model?: string }>) | undefined;
@@ -61,6 +64,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
       });
     },
     getSessionMessages: vi.fn(() => sessionMessagesResult()),
+    forkSession: vi.fn(async () => ({ sessionId: FORK_ID })),
   };
 });
 
@@ -105,6 +109,7 @@ describe("createSession options merging", () => {
     sessionMessages = [];
     sessionMessagesResult = async () => sessionMessages;
     vi.mocked(getSessionMessages).mockClear();
+    vi.mocked(forkSession).mockClear();
     initModels = undefined;
     initGate = undefined;
     initError = undefined;
@@ -1525,7 +1530,7 @@ describe("createSession options merging", () => {
       errors.mockRestore();
     });
 
-    it.each(["newSession", "loadSession", "resumeSession"] as const)(
+    it.each(["newSession", "loadSession", "resumeSession", "unstable_forkSession"] as const)(
       "%s rejects two entries of one configId before it starts a query",
       async (method) => {
         await expect(
@@ -1543,6 +1548,8 @@ describe("createSession options merging", () => {
           data: { configId: "mode" },
         });
         expect(capturedOptions).toBeUndefined();
+        // A fork copies no transcript either.
+        expect(forkSession).not.toHaveBeenCalled();
       },
     );
 
@@ -1570,6 +1577,24 @@ describe("createSession options merging", () => {
         expect(updates.map((u) => u.update.sessionUpdate)).not.toContain("config_option_update");
       },
     );
+
+    it("sets the configOptions of a session/fork on the fork, without an update", async () => {
+      const response = await agent.unstable_forkSession({
+        sessionId: "7f1c5b0e-3c53-4c0c-9d0a-0d6c1f0a2b11",
+        cwd,
+        mcpServers: [],
+        configOptions: [
+          { configId: "model", value: "claude-haiku-4-5" },
+          { configId: "mode", value: "plan" },
+        ],
+      });
+
+      expect(response.sessionId).toBe(FORK_ID);
+      expect(capturedOptions).toMatchObject({ resume: FORK_ID });
+      expect(values(response)).toMatchObject({ model: "claude-haiku-4-5", mode: "plan" });
+      expect(response.modes?.currentModeId).toBe("plan");
+      expect(updates.filter((u) => u.sessionId === FORK_ID)).toEqual([]);
+    });
 
     it("leaves the warning of an Auto mode fallback for the first prompt", async () => {
       const response = await agent.newSession({

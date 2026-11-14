@@ -16,6 +16,7 @@
 {"kind":"notification","method":"session/update","payload":{"sessionId":"<session>","update":{"content":[{"content":{"text":"Report.","type":"text"},"type":"content"}],"rawOutput":"Report.","sessionUpdate":"tool_call_update","status":"completed","toolCallId":"toolu_r_task"}}}
 {"kind":"notification","method":"session/update","payload":{"sessionId":"<session>","update":{"content":[],"messageId":"msg_r2","sessionUpdate":"agent_message"}}}
 {"kind":"notification","method":"session/update","payload":{"sessionId":"<session>","update":{"content":{"text":"Fixed.","type":"text"},"messageId":"msg_r2","sessionUpdate":"agent_message_chunk"}}}
+{"kind":"notification","method":"session/update","payload":{"sessionId":"<session>","update":{"sessionUpdate":"replay_complete"}}}
 {"kind":"notification","method":"session/update","payload":{"sessionId":"<session>","update":{"description":"The history of 1 subagent of this session could not be restored.","sessionUpdate":"notice","severity":"info","title":"Some subagent history is not available"}}}
 {"kind":"notification","method":"session/update","payload":{"sessionId":"<session>","update":{"sessionUpdate":"session_info_update","title":"Fix the app","updatedAt":"2026-01-01T00:00:00.000Z"}}}
 {"kind":"notification","method":"session/update","payload":{"sessionId":"<session>","update":{"background":[],"sessionUpdate":"state_update","state":"idle"}}}

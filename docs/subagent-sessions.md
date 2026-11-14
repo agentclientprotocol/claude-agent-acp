@@ -82,7 +82,9 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
 
 An [ACP v2](../README.md#experimental-acp-v2) client gets the same without declaring anything, since subagents
 are part of v2's baseline. Each child also reports its work state as its own `state_update`, right
-after the parent's copy.
+after the parent's copy. A replay ends each child's history with a `replay_complete` on the child's
+session, before the child's `idle`. The notice that subagent history is missing follows the
+parent's `replay_complete`.
 
 JetBrains AIR keeps the earlier draft of the RFD (`subagent_spawned`, `subagent_state_update`),
 which it enables with `nativeSubagentSessions` in `_meta.jetbrains.air.capabilities`. See

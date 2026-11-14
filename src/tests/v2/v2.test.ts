@@ -15,6 +15,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import {
+  forkSession,
   getSessionInfo,
   getSessionMessages,
   type Options,
@@ -217,6 +218,7 @@ beforeEach(async () => {
   sdk.startFailure = undefined;
   sdk.startGate = undefined;
   sdk.enableRemoteControl = undefined;
+  vi.mocked(forkSession).mockClear();
 });
 
 afterEach(async () => {
@@ -2032,6 +2034,11 @@ describe("ACP v2 core", () => {
               cwd,
               configOptions,
             }),
+            agent.request(v2.methods.agent.session.fork, {
+              sessionId: STORED,
+              cwd,
+              configOptions,
+            }),
           ].map((request) => request.catch((error: unknown) => error)),
         );
       });
@@ -2039,8 +2046,32 @@ describe("ACP v2 core", () => {
       expect(errors).toEqual([
         expect.objectContaining({ code: -32602 }),
         expect.objectContaining({ code: -32602 }),
+        expect.objectContaining({ code: -32602 }),
       ]);
       expect(sdk.processes).toHaveLength(0);
+      // The fork copied no transcript either.
+      expect(forkSession).not.toHaveBeenCalled();
+    });
+
+    it("sets the configOptions of a session/fork on the fork, without an update", async () => {
+      const client = v2Client();
+      const fork = await client.connect(async (agent) => {
+        await initialize(agent);
+        return agent.request(v2.methods.agent.session.fork, {
+          sessionId: STORED,
+          cwd,
+          configOptions: [
+            { configId: "model", type: "id", value: "haiku" },
+            { configId: "mode", type: "id", value: "plan" },
+          ],
+        });
+      });
+
+      const [claude] = sdk.processes;
+      expect(claude.options.resume).toBe(fork.sessionId);
+      expect(claude.setModel).toHaveBeenCalledWith("haiku");
+      expect(values(fork.configOptions)).toMatchObject({ model: "haiku", mode: "plan" });
+      expect(client.notifications).toEqual([]);
     });
 
     it("sets the configOptions of a session/resume on the session, an active one too", async () => {
@@ -2109,7 +2140,7 @@ describe("ACP v2 core", () => {
     expect(error).toMatchObject({ code: -32602 });
   });
 
-  it("replays the stored history, then sends the state, before the resume response", async () => {
+  it("replays the stored history, ends it with replay_complete, then sends the state, before the resume response", async () => {
     vi.mocked(getSessionMessages).mockResolvedValueOnce([
       {
         type: "user",
@@ -2157,12 +2188,13 @@ describe("ACP v2 core", () => {
         messageId: "msg_a",
         content: { type: "text", text: "Done" },
       },
+      { sessionUpdate: "replay_complete" },
       // A snapshot, not a completion: no stop reason.
       { sessionUpdate: "state_update", state: "idle", background: [] },
     ]);
   });
 
-  it("gives a replayed tool call that has no result a final status, before the state", async () => {
+  it("gives a replayed tool call that has no result a final status, before replay_complete", async () => {
     const entry = (type: string, uuid: string, message: unknown) => ({
       type,
       uuid,
@@ -2194,10 +2226,115 @@ describe("ACP v2 core", () => {
       });
     });
 
-    expect(client.sessionUpdates.slice(-2)).toEqual([
+    expect(client.sessionUpdates.slice(-3)).toEqual([
       { sessionUpdate: "tool_call_update", toolCallId: "toolu_make", status: "failed" },
+      { sessionUpdate: "replay_complete" },
       { sessionUpdate: "state_update", state: "idle", background: [] },
     ]);
+  });
+
+  it("ends the replay of an empty history with replay_complete, and sends none without replayFrom", async () => {
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      await agent.request(v2.methods.agent.initialize, {
+        protocolVersion: v2.PROTOCOL_VERSION,
+        info: { name: "v2-test-client", version: "1.0.0" },
+        capabilities: {},
+      });
+      const sessionId = randomUUID();
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+      await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+    });
+
+    expect(client.sessionUpdates).toEqual([
+      { sessionUpdate: "replay_complete" },
+      { sessionUpdate: "state_update", state: "idle", background: [] },
+      // The resume without a replay.
+      { sessionUpdate: "state_update", state: "idle", background: [] },
+    ]);
+  });
+
+  describe("what an active session sends while a resume replays it", () => {
+    const kinds = (updates: v2.SessionUpdate[]) => updates.map((update) => update.sessionUpdate);
+
+    /**
+     * Resumes the active session with a replay whose transcript read waits
+     * for `read`. Meanwhile Claude Code streams a message and asks for a
+     * permission. Returns the resume, once the client had time to receive
+     * what the session sent.
+     */
+    async function resumeWhileWorking(
+      agent: v2.ClientContext,
+      read: Promise<Awaited<ReturnType<typeof getSessionMessages>>>,
+    ) {
+      const { response, claude } = await openSession(agent);
+      vi.mocked(getSessionMessages).mockReturnValueOnce(read);
+      const resume = agent.request(v2.methods.agent.session.resume, {
+        sessionId: response.sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+      await vi.waitFor(() => expect(getSessionMessages).toHaveBeenCalled());
+      for (const message of textDelta("msg_live", "Live")) claude.send(message);
+      const asked = askPermission(claude, "Bash", { command: "make" });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return { resume, asked };
+    }
+
+    it("goes out after replay_complete, a permission request too", async () => {
+      const read = Promise.withResolvers<Awaited<ReturnType<typeof getSessionMessages>>>();
+      let receivedAtRequest: string[] = [];
+      const client = v2Client({
+        answerPermission: () => {
+          receivedAtRequest = kinds(client.sessionUpdates);
+          return { outcome: { outcome: "cancelled" } };
+        },
+      });
+      await client.connect(async (agent) => {
+        const { resume, asked } = await resumeWhileWorking(agent, read.promise);
+        expect(client.sessionUpdates).toEqual([]);
+        expect(client.permissionRequests).toEqual([]);
+        read.resolve([
+          {
+            type: "user",
+            uuid: "u1",
+            session_id: "s",
+            parent_tool_use_id: null,
+            parent_agent_id: null,
+            message: { role: "user", content: "Fix the build" },
+          },
+        ]);
+        await resume;
+        await asked;
+      });
+
+      const received = kinds(client.sessionUpdates);
+      const complete = received.indexOf("replay_complete");
+      // Only the history comes before it.
+      expect(received.slice(0, complete)).toEqual(["user_message", "user_message_chunk"]);
+      expect(received.slice(complete + 1)).toContain("agent_message_chunk");
+      expect(receivedAtRequest).toContain("replay_complete");
+    });
+
+    it("goes out without a replay_complete when the replay fails", async () => {
+      const read = Promise.withResolvers<Awaited<ReturnType<typeof getSessionMessages>>>();
+      const client = v2Client();
+      const error = await client.connect(async (agent) => {
+        const { resume } = await resumeWhileWorking(agent, read.promise);
+        read.reject(new Error("The transcript cannot be read"));
+        const error = await resume.catch((error: unknown) => error);
+        await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(1));
+        return error;
+      });
+
+      expect(error).toMatchObject({ code: -32603 });
+      expect(kinds(client.sessionUpdates)).toContain("agent_message_chunk");
+      expect(kinds(client.sessionUpdates)).not.toContain("replay_complete");
+    });
   });
 
   it("replays a compaction's summary message as the completed compaction, at its place", async () => {
@@ -3523,6 +3660,68 @@ describe("ACP v2 core", () => {
         sessionUpdate: "state_update",
         state: "running",
       });
+    });
+
+    it("holds what a live subagent's session sends during a replay until after the child's replay_complete", async () => {
+      sdk.subagents = new Map([
+        [
+          "toolu_bg_agent",
+          {
+            agentId: "a5966d",
+            background: true,
+            stoppedByUser: false,
+            agentType: "general-purpose",
+          },
+        ],
+      ]);
+      const client = v2Client();
+      const read = Promise.withResolvers<Awaited<ReturnType<typeof getSessionMessages>>>();
+      let resumedAt = 0;
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const sessionId = response.sessionId;
+        const child = subagent("a5966d", "toolu_bg_agent", { is_backgrounded: true });
+        claude.send(cycleStart());
+        claude.send(child.launch());
+        claude.send({
+          type: "system",
+          subtype: "background_tasks_changed",
+          tasks: [{ task_id: "a5966d", task_type: "local_agent", description: "sleeper" }],
+          uuid: randomUUID(),
+        });
+        claude.send(child.started());
+        claude.send(result({ result: "launched" }));
+        await vi.waitFor(() => expect(client.states().at(-1)).toBe("idle"));
+        vi.mocked(getSessionMessages).mockReturnValueOnce(read.promise);
+        resumedAt = client.notifications.length;
+        const resume = agent.request(v2.methods.agent.session.resume, {
+          sessionId,
+          cwd,
+          replayFrom: { type: "start" },
+        });
+        await vi.waitFor(() => expect(getSessionMessages).toHaveBeenCalled());
+        // The subagent works on while the transcript is read.
+        claude.send(child.says("Live report"));
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(client.notifications.slice(resumedAt)).toEqual([]);
+        read.resolve([
+          {
+            type: "assistant",
+            uuid: "a1",
+            session_id: sessionId,
+            parent_tool_use_id: null,
+            parent_agent_id: null,
+            message: child.launch().message,
+          },
+        ] as never);
+        await resume;
+      });
+
+      const received = updatesOf(client.notifications.slice(resumedAt), "a5966d").map((update) =>
+        update.sessionUpdate === "agent_message_chunk" ? "live report" : update.sessionUpdate,
+      );
+      expect(received).toContain("replay_complete");
+      expect(received.indexOf("live report")).toBeGreaterThan(received.indexOf("replay_complete"));
     });
 
     it.each([

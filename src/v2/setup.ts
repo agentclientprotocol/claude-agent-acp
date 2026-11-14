@@ -103,8 +103,16 @@ export async function sessionModels(
 }
 
 /**
- * The update that ends a replay, for a client that declares AIR's
- * `loadReplayEnd` capability, as v1 sends it.
+ * The update that ends the history replay of a `session/resume` with
+ * `replayFrom`, on the resumed session and on each subagent session that the
+ * replay announced.
+ */
+export const REPLAY_COMPLETE: v2.SessionUpdate = { sessionUpdate: "replay_complete" };
+
+/**
+ * AIR's own mark of the end of a replay, for a client that declares AIR's
+ * `loadReplayEnd` capability, as v1 sends it. It is not history, so on v2 it
+ * follows {@link REPLAY_COMPLETE}.
  */
 export function replayEndUpdate(
   capabilities: v2.ClientCapabilities | null | undefined,
