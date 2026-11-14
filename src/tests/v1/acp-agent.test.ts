@@ -5873,6 +5873,66 @@ describe("permission request cancellation", () => {
     });
   });
 
+  const fixedRefusal = {
+    behavior: "deny",
+    message: "User refused permission to run tool",
+    decisionClassification: "user_reject",
+  };
+  it.each<[string, RequestPermissionResponse["outcome"], Record<string, unknown>]>([
+    [
+      "a reject that gives a reason with that reason",
+      {
+        outcome: "selected",
+        optionId: "reject",
+        _meta: { claudeCode: { denyMessage: "  Run `npm test` instead.\n" } },
+      },
+      { ...fixedRefusal, message: "Run `npm test` instead." },
+    ],
+    [
+      "a reject that gives no reason with the fixed refusal",
+      { outcome: "selected", optionId: "reject", _meta: { claudeCode: {} } },
+      fixedRefusal,
+    ],
+    [
+      "a reject that gives a blank reason with the fixed refusal",
+      { outcome: "selected", optionId: "reject", _meta: { claudeCode: { denyMessage: " \n" } } },
+      fixedRefusal,
+    ],
+    [
+      "a reject whose reason is not a string with the fixed refusal",
+      { outcome: "selected", optionId: "reject", _meta: { claudeCode: { denyMessage: 42 } } },
+      fixedRefusal,
+    ],
+    [
+      "an allow that carries a reason as an allow",
+      {
+        outcome: "selected",
+        optionId: "allow-once",
+        _meta: { claudeCode: { denyMessage: "Run `npm test` instead." } },
+      },
+      {
+        behavior: "allow",
+        updatedInput: { command: "ls" },
+        decisionClassification: "user_temporary",
+      },
+    ],
+  ])("answers %s", async (_name, outcome, decision) => {
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async () => ({ outcome }),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    injectSession(agent, "session-1");
+
+    await expect(
+      agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "tool-1",
+      } as any),
+    ).resolves.toEqual({ ...decision, toolUseID: "tool-1" });
+  });
+
   it.each([
     ["exit-plan-bypass", "bypassPermissions", true],
     ["exit-plan-auto", "auto", true],

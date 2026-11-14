@@ -246,6 +246,41 @@ describe("Claude permission response effects", () => {
     });
   });
 
+  it.each([
+    // "No, keep planning" still ends the turn, and Claude reads the reason.
+    [PERMISSION_OPTION_ID.reject, "Also cover the migration."],
+    // Accepting the plan in a fresh context is no reject: its deny is the
+    // adapter's hand-off and keeps its own message.
+    [
+      PERMISSION_OPTION_ID.exitPlanClearAuto,
+      "User accepted the plan and requested a fresh context",
+    ],
+  ])("answers ExitPlanMode's %s that carries a deny message", (optionId, message) => {
+    const input = { plan: "Implement it" };
+    const offered = build("ExitPlanMode", undefined, input, undefined, true, ["auto"]);
+    expect(
+      permissionResult(
+        {
+          outcome: {
+            outcome: "selected",
+            optionId,
+            _meta: { claudeCode: { denyMessage: "Also cover the migration." } },
+          },
+        },
+        "ExitPlanMode",
+        input,
+        "tool-plan",
+        offered,
+      ),
+    ).toEqual({
+      behavior: "deny",
+      message,
+      interrupt: true,
+      toolUseID: "tool-plan",
+      decisionClassification: "user_reject",
+    });
+  });
+
   it("returns clear-context semantics with the decoded permission decision", () => {
     const input = { plan: "Implement it" };
     const offered = build("ExitPlanMode", undefined, input, undefined, true, ["auto"]);
