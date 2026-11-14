@@ -8963,6 +8963,9 @@ export class ClaudeAcpAgent {
         allowContextReset:
           !this.endsTurnsWithLiveSubagents() ||
           this.requestOwnerTurn(sessionId, session) !== undefined,
+        showClearContextOnPlanAccept: session.settingsManager.getShowClearContextOnPlanAccept(
+          session.effortSettingsOverride,
+        ),
         contextUsedPercent:
           session.contextUsedTokens === undefined || session.contextWindowSize <= 0
             ? undefined

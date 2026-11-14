@@ -32,6 +32,9 @@ const hookHeartbeat = (event: "PreToolUse" | "PostToolUse", toolUseId: string, u
   session_id: activeSdkSessionId(),
 });
 
+/** Project settings that make ExitPlanMode offer clearing the context. */
+const CLEAR_CONTEXT_SETTINGS = JSON.stringify({ showClearContextOnPlanAccept: true });
+
 export const SCENARIOS: Scenario[] = [
   {
     name: "session-setup",
@@ -963,6 +966,8 @@ export const SCENARIOS: Scenario[] = [
   },
   {
     name: "exit-plan-approve",
+    // Claude Code offers clearing the context only with this setting on.
+    files: { ".claude/settings.json": CLEAR_CONTEXT_SETTINGS },
     turns: [
       async function* (ctx) {
         yield* toolCall(
@@ -981,6 +986,8 @@ export const SCENARIOS: Scenario[] = [
   },
   {
     name: "exit-plan-reject",
+    // Claude Code offers clearing the context only with this setting on.
+    files: { ".claude/settings.json": CLEAR_CONTEXT_SETTINGS },
     permission: "reject_once",
     turns: [
       async function* (ctx) {

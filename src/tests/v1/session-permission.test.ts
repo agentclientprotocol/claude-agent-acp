@@ -46,6 +46,7 @@ describe("session permission updates", () => {
       emittedToolCalls: new Set(["toolu_1"]),
       contextWindowSize: 200_000,
       toolUseCache: {},
+      settingsManager: { getShowClearContextOnPlanAccept: () => false },
     } as any;
   });
 
@@ -60,7 +61,6 @@ describe("session permission updates", () => {
 
     expect(capturedPermissionRequest.options.map((option: any) => option.optionId)).toEqual([
       "exit-plan-default",
-      "exit-plan-clear-accept-edits",
       "exit-plan-accept-edits",
       "reject",
     ]);
@@ -79,6 +79,26 @@ describe("session permission updates", () => {
         sessionId: SESSION_ID,
         update: { sessionUpdate: "config_option_update", configOptions: [] },
       },
+    ]);
+  });
+
+  it("offers clearing the context only when the session's settings turn it on", async () => {
+    permissionResponse = { outcome: { outcome: "selected", optionId: "exit-plan-default" } };
+    agent.sessions[SESSION_ID].settingsManager = {
+      getShowClearContextOnPlanAccept: () => true,
+    } as any;
+
+    await (agent as any).canUseTool(SESSION_ID)(
+      "ExitPlanMode",
+      { plan: "do stuff" },
+      { signal: new AbortController().signal, toolUseID: "toolu_1" },
+    );
+
+    expect(capturedPermissionRequest.options.map((option: any) => option.optionId)).toEqual([
+      "exit-plan-default",
+      "exit-plan-clear-accept-edits",
+      "exit-plan-accept-edits",
+      "reject",
     ]);
   });
 

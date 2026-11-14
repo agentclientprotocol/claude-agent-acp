@@ -78,7 +78,10 @@ export interface ReportsHost {
 /** What the session's query was started with (see {@link SessionReports.configure}). */
 export interface ReportsSetup {
   /** The session's live Claude Code settings, disposed with the reports. */
-  settings: Pick<SettingsManager, "getCompactionSettings" | "dispose">;
+  settings: Pick<
+    SettingsManager,
+    "getCompactionSettings" | "getShowClearContextOnPlanAccept" | "dispose"
+  >;
   /** The client's `settings` option, which the query got as `--settings`. */
   configuredSettings: Settings | undefined;
   /** The query's environment. */
@@ -107,6 +110,7 @@ export class SessionReports {
   private readonly compaction: ContextCompactionLifecycle;
   private idleCompaction: IdleCompaction | undefined;
   private settings: ReportsSetup["settings"] | undefined;
+  private configuredSettings: Settings | undefined;
   private clientMcpServers = new Set<string>();
   private mcpOAuth = false;
   private readonly reportedMcpServers = new Set<string>();
@@ -166,6 +170,7 @@ export class SessionReports {
     this.clientMcpServers = new Set(setup.mcpServers);
     this.mcpOAuth = setup.mcpOAuth;
     this.settings = setup.settings;
+    this.configuredSettings = setup.configuredSettings;
     this.query = setup.query;
     // From the same env the query got.
     this.providerCacheKey = providerCacheKeyFor(setup.env);
@@ -351,6 +356,12 @@ export class SessionReports {
   }
 
   /** The share of the context window in use, in percent, once a request reported it. */
+  /** Claude Code's `showClearContextOnPlanAccept` for this session's query;
+   *  false before {@link configure}. */
+  showClearContextOnPlanAccept(): boolean {
+    return this.settings?.getShowClearContextOnPlanAccept(this.configuredSettings) ?? false;
+  }
+
   contextUsedPercent(): number | undefined {
     if (this.contextUsed === undefined || this.contextWindow <= 0) return undefined;
     return Math.max(0, Math.min(100, Math.round((this.contextUsed / this.contextWindow) * 100)));
