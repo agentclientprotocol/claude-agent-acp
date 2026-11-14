@@ -192,12 +192,20 @@ export function buildConfigOptions(
  * a fallback for resolutions that don't map back onto a selectable option
  * (e.g. a fuzzy hit on an out-of-picker verbatim entry). `value` is then the
  * canonical option value, the model id rather than the alias.
+ *
+ * With `passUnlisted`, a model value that resolves to none of the entries is
+ * returned as it is, marked `unlisted`, for Claude Code to decide: the CLI's
+ * picker leaves out models it runs, such as `claude-fable-5-2` before a CLI
+ * lists it, or `claude-opus-4-6` once a newer Opus replaces it.
+ * {@link setSelectedModel} refuses it with invalid params when Claude Code
+ * does. Without it, such a value is refused here.
  */
 export function configOptionValue(
   option: SessionConfigOption,
   params: SetSessionConfigOptionRequest,
   modelInfos: ModelInfo[],
-): { enabled: boolean } | { value: string } {
+  passUnlisted = false,
+): { enabled: boolean } | { value: string; unlisted?: true } {
   const expectedType = option.type === "boolean" ? "boolean" : "string";
   if (typeof params.value !== expectedType) {
     throw RequestError.invalidParams(
@@ -233,6 +241,9 @@ export function configOptionValue(
       }));
       validValue = toOptionValue(resolveModelPreference(optionInfos, requested));
     }
+    if (!validValue && passUnlisted && requested.trim() !== "") {
+      return { value: requested.trim(), unlisted: true };
+    }
   }
   if (!validValue) {
     throw RequestError.invalidParams(
@@ -241,4 +252,28 @@ export function configOptionValue(
     );
   }
   return { value: validValue.value };
+}
+
+/**
+ * Switches `query` to the model that {@link configOptionValue} selected. Claude
+ * Code's `setModel` refuses an id it does not know ("Model 'gpt-4' not found")
+ * or that settings restrict (an `availableModels` allowlist, a managed
+ * `deniedModels` entry). For an `unlisted` value that refusal is invalid
+ * params with Claude Code's reason, as for a listed value the option lacks;
+ * for a listed value it stays the internal error it is.
+ */
+export async function setSelectedModel(
+  query: Pick<Query, "setModel">,
+  selected: { value: string; unlisted?: true },
+): Promise<void> {
+  try {
+    await query.setModel(selected.value);
+  } catch (error) {
+    if (!selected.unlisted) throw error;
+    const reason = error instanceof Error ? error.message : String(error);
+    throw RequestError.invalidParams(
+      undefined,
+      `Invalid value for config option ${MODEL_CONFIG_ID}: ${selected.value}. ${reason}`,
+    );
+  }
 }

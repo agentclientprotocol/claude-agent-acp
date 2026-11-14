@@ -331,18 +331,22 @@ describe("session config options", () => {
       expect(modelOption?.currentValue).toBe("claude-sonnet-4-6");
     });
 
-    // "a" is a substring of "Claude", "son" of "sonnet": only whole words match.
+    // "a" is a substring of "Claude", "son" of "sonnet": only whole words match,
+    // so each goes to Claude Code as it is, which refuses an id it does not know.
     it.each(["gpt-4", "not-a-model", "son", "foo-sonnet"])(
-      "rejects the model %s and leaves the model as it was",
+      "rejects the model %s that Claude Code refuses and leaves the model as it was",
       async (value) => {
+        setModelSpy.mockRejectedValue(new Error(`Model '${value}' not found`));
         await expect(
           agent.setSessionConfigOption({ sessionId: SESSION_ID, configId: "model", value }),
         ).rejects.toMatchObject({
           code: -32602,
-          message: expect.stringContaining(`Invalid value for config option model: ${value}`),
+          message: expect.stringContaining(
+            `Invalid value for config option model: ${value}. Model '${value}' not found`,
+          ),
         });
 
-        expect(setModelSpy).not.toHaveBeenCalled();
+        expect(setModelSpy).toHaveBeenCalledWith(value);
         const session = (
           agent as unknown as {
             sessions: Record<string, { configOptions: typeof MOCK_CONFIG_OPTIONS }>;
@@ -1169,13 +1173,38 @@ describe("session config options", () => {
         value: "claude-sonnet-4-6",
       });
       expect(modelValues(switched.configOptions)).toEqual(["claude-opus-4-5", "claude-sonnet-4-6"]);
+    });
+
+    it("passes a model id the option does not list to Claude Code, and lists it once Claude Code takes it", async () => {
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-fable-5-2",
+      });
+
+      expect(setModelSpy).toHaveBeenCalledWith("claude-fable-5-2");
+      const model = response.configOptions?.find((o) => o.id === "model");
+      expect(model?.currentValue).toBe("claude-fable-5-2");
+      expect(
+        (model as { options: { value: string }[] } | undefined)?.options.map((o) => o.value),
+      ).toEqual(["claude-opus-4-5", "claude-sonnet-4-6", "claude-fable-5-2"]);
+    });
+
+    it("refuses a model id the option does not list when a gateway listed the models", async () => {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.modelsNarrowedByGateway = true;
+
       await expect(
         agent.setSessionConfigOption({
           sessionId: SESSION_ID,
           configId: "model",
-          value: "claude-offlist-9",
+          value: "claude-fable-5-2",
         }),
-      ).rejects.toThrow("Invalid value");
+      ).rejects.toMatchObject({
+        code: -32602,
+        message: expect.stringMatching(/Invalid value for config option model: claude-fable-5-2$/),
+      });
+      expect(setModelSpy).not.toHaveBeenCalled();
     });
 
     it("setSessionMode also syncs configOptions", async () => {

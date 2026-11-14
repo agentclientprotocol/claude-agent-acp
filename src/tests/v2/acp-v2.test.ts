@@ -1255,9 +1255,9 @@ describe("ACP v2 sessions", () => {
       ],
       // "a" is a substring of "claude": a substring match would pick Opus.
       [
-        "a model the session does not offer",
+        "a model Claude Code does not know",
         { configId: "model", type: "id", value: "not-a-model" },
-        "Invalid value for config option model: not-a-model",
+        "Invalid value for config option model: not-a-model. Model 'not-a-model' not found",
       ],
       [
         "a mode the session does not offer",
@@ -1274,6 +1274,8 @@ describe("ACP v2 sessions", () => {
       async (_case, request, message) => {
         const models: Array<string | undefined> = [];
         sdk.setModel = async (model) => {
+          // Claude Code refuses an id it does not know.
+          if (model === "not-a-model") throw new Error(`Model '${model}' not found`);
           models.push(model);
         };
         const client = v2Client();
@@ -1299,6 +1301,72 @@ describe("ACP v2 sessions", () => {
         expect(values(listed.configOptions)).toEqual(values(created.configOptions));
       },
     );
+
+    it("passes a model id the option does not list to Claude Code, and lists it once Claude Code takes it", async () => {
+      const models: Array<string | undefined> = [];
+      sdk.setModel = async (model) => {
+        models.push(model);
+      };
+      const client = v2Client();
+      const response = await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        const response = await agent.request(v2.methods.agent.session.setConfigOption, {
+          sessionId,
+          configId: "model",
+          type: "id",
+          value: "claude-fable-5-2",
+        });
+        await client.authUpdate(1);
+        return response;
+      });
+
+      expect(models).toEqual(["claude-fable-5-2"]);
+      const model = response.configOptions.find((option) => option.configId === "model");
+      expect(model?.currentValue).toBe("claude-fable-5-2");
+      expect(
+        (model as { options: { value: string }[] } | undefined)?.options.map(
+          (entry) => entry.value,
+        ),
+      ).toContain("claude-fable-5-2");
+    });
+
+    it("refuses a model id the option does not list when a gateway listed the models", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => new Response(JSON.stringify({ data: [{ id: OPUS.value }] }))),
+      );
+      const models: Array<string | undefined> = [];
+      sdk.setModel = async (model) => {
+        models.push(model);
+      };
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        await agent.request(v2.methods.agent.providers.set, {
+          providerId: "main",
+          apiType: "anthropic",
+          baseUrl: "https://gateway.example.com",
+        });
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await expect(
+          agent.request(v2.methods.agent.session.setConfigOption, {
+            sessionId,
+            configId: "model",
+            type: "id",
+            value: "claude-fable-5-2",
+          }),
+        ).rejects.toMatchObject({
+          code: -32602,
+          message: expect.stringMatching(
+            /Invalid value for config option model: claude-fable-5-2$/,
+          ),
+        });
+        await client.authUpdate(1);
+      });
+
+      expect(models).not.toContain("claude-fable-5-2");
+    });
 
     it("rebuilds the options for a model switch, and clears an effort the new model lacks", async () => {
       const client = v2Client();
