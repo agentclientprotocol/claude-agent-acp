@@ -18,6 +18,7 @@ import {
   TaskOutputPoll,
 } from "../background-output.js";
 import type { Logger } from "../logger.js";
+import { type StreamedTerminals, streamedTerminals } from "../tool-calls/background.js";
 import type { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 
 /** The display terminal of a command. */
@@ -108,27 +109,25 @@ export class SessionBackgroundWork {
 
   /**
    * The tool results in `content` came: stops reading the output of each
-   * foreground command among them. Returns the tool calls whose terminals got
-   * output as their commands ran: the result's output replaces it (see
-   * `withStreamedTerminal`).
-   *
-   * Not `backgrounded`, the call of a command that went to the background:
-   * its result has only Claude Code's "Command running in background" text, so
-   * its terminal keeps what it showed.
+   * foreground command among them. Returns how the result of each command
+   * whose terminal got output as it ran reaches that terminal (see
+   * `streamedTerminals`, for `withStreamedTerminal`): `backgrounded` is the
+   * command that went to the background, and `toolResultMeta` the
+   * `tool_result_meta` of the results' message.
    */
   async finishForeground(
     content: unknown,
-    backgrounded: string | undefined,
-  ): Promise<ReadonlySet<string>> {
-    const streamed = new Set<string>();
+    { backgrounded, toolResultMeta }: { backgrounded?: string; toolResultMeta?: unknown } = {},
+  ): Promise<StreamedTerminals> {
+    const shown: string[] = [];
     for (const block of Array.isArray(content) ? content : []) {
       const toolCallId: unknown = block?.type === "tool_result" ? block.tool_use_id : undefined;
       const followed = typeof toolCallId === "string" ? this.foreground.get(toolCallId) : undefined;
       if (!followed || typeof toolCallId !== "string") continue;
       this.foreground.delete(toolCallId);
-      if ((await followed.poll.finish()) && toolCallId !== backgrounded) streamed.add(toolCallId);
+      if (await followed.poll.finish()) shown.push(toolCallId);
     }
-    return streamed;
+    return streamedTerminals(shown, backgrounded, toolResultMeta);
   }
 
   /** Stops every foreground output poll: the session's query closed. */

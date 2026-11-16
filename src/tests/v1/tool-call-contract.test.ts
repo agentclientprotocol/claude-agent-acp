@@ -9,6 +9,7 @@ import { ClientCapabilities as ToolCallCapabilities } from "../../tool-calls/cli
 import {
   backgroundedBashToolCall,
   withRunningTerminal,
+  streamedTerminals,
   withStreamedTerminal,
 } from "../../tool-calls/background.js";
 import { foregroundBashTerminal } from "../../v1/background-work.js";
@@ -853,17 +854,45 @@ describe("background Bash", () => {
     expect(withRunningTerminal(onlyExit, "t")).toEqual(completed);
   });
 
-  it("makes the result's output replace the output that a foreground command's terminal showed", () => {
+  describe("the result of a command whose terminal showed output as the command ran", () => {
     const output = { terminal_id: "t", data: "line1\nline2" };
-    const withDelta = {
+    const resultWith = (meta: Record<string, unknown>) => ({
       ...completed,
-      update: { ...completed.update, _meta: { terminal_output_delta: output } },
-    };
-    expect(withStreamedTerminal(withDelta, new Set(["t"]))).toEqual({
-      ...completed,
-      update: { ...completed.update, _meta: { terminal_output: output } },
+      update: { ...completed.update, _meta: meta },
     });
-    expect(withStreamedTerminal(withDelta, new Set(["other"]))).toBe(withDelta);
+    // A client that appends chunks gets the result as a chunk, any other
+    // client, such as a v2 client, as the terminal's whole output.
+    const asChunk = resultWith({ terminal_output_delta: output });
+    const asWhole = resultWith({ terminal_output: output });
+
+    it.each([
+      { how: "replace" as const, sent: asChunk, expected: asWhole },
+      { how: "replace" as const, sent: asWhole, expected: asWhole },
+      { how: "append" as const, sent: asWhole, expected: asChunk },
+      { how: "append" as const, sent: asChunk, expected: asChunk },
+    ])("makes the output $how what the terminal showed", ({ how, sent, expected }) => {
+      expect(withStreamedTerminal(sent, new Map([["t", how]]))).toEqual(expected);
+    });
+
+    it("leaves the result of any other command as it is", () => {
+      expect(withStreamedTerminal(asChunk, new Map([["other", "replace"]]))).toBe(asChunk);
+    });
+
+    it("replaces with a result that carries the command's output, and appends a text of Claude Code", () => {
+      // What CLI 2.1.325 stamps on the result of a command that an interrupt
+      // stopped, and on one that ran after the user allowed it.
+      const toolResultMeta = [
+        { id: "stopped", non_execution_kind: "user-rejected" },
+        { id: "ran", permission_decision: { decision: "accept", source: "user_temporary" } },
+      ];
+      expect([
+        ...streamedTerminals(["ran", "stopped", "backgrounded"], "backgrounded", toolResultMeta),
+      ]).toEqual([
+        ["ran", "replace"],
+        ["stopped", "append"],
+        ["backgrounded", "append"],
+      ]);
+    });
   });
 
   describe("foregroundBashTerminal", () => {

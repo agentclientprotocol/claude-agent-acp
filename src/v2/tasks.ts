@@ -86,6 +86,7 @@ import {
 } from "../native-subagents.js";
 import { subagentLineage } from "../subagent-history.js";
 import {
+  streamedTerminals,
   withRunningTerminal,
   withRunningToolCall,
   withStreamedTerminal,
@@ -454,7 +455,6 @@ export class SessionTasks {
       (block) => block.type === "tool_result",
     ) as unknown as ToolResultBlock[];
     for (const { tool_use_id } of results) this.returned.add(tool_use_id);
-    const streamed = new Set<string>();
     const toolUses = output.toolUses();
     // Before the result's own updates: a SendMessage call whose message
     // reached its child is that message.
@@ -473,15 +473,21 @@ export class SessionTasks {
     const runningTerminal =
       command && this.started.has(command.taskId) ? command.toolCallId : undefined;
     // The output that a foreground command's terminal showed as it ran is
-    // replaced by the result's. A command that went to the background keeps
-    // it: its result has only Claude Code's "Command running in background"
-    // text, and its output file's tail goes on.
+    // replaced by the result's, when the result carries the command's output
+    // (see `streamedTerminals`). The output file's tail goes on for a command
+    // that went to the background.
+    const shown: string[] = [];
     for (const { tool_use_id: toolCallId } of results) {
       const poll = this.foreground.get(toolCallId);
       if (!poll) continue;
       this.foreground.delete(toolCallId);
-      if (poll.end() && toolCallId !== command?.toolCallId) streamed.add(toolCallId);
+      if (poll.end()) shown.push(toolCallId);
     }
+    const streamed = streamedTerminals(
+      shown,
+      command?.toolCallId,
+      (message as { tool_result_meta?: unknown }).tool_result_meta,
+    );
     if (command && runningTerminal) {
       this.terminals.set(command.taskId, {
         toolCallId: command.toolCallId,

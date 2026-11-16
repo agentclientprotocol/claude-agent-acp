@@ -9522,16 +9522,23 @@ describe("ACP v2 terminal of a command in the background", () => {
 });
 
 describe("ACP v2 output of a command in the foreground", () => {
+  /** Claude Code's result for a command that an interrupt stopped (CLI 2.1.325, shortened). */
+  const STOP_NOTICE =
+    "The user doesn't want to proceed with this tool use. The tool use was rejected. " +
+    "Correction to the text above: this call was stopped while running, not refused before it ran.";
+
   /**
    * Claude Code runs `make test` in the foreground until `done` resolves, as
    * CLI 2.1.325 reports it: the command's task starts once it has run for
    * about 3 s, and ends before its tool result, which comes once `resulted`
-   * resolves too.
+   * resolves too. A command that an interrupt `stopped` has Claude Code's
+   * notice for the model as its result, stamped as not executed.
    */
   async function* foregroundCommand(
     options: Options,
     done: Promise<void>,
     resulted: Promise<void>,
+    stopped = false,
   ) {
     yield toolUseMessage(options, "toolu_fg", "Bash", { command: "make test" });
     const task = {
@@ -9552,19 +9559,46 @@ describe("ACP v2 output of a command in the foreground", () => {
     yield {
       ...task,
       subtype: "task_notification",
-      status: "completed",
+      status: stopped ? "stopped" : "completed",
       output_file: "",
       summary: "",
       uuid: randomUUID(),
     };
     await resulted;
-    yield {
-      ...toolResultMessage(options, "toolu_fg", { content: "line1\nline2" }),
-      tool_use_result: { stdout: "line1\nline2", stderr: "", interrupted: false, isImage: false },
-    };
+    yield stopped
+      ? {
+          ...toolResultMessage(
+            options,
+            "toolu_fg",
+            { content: STOP_NOTICE, is_error: true },
+            "user-rejected",
+          ),
+          tool_use_result: "User rejected tool use",
+        }
+      : {
+          ...toolResultMessage(options, "toolu_fg", { content: "line1\nline2" }),
+          tool_use_result: {
+            stdout: "line1\nline2",
+            stderr: "",
+            interrupted: false,
+            isImage: false,
+          },
+        };
     yield result(options);
     yield idleState(options);
   }
+
+  /** What the client was sent for the terminal: appended chunks, and outputs that replace. */
+  const output = (client: ReturnType<typeof v2Client>) =>
+    client.sessionUpdates.flatMap(({ update }) => {
+      if (update.sessionUpdate === "terminal_output_chunk") {
+        return [`chunk ${Buffer.from(String(update.data), "base64").toString()}`];
+      }
+      if (update.sessionUpdate !== "terminal_update" || !update.output) return [];
+      return [
+        `output ${Buffer.from((update.output as { data: string }).data, "base64").toString()}`,
+      ];
+    });
 
   it("sends the output as chunks while the command runs, then the result's output as the terminal's", async () => {
     let written = "line1\n";
@@ -9575,16 +9609,6 @@ describe("ACP v2 output of a command in the foreground", () => {
     });
     const done = Promise.withResolvers<void>();
     scriptTurns((options) => foregroundCommand(options, done.promise, done.promise));
-    const output = (client: ReturnType<typeof v2Client>) =>
-      client.sessionUpdates.flatMap(({ update }) => {
-        if (update.sessionUpdate === "terminal_output_chunk") {
-          return [`chunk ${Buffer.from(String(update.data), "base64").toString()}`];
-        }
-        if (update.sessionUpdate !== "terminal_update" || !update.output) return [];
-        return [
-          `output ${Buffer.from((update.output as { data: string }).data, "base64").toString()}`,
-        ];
-      });
 
     const client = v2Client();
     await client.app.connectWith(connectRouter(), async (agent) => {
@@ -9608,6 +9632,30 @@ describe("ACP v2 output of a command in the foreground", () => {
 
     // A v2 terminal's lines end in CR LF, as a PTY's do.
     expect(output(client)).toEqual(["chunk line1\r\n", "chunk line2", "output line1\r\nline2"]);
+  });
+
+  // The result of a command that an interrupt stopped is Claude Code's notice
+  // for the model: it must not replace the output that the user was reading.
+  it("keeps what the terminal showed of a stopped command, and appends Claude Code's notice", async () => {
+    sdk.getTaskOutput = async () => ({ output: "line1\n", total_bytes: 6, truncated: false });
+    const done = Promise.withResolvers<void>();
+    scriptTurns((options) => foregroundCommand(options, done.promise, done.promise, true));
+
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const prompt = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("hi"),
+      });
+      await vi.waitFor(() => expect(output(client)).toHaveLength(1), { timeout: 2000 });
+      done.resolve();
+      await prompt;
+      await vi.waitFor(() => expect(output(client)).toHaveLength(2), { timeout: 2000 });
+    });
+
+    expect(output(client)).toEqual(["chunk line1\r\n", `chunk ${STOP_NOTICE}`]);
   });
 
   // A tool call that gets no result, such as one of a reply that Claude Code

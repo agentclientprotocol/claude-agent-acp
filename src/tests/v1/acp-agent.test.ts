@@ -23216,11 +23216,25 @@ describe("terminal of a command in the background", () => {
 // command's task with `get_task_output` from its `task_started` until the Bash
 // result, whose output then replaces what the terminal showed.
 describe("output of a command in the foreground", () => {
+  /** Claude Code's result for a command that an interrupt stopped (CLI 2.1.325, shortened). */
+  const STOP_NOTICE =
+    "The user doesn't want to proceed with this tool use. The tool use was rejected. " +
+    "Correction to the text above: this call was stopped while running, not refused before it ran.";
+
   /**
    * A turn that runs `make test` in the foreground until `done` resolves. The
    * command's tool result comes once `resulted` resolves too.
+   *
+   * With `cancelled`, a `session/cancel` (`cancel`) ends the turn at `done`.
+   * Claude Code's interrupt then stops the command, whose result is the
+   * `notice` for the model, stamped as not executed. A command that ended
+   * just before the interrupt has its `output` as its result instead.
    */
-  function foregroundCommand(done: Promise<void>, resulted: Promise<void>) {
+  function foregroundCommand(
+    done: Promise<void>,
+    resulted: Promise<void>,
+    cancelled?: { cancel: () => Promise<void>; result: "notice" | "output" },
+  ) {
     return (input: Pushable<any>) =>
       (async function* () {
         const iter = input[Symbol.asyncIterator]();
@@ -23258,12 +23272,14 @@ describe("output of a command in the foreground", () => {
           session_id: "test-session",
         };
         await done;
+        await cancelled?.cancel();
+        const stopped = cancelled?.result === "notice";
         yield {
           type: "system",
           subtype: "task_notification",
           task_id: "fg1",
           tool_use_id: "toolu_fg",
-          status: "completed",
+          status: stopped ? "stopped" : "completed",
           output_file: "",
           summary: "",
           uuid: randomUUID(),
@@ -23272,21 +23288,43 @@ describe("output of a command in the foreground", () => {
         await resulted;
         yield {
           type: "user",
-          message: {
-            role: "user",
-            content: [{ type: "tool_result", tool_use_id: "toolu_fg", content: "line1\nline2" }],
-          },
-          tool_use_result: {
-            stdout: "line1\nline2",
-            stderr: "",
-            interrupted: false,
-            isImage: false,
-          },
+          ...(stopped
+            ? {
+                message: {
+                  role: "user",
+                  content: [
+                    {
+                      type: "tool_result",
+                      tool_use_id: "toolu_fg",
+                      is_error: true,
+                      content: STOP_NOTICE,
+                    },
+                  ],
+                },
+                tool_use_result: "User rejected tool use",
+                tool_result_meta: [{ id: "toolu_fg", non_execution_kind: "user-rejected" }],
+              }
+            : {
+                message: {
+                  role: "user",
+                  content: [
+                    { type: "tool_result", tool_use_id: "toolu_fg", content: "line1\nline2" },
+                  ],
+                },
+                tool_use_result: {
+                  stdout: "line1\nline2",
+                  stderr: "",
+                  interrupted: false,
+                  isImage: false,
+                },
+              }),
           parent_tool_use_id: null,
           uuid: randomUUID(),
           session_id: "test-session",
         };
-        yield successfulResultMessage();
+        yield cancelled
+          ? { ...successfulResultMessage(), is_error: true, terminal_reason: "aborted_tools" }
+          : successfulResultMessage();
         yield { type: "system", subtype: "session_state_changed", state: "idle" };
       })();
   }
@@ -23304,9 +23342,14 @@ describe("output of a command in the foreground", () => {
 
   /**
    * Starts the turn for a client with `capabilities`. The query answers
-   * `get_task_output` with what `written` returns.
+   * `get_task_output` with what `written` returns. With `cancelledResult`, the
+   * client cancels the turn once `taskEnds` is called (see `foregroundCommand`).
    */
-  async function start(capabilities: ClientCapabilities, written: () => string) {
+  async function start(
+    capabilities: ClientCapabilities,
+    written: () => string,
+    cancelledResult?: "notice" | "output",
+  ) {
     const updates: SessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
       { sessionUpdate: async (n: SessionNotification) => void updates.push(n) } as AcpClient,
@@ -23315,7 +23358,17 @@ describe("output of a command in the foreground", () => {
     await initializeClient(agent, capabilities);
     const done = Promise.withResolvers<void>();
     const resulted = Promise.withResolvers<void>();
-    injectGeneratorSession(agent, foregroundCommand(done.promise, resulted.promise));
+    injectGeneratorSession(
+      agent,
+      foregroundCommand(
+        done.promise,
+        resulted.promise,
+        cancelledResult && {
+          cancel: () => agent.cancel({ sessionId: "test-session" }),
+          result: cancelledResult,
+        },
+      ),
+    );
     const getTaskOutput = vi.fn(async (taskId: string) => {
       expect(taskId).toBe("fg1");
       const output = written();
@@ -23367,6 +23420,29 @@ describe("output of a command in the foreground", () => {
       outputs: [{ snapshot: "line1\nline2" }],
       reads: 0,
     });
+  });
+
+  // The result of a command that a cancel stopped is Claude Code's notice for
+  // the model: it must not replace the output that the user was reading.
+  it.each([
+    {
+      result: "notice" as const,
+      name: "keeps what the terminal showed, and appends Claude Code's notice",
+      expected: [{ delta: "line1\n" }, { delta: STOP_NOTICE }],
+    },
+    {
+      result: "output" as const,
+      name: "replaces what the terminal showed with the output of a command that had ended",
+      expected: [{ delta: "line1\n" }, { snapshot: "line1\nline2" }],
+    },
+  ])("at a cancel, $name", async ({ result, expected }) => {
+    const turn = await start({ _meta: { terminal_output_delta: true } }, () => "line1\n", result);
+    await vi.waitFor(() => expect(outputs(turn.updates)).toHaveLength(1), { timeout: 1500 });
+    turn.taskEnds();
+    turn.resultComes();
+
+    await expect(turn.prompt).resolves.toMatchObject({ stopReason: "cancelled" });
+    await vi.waitFor(() => expect(outputs(turn.updates)).toEqual(expected), { timeout: 1500 });
   });
 
   // A tool call that gets no result, such as one of a reply that Claude Code

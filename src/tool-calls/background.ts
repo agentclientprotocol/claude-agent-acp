@@ -1,5 +1,6 @@
 import type { SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import { AIR_ASYNC_TASKS_CAPABILITY, withAirMeta } from "../air-extension.js";
+import { parseToolResultMeta } from "../tool-result-meta.js";
 
 /**
  * Marks the Bash `tool_call_update` whose command detached into the background.
@@ -74,27 +75,70 @@ export function withRunningTerminal(
 }
 
 /**
- * Makes the output of the tool result update of a command in `toolCallIds`
- * replace its terminal's output: `terminal_output_delta` becomes
- * `terminal_output`. The terminal showed the command's output as it ran (see
- * `SessionBackgroundWork.followForeground`), and the result carries the whole
- * output again, also the end that the last read missed.
+ * How the tool result of each command whose terminal got output as the command
+ * ran reaches that terminal, by tool call id (see `withStreamedTerminal`).
+ */
+export type StreamedTerminals = ReadonlyMap<string, "replace" | "append">;
+
+/**
+ * How the tool results of the commands `shown`, whose terminals got output as
+ * they ran, reach those terminals. A result that carries the command's whole
+ * output replaces what the terminal showed. Two results carry a text of Claude
+ * Code instead, so that text is appended to what the terminal showed:
+ * - the result of `backgrounded`, the command that went to the background:
+ *   "Command running in background";
+ * - a result that `toolResultMeta` (the `tool_result_meta` of the result's
+ *   message) stamps as not executed. CLI 2.1.325 stamps the command that a
+ *   `session/cancel` stopped `user-rejected`, and its result is the notice
+ *   "The user doesn't want to proceed with this tool use".
+ */
+export function streamedTerminals(
+  shown: readonly string[],
+  backgrounded: string | undefined,
+  toolResultMeta: unknown,
+): StreamedTerminals {
+  const notExecuted = parseToolResultMeta(toolResultMeta);
+  return new Map(
+    shown.map((toolCallId) => [
+      toolCallId,
+      toolCallId === backgrounded || notExecuted?.has(toolCallId) ? "append" : "replace",
+    ]),
+  );
+}
+
+/**
+ * Makes the output of the tool result update of a command in `streamed` reach
+ * its terminal as `streamed` says. The terminal showed the command's output as
+ * it ran (see `SessionBackgroundWork.followForeground`):
+ * - `replace`: the output goes as `terminal_output`. The result carries the
+ *   whole output again, also the end that the last read missed.
+ * - `append`: the output goes as `terminal_output_delta`, after what the
+ *   terminal showed.
+ *
+ * Without this, the client's kind decides: the result of a client that appends
+ * chunks would repeat the output, and the result of any other client, such as
+ * a v2 client, would replace it also with a notice.
  */
 export function withStreamedTerminal(
   notification: SessionNotification,
-  toolCallIds: ReadonlySet<string>,
+  streamed: StreamedTerminals,
 ): SessionNotification {
   const update = notification.update;
-  if (
-    update.sessionUpdate !== "tool_call_update" ||
-    !toolCallIds.has(update.toolCallId) ||
-    !update._meta ||
-    !("terminal_output_delta" in update._meta)
-  ) {
-    return notification;
-  }
-  const { terminal_output_delta: output, ...meta } = update._meta;
-  return { ...notification, update: { ...update, _meta: { ...meta, terminal_output: output } } };
+  const how = update.sessionUpdate === "tool_call_update" && streamed.get(update.toolCallId);
+  if (update.sessionUpdate !== "tool_call_update" || !how || !update._meta) return notification;
+  const { terminal_output_delta: delta, terminal_output: whole, ...meta } = update._meta;
+  const output: unknown = delta ?? whole;
+  if (output === undefined) return notification;
+  return {
+    ...notification,
+    update: {
+      ...update,
+      _meta: {
+        ...meta,
+        ...(how === "replace" ? { terminal_output: output } : { terminal_output_delta: output }),
+      },
+    },
+  };
 }
 
 /**
