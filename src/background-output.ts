@@ -150,23 +150,34 @@ const CUT_CHARACTER_BYTES = 4;
  * Follows the output of a command that runs in the foreground, read with
  * `read` (Claude Code's `get_task_output`), and hands each piece of new text
  * to `publish`, in order. Claude Code streams no output of a foreground Bash
- * command either: its `tool_progress` carries only the elapsed time, and the
- * output arrives in the tool result. Claude Code writes the output to its task
- * before then, and `get_task_output` reads it, though the task's
- * `task_started` names no output file.
+ * command either: the output arrives in the tool result. Claude Code writes
+ * the output to the command's task before then, and `get_task_output` reads
+ * it, though the task's `task_started` names no output file.
  *
  * The new text is the output past the bytes already sent. When `output` does
  * not hold all of it, or its bytes may not match the command's (not UTF-8),
  * the whole `output` replaces the terminal's output, as a snapshot. A read
  * that ends in U+FFFD may have cut a character that the command is still
- * writing, so it is sent only at the next read. A read that fails is tried
- * again at the next poll. Reads never overlap. `publish` must not reject.
+ * writing, so it is sent only at the next read.
+ *
+ * Once the command ends, Claude Code drops its output: the task then reads as
+ * empty (`total_bytes: 0`, CLI 2.1.325), up to the tool result that carries
+ * the whole output. A read that holds less than was sent is that end, so it
+ * stops the poll and publishes nothing: an empty snapshot would clear the
+ * terminal.
+ *
+ * One read runs at a time: a poll that comes during a read is skipped, so a
+ * read that Claude Code never answers queues nothing behind it. A read that
+ * fails is tried again at the next poll. `publish` must not reject.
  */
 export class TaskOutputPoll {
   private sentBytes = 0;
   private sent = false;
   private stopped = false;
-  private reading: Promise<void> = Promise.resolve();
+  /** A read is in progress, or the publish of its text. */
+  private busy = false;
+  /** The publish in progress, or the last one. */
+  private publishing: Promise<void> = Promise.resolve();
   private readonly timer: ReturnType<typeof setInterval>;
 
   constructor(
@@ -179,55 +190,62 @@ export class TaskOutputPoll {
   }
 
   /**
-   * Stops, once a read in progress has published its text. Returns whether
-   * any text was published: the tool result then replaces it with the whole
-   * output, which a read in progress may have missed the end of.
+   * Stops, once a publish in progress is out. Returns whether any text was
+   * published: the tool result then replaces it with the whole output.
+   *
+   * A read in progress is not waited for. It publishes nothing after this,
+   * and Claude Code may never answer it.
    */
   async finish(): Promise<boolean> {
     this.stop();
-    await this.reading;
+    await this.publishing;
     return this.sent;
   }
 
   /**
-   * Stops now and returns whether any text was published, for a caller that
-   * cannot wait for a read in progress (the v2 tool result path is
-   * synchronous). A read in progress publishes nothing after this: `poll`
-   * checks `stopped` after its read and calls `publish` in the same
-   * synchronous step.
+   * Stops now and returns whether any text was published, for a caller whose
+   * `publish` sends in the same synchronous step (v2), so none is in progress.
    */
   end(): boolean {
     this.stop();
     return this.sent;
   }
 
-  /** Stops without waiting: the session ended. */
+  /** Stops without waiting: the command's task, the query or the session ended. */
   stop(): void {
     clearInterval(this.timer);
     this.stopped = true;
   }
 
-  private poll(): Promise<void> {
-    this.reading = this.reading.then(async () => {
+  private async poll(): Promise<void> {
+    if (this.stopped || this.busy) return;
+    this.busy = true;
+    try {
+      const read = await this.read();
       if (this.stopped) return;
-      let read: TaskOutput;
-      try {
-        read = await this.read();
-      } catch {
+      if (read.total_bytes < this.sentBytes) {
+        this.stop();
         return;
       }
       const output = this.newText(read);
-      if (this.stopped || output === undefined) return;
+      if (output === undefined) return;
       this.sentBytes = read.total_bytes;
       this.sent = true;
-      await this.publish(output);
-    });
-    return this.reading;
+      this.publishing = this.publish(output);
+      await this.publishing;
+    } catch {
+      // The read failed: try again at the next poll.
+    } finally {
+      this.busy = false;
+    }
   }
 
-  /** The text that `read` adds to what was sent, or undefined when it adds none yet. */
+  /**
+   * The text that `read` adds to what was sent, or undefined when it adds none
+   * yet. `read` holds at least the bytes that were sent.
+   */
   private newText({ output, total_bytes, truncated }: TaskOutput): BackgroundOutput | undefined {
-    if (total_bytes === this.sentBytes || output.endsWith("�")) return undefined;
+    if (total_bytes === this.sentBytes || output.endsWith("\uFFFD")) return undefined;
     const bytes = Buffer.from(output, "utf8");
     const added = total_bytes - this.sentBytes;
     const exact = truncated
@@ -235,11 +253,33 @@ export class TaskOutputPoll {
       : bytes.length === total_bytes;
     // `sentBytes` ends a read that ended in a whole character, so the cut is
     // at a character boundary.
-    if (added > 0 && exact) {
+    if (exact) {
       return { text: bytes.subarray(bytes.length - added).toString("utf8"), replaces: false };
     }
     return { text: output, replaces: true };
   }
+}
+
+/**
+ * The id of the tool call whose command the task `started` runs in the
+ * foreground, or undefined for any other task. Claude Code starts the task of
+ * a foreground command once the command has run for a few seconds (3.1 s with
+ * CLI 2.1.325). A faster command gets no task, and its output comes with its
+ * tool result, as before.
+ */
+export function foregroundCommandToolCall(started: {
+  task_type?: string;
+  is_backgrounded?: boolean;
+  tool_use_id?: string;
+}): string | undefined {
+  return started.task_type === "local_bash" && started.is_backgrounded === false
+    ? started.tool_use_id
+    : undefined;
+}
+
+/** Whether a call of the tool `name` runs a command that a terminal shows. */
+export function isCommandTool(name: string | undefined): boolean {
+  return name === "Bash" || name === "PowerShell";
 }
 
 /**

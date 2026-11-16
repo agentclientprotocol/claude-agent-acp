@@ -9522,6 +9522,50 @@ describe("ACP v2 terminal of a command in the background", () => {
 });
 
 describe("ACP v2 output of a command in the foreground", () => {
+  /**
+   * Claude Code runs `make test` in the foreground until `done` resolves, as
+   * CLI 2.1.325 reports it: the command's task starts once it has run for
+   * about 3 s, and ends before its tool result, which comes once `resulted`
+   * resolves too.
+   */
+  async function* foregroundCommand(
+    options: Options,
+    done: Promise<void>,
+    resulted: Promise<void>,
+  ) {
+    yield toolUseMessage(options, "toolu_fg", "Bash", { command: "make test" });
+    const task = {
+      type: "system",
+      task_id: "fg1",
+      tool_use_id: "toolu_fg",
+      session_id: options.sessionId,
+    };
+    yield {
+      ...task,
+      subtype: "task_started",
+      task_type: "local_bash",
+      description: "make test",
+      is_backgrounded: false,
+      uuid: randomUUID(),
+    };
+    await done;
+    yield {
+      ...task,
+      subtype: "task_notification",
+      status: "completed",
+      output_file: "",
+      summary: "",
+      uuid: randomUUID(),
+    };
+    await resulted;
+    yield {
+      ...toolResultMessage(options, "toolu_fg", { content: "line1\nline2" }),
+      tool_use_result: { stdout: "line1\nline2", stderr: "", interrupted: false, isImage: false },
+    };
+    yield result(options);
+    yield idleState(options);
+  }
+
   it("sends the output as chunks while the command runs, then the result's output as the terminal's", async () => {
     let written = "line1\n";
     sdk.getTaskOutput = async () => ({
@@ -9530,51 +9574,7 @@ describe("ACP v2 output of a command in the foreground", () => {
       truncated: false,
     });
     const done = Promise.withResolvers<void>();
-    scriptTurns(async function* (options) {
-      yield {
-        type: "assistant",
-        message: {
-          id: "msg_fg",
-          type: "message",
-          role: "assistant",
-          model: "claude-sonnet-4-6",
-          content: [
-            { type: "tool_use", id: "toolu_fg", name: "Bash", input: { command: "make test" } },
-          ],
-          stop_reason: "tool_use",
-          stop_sequence: null,
-          usage: { input_tokens: 1, output_tokens: 1 },
-        },
-        parent_tool_use_id: null,
-        uuid: randomUUID(),
-        session_id: options.sessionId,
-      };
-      yield {
-        type: "system",
-        subtype: "task_started",
-        task_id: "fg1",
-        task_type: "local_bash",
-        description: "make test",
-        tool_use_id: "toolu_fg",
-        is_backgrounded: false,
-        uuid: randomUUID(),
-        session_id: options.sessionId,
-      };
-      await done.promise;
-      yield {
-        type: "user",
-        message: {
-          role: "user",
-          content: [{ type: "tool_result", tool_use_id: "toolu_fg", content: "line1\nline2" }],
-        },
-        tool_use_result: { stdout: "line1\nline2", stderr: "", interrupted: false, isImage: false },
-        parent_tool_use_id: null,
-        uuid: randomUUID(),
-        session_id: options.sessionId,
-      };
-      yield result(options);
-      yield idleState(options);
-    });
+    scriptTurns((options) => foregroundCommand(options, done.promise, done.promise));
     const output = (client: ReturnType<typeof v2Client>) =>
       client.sessionUpdates.flatMap(({ update }) => {
         if (update.sessionUpdate === "terminal_output_chunk") {
@@ -9594,15 +9594,53 @@ describe("ACP v2 output of a command in the foreground", () => {
         sessionId,
         prompt: text("hi"),
       });
-      await vi.waitFor(() => expect(output(client)).toEqual(["chunk line1\n"]), { timeout: 2000 });
+      await vi.waitFor(() => expect(output(client)).toEqual(["chunk line1\r\n"]), {
+        timeout: 2000,
+      });
       written = "line1\nline2";
       await vi.waitFor(() => expect(output(client)).toHaveLength(2), { timeout: 2000 });
+      // Claude Code drops the output of a command that ended (CLI 2.1.325).
+      written = "";
       done.resolve();
       await prompt;
       await vi.waitFor(() => expect(output(client)).toHaveLength(3), { timeout: 2000 });
     });
 
-    expect(output(client)).toEqual(["chunk line1\n", "chunk line2", "output line1\nline2"]);
+    // A v2 terminal's lines end in CR LF, as a PTY's do.
+    expect(output(client)).toEqual(["chunk line1\r\n", "chunk line2", "output line1\r\nline2"]);
+  });
+
+  // A tool call that gets no result, such as one of a reply that Claude Code
+  // took back, must not be read until the query ends.
+  it("reads no more output once the command's task ended", async () => {
+    let reads = 0;
+    // The command prints nothing, so no read tells that it ended.
+    sdk.getTaskOutput = async () => {
+      reads++;
+      return { output: "", total_bytes: 0, truncated: false };
+    };
+    const done = Promise.withResolvers<void>();
+    const resulted = Promise.withResolvers<void>();
+    scriptTurns((options) => foregroundCommand(options, done.promise, resulted.promise));
+
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const prompt = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("hi"),
+      });
+      await vi.waitFor(() => expect(reads).toBeGreaterThan(0), { timeout: 2000 });
+      done.resolve();
+      // The task's end reaches the agent a few steps later.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const readsAtTaskEnd = reads;
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      expect(reads).toBe(readsAtTaskEnd);
+      resulted.resolve();
+      await prompt;
+    });
   });
 
   it("reads no task output for a command that Claude Code runs in the background", async () => {

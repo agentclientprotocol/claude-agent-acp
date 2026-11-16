@@ -23216,8 +23216,11 @@ describe("terminal of a command in the background", () => {
 // command's task with `get_task_output` from its `task_started` until the Bash
 // result, whose output then replaces what the terminal showed.
 describe("output of a command in the foreground", () => {
-  /** A turn that runs `make test` in the foreground until `done` resolves. */
-  function foregroundCommand(done: Promise<void>) {
+  /**
+   * A turn that runs `make test` in the foreground until `done` resolves. The
+   * command's tool result comes once `resulted` resolves too.
+   */
+  function foregroundCommand(done: Promise<void>, resulted: Promise<void>) {
     return (input: Pushable<any>) =>
       (async function* () {
         const iter = input[Symbol.asyncIterator]();
@@ -23242,7 +23245,7 @@ describe("output of a command in the foreground", () => {
             },
           },
         };
-        // What CLI 2.1.321 sends once the command has run for about 3 s.
+        // What CLI 2.1.325 sends once the command has run for about 3 s.
         yield {
           type: "system",
           subtype: "task_started",
@@ -23266,6 +23269,7 @@ describe("output of a command in the foreground", () => {
           uuid: randomUUID(),
           session_id: "test-session",
         };
+        await resulted;
         yield {
           type: "user",
           message: {
@@ -23298,9 +23302,11 @@ describe("output of a command in the foreground", () => {
       return [];
     });
 
-  /** Runs the turn for a client with `capabilities`. The command prints
-   *  `line1` and, once the client was sent it (or after 1.5 s), `line2`. */
-  async function run(capabilities: ClientCapabilities) {
+  /**
+   * Starts the turn for a client with `capabilities`. The query answers
+   * `get_task_output` with what `written` returns.
+   */
+  async function start(capabilities: ClientCapabilities, written: () => string) {
     const updates: SessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
       { sessionUpdate: async (n: SessionNotification) => void updates.push(n) } as AcpClient,
@@ -23308,11 +23314,12 @@ describe("output of a command in the foreground", () => {
     );
     await initializeClient(agent, capabilities);
     const done = Promise.withResolvers<void>();
-    injectGeneratorSession(agent, foregroundCommand(done.promise));
-    let written = "line1\n";
+    const resulted = Promise.withResolvers<void>();
+    injectGeneratorSession(agent, foregroundCommand(done.promise, resulted.promise));
     const getTaskOutput = vi.fn(async (taskId: string) => {
       expect(taskId).toBe("fg1");
-      return { output: written, total_bytes: Buffer.byteLength(written), truncated: false };
+      const output = written();
+      return { output, total_bytes: Buffer.byteLength(output), truncated: false };
     });
     // Not in the SDK's `Query` type (see `supportsTaskOutput`).
     Object.assign(agent.sessions["test-session"]!.query, { getTaskOutput });
@@ -23320,14 +23327,31 @@ describe("output of a command in the foreground", () => {
       sessionId: "test-session",
       prompt: [{ type: "text", text: "test it" }],
     });
+    return {
+      updates,
+      getTaskOutput,
+      prompt,
+      taskEnds: done.resolve,
+      resultComes: resulted.resolve,
+    };
+  }
+
+  /** Runs the turn for a client with `capabilities`. The command prints
+   *  `line1` and, once the client was sent it (or after 1.5 s), `line2`. */
+  async function run(capabilities: ClientCapabilities) {
+    let written = "line1\n";
+    const turn = await start(capabilities, () => written);
     await vi
-      .waitFor(() => expect(outputs(updates)).not.toEqual([]), { timeout: 1500 })
+      .waitFor(() => expect(outputs(turn.updates)).not.toEqual([]), { timeout: 1500 })
       .catch(() => {});
     written = "line1\nline2";
     await new Promise((resolve) => setTimeout(resolve, 700));
-    done.resolve();
-    await prompt;
-    return { outputs: outputs(updates), reads: getTaskOutput.mock.calls.length };
+    // Claude Code drops the output of a command that ended (CLI 2.1.325).
+    written = "";
+    turn.taskEnds();
+    turn.resultComes();
+    await turn.prompt;
+    return { outputs: outputs(turn.updates), reads: turn.getTaskOutput.mock.calls.length };
   }
 
   it("appends the output while the command runs, then replaces it with the result's", async () => {
@@ -23343,6 +23367,23 @@ describe("output of a command in the foreground", () => {
       outputs: [{ snapshot: "line1\nline2" }],
       reads: 0,
     });
+  });
+
+  // A tool call that gets no result, such as one of a reply that Claude Code
+  // took back, must not be read until the query closes.
+  it("reads no more output once the command's task ended", async () => {
+    // The command prints nothing, so no read tells that it ended.
+    const turn = await start({ _meta: { terminal_output_delta: true } }, () => "");
+    await vi.waitFor(() => expect(turn.getTaskOutput).toHaveBeenCalled(), { timeout: 1500 });
+    turn.taskEnds();
+    // The task's end reaches the agent a few steps later.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const reads = turn.getTaskOutput.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 700));
+
+    expect(turn.getTaskOutput).toHaveBeenCalledTimes(reads);
+    turn.resultComes();
+    await turn.prompt;
   });
 });
 

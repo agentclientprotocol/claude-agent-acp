@@ -133,10 +133,16 @@ describe("BackgroundOutputTail", () => {
 describe("TaskOutputPoll", () => {
   let published: BackgroundOutput[];
   let poll: TaskOutputPoll | undefined;
-  /** `get_task_output` returning each of `reads` in turn, then the last one again. */
-  const follow = (reads: TaskOutput[]) => {
+  /**
+   * `get_task_output` returning each of `reads` in turn, then the last one
+   * again. An `unanswered` read never returns.
+   */
+  const follow = (reads: Array<TaskOutput | "unanswered">) => {
     let next = 0;
-    const read = async () => reads[Math.min(next++, reads.length - 1)]!;
+    const read = async () => {
+      const answer = reads[Math.min(next++, reads.length - 1)]!;
+      return answer === "unanswered" ? new Promise<never>(() => {}) : answer;
+    };
     poll = new TaskOutputPoll(read, async (output) => void published.push(output));
     return () => next;
   };
@@ -171,8 +177,6 @@ describe("TaskOutputPoll", () => {
       "a tail that misses text",
       [whole("a\n"), { output: "z\n", total_bytes: 9000, truncated: true }],
     ],
-    // A new run of the task starts its output over.
-    ["an output that shrank", [whole("abc\n"), whole("d\n")]],
     // Bytes that are not UTF-8 decode to other bytes.
     [
       "an output that is not UTF-8",
@@ -183,6 +187,26 @@ describe("TaskOutputPoll", () => {
     await vi.waitFor(() => expect(published).toHaveLength(2), { timeout: 3000 });
 
     expect(published[1]).toEqual({ text: reads[1]!.output, replaces: true });
+  });
+
+  // Claude Code drops a foreground command's output when the command ends:
+  // CLI 2.1.325 then answers `total_bytes: 0` until the tool result comes.
+  it("stops at a read that holds less than was sent, without clearing the terminal", async () => {
+    const reads = follow([whole("line1\n"), whole("")]);
+    await vi.waitFor(() => expect(reads()).toBe(2), { timeout: 3000 });
+    await new Promise((resolve) => setTimeout(resolve, 700));
+
+    expect(reads()).toBe(2);
+    expect(published).toEqual([{ text: "line1\n", replaces: false }]);
+    expect(await poll!.finish()).toBe(true);
+  });
+
+  it("does not wait at finish for a read that Claude Code never answers", async () => {
+    const reads = follow([whole("line1\n"), "unanswered"]);
+    await vi.waitFor(() => expect(reads()).toBe(2), { timeout: 3000 });
+
+    expect(await poll!.finish()).toBe(true);
+    expect(published).toEqual([{ text: "line1\n", replaces: false }]);
   });
 
   it("appends from the end of a truncated tail that holds all the new text", async () => {

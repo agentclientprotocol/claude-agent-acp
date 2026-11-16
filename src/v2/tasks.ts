@@ -59,6 +59,8 @@ import { backgroundBashTaskFromToolResult, taskProgressFields } from "../async-t
 import {
   BackgroundOutputTail,
   type BackgroundOutput,
+  foregroundCommandToolCall,
+  isCommandTool,
   type TaskOutput,
   TaskOutputPoll,
 } from "../background-output.js";
@@ -292,7 +294,11 @@ export class SessionTasks {
       leveled?: boolean;
     }
   >();
-  /** The output polls of the commands that run in the foreground, by Bash tool call id. */
+  /**
+   * The output polls of the commands that run in the foreground, by tool call
+   * id. A poll stays here after its task ended, stopped, until the command's
+   * tool result asks whether its terminal got output.
+   */
   private readonly foreground = new Map<string, TaskOutputPoll>();
   /**
    * The tool calls whose tasks go on in the background, by task id. A call
@@ -1124,6 +1130,11 @@ export class SessionTasks {
               },
       );
     }
+    // A foreground command's output is read no more: a tool call that gets no
+    // result, such as one of a reply that Claude Code took back, would
+    // otherwise be read until the query ends.
+    const commandToolCall = this.started.get(taskId)?.toolUseId;
+    if (commandToolCall !== undefined) this.foreground.get(commandToolCall)?.stop();
     this.started.delete(taskId);
     const terminal = this.terminals.get(taskId);
     if (terminal && !terminal.ending) {
@@ -2067,31 +2078,19 @@ export class SessionTasks {
 
   /**
    * Starts reading the output of the foreground command that the task
-   * `started` runs into its terminal, until its tool result (see
-   * {@link TaskOutputPoll}). Claude Code streams no output of a foreground
-   * Bash command: its `tool_progress` carries only the elapsed time. It starts
-   * the command's `local_bash` task once the command has run for a few
-   * seconds (about 3 s with CLI 2.1.321), and `get_task_output` reads the
-   * task's output from then on. A faster command ends with its output in the
-   * tool result, as before. A subagent's command goes to the subagent's
-   * session, and gets no poll before that session is announced.
+   * `started` runs (see `foregroundCommandToolCall`) into its terminal, until
+   * its tool result or the end of its task (see {@link TaskOutputPoll}). A
+   * subagent's command goes to the subagent's session, and gets no poll
+   * before that session is announced.
    */
   private followForeground(started: Extract<SDKMessage, { subtype: "task_started" }>): void {
     const read = this.host.taskOutput();
-    const toolCallId = started.tool_use_id;
-    if (
-      !read ||
-      started.task_type !== "local_bash" ||
-      started.is_backgrounded !== false ||
-      toolCallId === undefined ||
-      this.foreground.has(toolCallId)
-    ) {
-      return;
-    }
+    const toolCallId = foregroundCommandToolCall(started);
+    if (!read || toolCallId === undefined || this.foreground.has(toolCallId)) return;
     const parent =
       started.parent_task_id === undefined ? undefined : this.children.get(started.parent_task_id);
     const output = started.parent_task_id === undefined ? this.rootOutput : parent?.output;
-    if (!output?.holds(toolCallId) || output.toolUses()[toolCallId]?.name !== "Bash") return;
+    if (!output?.holds(toolCallId) || !isCommandTool(output.toolUses()[toolCallId]?.name)) return;
     const taskId = started.task_id;
     this.foreground.set(
       toolCallId,

@@ -160,8 +160,7 @@ import {
   backgroundedBashToolCallIds,
   clientSupportsAsyncTasks,
 } from "../async-tasks.js";
-import { foregroundBashTerminal, SessionBackgroundWork } from "./background-work.js";
-import { supportsTaskOutput } from "../background-output.js";
+import { SessionBackgroundWork } from "./background-work.js";
 import {
   ASYNC_TASK_STOP_METHOD,
   parseAsyncTaskStopRequest,
@@ -5278,30 +5277,13 @@ export class ClaudeAcpAgent {
                   skip_transcript: message.skip_transcript,
                   tool_use_id: message.tool_use_id,
                 });
-                // A foreground command's terminal shows its output as it runs,
-                // for a client that appends chunks (`terminal_output_delta`).
-                // A client that declared only `terminal_output`, and AIR, which
-                // shows commands through its async tasks, get the output with
-                // the result, as before.
-                {
-                  const caps = this.toolCallCapabilities;
-                  const query = session.query;
-                  const terminal =
-                    caps.terminalOutput && caps.terminalOutputDelta && !caps.air.client
-                      ? foregroundBashTerminal(session, message)
-                      : undefined;
-                  if (terminal && supportsTaskOutput(query)) {
-                    const taskId = message.task_id;
-                    session.background.followForeground(
-                      terminal,
-                      () => query.getTaskOutput(taskId),
-                      (notification) =>
-                        sendUpdate(notification).catch((error) => {
-                          this.logger.error("Failed to send command output:", error);
-                        }),
-                    );
-                  }
-                }
+                // A foreground command's terminal shows its output as it runs.
+                session.background.followForeground(message, {
+                  owner: session,
+                  capabilities: this.toolCallCapabilities,
+                  send: sendUpdate,
+                  logger: this.logger,
+                });
                 break;
               case "task_notification":
                 if (isLateTaskRun(session, message.task_id, message.run_id)) {
@@ -6882,7 +6864,7 @@ export class ClaudeAcpAgent {
             const acceptedPlanToolUseId = observeExitPlanToolResults(message, content, session);
             let backgroundedToolCalls: ReadonlySet<string> = new Set();
             let runningTerminal: string | undefined;
-            const streamedTerminals = new Set<string>();
+            let streamedTerminals: ReadonlySet<string> = new Set();
             if (message.type === "user") {
               rememberResolvedToolNames(session, content);
               recordSubagentFileEdits(
@@ -6910,18 +6892,11 @@ export class ClaudeAcpAgent {
               );
               if (backgroundBashTask) await asyncTasks.taskBackgrounded(backgroundBashTask);
               // The output that a foreground command's terminal showed as it
-              // ran is replaced by the result's. A command that went to the
-              // background keeps it: its result has only Claude Code's
-              // "Command running in background" text.
-              for (const block of Array.isArray(content) ? content : []) {
-                if (
-                  block.type === "tool_result" &&
-                  (await session.background.finishForeground(block.tool_use_id)) &&
-                  block.tool_use_id !== backgroundBashTask?.toolCallId
-                ) {
-                  streamedTerminals.add(block.tool_use_id);
-                }
-              }
+              // ran is replaced by the result's.
+              streamedTerminals = await session.background.finishForeground(
+                content,
+                backgroundBashTask?.toolCallId,
+              );
               // The command's terminal runs until its task ends, unless the
               // task has ended already (a fast command can end before the tool
               // result comes).

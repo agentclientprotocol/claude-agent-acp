@@ -871,8 +871,12 @@ describe("background Bash", () => {
       liveBackgroundTasks: new Map([
         ["agent1", { parentToolUseId: "toolu_agent", isSubagent: true }],
       ]),
-      toolUseCache: { toolu_bash: { name: "Bash" }, toolu_read: { name: "Read" } },
-      emittedToolCalls: new Set(["toolu_bash", "toolu_read"]),
+      toolUseCache: {
+        toolu_bash: { name: "Bash" },
+        toolu_powershell: { name: "PowerShell" },
+        toolu_read: { name: "Read" },
+      },
+      emittedToolCalls: new Set(["toolu_bash", "toolu_powershell", "toolu_read"]),
     };
     const started = {
       task_type: "local_bash",
@@ -882,6 +886,9 @@ describe("background Bash", () => {
 
     it("names the terminal of a foreground command, under its subagent's Agent call if any", () => {
       expect(foregroundBashTerminal(owner, started)).toEqual({ toolCallId: "toolu_bash" });
+      expect(
+        foregroundBashTerminal(owner, { ...started, tool_use_id: "toolu_powershell" }),
+      ).toEqual({ toolCallId: "toolu_powershell" });
       expect(foregroundBashTerminal(owner, { ...started, parent_task_id: "agent1" })).toEqual({
         toolCallId: "toolu_bash",
         parentToolUseId: "toolu_agent",
@@ -891,7 +898,7 @@ describe("background Bash", () => {
     it.each([
       ["a command in the background", { is_backgrounded: true }],
       ["a task that is not a command", { task_type: "local_agent" }],
-      ["a tool call that is not Bash", { tool_use_id: "toolu_read" }],
+      ["a tool call that runs no command", { tool_use_id: "toolu_read" }],
       ["a tool call the client was not sent", { tool_use_id: "toolu_other" }],
       ["a subagent whose Agent call is not known", { parent_task_id: "agent2" }],
     ])("names none for %s", (_case, fields) => {
