@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.107.2](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.107.1...v0.107.2) (2026-11-16)
+
+
+### Bug Fixes
+
+* end the turn task of a cycle that has no turn to claim its result ([#1622](https://github.com/agentclientprotocol/claude-agent-acp/issues/1622)) ([8de4981](https://github.com/agentclientprotocol/claude-agent-acp/commit/8de49818f1172c5187496a736f721dc6d2ba3fec))
+* keep Fast mode on when it is turned on after a model switch or mid-turn ([#1637](https://github.com/agentclientprotocol/claude-agent-acp/issues/1637)) ([81650db](https://github.com/agentclientprotocol/claude-agent-acp/commit/81650db3d3ca6f7b640fd5e1bbb5e1ff45f62fb7))
+* list a live Monitor whose task Claude Code reports as local_bash ([#1607](https://github.com/agentclientprotocol/claude-agent-acp/issues/1607)) ([41417f6](https://github.com/agentclientprotocol/claude-agent-acp/commit/41417f6eeeb5010c0eb439e256032cd7e9a44e37))
+* read the Claude Code stream after a query restart, not at the next prompt ([#1636](https://github.com/agentclientprotocol/claude-agent-acp/issues/1636)) ([c03b66c](https://github.com/agentclientprotocol/claude-agent-acp/commit/c03b66cc9f1aa6aa5e56668ac05e5a7f48418850))
+* read the Claude Code stream after every session setup, not at the first prompt ([#1623](https://github.com/agentclientprotocol/claude-agent-acp/issues/1623)) ([7d9e1f6](https://github.com/agentclientprotocol/claude-agent-acp/commit/7d9e1f6135b2c85cd8bdd0e76bc2bcf00795e6c9))
+* reject the SDK no-token sentinel in auth guards ([#1609](https://github.com/agentclientprotocol/claude-agent-acp/issues/1609)) ([c203b91](https://github.com/agentclientprotocol/claude-agent-acp/commit/c203b919ecca8a58e11bebb72274a5a203653d88))
+* update to @anthropic-ai/claude-agent-sdk 0.3.325 ([#1634](https://github.com/agentclientprotocol/claude-agent-acp/issues/1634)) ([db54135](https://github.com/agentclientprotocol/claude-agent-acp/commit/db5413513cbe58c045885e6bb015abfdb76be524))
+
 ## [0.107.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.107.0...v0.107.1) (2026-11-16)
 
 
