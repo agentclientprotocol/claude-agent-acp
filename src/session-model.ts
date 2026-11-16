@@ -146,6 +146,8 @@ function modelCoversTokens(model: ModelInfo, tokens: string[]): boolean {
  * of its model words, preferring one with the same context hint ("sonnet[1m]"
  * for "claude-sonnet-5-1m"). The fuzzy tiers need a compatible version, and
  * words match whole: "not-a-model", "son" and "foo-sonnet" name no entry.
+ * For a preference without a version, the fuzzy tiers take the entry of the
+ * newest version: "opus[1m]" gives "claude-opus-5-5", not "claude-opus-4-5".
  */
 export function resolveModelPreference(models: ModelInfo[], preference: string): ModelInfo | null {
   const trimmed = preference.trim();
@@ -175,25 +177,56 @@ export function resolveModelPreference(models: ModelInfo[], preference: string):
 
   const preferenceHint = contextHintOf(trimmed);
   const tokens = modelPreferenceTokens(trimmed);
-  const includesMatch = models.find((model) => {
-    if (!modelVersionsCompatible(trimmed, model)) return false;
-    if (contextHintOf(model.value) !== preferenceHint) return false;
-    return (
-      containsWords(model.value, trimmed) ||
-      containsWords(model.displayName, trimmed) ||
-      (containsWords(trimmed, model.value) && modelCoversTokens(model, tokens))
-    );
-  });
+  // A preference without a version (`opus`, `opus[1m]`) runs its family's
+  // newest model in the CLI, so the fuzzy tiers pick the newest row, not the
+  // first: an allowlist lists `claude-opus-4-5-20251101` before `claude-opus-5-5`.
+  const pick =
+    extractModelFamilyVersion(trimmed) === null
+      ? newestModel
+      : (rows: ModelInfo[]): ModelInfo | undefined => rows[0];
+  const includesMatch = pick(
+    models.filter((model) => {
+      if (!modelVersionsCompatible(trimmed, model)) return false;
+      if (contextHintOf(model.value) !== preferenceHint) return false;
+      return (
+        containsWords(model.value, trimmed) ||
+        containsWords(model.displayName, trimmed) ||
+        (containsWords(trimmed, model.value) && modelCoversTokens(model, tokens))
+      );
+    }),
+  );
   if (includesMatch) return includesMatch;
 
   const candidates = models.filter(
     (model) => modelVersionsCompatible(trimmed, model) && modelCoversTokens(model, tokens),
   );
   return (
-    candidates.find((model) => contextHintOf(model.value) === preferenceHint) ??
-    candidates[0] ??
+    pick(candidates.filter((model) => contextHintOf(model.value) === preferenceHint)) ??
+    pick(candidates) ??
     null
   );
+}
+
+/** The row of `models` that runs the newest family version, the first one of
+ *  equal versions. A row of an unknown version (`my-model`) ranks below each
+ *  row of a known one. */
+function newestModel(models: ModelInfo[]): ModelInfo | undefined {
+  let newest: ModelInfo | undefined;
+  let newestVersion: { major: number; minor: number } | null = null;
+  for (const model of models) {
+    const version = familyVersionOf(normalizeModelId(model.resolvedModel ?? model.value));
+    const newer =
+      newest === undefined ||
+      (version !== null &&
+        (newestVersion === null ||
+          version.major > newestVersion.major ||
+          (version.major === newestVersion.major && version.minor > newestVersion.minor)));
+    if (newer) {
+      newest = model;
+      newestVersion = version;
+    }
+  }
+  return newest;
 }
 
 export function matchResumedModel(models: ModelInfo[], liveModel: string): ModelInfo {
