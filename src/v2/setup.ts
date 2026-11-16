@@ -23,7 +23,6 @@ import {
 import {
   aliasResumedModelRow,
   applyAvailableModelsAllowlist,
-  requireCompatibleProviderModels,
   getAvailableModels,
   type SessionModelState,
   withCurrentModelInfo,
@@ -86,7 +85,6 @@ export async function sessionModels(
       )
     : listed;
   const narrowed = narrow(allowed);
-  requireCompatibleProviderModels(sdkModels, allowed, narrowed, narrowedByProvider);
   const models = await getAvailableModels(
     query,
     narrowed,

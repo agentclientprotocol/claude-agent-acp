@@ -179,7 +179,11 @@ class V2Agent implements AgentHandle, SessionConnection {
           this.stop(
             sessionId,
             error instanceof RequestError
-              ? error
+              ? new RequestError(
+                  error.code,
+                  `${error.message} Then resume the session to continue.`,
+                  error.data,
+                )
               : "Claude Code could not start again. Resume the session to continue.",
           );
         }

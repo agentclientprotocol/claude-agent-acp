@@ -528,52 +528,47 @@ describe("ACP v2 core", () => {
         baseUrl: "https://gateway.example.com",
       });
 
-    it.each([{ listing: [] }, { listing: ["gpt-5"] }])(
-      "rejects an incompatible provider listing %j before a prompt and recovers",
-      async ({ listing }) => {
-        sdk.models = [
-          {
-            value: "sonnet",
-            displayName: "Sonnet",
-            description: "",
-            resolvedModel: "claude-sonnet-5-5",
-          },
-        ];
-        const client = v2Client();
-        await client.connect(async (agent) => {
-          await agent.request(v2.methods.agent.initialize, {
-            protocolVersion: v2.PROTOCOL_VERSION,
-            info: { name: "v2-test-client", version: "1" },
-          });
-          vi.mocked(fetch).mockResolvedValueOnce(
-            Response.json({ data: listing.map((id) => ({ id })) }),
-          );
-          await setProvider(agent);
-          await expect(agent.request(v2.methods.agent.session.new, { cwd })).rejects.toMatchObject({
-            code: -32603,
-            message: expect.stringContaining(
-              "The selected provider offers no compatible Claude models.",
-            ),
-          });
-          expect(sdk.processes[0].close).toHaveBeenCalledOnce();
-          expect(sdk.processes[0].prompts).toEqual([]);
-          vi.mocked(fetch).mockResolvedValueOnce(
-            Response.json({ data: [{ id: "claude-sonnet-5-5" }] }),
-          );
-          await agent.request(v2.methods.agent.providers.set, {
-            providerId: "main",
-            apiType: "anthropic",
-            baseUrl: "https://recovered.example.com",
-          });
-          const response = await agent.request(v2.methods.agent.session.new, { cwd });
-          expect(
-            response.configOptions?.find((option) => option.configId === "model"),
-          ).toMatchObject({
-            options: [expect.objectContaining({ value: "sonnet" })],
-          });
+    it("rejects an incompatible provider listing before a prompt and recovers", async () => {
+      sdk.models = [
+        {
+          value: "sonnet",
+          displayName: "Sonnet",
+          description: "",
+          resolvedModel: "claude-sonnet-5-5",
+        },
+      ];
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        await agent.request(v2.methods.agent.initialize, {
+          protocolVersion: v2.PROTOCOL_VERSION,
+          info: { name: "v2-test-client", version: "1" },
         });
-      },
-    );
+        vi.mocked(fetch).mockResolvedValueOnce(Response.json({ data: [{ id: "gpt-5" }] }));
+        await setProvider(agent);
+        await expect(agent.request(v2.methods.agent.session.new, { cwd })).rejects.toMatchObject({
+          code: -32603,
+          message: expect.stringContaining(
+            "The selected provider offers no compatible Claude models.",
+          ),
+        });
+        expect(sdk.processes[0].close).toHaveBeenCalledOnce();
+        expect(sdk.processes[0].prompts).toEqual([]);
+        vi.mocked(fetch).mockResolvedValueOnce(
+          Response.json({ data: [{ id: "claude-sonnet-5-5" }] }),
+        );
+        await agent.request(v2.methods.agent.providers.set, {
+          providerId: "main",
+          apiType: "anthropic",
+          baseUrl: "https://recovered.example.com",
+        });
+        const response = await agent.request(v2.methods.agent.session.new, { cwd });
+        expect(response.configOptions?.find((option) => option.configId === "model")).toMatchObject(
+          {
+            options: [expect.objectContaining({ value: "sonnet" })],
+          },
+        );
+      });
+    });
 
     it("answers at once while a background subagent runs, and restarts the session once it ends", async () => {
       const client = v2Client();
@@ -834,7 +829,8 @@ describe("ACP v2 core", () => {
         ).rejects.toMatchObject({
           code: -32603,
           message:
-            "Internal error: The selected provider offers no compatible Claude models. Choose a different provider and try again.",
+            "Internal error: The selected provider offers no compatible Claude models. Choose a different provider and try again. Then resume the session to continue.",
+          data: { providerId: "main" },
         });
         expect(sdk.processes.every((process) => process.prompts.length === 0)).toBe(true);
 
@@ -845,6 +841,13 @@ describe("ACP v2 core", () => {
           providerId: "main",
           apiType: "anthropic",
           baseUrl: "https://recovered.example.com",
+        });
+        await expect(
+          agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: PROMPT }),
+        ).rejects.toMatchObject({
+          code: -32603,
+          message: expect.stringContaining("Then resume the session to continue."),
+          data: { providerId: "main" },
         });
         await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
         const recovered = sdk.processes.at(-1)!;
@@ -859,11 +862,33 @@ describe("ACP v2 core", () => {
       });
     });
 
-    it("stops a session whose query does not start again under the new route", async () => {
+    it.each([
+      {
+        name: "an unknown startup failure",
+        failure: new Error("Claude Code could not start"),
+        error: {
+          code: -32603,
+          message:
+            "Internal error: Claude Code could not start again. Resume the session to continue.",
+        },
+      },
+      {
+        name: "a gateway sign-in failure",
+        failure: Object.assign(new Error("Sign in to the gateway."), {
+          startupFailureReason: "gateway_signin_required",
+        }),
+        error: {
+          code: -32000,
+          message:
+            "Authentication required: Sign in to the gateway. Then resume the session to continue.",
+          data: { startupFailureReason: "gateway_signin_required" },
+        },
+      },
+    ])("stops a session after $name under the new route", async ({ failure, error }) => {
       const client = v2Client();
       await client.connect(async (agent) => {
         const { response } = await openSession(agent);
-        sdk.startFailure = new Error("Claude Code could not start");
+        sdk.startFailure = failure;
         await setProvider(agent);
         // The session is still active: v2 ends that only at close.
         await expect(
@@ -871,10 +896,7 @@ describe("ACP v2 core", () => {
             sessionId: response.sessionId,
             prompt: PROMPT,
           }),
-        ).rejects.toMatchObject({
-          code: -32603,
-          message: expect.stringContaining("could not start again. Resume the session"),
-        });
+        ).rejects.toMatchObject(error);
         // A close ends it: it is no longer active then.
         await agent.request(v2.methods.agent.session.close, { sessionId: response.sessionId });
         await expect(
