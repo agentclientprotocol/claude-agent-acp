@@ -8409,11 +8409,11 @@ describe("ACP v2 terminal of a command in the background", () => {
         });
       try {
         const client = await promptUntil("idle end_turn [toolu_bg]", async (_, __, client) => {
-          await vi.waitFor(() => expect(output(client)).toContain("output compiling\n"), {
+          await vi.waitFor(() => expect(output(client)).toContain("output compiling\r\n"), {
             timeout: 2000,
           });
           await appendFile(outputFile, "tests passed\n");
-          await vi.waitFor(() => expect(output(client)).toContain("chunk tests passed\n"), {
+          await vi.waitFor(() => expect(output(client)).toContain("chunk tests passed\r\n"), {
             timeout: 2000,
           });
           // The command writes its last line as it ends.
@@ -8424,9 +8424,9 @@ describe("ACP v2 terminal of a command in the background", () => {
 
         // The file's first text replaces the Bash result's placeholder.
         expect(output(client).slice(-4)).toEqual([
-          "output compiling\n",
-          "chunk tests passed\n",
-          "chunk done\n",
+          "output compiling\r\n",
+          "chunk tests passed\r\n",
+          "chunk done\r\n",
           "exit",
         ]);
       } finally {
@@ -9451,6 +9451,32 @@ describe("ACP v2 session translation", () => {
       _meta: { claudeCode: { toolResponse: { stdout: "build" } } },
     };
     expect(terminals.split("s", hook)).toEqual({ terminal: [], report: hook });
+  });
+
+  it("sends piped output with each line feed as CR LF, as a PTY would", () => {
+    const terminals = new V2Terminals();
+    const decoded = (data: unknown) => Buffer.from(String(data), "base64").toString();
+    terminals.split("s", {
+      sessionUpdate: "tool_call",
+      toolCallId: "toolu_bash",
+      title: "Terminal",
+      _meta: { terminal_info: { terminal_id: "term" } },
+    });
+    const [chunk] = terminals.split("s", {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_bash",
+      _meta: { terminal_output_delta: { terminal_id: "term", data: "a\nb\n" } },
+    }).terminal;
+    expect(chunk).toMatchObject({ sessionUpdate: "terminal_output_chunk" });
+    expect(decoded((chunk as { data: string }).data)).toBe("a\r\nb\r\n");
+    // The line discipline adds a CR before every LF, also one that a CR precedes.
+    const [snapshot] = terminals.split("s", {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_bash",
+      _meta: { terminal_output: { terminal_id: "term", data: "a\nb\r\n" } },
+    }).terminal;
+    expect(snapshot).toMatchObject({ sessionUpdate: "terminal_update" });
+    expect(decoded((snapshot as { output: { data: string } }).output.data)).toBe("a\r\nb\r\r\n");
   });
 
   it("leaves an exit code that the agent does not know out of the terminal's exit", () => {
