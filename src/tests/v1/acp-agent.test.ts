@@ -26220,6 +26220,38 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
         ]);
       });
 
+      // A scheduler fire is not an autonomous origin: its result has no
+      // `origin`, so it takes the user lane with no turn to claim it.
+      it("ends the task at the result of the cycle that a fire started (#1620)", async () => {
+        const { agent, asyncTaskUpdates } = await airAgent();
+        injectGeneratorSession(agent, (input) => {
+          async function* messageGenerator() {
+            const iter = input[Symbol.asyncIterator]();
+            yield userEcho((await iter.next()).value);
+            yield running();
+            yield assistantText("working");
+            yield resultMessage();
+            // The overdue ScheduleWakeup fires at once, before the prompt's idle.
+            yield lifecycleStarted({ wakeup_source: "loop_wakeup" });
+            yield assistantText("That wakeup was stale");
+            yield resultMessage();
+            // One idle covers both results.
+            yield idle();
+          }
+          return messageGenerator();
+        });
+
+        await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+        await agent.sessions["test-session"]?.consumer;
+
+        // The stream ending closes an open task as failed, so a task that only the
+        // end of the stream ended would not be completed.
+        expect(asyncTaskUpdates().map((update) => update.state ?? update.sessionUpdate)).toEqual([
+          "async_task_spawned",
+          "completed",
+        ]);
+      });
+
       it("leaves the task as before for a started frame without a known wakeup source", async () => {
         const updates = await autonomousTurn((afterRunning) =>
           afterRunning
