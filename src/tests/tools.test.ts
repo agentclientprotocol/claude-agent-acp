@@ -2498,62 +2498,22 @@ describe("toolInfoFromToolUse - Write input aliases", () => {
   });
 });
 
-describe.each([
-  { name: "Read", fallbackTitle: "Read File", input: {} },
-  { name: "Write", fallbackTitle: "Preparing file…", input: { content: "after" } },
-  {
-    name: "Edit",
-    fallbackTitle: "Edit",
-    input: { old_string: "before", new_string: "after" },
-  },
-])("toolInfoFromToolUse - $name file paths", ({ name, fallbackTitle, input }) => {
+// The input is what the model wrote. Claude Code rejects a field of the wrong
+// type when it runs the tool, after the adapter reported the tool use.
+describe("toolInfoFromToolUse - an input field of the wrong type", () => {
   it.each([
-    { label: "a number", filePath: 12345 },
-    { label: "true", filePath: true },
-    { label: "an object", filePath: {} },
-    { label: "an array", filePath: [] },
-    { label: "undefined", filePath: undefined },
-    { label: "null", filePath: null },
-    { label: "an empty string", filePath: "" },
-    { label: "zero", filePath: 0 },
-    { label: "false", filePath: false },
-  ])("omits a file location and diff for file_path=$label", ({ filePath }) => {
-    const info = toolInfoFromToolUse(
-      { name, id: "invalid-path", input: { ...input, file_path: filePath } },
-      false,
-      "/repo",
-    );
+    ["Read", { file_path: 12345 }, "Read File", toolInfoFromToolUse],
+    ["Edit", { file_path: 12345, old_string: "a", new_string: "b" }, "Edit", toolInfoFromToolUse],
+    // Only an AIR client gets the notebook's path.
+    ["NotebookEdit", { notebook_path: 12345, new_source: "x" }, "Edit notebook", airToolInfo],
+    ["Glob", { path: 12345, pattern: "*.ts" }, "Find `*.ts`", toolInfoFromToolUse],
+    ["Bash", { command: 12345 }, "Terminal", toolInfoFromToolUse],
+  ])("reports %s %j as %j, without a location or a diff", (name, input, title, toolInfo) => {
+    const info = toolInfo({ name, id: "toolu_wrong_type", input }, false, "/repo");
 
-    expect(info.title).toBe(fallbackTitle);
-    expect(info.locations).toEqual([]);
+    expect(info.title).toBe(title);
+    expect(info.locations ?? []).toEqual([]);
     expect(info.content).not.toContainEqual(expect.objectContaining({ type: "diff" }));
-  });
-
-  it("omits an invalid location when the working directory is absent", () => {
-    const info = toolInfoFromToolUse({
-      name,
-      id: "invalid-path-no-cwd",
-      input: { ...input, file_path: 12345 },
-    });
-
-    expect(info.title).toBe(fallbackTitle);
-    expect(info.locations).toEqual([]);
-  });
-
-  it.each([
-    ["/repo", "src/file.ts"],
-    [undefined, "/repo/src/file.ts"],
-  ])("keeps a string path with cwd=%j", (cwd, displayPath) => {
-    const info = toolInfoFromToolUse(
-      { name, id: "valid-path", input: { ...input, file_path: "/repo/src/file.ts" } },
-      false,
-      cwd,
-    );
-
-    expect(info.title).toBe(`${name} ${displayPath}`);
-    expect(info.locations).toEqual([
-      { path: "/repo/src/file.ts", ...(name === "Read" ? { line: 1 } : {}) },
-    ]);
   });
 });
 

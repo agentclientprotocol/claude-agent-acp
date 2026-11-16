@@ -1,5 +1,6 @@
 import type { FileReadInput, FileReadOutput } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import {
+  inputString,
   markdownEscape,
   structuredResult,
   textContent,
@@ -18,7 +19,7 @@ import type {
 export class ReadReporter implements ToolReporter {
   toolUse(input: unknown, { cwd }: ToolUseContext): ToolUseFacts {
     const read = input as FileReadInput | undefined;
-    const filePath = typeof read?.file_path === "string" ? read.file_path : undefined;
+    const filePath = inputString(input, "file_path");
     let limit = "";
     if (read?.limit && read.limit > 0) {
       limit = " (" + (read.offset ?? 1) + " - " + ((read.offset ?? 1) + read.limit - 1) + ")";

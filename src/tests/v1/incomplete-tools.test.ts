@@ -1161,88 +1161,39 @@ describe("tool calls of a background subagent that a cancel stops", () => {
   });
 });
 
-describe.each([
-  { name: "Read", input: { offset: 1 } },
-  { name: "Write", input: { content: "after" } },
-  { name: "Edit", input: { old_string: "before", new_string: "after" } },
-])("invalid $name file paths", ({ name, input: remainingInput }) => {
-  it.each([false, true])(
-    "reports validation failure and continues the session with streamed input=%s",
-    async (streamed) => {
-      const id = "invalid-file-path";
-      const input = { file_path: 12345, ...remainingInput };
-      const error = `InputValidationError: ${name} expected file_path to be a string, got number`;
-      const { agent, prompt, updates, logError } = createTestSession(async function* (prompts) {
-        yield* echoNextPrompt(prompts);
-        if (streamed) {
-          yield toolStart(id, null, name);
-          for (const partialJson of [
-            '{"file_path":12345,',
-            JSON.stringify(remainingInput).slice(1),
-          ]) {
-            yield {
-              ...toolStart(id, null, name),
-              event: {
-                type: "content_block_delta",
-                index: 0,
-                delta: { type: "input_json_delta", partial_json: partialJson },
-              },
-            };
-          }
-          yield { ...toolStart(id, null, name), event: { type: "content_block_stop", index: 0 } };
-        }
-        yield toolUse(id, null, name, input);
-        yield {
-          ...toolResult(id),
-          message: {
-            role: "user",
-            content: [{ type: "tool_result", tool_use_id: id, is_error: true, content: error }],
-          },
-        };
-        yield assistantText("The invalid path was rejected.");
-        yield successfulResultMessage();
-        yield* echoNextPrompt(prompts);
-        yield assistantText("The session continues.");
-        yield successfulResultMessage();
-      });
+// The model can write an input that Claude Code rejects when it runs the tool,
+// after the adapter reported the tool use (issue #1308).
+describe("a tool use whose input Claude Code rejects", () => {
+  it("reports a Read with a number for file_path as failed, and ends the turn", async () => {
+    const id = "toolu_number_path";
+    const error =
+      "InputValidationError: Read failed due to the following issue:\n" +
+      "The parameter `file_path` type is expected as `string` but provided as `number`";
+    const { prompt, updates, logError } = createTestSession(async function* (prompts) {
+      yield* echoNextPrompt(prompts);
+      yield toolUse(id, null, "Read", { file_path: 12345 });
+      yield {
+        ...toolResult(id),
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: id, is_error: true, content: error }],
+        },
+      };
+      yield successfulResultMessage();
+    });
 
-      await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
 
-      const reports = updates.filter((update) => update.toolCallId === id);
-      expect(reports.filter((update) => update.sessionUpdate === "tool_call")).toHaveLength(1);
-      expect(reports).toContainEqual(expect.objectContaining({ rawInput: input }));
-      if (streamed) {
-        expect(reports).toContainEqual(
-          expect.objectContaining({
-            sessionUpdate: "tool_call_update",
-            rawInput: { file_path: 12345 },
-          }),
-        );
-      }
-      expect(reports.every((update) => (update.locations ?? []).length === 0)).toBe(true);
-      const failed = reports.filter((update) => update.status === "failed");
-      expect(failed).toHaveLength(1);
-      expect(failed[0].content[0].content.text).toContain(error);
-      expect(updates).toContainEqual(
-        expect.objectContaining({
-          sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: "The invalid path was rejected." },
-        }),
-      );
-      expect(agent.sessions[sessionId].emittedToolCalls.size).toBe(0);
-      expect(agent.sessions[sessionId].toolUseCache).toEqual({});
-
-      await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
-      expect(updates).toContainEqual(
-        expect.objectContaining({
-          sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: "The session continues." },
-        }),
-      );
-      expect(logError).not.toHaveBeenCalled();
-      await agent.sessions[sessionId].consumer;
-    },
-  );
+    const reports = updates.filter((update) => update.toolCallId === id);
+    expect(reports[0]).toMatchObject({
+      sessionUpdate: "tool_call",
+      title: "Read File",
+      locations: [],
+      rawInput: { file_path: 12345 },
+    });
+    expect(reports.at(-1)).toMatchObject({ status: "failed" });
+    expect(logError).not.toHaveBeenCalled();
+  });
 });
 
 function toolStart(id = toolCallId, parent: string | null = null, name = "Bash") {

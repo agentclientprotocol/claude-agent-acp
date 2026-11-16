@@ -4086,6 +4086,39 @@ describe("ACP v2 prompts", () => {
     },
   );
 
+  // The model can write an input that Claude Code rejects when it runs the
+  // tool, after the adapter reported the tool use (issue #1308).
+  it("reports a Read with a number for file_path as failed, and ends the turn", async () => {
+    scriptTurns(async function* (options) {
+      yield toolUseMessage(options, "toolu_number_path", "Read", { file_path: 12345 });
+      yield toolResultMessage(options, "toolu_number_path", {
+        is_error: true,
+        content:
+          "InputValidationError: Read failed due to the following issue:\n" +
+          "The parameter `file_path` type is expected as `string` but provided as `number`",
+      });
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      await client.authUpdate(1);
+    });
+
+    const reports = client.sessionUpdates
+      .map(({ update }) => update)
+      .filter((update) => "toolCallId" in update && update.toolCallId === "toolu_number_path");
+    expect(reports[0]).toMatchObject({
+      title: "Read File",
+      locations: [],
+      rawInput: { file_path: 12345 },
+    });
+    expect(reports.at(-1)).toMatchObject({ status: "failed" });
+  });
+
   it("reports a turn that fails after it was taken in as idle with the error stop reason", async () => {
     scriptTurns(async function* (options) {
       yield result(options, { is_error: true, result: "API Error: 529 Overloaded" });

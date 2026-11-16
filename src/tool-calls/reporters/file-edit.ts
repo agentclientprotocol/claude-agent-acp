@@ -9,7 +9,7 @@ import {
   toolUpdateFromDiffToolResponse,
   v2UpdateFromDiffToolResponse,
 } from "../../diff.js";
-import { markdownEscape, resultText, textContent, toDisplayPath } from "../content.js";
+import { inputString, markdownEscape, resultText, textContent, toDisplayPath } from "../content.js";
 import type {
   ToolReporter,
   ToolResultContext,
@@ -97,7 +97,7 @@ export function normalizeWriteInput(input: unknown): NormalizedWriteInput | unde
 export class EditReporter implements ToolReporter {
   toolUse(input: unknown, { cwd, capabilities }: ToolUseContext): ToolUseFacts {
     const edit = input as FileEditInput | undefined;
-    const filePath = typeof edit?.file_path === "string" ? edit.file_path : undefined;
+    const filePath = inputString(input, "file_path");
     const displayPath = filePath ? toDisplayPath(filePath, cwd) : undefined;
     const facts: ToolUseFacts = {
       title: displayPath ? `Edit ${displayPath}` : "Edit",
@@ -182,9 +182,8 @@ export class NotebookEditReporter implements ToolReporter {
   toolUse(input: unknown, { cwd, capabilities }: ToolUseContext): ToolUseFacts {
     if (!capabilities.air.client) return { title: "NotebookEdit", kind: "other" };
     const notebook = input as Partial<NotebookEditInput> | undefined;
-    const displayPath = notebook?.notebook_path
-      ? toDisplayPath(notebook.notebook_path, cwd)
-      : undefined;
+    const notebookPath = inputString(input, "notebook_path");
+    const displayPath = notebookPath ? toDisplayPath(notebookPath, cwd) : undefined;
     const cell = notebook?.cell_id ? ` ${notebook.cell_id}` : "";
     const verb =
       notebook?.edit_mode === "insert"
@@ -196,7 +195,7 @@ export class NotebookEditReporter implements ToolReporter {
     return {
       title: displayPath ? `${verb} cell${cell} in ${displayPath}` : "Edit notebook",
       kind: "edit",
-      locations: notebook?.notebook_path ? [{ path: notebook.notebook_path }] : [],
+      locations: notebookPath ? [{ path: notebookPath }] : [],
       ...(source ? { display: source } : {}),
     };
   }
