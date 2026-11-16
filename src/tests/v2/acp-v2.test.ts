@@ -10473,6 +10473,11 @@ describe("ACP v2 subscription guard (--hide-claude-auth)", () => {
       { code: -32000, data: undefined },
     ],
     ["a subscription has no token", { ...SUBSCRIPTION, tokenSource: "none" }, NOT_SUPPORTED],
+    [
+      "a Claude Team plan would pay",
+      { ...SUBSCRIPTION, subscriptionType: "Claude Team" },
+      NOT_SUPPORTED,
+    ],
   ])("refuses session/new when %s", async (_case, account, refusal) => {
     accountsAtStart(account);
     const client = v2Client();
@@ -10491,6 +10496,7 @@ describe("ACP v2 subscription guard (--hide-claude-auth)", () => {
     ["a bearer token", { tokenSource: "ANTHROPIC_AUTH_TOKEN" }],
     ["a setup token", { tokenSource: "CLAUDE_CODE_OAUTH_TOKEN" }],
     ["external credentials", { apiProvider: "bedrock", tokenSource: "none" }],
+    ["a Claude Enterprise plan", { ...SUBSCRIPTION, subscriptionType: "Claude Enterprise" }],
     ["an unavailable account", undefined],
   ])("allows session/new with %s", async (_case, account) => {
     accountsAtStart(account);
