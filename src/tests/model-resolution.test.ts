@@ -4,9 +4,10 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk/unstable";
 import {
+  aliasResumedModelRow,
   resolveModelPreference,
   applyAvailableModelsAllowlist,
-  isDeniedModel,
+  deniedModelIds,
   matchResumedModel,
   modelEntryFor,
 } from "../session-model.js";
@@ -73,9 +74,71 @@ describe("resolveModelPreference - resolvedModel matching", () => {
     expect(resolveModelPreference(LIVE_SHAPED_MODELS, "claude-opus-4-8")?.value).toBe("opus[1m]");
   });
 
-  it("returns null for a preference that matches nothing", () => {
-    expect(resolveModelPreference(LIVE_SHAPED_MODELS, "claude-gpt-99")).toBeNull();
+  // Words match whole: "a" is inside "Default", "son" inside "sonnet".
+  it.each(["claude-gpt-99", "not-a-model", "a", "son", "foo-sonnet", "not-default-model"])(
+    "returns null for %s, which names no model",
+    (preference) => {
+      expect(resolveModelPreference(LIVE_SHAPED_MODELS, preference)).toBeNull();
+    },
+  );
+
+  it.each([
+    ["us.anthropic.claude-sonnet-5-v1:0", "sonnet"],
+    ["global.anthropic.claude-haiku-4-5-20251001-v1:0", "haiku"],
+    ["anthropic/claude-sonnet-5:batch", "sonnet"],
+    ["claude-opus-4-8@20260101", "opus[1m]"],
+    ["claude-sonnet-5-fast", "sonnet"],
+    ["claude-haiku-4-5", "haiku"],
+    ["opusplan", "opus[1m]"],
+    ["opus", "opus[1m]"],
+    ["Sonnet 5", "sonnet"],
+    // The CLI's `best` alias runs Opus and ignores a `[1m]` hint.
+    ["best", "opus[1m]"],
+    ["BEST", "opus[1m]"],
+    ["best[1m]", "opus[1m]"],
+  ])("resolves the spelling %s to %s", (preference, value) => {
+    expect(resolveModelPreference(LIVE_SHAPED_MODELS, preference)?.value).toBe(value);
   });
+
+  it("resolves best to the Opus entry rather than the default when the default runs Sonnet", () => {
+    const models: ModelInfo[] = [
+      {
+        value: "default",
+        resolvedModel: "claude-sonnet-5",
+        displayName: "Default (recommended)",
+        description: "Use the default model (currently Sonnet 5)",
+      },
+      { value: "opus", resolvedModel: "claude-opus-4-8", displayName: "Opus", description: "" },
+      { value: "sonnet", resolvedModel: "claude-sonnet-5", displayName: "Sonnet", description: "" },
+    ];
+    expect(resolveModelPreference(models, "best")?.value).toBe("opus");
+  });
+
+  // A gateway listing of dated ids, as `ANTHROPIC_MODEL`, `settings.model` or
+  // `set_config_option` may spell them.
+  const DATED_MODELS: ModelInfo[] = [
+    { value: "claude-3-7-sonnet-20250219", displayName: "Claude 3.7 Sonnet", description: "" },
+    { value: "claude-3-5-haiku-20241022", displayName: "Claude 3.5 Haiku", description: "" },
+    { value: "claude-sonnet-4-5-20250929", displayName: "Claude Sonnet 4.5", description: "" },
+  ];
+
+  it.each([
+    ["claude-3-7-sonnet-latest", "claude-3-7-sonnet-20250219"],
+    ["claude-3-5-haiku-latest", "claude-3-5-haiku-20241022"],
+    ["openrouter/anthropic/claude-sonnet-4.5", "claude-sonnet-4-5-20250929"],
+    ["vertex_ai/claude-sonnet-4-5@20250929", "claude-sonnet-4-5-20250929"],
+    ["litellm/claude-sonnet-4-5", "claude-sonnet-4-5-20250929"],
+    ["publishers/anthropic/models/claude-sonnet-4-5", "claude-sonnet-4-5-20250929"],
+  ])("resolves the gateway spelling %s to %s", (preference, value) => {
+    expect(resolveModelPreference(DATED_MODELS, preference)?.value).toBe(value);
+  });
+
+  it.each(["openai/gpt-5", "openrouter/foo-sonnet", "claude-3-5-opus-latest"])(
+    "returns null for the gateway spelling %s, which names no listed model",
+    (preference) => {
+      expect(resolveModelPreference(DATED_MODELS, preference)).toBeNull();
+    },
+  );
 
   it("matches a '-1m' id-suffix preference against a '[1m]'-spelled resolvedModel", () => {
     // Without hint canonicalization the exact tier misses and the substring
@@ -114,6 +177,27 @@ describe("resolveModelPreference - resolvedModel matching", () => {
     expect(resolveModelPreference(models, "claude-sonnet-5-1m")?.value).toBe("sonnet[1m]");
     // Bare preferences still land on the bare row via the substring tier.
     expect(resolveModelPreference(models, "claude-sonnet-5")?.value).toBe("sonnet");
+  });
+
+  // An `availableModels` allowlist of dated and versioned ids, oldest first,
+  // as `applyAvailableModelsAllowlist` gives it with `settings.model: "opus[1m]"`.
+  // `my-opus` has no version, so it ranks below each versioned row.
+  const VERSIONED_MODELS: ModelInfo[] = [
+    "my-opus",
+    "claude-sonnet-4-5-20250929",
+    "claude-opus-4-5-20251101",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "claude-opus-5-5",
+    "claude-sonnet-5",
+  ].map((value) => ({ value, resolvedModel: value, displayName: value, description: "" }));
+
+  it.each([
+    ["opus[1m]", "claude-opus-5-5"],
+    ["opus", "claude-opus-5-5"],
+    ["sonnet", "claude-sonnet-5"],
+  ])("resolves %s to the newest listed row of its family, %s", (preference, value) => {
+    expect(resolveModelPreference(VERSIONED_MODELS, preference)?.value).toBe(value);
   });
 });
 
@@ -159,8 +243,8 @@ describe("matchResumedModel", () => {
   it("prefers an exact named-row resolvedModel match over the hint-stripped Default tier", () => {
     // "claude-sonnet-5[1m]" differs from Default's "claude-sonnet-5" only by
     // the context hint; stripping both would misreport the explicit 1M row as
-    // Default (and infer the wrong context window downstream). Both hint
-    // spellings must land on the row regardless of which one it uses.
+    // Default. Both hint spellings must land on the row regardless of which
+    // one it uses.
     expect(matchResumedModel(SONNET_DEFAULT_MODELS, "claude-sonnet-5[1m]").value).toBe(
       "sonnet[1m]",
     );
@@ -196,9 +280,53 @@ describe("matchResumedModel", () => {
   });
 });
 
+describe("aliasResumedModelRow", () => {
+  const row = (value: string, resolvedModel = value): ModelInfo => ({
+    value,
+    resolvedModel,
+    displayName: value,
+    description: "",
+  });
+  // What CLI 2.1.321 lists after resuming a session on `fable` (Fable 5.2).
+  const STARTED_ON_FABLE = [
+    row("default", "claude-opus-5-5"),
+    row("claude-fable-5-2"),
+    row("claude-fable-5-1"),
+    row("claude-fable-5"),
+  ];
+
+  it("lists the resumed model's row under its family alias", () => {
+    expect(aliasResumedModelRow(STARTED_ON_FABLE, "claude-fable-5-2").map((m) => m.value)).toEqual([
+      "default",
+      "fable",
+      "claude-fable-5-1",
+      "claude-fable-5",
+    ]);
+  });
+
+  it.each([
+    [
+      "the alias already has a row",
+      [row("fable", "claude-fable-5-1"), row("claude-fable-5")],
+      "claude-fable-5",
+    ],
+    ["the row is not the resumed model", STARTED_ON_FABLE, "claude-opus-5-5"],
+    ["the session is not resumed", STARTED_ON_FABLE, undefined],
+    ["the family has a newer row", STARTED_ON_FABLE, "claude-fable-5-1"],
+    [
+      "the row carries a context hint",
+      [row("claude-fable-5-1[1m]", "claude-fable-5-1")],
+      "claude-fable-5-1[1m]",
+    ],
+    ["the row is not a family model", [row("claude-gpt-9")], "claude-gpt-9"],
+  ])("keeps every value when %s", (_case, models, resumedModel) => {
+    expect(aliasResumedModelRow(models, resumedModel)).toEqual(models);
+  });
+});
+
 describe("applyAvailableModelsAllowlist - resolvedModel matching", () => {
-  it("resolves an allowlist entry pinned to a canonical resolvedModel id", () => {
-    const result = applyAvailableModelsAllowlist(LIVE_SHAPED_MODELS, ["claude-sonnet-5"]);
+  it("resolves an allowlist entry pinned to a canonical resolvedModel id", async () => {
+    const result = await applyAvailableModelsAllowlist(LIVE_SHAPED_MODELS, ["claude-sonnet-5"]);
     const entry = result.find((m) => m.value === "claude-sonnet-5");
     expect(entry).toBeDefined();
     expect(entry?.displayName).toBe("Sonnet");
@@ -217,14 +345,14 @@ describe("applyAvailableModelsAllowlist - modelOverrides", () => {
     },
   ];
 
-  it("surfaces the override target as the value while keeping the alias's display metadata", () => {
+  it("surfaces the override target as the value while keeping the alias's display metadata", async () => {
     // The override target is an opaque Bedrock ARN with no "opus" substring,
     // so matching against it (instead of the "claude-opus-4-6" alias) would
     // find nothing and silently drop displayName/description/supportsEffort.
     const overrides = {
       "claude-opus-4-6": "arn:aws:bedrock:us-west-2:111122223333:inference-profile/custom-7f3a",
     };
-    const result = applyAvailableModelsAllowlist(SDK_MODELS, ["claude-opus-4-6"], overrides);
+    const result = await applyAvailableModelsAllowlist(SDK_MODELS, ["claude-opus-4-6"], overrides);
 
     const entry = result.find((m) => m.value === overrides["claude-opus-4-6"]);
     expect(entry).toEqual({
@@ -238,8 +366,8 @@ describe("applyAvailableModelsAllowlist - modelOverrides", () => {
 });
 
 describe("applyAvailableModelsAllowlist - managed deniedModels", () => {
-  it("drops an allowlisted model that deniedModels blocks, keeping Default", () => {
-    const result = applyAvailableModelsAllowlist(
+  it("drops an allowlisted model that deniedModels blocks, keeping Default", async () => {
+    const result = await applyAvailableModelsAllowlist(
       LIVE_SHAPED_MODELS,
       ["claude-sonnet-5", "claude-opus-5-5"],
       undefined,
@@ -248,43 +376,87 @@ describe("applyAvailableModelsAllowlist - managed deniedModels", () => {
     expect(result.map((m) => m.value)).toEqual(["default", "claude-sonnet-5"]);
   });
 
-  it("checks an alias entry against the row it resolves to", () => {
-    const result = applyAvailableModelsAllowlist(LIVE_SHAPED_MODELS, ["sonnet"], undefined, [
+  it("checks an alias entry against the row it resolves to", async () => {
+    const result = await applyAvailableModelsAllowlist(LIVE_SHAPED_MODELS, ["sonnet"], undefined, [
       "claude-sonnet-5",
     ]);
     expect(result.map((m) => m.value)).toEqual(["default"]);
   });
+
+  it("checks an entry against its modelOverrides target", async () => {
+    const result = await applyAvailableModelsAllowlist(
+      LIVE_SHAPED_MODELS,
+      ["sonnet", "haiku"],
+      {
+        haiku:
+          "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-opus-5-5-v1:0",
+      },
+      ["claude-opus-5-5"],
+    );
+    expect(result.map((m) => m.value)).toEqual(["default", "sonnet"]);
+  });
 });
 
-describe("isDeniedModel", () => {
-  it("blocks every spelling of a denied version and its later minors", () => {
-    const denied = ["claude-opus-5"];
-    expect(isDeniedModel("claude-opus-5", denied)).toBe(true);
-    expect(isDeniedModel("claude-opus-5-20260101", denied)).toBe(true);
-    expect(isDeniedModel("claude-opus-5[1m]", denied)).toBe(true);
-    expect(isDeniedModel("us.anthropic.claude-opus-5-v1:0", denied)).toBe(true);
-    expect(isDeniedModel("claude-opus-5-5", denied)).toBe(true);
-    expect(isDeniedModel("claude-opus-4-8", denied)).toBe(false);
-    expect(isDeniedModel("anthropic/claude-opus-5.5:batch[1m]", denied)).toBe(true);
-    expect(isDeniedModel("anthropic/us.anthropic.claude-opus-5-v1:0", denied)).toBe(true);
-  });
-
-  it("reads an entry in OpenRouter or dotted spelling as the dashed SDK id", () => {
-    expect(isDeniedModel("claude-opus-4-5", ["claude-opus-4.5"])).toBe(true);
-    expect(isDeniedModel("claude-opus-5-5", ["anthropic/claude-opus-5.5"])).toBe(true);
-    expect(isDeniedModel("claude-opus-5", ["anthropic/claude-opus-5.5"])).toBe(false);
-  });
-
-  it("blocks only that version when the entry names a minor", () => {
-    expect(isDeniedModel("claude-opus-5", ["claude-opus-5-5"])).toBe(false);
-    expect(isDeniedModel("claude-opus-5-5-fast", ["claude-opus-5-5"])).toBe(true);
-  });
-
-  it("blocks a whole family for a family alias and ignores settings-dependent aliases", () => {
-    expect(isDeniedModel("claude-haiku-4-5-20251001", ["haiku"])).toBe(true);
-    expect(isDeniedModel("haiku", ["haiku"])).toBe(true);
-    expect(isDeniedModel("claude-sonnet-5", ["haiku"])).toBe(false);
-    expect(isDeniedModel("claude-opus-5", ["default", "best", "opusplan"])).toBe(false);
+describe("deniedModelIds", () => {
+  // What CLI 2.1.323 answered `setModel(id)` under each managed `deniedModels`
+  // list: it refused the `blocked` ids as restricted by the organization, and
+  // not the `allowed` ones.
+  it.each<{ name: string; denied: string[]; blocked: string[]; allowed: string[] }>([
+    {
+      name: "a family alias blocks the family",
+      denied: ["opus"],
+      blocked: ["opus[1m]", "vertex_ai/claude-opus-5-5", "claude-opus-5.5", "my-opus-proxy"],
+      allowed: ["opusplan", "anthropic/openai/gpt-5", "claude-sonnet-5.5"],
+    },
+    {
+      name: "a version without a minor blocks its later minors",
+      denied: ["claude-opus-5"],
+      blocked: ["claude-opus-5", "claude-opus-5-5", "us.anthropic.claude-opus-5-5-v1:0"],
+      allowed: ["opus", "claude-opus-4-5"],
+    },
+    {
+      name: "a version with a minor blocks that version in every spelling",
+      denied: ["claude-opus-5-5"],
+      blocked: [
+        "claude-opus-5-5-fast",
+        "claude-opus-5-5[1m]",
+        "claude-opus-5-5@20260101",
+        "openrouter/anthropic/claude-opus-5-5",
+      ],
+      allowed: ["claude-opus-5", "opus", "claude-opus-5-50"],
+    },
+    {
+      name: "a version is blocked behind a :variant suffix and written with a dot",
+      denied: ["claude-opus-5-5"],
+      blocked: [
+        "claude-opus-5-5:free",
+        "claude-opus-5-5:batch[1m]",
+        "anthropic/claude-opus-5.5",
+        "x/claude-opus-5.5:free",
+        "claude-opus-5.5-20260101",
+      ],
+      allowed: ["claude-opus-5.50", "anthropic/claude-opus-5"],
+    },
+    {
+      name: "an entry that is no version blocks that exact name, also as the last path segment",
+      denied: ["my-model"],
+      blocked: ["My-Model", "gateway/my-model", "a/b/my-model", "gateway/my-model[1m]"],
+      allowed: ["my-model:free", "gateway/my-model:free", "my-model-2", "my-model/x"],
+    },
+    {
+      name: "a dotted entry is an exact name, not a version",
+      denied: ["claude-opus-4.5"],
+      blocked: ["claude-opus-4.5", "anthropic/claude-opus-4.5"],
+      allowed: ["claude-opus-4-5", "claude-opus-4-5-20251101", "claude-opus-4.5:batch"],
+    },
+    {
+      name: "an alias whose model depends on the release blocks nothing",
+      denied: ["default", "best", "opusplan"],
+      blocked: [],
+      allowed: ["default", "best", "opusplan", "opus"],
+    },
+  ])("$name", async ({ denied, blocked, allowed }) => {
+    expect([...(await deniedModelIds([...allowed, ...blocked], denied))]).toEqual(blocked);
   });
 });
 
@@ -381,17 +553,17 @@ describe("settingsEffortForModel", () => {
 });
 
 describe("effortFlagSettings", () => {
-  it("carries ultracode only when settings request it", () => {
-    expect(effortFlagSettings("high", { ultracode: true })).toEqual({
+  it("carries ultracode only while the session has it on", () => {
+    expect(effortFlagSettings("high", true)).toEqual({
       effortLevel: "high",
       ultracode: true,
     });
-    expect(effortFlagSettings("default", { ultracode: true })).toEqual({
+    expect(effortFlagSettings("default", true)).toEqual({
       effortLevel: null,
       ultracode: true,
     });
-    expect(effortFlagSettings("high", { ultracode: false })).toEqual({ effortLevel: "high" });
-    expect(effortFlagSettings(undefined, {})).toEqual({ effortLevel: null });
+    expect(effortFlagSettings("high", false)).toEqual({ effortLevel: "high" });
+    expect(effortFlagSettings(undefined, false)).toEqual({ effortLevel: null });
   });
 });
 

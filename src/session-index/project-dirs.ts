@@ -14,23 +14,9 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { claudeConfigDir } from "../paths.js";
 
 /** The SDK cuts an encoded path at this length and appends a hash. */
 const MAX_SANITIZED_LENGTH = 200;
-
-const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-/** Whether `value` is a Claude session id (a UUID). Only such ids name a
- *  transcript, and only such ids are safe to use as a file name. */
-export function isSessionId(value: unknown): value is string {
-  return typeof value === "string" && SESSION_ID_PATTERN.test(value);
-}
-
-/** `<config>/projects`, normalized like the SDK does. */
-export function projectsRoot(): string {
-  return path.join(claudeConfigDir(), "projects").normalize("NFC");
-}
 
 function sanitize(value: string): string {
   return value.replace(/[^a-zA-Z0-9]/g, "-");
@@ -101,6 +87,17 @@ export async function canonicalPath(cwd: string): Promise<string> {
     return normalizePath(await fs.realpath(cwd));
   } catch {
     return normalizePath(cwd);
+  }
+}
+
+/** Whether the path exists, including a symlink whose target is missing. */
+export async function exists(target: string): Promise<boolean> {
+  try {
+    await fs.lstat(target);
+    return true;
+  } catch (error) {
+    if (errorCode(error) === "ENOENT" || errorCode(error) === "ENOTDIR") return false;
+    throw error;
   }
 }
 

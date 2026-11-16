@@ -15,8 +15,8 @@ import {
 } from "../diff.js";
 import { AcpToolCallRenderer } from "../tool-calls/renderer.js";
 import { buildClaudePermissionPresentation } from "../permissions/presentation.js";
-import { toolInfoFromToolUse } from "../tools.js";
 import { WriteReporter } from "../tool-calls/reporters/file-edit.js";
+import { toolInfoFromToolUse } from "./tool-render.js";
 
 const tempDirectories: string[] = [];
 
@@ -463,6 +463,12 @@ describe("ACP v2 diffs", () => {
     );
     expect(gitPatchText("/work/my file.ts", "update", [hunk], "absolute")).toContain(
       "--- /work/my file.ts\t\n+++ /work/my file.ts\t\n",
+    );
+  });
+
+  it("keeps a Windows path native in a git patch, so it matches the changes entry", () => {
+    expect(gitPatchText("C:\\work\\App.ts", "update", [hunk], "absolute")).toContain(
+      'diff --git "C:\\\\work\\\\App.ts" "C:\\\\work\\\\App.ts"\n--- "C:\\\\work\\\\App.ts"\n+++ "C:\\\\work\\\\App.ts"\n',
     );
   });
 

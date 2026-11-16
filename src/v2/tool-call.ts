@@ -1,6 +1,7 @@
 /**
- * The v2 form of the tool call reports that `ClaudeAcpAgent` sends as v1
- * `tool_call` and `tool_call_update` updates, and in permission requests.
+ * The v2 form of the tool call reports that the shared SDK-to-ACP mapping
+ * produces as v1 `tool_call` and `tool_call_update` updates, and of the tool
+ * calls of permission requests.
  */
 import type { ToolCall, ToolCallContent, ToolCallUpdate } from "@agentclientprotocol/sdk/unstable";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
@@ -31,6 +32,36 @@ export function v2ToolCallUpdate(report: V1ToolCallReport): V2ToolCallUpdate {
   return { ...v2ToolCallPatch(report), sessionUpdate: "tool_call_update" };
 }
 
+/** The fields of a v2 tool call besides `toolCallId` and `_meta`. */
+const TOOL_CALL_FIELDS = [
+  "name",
+  "title",
+  "kind",
+  "status",
+  "content",
+  "locations",
+  "rawInput",
+  "rawOutput",
+] as const;
+
+/**
+ * The v2 form of a v1 `tool_call`, for a client that may already hold a tool
+ * call with the same id. Each field that the `tool_call` leaves out is `null`,
+ * so the client resets it to its default instead of keeping the old value. For
+ * example, a replayed Bash call that the client holds with the `rawOutput` of
+ * the live run gets `rawOutput: null`, which removes it.
+ *
+ * `V2ToolCallMeta` decides what `_meta` clears. Its `_meta: null` is a v2
+ * clear, so it stays, where {@link v2ToolCallUpdate} drops a v1 `null`.
+ */
+export function v2RestartedToolCall(report: V1ToolCallReport): V2ToolCallUpdate {
+  const update = v2ToolCallUpdate(report);
+  const reset = Object.fromEntries(
+    TOOL_CALL_FIELDS.filter((field) => !(field in update)).map((field) => [field, null]),
+  );
+  return { ...reset, ...update, ...(report._meta === null ? { _meta: null } : {}) };
+}
+
 /**
  * The v2 form of the fields of a v1 tool call report, which a session update
  * and the subject of a permission request carry. See {@link v2ToolCallUpdate}.
@@ -53,6 +84,9 @@ function v2ToolCallContent(item: ToolCallContent): v2.ToolCallContent {
       // v2 content blocks are a superset of the v1 blocks.
       return item;
     case "terminal":
+      return item;
+    case "session":
+      // A reference to a session, such as a subagent's, is the same in v2.
       return item;
     default:
       if (isV2Diff(item)) return item;

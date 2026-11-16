@@ -94,6 +94,7 @@ export const PROFILES: Record<Profile["name"], Profile> = {
 type QueryOptions = {
   sessionId?: string;
   resume?: string;
+  env?: Record<string, string | undefined>;
   canUseTool?: (
     toolName: string,
     input: Record<string, unknown>,
@@ -234,6 +235,16 @@ export function mockedQuery(args: { prompt: AsyncIterable<any>; options: QueryOp
       );
     },
   };
+  // With `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS`, Claude Code reports that it
+  // works once it takes a prompt in, and that it is idle after the result.
+  const stateEvents = options.env?.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS === "1";
+  const state = (value: "running" | "idle") => ({
+    type: "system",
+    subtype: "session_state_changed",
+    state: value,
+    uuid: `state-${value}`,
+    session_id: sessionId,
+  });
   async function* run() {
     const iterator = args.prompt[Symbol.asyncIterator]();
     for (const turn of script.scenario.turns) {
@@ -241,6 +252,7 @@ export function mockedQuery(args: { prompt: AsyncIterable<any>; options: QueryOp
       if (next.done) return;
       const user = next.value;
       ctx.promptUuid = user.uuid;
+      if (stateEvents) yield state("running");
       yield {
         type: "user",
         message: user.message,
@@ -250,6 +262,7 @@ export function mockedQuery(args: { prompt: AsyncIterable<any>; options: QueryOp
         isReplay: true,
       };
       yield* turn(ctx);
+      if (stateEvents) yield state("idle");
     }
     // Stay open like a live Claude Code process.
     await iterator.next();
@@ -282,6 +295,16 @@ export function mockedQuery(args: { prompt: AsyncIterable<any>; options: QueryOp
 /** The `getSessionMessages` of the SDK mock: the transcript of the active scenario. */
 export async function mockedSessionMessages(): Promise<Record<string, unknown>[]> {
   return activeScript?.transcript ?? [];
+}
+
+/** The `getSessionInfo` of the SDK mock: a stored title and modification
+ *  time for a scenario that replays a transcript, and none for a new
+ *  session, whose transcript the mock never writes. */
+export async function mockedSessionInfo(
+  sessionId: string,
+): Promise<{ sessionId: string; summary: string; lastModified: number } | undefined> {
+  if (!activeScript?.transcript.length) return undefined;
+  return { sessionId, summary: "Fix the app", lastModified: Date.UTC(2026, 0, 1) };
 }
 
 type AgentClass = new (client: any, logger?: any) => any;
@@ -350,6 +373,8 @@ export async function runScenario(
     async extNotification(method: string, params: unknown) {
       record("extNotification", { method, params });
     },
+    // Not recorded: no scenario reads the auth status.
+    async authStatusUpdate() {},
     async readTextFile() {
       return { content: "" };
     },
@@ -490,21 +515,17 @@ export async function runScenarioV2(
   const idles: unknown[] = [];
   const failures: string[] = [];
 
-  const each = (message: v2.AnyWireMessage) =>
-    (Array.isArray(message) ? message : [message]) as Record<string, any>[];
-  const toAgent = new TransformStream<v2.AnyWireMessage, v2.AnyWireMessage>({
+  const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>({
     transform(message, controller) {
-      for (const m of each(message)) {
-        if ("method" in m && "id" in m) methodsOfClientRequests.set(m.id, m.method);
+      if ("method" in message && "id" in message && message.id !== null) {
+        methodsOfClientRequests.set(message.id, message.method);
       }
       controller.enqueue(message);
     },
   });
-  const toClient = new TransformStream<v2.AnyWireMessage, v2.AnyWireMessage>({
+  const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>({
     transform(message, controller) {
-      for (const m of each(message)) {
-        if (recording) raw.push(wireRecord(m, methodsOfClientRequests));
-      }
+      if (recording) raw.push(wireRecord(message, methodsOfClientRequests));
       controller.enqueue(message);
     },
   });
@@ -540,7 +561,8 @@ export async function runScenarioV2(
       "_auth/status_update",
       (params) => params,
       () => {},
-    );
+    )
+    .onNotification(v2.methods.client.auth.statusUpdate, () => {});
 
   try {
     await client.connectWith(

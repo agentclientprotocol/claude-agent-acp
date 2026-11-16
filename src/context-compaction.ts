@@ -1,8 +1,10 @@
 import { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import {
   ContextCompactionMetadata,
+  ContextCompactionTrigger,
   createContextCompactionMeta,
 } from "./context-compaction-meta.js";
+import { assistantMessageText } from "./session-failure-extension.js";
 import { compactionToolCall } from "./tool-calls/reporters/compaction.js";
 
 type CompactionStatus = "completed" | "failed";
@@ -66,7 +68,7 @@ const ANALYSIS_BLOCKS = [
  *  it as the post-compaction user message. */
 const CONTINUATION_PREAMBLE = /^\s*This session is being continued from a previous conversation/i;
 const PERSISTED_PREAMBLE =
-  /^\s*This session is being continued from a previous conversation[^\n]*\n+Summary:[ \t]*\r?\n/;
+  /^\s*This session is being continued from a previous conversation[^\n]*\n(?:[\s\S]*?\n)?Summary:[ \t]*\r?\n/;
 const PERSISTED_TRAILERS = [
   /\n+If you need specific details from before compaction[\s\S]*$/,
   /\n+(?:Please )?[Cc]ontinue the conversation from where it left (?:it )?off[\s\S]*$/,
@@ -129,6 +131,36 @@ export function isCompactSummaryMessage(message: unknown): boolean {
     (message as { type?: unknown }).type === "user" &&
     (message as { isCompactSummary?: unknown }).isCompactSummary === true
   );
+}
+
+/**
+ * Replays the compact summary message `message` (see
+ * {@link isCompactSummaryMessage}) of the root conversation as one completed
+ * `compaction_update` at its transcript position, keyed by the message's
+ * uuid. Returns false, and sends nothing, for any other message.
+ *
+ * The boundary's own system record comes back from `getSessionMessages`
+ * without its metadata, so the summary message is the one durable marker.
+ * Its uuid differs from the live id (the `compacting` status uuid): replay
+ * is terminal-first by the RFD, and no client merges a replay into a live
+ * entity store. A summary whose framing is unrecognized is still this
+ * compaction, without summary text.
+ */
+export async function replayCompactSummary(
+  message: { uuid?: unknown; message?: unknown },
+  sendUpdate: SendUpdate,
+  options: { sessionId: string; airClient?: boolean },
+): Promise<boolean> {
+  if (!isCompactSummaryMessage(message) || typeof message.uuid !== "string" || !message.uuid) {
+    return false;
+  }
+  const replayed = new ContextCompactionLifecycle(sendUpdate, {
+    ...options,
+    presentation: "compaction_update",
+  });
+  replayed.recordSummary(assistantMessageText(message.message));
+  await replayed.finish(message.uuid, "completed");
+  return true;
 }
 
 /**
@@ -408,14 +440,29 @@ function withoutError({
   return facts;
 }
 
-export function contextCompactionMetadataFromBoundary(compactMetadata: {
-  trigger: "manual" | "auto";
-  pre_tokens: number;
-  post_tokens?: number;
-  duration_ms?: number;
-}): Omit<ContextCompactionMetadata, "version"> {
+function compactionTrigger(
+  cliTrigger: "manual" | "auto",
+  sentByAdapter: boolean,
+): ContextCompactionTrigger {
+  // The CLI's own automatic compaction stays automatic, even inside the adapter's /compact turn.
+  if (cliTrigger === "auto") return "automatic";
+  // The CLI reports every /compact as manual; only the adapter knows it sent this one itself.
+  if (sentByAdapter) return "idle";
+  return "manual";
+}
+
+/** `idleCompaction` marks a `/compact` that the adapter sent itself (see `IdleCompaction`). */
+export function contextCompactionMetadataFromBoundary(
+  compactMetadata: {
+    trigger: "manual" | "auto";
+    pre_tokens: number;
+    post_tokens?: number;
+    duration_ms?: number;
+  },
+  { idleCompaction = false }: { idleCompaction?: boolean } = {},
+): Omit<ContextCompactionMetadata, "version"> {
   return {
-    trigger: compactMetadata.trigger === "auto" ? "automatic" : "manual",
+    trigger: compactionTrigger(compactMetadata.trigger, idleCompaction),
     preTokens: compactMetadata.pre_tokens,
     ...(compactMetadata.post_tokens !== undefined
       ? { postTokens: compactMetadata.post_tokens }

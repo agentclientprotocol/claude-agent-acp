@@ -1,4 +1,4 @@
-import type { PermissionMode } from "@anthropic-ai/claude-agent-sdk";
+import type { PermissionMode, Settings } from "@anthropic-ai/claude-agent-sdk";
 
 interface PermissionModeLogger {
   error: (...args: unknown[]) => void;
@@ -57,4 +57,11 @@ export function resolvePermissionMode(
   }
 
   return mapped;
+}
+
+/** Claude Code reads `disableAutoMode` both at the top level and under `permissions`. */
+export function autoModeDisabled(settings: Settings): boolean {
+  return (
+    settings.disableAutoMode === "disable" || settings.permissions?.disableAutoMode === "disable"
+  );
 }

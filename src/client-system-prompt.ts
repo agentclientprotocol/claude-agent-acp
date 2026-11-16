@@ -72,3 +72,30 @@ export function sdkSystemPrompt(
     ? { type: "preset", preset: "claude_code", append: text }
     : { type: "preset", preset: "claude_code" };
 }
+
+/**
+ * The SDK `systemPrompt` of a session: the spec's `systemPrompt`
+ * (`clientPrompt`), else the `_meta.systemPrompt` extension (`metaPrompt`), a
+ * string that replaces the preset or an object of preset options, else the
+ * Claude Code preset. `customInstructions` are appended to the preset.
+ */
+export function sessionSystemPrompt(
+  clientPrompt: ClientSystemPrompt | undefined,
+  metaPrompt: unknown,
+  customInstructions?: string,
+): NonNullable<Options["systemPrompt"]> {
+  if (clientPrompt) return sdkSystemPrompt(clientPrompt, customInstructions);
+  if (typeof metaPrompt === "string" && metaPrompt) return metaPrompt;
+  if (typeof metaPrompt === "object" && metaPrompt !== null && !Array.isArray(metaPrompt)) {
+    // Forward all preset options (append, excludeDynamicSections, and
+    // anything the SDK adds later) while locking type/preset.
+    return {
+      ...(metaPrompt as object),
+      type: "preset",
+      preset: "claude_code",
+    } as NonNullable<Options["systemPrompt"]>;
+  }
+  return customInstructions === undefined
+    ? { type: "preset", preset: "claude_code" }
+    : { type: "preset", preset: "claude_code", append: customInstructions };
+}

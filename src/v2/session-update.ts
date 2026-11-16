@@ -1,18 +1,12 @@
 /**
- * The v2 form of the session updates that `ClaudeAcpAgent` sends as v1
- * updates.
+ * The v2 form of the v1 session updates that the shared SDK-to-ACP mapping
+ * produces (`toAcpNotifications`).
  */
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { AcpSessionNotification } from "../acp-subagents.js";
-import { v2AvailableCommands, v2ConfigOptions } from "./session.js";
+import { v2AvailableCommands, v2ConfigOptions } from "./session-requests.js";
+import { checklistPlanOperation } from "../plans.js";
 import { v2ToolCallUpdate } from "./tool-call.js";
-
-/**
- * The id of the plan of a session. v1 has one plan per session, which every
- * plan update replaces whole, from TodoWrite and from the Task tools alike.
- * v2 tracks plans by id, so that plan gets one.
- */
-export const SESSION_PLAN_ID = "plan";
 
 /**
  * The v2 form of a v1 session update, or `undefined` when v2 has no
@@ -48,21 +42,18 @@ export function v2SessionUpdate(
     case "tool_call":
     case "tool_call_update":
       return v2ToolCallUpdate(update);
-    case "plan":
-      // A v2 plan of items is replaced whole as well.
-      return {
-        sessionUpdate: "plan_update",
-        plan: { type: "items", planId: SESSION_PLAN_ID, entries: update.entries },
-        ...(update._meta != null ? { _meta: update._meta } : {}),
-      };
+    case "plan": {
+      // Every v2 client has the `plan` capability, so the agent sends the
+      // checklist as `plan_update`; a legacy plan converts the same way.
+      const converted = checklistPlanOperation(update.entries);
+      return update._meta != null ? { ...converted, _meta: update._meta } : converted;
+    }
     case "plan_update":
     case "plan_removed":
       // v1's draft plan operations have v2's shape.
       return update;
     case "subagent_update": {
-      // The subagents RFD gives it the same shape in v1 and v2. One that
-      // reports a state also has a copy on the child's stream (see
-      // `v2ChildStateUpdate`).
+      // The subagents RFD gives it the same shape in v1 and v2.
       const { state, ...association } = update;
       return { ...association, ...(state != null ? { state: v2SubagentState(state) } : {}) };
     }
@@ -80,26 +71,6 @@ export function v2SessionUpdate(
         `The ACP v2 surface does not translate ${update.sessionUpdate} session updates yet`,
       );
   }
-}
-
-/**
- * The child's own `state_update` for a v1 `subagent_update` that reports the
- * child's work state, or `undefined` when it reports none.
- *
- * v1 reports a child's work state only on its parent, as the `state` of the
- * `subagent_update`. v2 reports it on the child's own stream, as for any
- * session, and mirrors it on the parent (the subagents RFD). The child's copy
- * goes right after the parent's: never before the announcement, and both
- * copies of a state before any later state.
- */
-export function v2ChildStateUpdate(
-  update: AcpSessionNotification["update"],
-): v2.UpdateSessionNotification | undefined {
-  if (update.sessionUpdate !== "subagent_update" || update.state == null) return undefined;
-  return {
-    sessionId: update.sessionId,
-    update: { sessionUpdate: "state_update", ...v2SubagentState(update.state) },
-  };
 }
 
 type V1SubagentState = NonNullable<

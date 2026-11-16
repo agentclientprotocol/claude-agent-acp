@@ -15,6 +15,7 @@ import {
   RequestError,
   type ListSessionsRequest,
   type ListSessionsResponse,
+  type SessionInfo,
 } from "@agentclientprotocol/sdk/unstable";
 import { deleteSession as sdkDeleteSession } from "@anthropic-ai/claude-agent-sdk";
 import { airExtensionMeta } from "../air-extension.js";
@@ -35,11 +36,11 @@ import {
   type ListSubscriptionDeps,
 } from "./list-subscriptions.js";
 import { LiveSessionRegistry } from "./live-registry.js";
+import { isSessionId } from "../paths.js";
 import {
   canonicalPath,
-  errorCode,
+  exists,
   isExactProjectDir,
-  isSessionId,
   projectDirMatches,
   sameProjectPath,
 } from "./project-dirs.js";
@@ -65,6 +66,7 @@ import { sessionInfoOf } from "./session-info.js";
 export const SESSION_RENAME_METHOD = "_session/rename";
 export const SESSION_ARCHIVE_METHOD = "_session/archive";
 export const SESSION_UNARCHIVE_METHOD = "_session/unarchive";
+export const SESSION_BATCH_GET_METHOD = "_session/batch_get";
 
 /** The JSON-RPC code of an unknown session (ACP `ResourceNotFound`). */
 const RESOURCE_NOT_FOUND = -32002;
@@ -73,6 +75,27 @@ const CURSOR_VERSION = 5;
 
 export type SessionIdRequest = { sessionId: string };
 export type RenameSessionRequest = { sessionId: string; title: string };
+export type BatchGetSessionsRequest = { sessionIds: string[] };
+export type BatchGetSessionsResponse = {
+  sessions: SessionInfo[];
+};
+
+export function parseBatchGetSessionsRequest(value: unknown): BatchGetSessionsRequest {
+  const record = asRecord(value);
+  const ids = record.sessionIds;
+  if (
+    Object.keys(record).length !== 1 ||
+    !Array.isArray(ids) ||
+    ids.some((id) => typeof id !== "string" || !id.trim()) ||
+    new Set(ids).size !== ids.length
+  ) {
+    throw RequestError.invalidParams(
+      undefined,
+      "params require only sessionIds: distinct, non-blank strings",
+    );
+  }
+  return { sessionIds: ids };
+}
 
 export function sessionNotFound(sessionId: string): RequestError {
   return new RequestError(RESOURCE_NOT_FOUND, `Session not found: ${sessionId}`, { sessionId });
@@ -364,26 +387,6 @@ function isSdkNotFound(error: unknown): boolean {
   return error instanceof Error && /^Session \S+ not found in /.test(error.message);
 }
 
-async function exists(target: string): Promise<boolean> {
-  try {
-    await fs.lstat(target);
-    return true;
-  } catch (error) {
-    if (errorCode(error) === "ENOENT" || errorCode(error) === "ENOTDIR") return false;
-    throw error;
-  }
-}
-
-/** The error the SDK `deleteSession` gives for a session id it rejects or
- *  does not find, which a client without `sessionIndex` got before. */
-function sdkDeleteError(sessionId: string): Error {
-  return new Error(
-    isSessionId(sessionId)
-      ? `Session ${sessionId} not found in any project directory`
-      : `Invalid sessionId: ${sessionId}`,
-  );
-}
-
 /**
  * `session/delete` of a client that is neither AIR nor a `sessionIndex` client:
  * the SDK delete of the session's transcript. A session without one succeeds,
@@ -409,16 +412,18 @@ export async function deleteSessionIfStored(
 /**
  * `session/delete` of an AIR client without `sessionIndex`, which uses delete
  * to mark a session done: archives it instead, so the transcript survives. A
- * session without a transcript fails as the SDK delete did.
+ * session without a transcript has nothing to archive and succeeds, as ACP
+ * asks of a delete of a session that never existed (see
+ * {@link deleteSessionIfStored}).
  */
 export async function archiveInsteadOfDelete(
   sessionId: string,
   service: SessionIndexService,
 ): Promise<void> {
-  if (!isSessionId(sessionId)) throw sdkDeleteError(sessionId);
+  if (!isSessionId(sessionId)) return;
   // The SDK delete skips empty transcripts, so they do not count.
   const found = await service.index.findTranscripts(sessionId);
-  if (found.length === 0) throw sdkDeleteError(sessionId);
+  if (found.length === 0) return;
   await service.retitle(sessionId, archiveTo(true), { sidecar: "existing" });
 }
 
@@ -460,6 +465,18 @@ export type SessionIndexDeps = {
   >;
   logError: (message: string, error: unknown) => void;
 };
+
+/** The transcript reads and writes of the session index, without its list
+ *  or watcher: what a client without `sessionIndex` uses for
+ *  `session/set_title`, AIR's archive on delete, and delete's ordering
+ *  after them (see {@link SessionIndexService.exclusive}). */
+export function transcriptWriter(logger: {
+  error: (message: string, error: unknown) => void;
+}): SessionIndexService {
+  return new SessionIndexService({
+    logError: (message, error) => logger.error(`[session-index] ${message}:`, error),
+  });
+}
 
 export class SessionIndexService {
   readonly index: SessionIndex;
@@ -520,8 +537,26 @@ export class SessionIndexService {
     return hasMore && last ? { sessions, nextCursor: encodeListCursor(last, scope) } : { sessions };
   }
 
-  /** Runs `mutation` after the previous mutation of the session ended. */
-  private exclusive<T>(sessionId: string, mutation: () => Promise<T>): Promise<T> {
+  /** Metadata for known ids, independent of list pages and project filters. */
+  async batchGet(
+    { sessionIds }: BatchGetSessionsRequest,
+    own: (sessionId: string) => OwnSessionState | undefined,
+  ): Promise<BatchGetSessionsResponse> {
+    if (sessionIds.length === 0) return { sessions: [] };
+    const live = await this.registry.snapshot();
+    const now = this.now();
+    const rows = await this.index.getSessions(sessionIds);
+    return {
+      sessions: rows.map((row) =>
+        sessionInfoOf(row, own(row.sessionId), live.get(row.sessionId), now),
+      ),
+    };
+  }
+
+  /** Runs `mutation` after the previous mutation of the session ended, such
+   *  as a delete that does not go through {@link delete}, so that a retitle
+   *  cannot append to a transcript the delete is removing. */
+  exclusive<T>(sessionId: string, mutation: () => Promise<T>): Promise<T> {
     const previous = this.mutations.get(sessionId) ?? Promise.resolve();
     const next = previous.catch(() => undefined).then(mutation);
     const settled = next.catch(() => undefined);

@@ -24,6 +24,11 @@ export interface SubagentRecord {
   background: boolean;
   /** Whether the user stopped it. */
   stoppedByUser: boolean;
+  /**
+   * Its working directory, when Claude Code placed it outside its parent's:
+   * in a worktree of its own or of an ancestor, or in a `cwd` of its own.
+   */
+  cwd?: string;
 }
 
 /** Where the subagent transcripts of a session are. */
@@ -43,7 +48,9 @@ export interface SubagentHistory {
  * Claude keeps the history of a subagent in its own transcript,
  * `<session>/subagents/agent-<id>.jsonl`, next to the session transcript.
  * The `agent-<id>.meta.json` file beside it names the launching tool use.
- * The ids are empty for a session without a local transcript.
+ * For a child that Claude Code placed elsewhere, it has `worktreePath`,
+ * `inheritedWorktreePath` or `cwd`; then the child's working directory is the
+ * `cwd` of its transcript's records. The ids are empty for a session without a local transcript.
  */
 export async function subagentHistory(sessionId: string): Promise<SubagentHistory> {
   const agents = new Map<string, SubagentRecord>();
@@ -67,6 +74,12 @@ export async function subagentHistory(sessionId: string): Promise<SubagentHistor
         > | null;
         if (typeof meta?.toolUseId !== "string") return;
         const text = (value: unknown) => (typeof value === "string" ? value : undefined);
+        const placement = [meta.cwd, meta.worktreePath, meta.inheritedWorktreePath]
+          .map(text)
+          .find((value) => value && path.isAbsolute(value));
+        const cwd = placement
+          ? ((await recordedCwd(path.join(directory, `agent-${match[1]!}.jsonl`))) ?? placement)
+          : undefined;
         agents.set(meta.toolUseId, {
           agentId: match[1]!,
           name: text(meta.name),
@@ -74,6 +87,7 @@ export async function subagentHistory(sessionId: string): Promise<SubagentHistor
           description: text(meta.description),
           background: meta.requestShape === "background",
           stoppedByUser: meta.stoppedByUser === true,
+          ...(cwd ? { cwd } : {}),
         });
       } catch {
         // A damaged meta file leaves its subagent without history.
@@ -85,6 +99,31 @@ export async function subagentHistory(sessionId: string): Promise<SubagentHistor
   // characters. The session info reads it back from the transcript.
   const dir = (await getSessionInfo(sessionId).catch(() => undefined))?.cwd;
   return dir ? { agents, dir } : { agents };
+}
+
+/**
+ * The `cwd` of the first record of the transcript `file` that has one, or
+ * undefined when the file cannot be read. Claude Code writes the working
+ * directory of the session or subagent on each record.
+ */
+async function recordedCwd(file: string): Promise<string | undefined> {
+  const stream = createReadStream(file, { encoding: "utf8" });
+  try {
+    for await (const line of readline.createInterface({ input: stream, crlfDelay: Infinity })) {
+      if (!line.includes('"cwd"')) continue;
+      try {
+        const cwd = (JSON.parse(line) as { cwd?: unknown } | null)?.cwd;
+        if (typeof cwd === "string" && path.isAbsolute(cwd)) return cwd;
+      } catch {
+        // A damaged record; a later one can have the `cwd`.
+      }
+    }
+  } catch {
+    // An unreadable transcript; the caller falls back to the metadata's path.
+  } finally {
+    stream.destroy();
+  }
+  return undefined;
 }
 
 /** The folder of the subagent transcripts, next to the session transcript `transcript`. */
@@ -162,6 +201,7 @@ export async function subagentLineage(
       agentId: current,
       launchId: launch.launchId,
       ...(launcher !== null ? { parentAgentId: launcher } : {}),
+      ...(launch.record.cwd ? { cwd: launch.record.cwd } : {}),
       ...(launch.record.name ? { name: launch.record.name } : {}),
       ...(launch.record.agentType ? { agentType: launch.record.agentType } : {}),
       ...(launch.record.description ? { description: launch.record.description } : {}),
