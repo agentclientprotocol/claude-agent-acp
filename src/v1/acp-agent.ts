@@ -258,11 +258,8 @@ import {
   supportsAirSessionFailures,
 } from "../session-failure-extension.js";
 import {
-  billsClaudeSubscription,
-  claudeLoginRequiredError,
+  claudeAuthRefusal,
   type ClaudeSubscriptionGuardState,
-  claudeSubscriptionNotSupportedError,
-  holdsNonSubscriptionCredential,
   refuseClaudeSubscriptionTurn,
   shouldHideClaudeAuth,
   warnClaudeSubscriptionGuardDegraded,
@@ -10275,15 +10272,14 @@ export class ClaudeAcpAgent {
             logger: this.logger,
             cause: "the CLI reported no account at initialize",
           });
-        } else if (billsClaudeSubscription(initializationResult.account)) {
-          throw claudeSubscriptionNotSupportedError();
-        } else if (!holdsNonSubscriptionCredential(initializationResult.account)) {
-          // Fail closed: the account holds nothing this integration can bill.
-          // A logged-out session must never exist, because the CLI can pick up
-          // a claude.ai login by itself and AIR resumes a parked prompt on the
-          // SAME session after a sign-in. Refusing before the session exists
-          // makes every sign-in lead to a new session and a fresh `initialize`.
-          throw claudeLoginRequiredError();
+        } else {
+          // Fail closed on a signed-out account too: a logged-out session must
+          // never exist, because the CLI can pick up a claude.ai login by itself
+          // and AIR resumes a parked prompt on the SAME session after a sign-in.
+          // Refusing before the session exists makes every sign-in lead to a new
+          // session and a fresh `initialize`.
+          const refusal = claudeAuthRefusal(initializationResult.account);
+          if (refusal) throw refusal;
         }
       }
 
