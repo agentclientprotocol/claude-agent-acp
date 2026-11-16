@@ -1,0 +1,1499 @@
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { SessionNotification } from "@agentclientprotocol/sdk/unstable";
+import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
+import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../../v1/acp-agent.js";
+import type { AcpClient } from "../../acp-client.js";
+import { makeMockQuery } from "../helpers.js";
+
+const { registerHookCallbackSpy } = vi.hoisted(() => ({
+  registerHookCallbackSpy: vi.fn(),
+}));
+
+vi.mock("../../tools.js", async () => {
+  const actual = await vi.importActual<typeof import("../../tools.js")>("../../tools.js");
+  return {
+    ...actual,
+    registerHookCallback: registerHookCallbackSpy,
+  };
+});
+
+const SESSION_ID = "test-session-id";
+
+const MOCK_MODES = {
+  currentModeId: "default",
+  availableModes: [
+    { id: "default", name: "Default", description: "Standard behavior" },
+    { id: "plan", name: "Plan Mode", description: "Planning mode" },
+    { id: "acceptEdits", name: "Accept Edits", description: "Auto-accept edits" },
+  ],
+};
+
+const MOCK_MODELS = {
+  currentModelId: "claude-opus-4-5",
+  availableModels: [
+    { modelId: "claude-opus-4-5", name: "Claude Opus", description: "Most capable" },
+    { modelId: "claude-sonnet-4-6", name: "Claude Sonnet", description: "Balanced" },
+  ],
+};
+
+const MOCK_CONFIG_OPTIONS = [
+  {
+    id: "mode",
+    name: "Mode",
+    type: "select",
+    category: "mode",
+    currentValue: "default",
+    options: MOCK_MODES.availableModes.map((m) => ({
+      value: m.id,
+      name: m.name,
+      description: m.description,
+    })),
+  },
+  {
+    id: "model",
+    name: "Model",
+    type: "select",
+    category: "model",
+    currentValue: "claude-opus-4-5",
+    options: MOCK_MODELS.availableModels.map((m) => ({
+      value: m.modelId,
+      name: m.name,
+      description: m.description,
+    })),
+  },
+  {
+    id: "effort",
+    name: "Effort",
+    description: "Available effort levels for this model",
+    type: "select",
+    category: "effort",
+    currentValue: "default",
+    options: [
+      { value: "default", name: "Default" },
+      { value: "low", name: "Low" },
+      { value: "medium", name: "Medium" },
+      { value: "high", name: "High" },
+    ],
+  },
+];
+
+describe("session config options", () => {
+  let agent: ClaudeAcpAgentType;
+  let ClaudeAcpAgent: typeof ClaudeAcpAgentType;
+  let sessionUpdates: SessionNotification[];
+  let createSessionSpy: ReturnType<typeof vi.fn>;
+  let setPermissionModeSpy: ReturnType<typeof vi.fn>;
+  let setModelSpy: ReturnType<typeof vi.fn>;
+  let applyFlagSettingsSpy: ReturnType<typeof vi.fn>;
+
+  function createMockClient(): AcpClient {
+    return {
+      sessionUpdate: async (notification: SessionNotification) => {
+        sessionUpdates.push(notification);
+      },
+      requestPermission: async () => ({ outcome: { outcome: "cancelled" } }),
+      readTextFile: async () => ({ content: "" }),
+      writeTextFile: async () => ({}),
+    } as unknown as AcpClient;
+  }
+
+  function populateSession() {
+    setPermissionModeSpy = vi.fn();
+    setModelSpy = vi.fn();
+    applyFlagSettingsSpy = vi.fn();
+
+    (agent as unknown as { sessions: Record<string, unknown> }).sessions[SESSION_ID] = {
+      query: makeMockQuery({
+        setPermissionMode: setPermissionModeSpy,
+        setModel: setModelSpy,
+        applyFlagSettings: applyFlagSettingsSpy,
+      }),
+      input: null,
+      cancelled: false,
+      permissionMode: "default",
+      settingsManager: { getSettings: () => ({}) },
+      modes: structuredClone(MOCK_MODES),
+      models: structuredClone(MOCK_MODELS),
+      modelInfos: MOCK_MODELS.availableModels.map((m): ModelInfo => ({
+        value: m.modelId,
+        displayName: m.name,
+        description: m.description,
+        supportsEffort: true,
+        supportedEffortLevels: ["low", "medium", "high"],
+      })),
+      configOptions: structuredClone(MOCK_CONFIG_OPTIONS),
+      contextWindowSize: 200000,
+      toolUseCache: {},
+      emittedToolCalls: new Set(),
+    };
+  }
+
+  beforeEach(async () => {
+    sessionUpdates = [];
+    registerHookCallbackSpy.mockClear();
+
+    vi.resetModules();
+    const acpAgent = await import("../../v1/acp-agent.js");
+    ClaudeAcpAgent = acpAgent.ClaudeAcpAgent;
+
+    agent = new ClaudeAcpAgent(createMockClient());
+    createSessionSpy = vi.fn(async () => ({
+      sessionId: SESSION_ID,
+      modes: MOCK_MODES,
+      models: MOCK_MODELS,
+      configOptions: MOCK_CONFIG_OPTIONS,
+    }));
+    (agent as unknown as { createSession: typeof createSessionSpy }).createSession =
+      createSessionSpy;
+  });
+
+  describe("newSession returns configOptions", () => {
+    it("includes configOptions in the response", async () => {
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(response.configOptions).toBeDefined();
+      expect(response.configOptions).toEqual(MOCK_CONFIG_OPTIONS);
+    });
+
+    it("includes mode and model config options", async () => {
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      const modeOption = response.configOptions?.find((o) => o.id === "mode");
+      const modelOption = response.configOptions?.find((o) => o.id === "model");
+      expect(modeOption).toBeDefined();
+      expect(modelOption).toBeDefined();
+    });
+  });
+
+  describe("loadSession returns configOptions", () => {
+    it("includes configOptions from createSession", async () => {
+      // loadSession calls findSessionFile first - override the whole method
+      const loadSessionSpy = vi.fn(async () => ({
+        modes: MOCK_MODES,
+        models: MOCK_MODELS,
+        configOptions: MOCK_CONFIG_OPTIONS,
+      }));
+      (agent as unknown as { loadSession: typeof loadSessionSpy }).loadSession = loadSessionSpy;
+
+      const response = await agent.loadSession({
+        cwd: process.cwd(),
+        sessionId: SESSION_ID,
+        mcpServers: [],
+      });
+      expect(response.configOptions).toEqual(MOCK_CONFIG_OPTIONS);
+    });
+  });
+
+  describe("setSessionConfigOption", () => {
+    beforeEach(() => {
+      populateSession();
+    });
+
+    it("throws when session not found", async () => {
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: "nonexistent",
+          configId: "mode",
+          value: "plan",
+        }),
+      ).rejects.toMatchObject({ code: -32002, data: { sessionId: "nonexistent" } });
+    });
+
+    it("throws when config option not found", async () => {
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: SESSION_ID,
+          configId: "unknown-option",
+          value: "some-value",
+        }),
+      ).rejects.toMatchObject({
+        code: -32602,
+        message: expect.stringContaining("Unknown config option: unknown-option"),
+      });
+    });
+
+    it("throws when value is not valid for the option", async () => {
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: SESSION_ID,
+          configId: "mode",
+          value: "invalid-mode",
+        }),
+      ).rejects.toMatchObject({
+        code: -32602,
+        message: expect.stringContaining("Invalid value for config option mode: invalid-mode"),
+      });
+    });
+
+    it("rejects mode and config changes once the query stream has closed (husk session)", async () => {
+      // After an unexpected stream death the session lingers as a husk
+      // (queryClosed=true) so prompt() can answer with a clear error. The
+      // config/mode handlers must do the same rather than calling setModel/
+      // setPermissionMode on the closed query.
+      const session = (agent as unknown as { sessions: Record<string, { queryClosed?: boolean }> })
+        .sessions[SESSION_ID];
+      session.queryClosed = true;
+
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: SESSION_ID,
+          configId: "model",
+          value: "claude-sonnet-4-6",
+        }),
+      ).rejects.toThrow(/start a new session/);
+      await expect(agent.setSessionMode({ sessionId: SESSION_ID, modeId: "plan" })).rejects.toThrow(
+        /start a new session/,
+      );
+
+      // Short-circuited before touching the (closed) query.
+      expect(setModelSpy).not.toHaveBeenCalled();
+      expect(setPermissionModeSpy).not.toHaveBeenCalled();
+    });
+
+    it("changes mode, sends current_mode_update but not config_option_update", async () => {
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "mode",
+        value: "plan",
+      });
+
+      expect(setPermissionModeSpy).toHaveBeenCalledWith("plan");
+
+      const modeUpdate = sessionUpdates.find(
+        (n) => n.update.sessionUpdate === "current_mode_update",
+      );
+      expect(modeUpdate?.update).toMatchObject({
+        sessionUpdate: "current_mode_update",
+        currentModeId: "plan",
+      });
+
+      const configUpdate = sessionUpdates.find(
+        (n) => n.update.sessionUpdate === "config_option_update",
+      );
+      expect(configUpdate).toBeUndefined();
+    });
+
+    it("changes model and does not send a config_option_update notification", async () => {
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-6");
+
+      const configUpdate = sessionUpdates.find(
+        (n) => n.update.sessionUpdate === "config_option_update",
+      );
+      expect(configUpdate).toBeUndefined();
+    });
+
+    it("resolves model alias 'opus' to full model ID", async () => {
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "opus",
+      });
+
+      expect(setModelSpy).toHaveBeenCalledWith("claude-opus-4-5");
+
+      const modelOption = response.configOptions.find((o) => o.id === "model");
+      expect(modelOption?.currentValue).toBe("claude-opus-4-5");
+    });
+
+    it("resolves model alias 'sonnet' to full model ID", async () => {
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "sonnet",
+      });
+
+      expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-6");
+    });
+
+    it("resolves display name to model ID", async () => {
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "Claude Sonnet",
+      });
+
+      expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-6");
+    });
+
+    it("still works with exact model ID", async () => {
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-6");
+      const modelOption = response.configOptions.find((o) => o.id === "model");
+      expect(modelOption?.currentValue).toBe("claude-sonnet-4-6");
+    });
+
+    // "a" is a substring of "Claude", "son" of "sonnet": only whole words match.
+    it.each(["gpt-4", "not-a-model", "son", "foo-sonnet"])(
+      "rejects the model %s and leaves the model as it was",
+      async (value) => {
+        await expect(
+          agent.setSessionConfigOption({ sessionId: SESSION_ID, configId: "model", value }),
+        ).rejects.toMatchObject({
+          code: -32602,
+          message: expect.stringContaining(`Invalid value for config option model: ${value}`),
+        });
+
+        expect(setModelSpy).not.toHaveBeenCalled();
+        const session = (
+          agent as unknown as {
+            sessions: Record<string, { configOptions: typeof MOCK_CONFIG_OPTIONS }>;
+          }
+        ).sessions[SESSION_ID];
+        expect(session.configOptions.find((o) => o.id === "model")?.currentValue).toBe(
+          "claude-opus-4-5",
+        );
+      },
+    );
+
+    it("rejects a non-string value for a select option with invalid params", async () => {
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: SESSION_ID,
+          configId: "mode",
+          type: "boolean",
+          value: true,
+        }),
+      ).rejects.toMatchObject({ code: -32602 });
+    });
+
+    it("closes an unknown session without an error", async () => {
+      await expect(agent.closeSession({ sessionId: "nonexistent" })).resolves.toEqual({});
+    });
+
+    it("returns full configOptions in the response", async () => {
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "mode",
+        value: "plan",
+      });
+
+      expect(response.configOptions).toHaveLength(MOCK_CONFIG_OPTIONS.length);
+      const modeOption = response.configOptions.find((o) => o.id === "mode");
+      expect(modeOption?.currentValue).toBe("plan");
+    });
+
+    it("other options are unchanged when one is updated", async () => {
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "mode",
+        value: "plan",
+      });
+
+      const modelOption = response.configOptions.find((o) => o.id === "model");
+      expect(modelOption?.currentValue).toBe("claude-opus-4-5");
+    });
+  });
+
+  describe("setSessionConfigOption(model) returns updated configOptions", () => {
+    beforeEach(() => {
+      populateSession();
+    });
+
+    it("returns configOptions with the new model when changed", async () => {
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      expect(response.configOptions).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: "model", currentValue: "claude-sonnet-4-6" }),
+        ]),
+      );
+    });
+
+    it("updates stored configOptions currentValue when model changes", async () => {
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      const session = (
+        agent as unknown as {
+          sessions: Record<string, { configOptions: typeof MOCK_CONFIG_OPTIONS }>;
+        }
+      ).sessions[SESSION_ID];
+      const modelOption = session.configOptions.find((o) => o.id === "model");
+      expect(modelOption?.currentValue).toBe("claude-sonnet-4-6");
+    });
+
+    it("drops effort from returned configOptions when model drops effort support", async () => {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.modelInfos = [
+        {
+          value: "claude-opus-4-5",
+          displayName: "Claude Opus",
+          description: "Most capable",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high"],
+        },
+        {
+          value: "claude-sonnet-4-6",
+          displayName: "Claude Sonnet",
+          description: "Balanced",
+          supportsEffort: false,
+        },
+      ];
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      const effortOption = response.configOptions.find((o) => o.id === "effort");
+      expect(effortOption).toBeUndefined();
+      // Nothing was pinned at the flag layer (effort was "default"), so there
+      // is nothing to clear — the CLI resolves its own effort for the new model.
+      expect(applyFlagSettingsSpy).not.toHaveBeenCalled();
+    });
+
+    it("clamps effort in returned configOptions when new model has different supported levels", async () => {
+      // Set current effort to "max" which the new model won't support —
+      // pinned, as a user's ACP picker choice would be.
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      const effortOpt = session.configOptions.find((o: any) => o.id === "effort");
+      if (effortOpt) effortOpt.currentValue = "max";
+      session.effortPinnedLevel = "max";
+
+      session.modelInfos = [
+        {
+          value: "claude-opus-4-5",
+          displayName: "Claude Opus",
+          description: "Most capable",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high", "max"],
+        },
+        {
+          value: "claude-sonnet-4-6",
+          displayName: "Claude Sonnet",
+          description: "Balanced",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high"],
+        },
+      ];
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      const effortOption = response.configOptions.find((o) => o.id === "effort");
+      expect(effortOption).toBeDefined();
+      expect(effortOption?.currentValue).toBe("default");
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null });
+    });
+
+    it("preserves effort in returned configOptions when new model supports same level", async () => {
+      // Set effort to "low" first — pinned, as a user's ACP picker choice
+      // would be (an unpinned value re-seeds from settings on a switch).
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      const effortOpt = session.configOptions.find((o: any) => o.id === "effort");
+      if (effortOpt) effortOpt.currentValue = "low";
+      session.effortPinnedLevel = "low";
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      const effortOption = response.configOptions.find((o) => o.id === "effort");
+      expect(effortOption?.currentValue).toBe("low");
+      // Effort didn't change, so applyFlagSettings should NOT be called
+      expect(applyFlagSettingsSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("no config_option_update notification when using setSessionConfigOption", () => {
+    beforeEach(() => {
+      populateSession();
+    });
+
+    it("sends no config_option_update when setting mode via config option", async () => {
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "mode",
+        value: "plan",
+      });
+
+      const configUpdates = sessionUpdates.filter(
+        (n) => n.update.sessionUpdate === "config_option_update",
+      );
+      expect(configUpdates).toHaveLength(0);
+    });
+
+    it("sends no config_option_update when setting model via config option", async () => {
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      const configUpdates = sessionUpdates.filter(
+        (n) => n.update.sessionUpdate === "config_option_update",
+      );
+      expect(configUpdates).toHaveLength(0);
+    });
+  });
+
+  describe("setSessionConfigOption for effort", () => {
+    beforeEach(() => {
+      populateSession();
+    });
+
+    it("calls applyFlagSettings with effortLevel", async () => {
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "low",
+      });
+
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: "low" });
+    });
+
+    it("calls applyFlagSettings with null effortLevel for 'default'", async () => {
+      // Set effort to a non-default value first
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      const effortOpt = session.configOptions.find((o: any) => o.id === "effort");
+      if (effortOpt) effortOpt.currentValue = "high";
+
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "default",
+      });
+
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null });
+
+      // The SDK's applyFlagSettings travels over a JSON pipe and only clears a
+      // flag-layer key when an explicit `null` is sent — `undefined` is
+      // dropped during JSON.stringify, which would leave the previous effort
+      // override in place. Round-trip the call args through JSON to make sure
+      // the key actually reaches the SDK.
+      const calls = applyFlagSettingsSpy.mock.calls;
+      const lastCallArgs = calls[calls.length - 1]?.[0];
+      const serialized = JSON.parse(JSON.stringify(lastCallArgs));
+      expect(serialized).toHaveProperty("effortLevel", null);
+    });
+
+    it("updates effort currentValue in returned configOptions", async () => {
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "medium",
+      });
+
+      const effortOption = response.configOptions.find((o) => o.id === "effort");
+      expect(effortOption?.currentValue).toBe("medium");
+    });
+
+    it("keeps effort state unchanged when the SDK rejects a direct selection", async () => {
+      applyFlagSettingsSpy.mockRejectedValueOnce(new Error("effort update failed"));
+
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: SESSION_ID,
+          configId: "effort",
+          value: "low",
+        }),
+      ).rejects.toThrow("effort update failed");
+
+      const session = agent.sessions[SESSION_ID];
+      expect(session.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("default");
+      expect(session.effortPinnedLevel).toBeUndefined();
+      expect(session.appliedEffortLevel).toBeUndefined();
+    });
+
+    it("throws for invalid effort value", async () => {
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: SESSION_ID,
+          configId: "effort",
+          value: "turbo",
+        }),
+      ).rejects.toThrow("Invalid value for config option effort: turbo");
+    });
+
+    it("does not send config_option_update notification", async () => {
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "low",
+      });
+
+      const configUpdates = sessionUpdates.filter(
+        (n) => n.update.sessionUpdate === "config_option_update",
+      );
+      expect(configUpdates).toHaveLength(0);
+    });
+
+    it("other options are unchanged when effort is updated", async () => {
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "low",
+      });
+
+      const modeOption = response.configOptions.find((o) => o.id === "mode");
+      expect(modeOption?.currentValue).toBe("default");
+      const modelOption = response.configOptions.find((o) => o.id === "model");
+      expect(modelOption?.currentValue).toBe("claude-opus-4-5");
+    });
+  });
+
+  describe("effort level and model switch interactions", () => {
+    beforeEach(() => {
+      populateSession();
+    });
+
+    it("applies concrete defaults and re-seeds automatic effort from each model's settings", async () => {
+      (agent as any).clientCapabilities = {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
+      };
+      const session = agent.sessions[SESSION_ID];
+      session.settingsManager.getSettings = () => ({
+        modelSettings: { "claude-opus-4-5": { effortLevel: "high" } },
+      });
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+      expect(response.configOptions.find((o) => o.id === "effort")).toMatchObject({
+        currentValue: "medium",
+        _meta: { jetbrains: { air: { recommendedValue: "medium" } } },
+      });
+      expect(applyFlagSettingsSpy).toHaveBeenLastCalledWith({ effortLevel: "medium" });
+      expect(session.effortPinnedLevel).toBeUndefined();
+      expect(session.appliedEffortLevel).toBe("medium");
+
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-opus-4-5",
+      });
+      expect(applyFlagSettingsSpy).toHaveBeenLastCalledWith({ effortLevel: "high" });
+      expect(session.effortPinnedLevel).toBeUndefined();
+      expect(session.appliedEffortLevel).toBe("high");
+
+      session.modelInfos[1].supportsEffort = false;
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+      expect(applyFlagSettingsSpy).toHaveBeenLastCalledWith({ effortLevel: null });
+    });
+
+    it("re-seeds switches from retained programmatic settings before file settings", async () => {
+      (agent as any).clientCapabilities = {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
+      };
+      const session = agent.sessions[SESSION_ID];
+      session.settingsManager.getSettings = () => ({ effortLevel: "high" });
+      session.effortSettingsOverride = {
+        effortLevel: "medium",
+        modelSettings: { "claude-sonnet-4-6": { effortLevel: "low" } },
+      };
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      expect(response.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("low");
+      expect(applyFlagSettingsSpy).toHaveBeenLastCalledWith({ effortLevel: "low" });
+    });
+
+    it("clears an unsupported user pin before choosing the new model's concrete effort", async () => {
+      (agent as any).clientCapabilities = {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
+      };
+      const session = agent.sessions[SESSION_ID];
+      session.modelInfos[0].supportedEffortLevels = ["low", "medium", "high", "max"];
+      session.settingsManager.getSettings = () => ({ effortLevel: "low" });
+      session.configOptions.find((o) => o.id === "effort")!.currentValue = "max";
+      session.effortPinnedLevel = "max";
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+      expect(response.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("low");
+      expect(applyFlagSettingsSpy).toHaveBeenLastCalledWith({ effortLevel: "low" });
+      expect(session.effortPinnedLevel).toBeUndefined();
+      expect(session.appliedEffortLevel).toBe("low");
+    });
+
+    it("clears a legacy pin without promoting persisted effort to a flag override", async () => {
+      const session = agent.sessions[SESSION_ID];
+      session.modelInfos[0].supportedEffortLevels = ["low", "medium", "high", "max"];
+      session.settingsManager.getSettings = () => ({ effortLevel: "low" });
+      session.configOptions.find((o) => o.id === "effort")!.currentValue = "max";
+      session.effortPinnedLevel = "max";
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      expect(response.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("low");
+      expect(applyFlagSettingsSpy).toHaveBeenLastCalledWith({ effortLevel: null });
+      expect(session.effortPinnedLevel).toBeUndefined();
+      expect(session.appliedEffortLevel).toBeUndefined();
+    });
+
+    it("retains the original pin value when a legacy clamp fails", async () => {
+      const session = agent.sessions[SESSION_ID];
+      session.modelInfos[0].supportedEffortLevels = ["low", "medium", "high", "max"];
+      session.settingsManager.getSettings = () => ({ effortLevel: "low" });
+      session.configOptions.find((o) => o.id === "effort")!.currentValue = "max";
+      session.effortPinnedLevel = "max";
+      applyFlagSettingsSpy.mockRejectedValueOnce(new Error("effort clear failed"));
+
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+      expect(session.configOptions.find((o) => o.id === "effort")).toBeUndefined();
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-opus-4-5",
+      });
+
+      expect(response.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("max");
+      expect(session.effortPinnedLevel).toBe("max");
+    });
+
+    it("restores the last applied effort when recommended-value synchronization fails", async () => {
+      (agent as any).clientCapabilities = {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
+      };
+      const session = agent.sessions[SESSION_ID];
+      session.configOptions.find((o) => o.id === "effort")!.currentValue = "low";
+      session.appliedEffortLevel = "low";
+      session.settingsManager.getSettings = () => ({ effortLevel: "high" });
+      applyFlagSettingsSpy.mockRejectedValueOnce(new Error("effort sync failed"));
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      expect(response.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("low");
+      expect(session.appliedEffortLevel).toBe("low");
+      expect(session.effortPinnedLevel).toBeUndefined();
+    });
+
+    it("returns the new model state when effort synchronization fails", async () => {
+      (agent as any).clientCapabilities = {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
+      };
+      applyFlagSettingsSpy.mockRejectedValueOnce(new Error("effort sync failed"));
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-6");
+      expect(response.configOptions.find((o) => o.id === "model")?.currentValue).toBe(
+        "claude-sonnet-4-6",
+      );
+      expect(agent.sessions[SESSION_ID].models.currentModelId).toBe("claude-sonnet-4-6");
+    });
+
+    it("publishes the new model state when external-switch effort synchronization fails", async () => {
+      (agent as any).clientCapabilities = {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
+      };
+      applyFlagSettingsSpy.mockRejectedValueOnce(new Error("effort sync failed"));
+      const session = agent.sessions[SESSION_ID];
+
+      await (agent as any).syncModelAfterExternalSwitch(SESSION_ID, session, "claude-sonnet-4-6");
+
+      expect(setModelSpy).not.toHaveBeenCalled();
+      expect(session.models.currentModelId).toBe("claude-sonnet-4-6");
+      expect(
+        sessionUpdates
+          .filter((notification) => notification.update.sessionUpdate === "config_option_update")
+          .at(-1)?.update,
+      ).toMatchObject({
+        sessionUpdate: "config_option_update",
+        configOptions: expect.arrayContaining([
+          expect.objectContaining({ id: "model", currentValue: "claude-sonnet-4-6" }),
+        ]),
+      });
+    });
+
+    it("drops effort option when switching to a model without effort support", async () => {
+      // Make sonnet not support effort
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.modelInfos = [
+        {
+          value: "claude-opus-4-5",
+          displayName: "Claude Opus",
+          description: "Most capable",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high"],
+        },
+        {
+          value: "claude-sonnet-4-6",
+          displayName: "Claude Sonnet",
+          description: "Balanced",
+          supportsEffort: false,
+        },
+      ];
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      const effortOption = response.configOptions.find((o) => o.id === "effort");
+      expect(effortOption).toBeUndefined();
+    });
+
+    it("clears a pinned effort via applyFlagSettings when switching to a model without effort", async () => {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.modelInfos = [
+        {
+          value: "claude-opus-4-5",
+          displayName: "Claude Opus",
+          description: "Most capable",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high"],
+        },
+        {
+          value: "claude-sonnet-4-6",
+          displayName: "Claude Sonnet",
+          description: "Balanced",
+          supportsEffort: false,
+        },
+      ];
+
+      // Pin an effort the way a user would, then switch to a model that
+      // cannot serve it: the flag layer must be cleared alongside, or the
+      // SDK would keep running the old pin invisibly.
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "high",
+      });
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null });
+      // The clamp un-pins: a later switch back re-seeds from settings.
+      expect(session.effortPinnedLevel).toBeUndefined();
+    });
+
+    it("adds effort option when switching to a model that supports effort", async () => {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      // Start with sonnet (no effort) as current
+      session.models = { ...session.models, currentModelId: "claude-sonnet-4-6" };
+      session.modelInfos = [
+        {
+          value: "claude-opus-4-5",
+          displayName: "Claude Opus",
+          description: "Most capable",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high"],
+        },
+        {
+          value: "claude-sonnet-4-6",
+          displayName: "Claude Sonnet",
+          description: "Balanced",
+          supportsEffort: false,
+        },
+      ];
+      // Remove effort from current config options
+      session.configOptions = session.configOptions.filter((o: any) => o.id !== "effort");
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-opus-4-5",
+      });
+
+      const effortOption = response.configOptions.find((o) => o.id === "effort");
+      expect(effortOption).toBeDefined();
+      // No previous effort, so defaults to "default" (no effort override)
+      expect(effortOption?.currentValue).toBe("default");
+    });
+
+    it("clamps effort to valid value when new model has different supported levels", async () => {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      // Set current effort to "max" (not supported by sonnet in our mock) —
+      // pinned, as a user's ACP picker choice would be.
+      const effortOpt = session.configOptions.find((o: any) => o.id === "effort");
+      if (effortOpt) effortOpt.currentValue = "max";
+      session.effortPinnedLevel = "max";
+
+      session.modelInfos = [
+        {
+          value: "claude-opus-4-5",
+          displayName: "Claude Opus",
+          description: "Most capable",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high", "max"],
+        },
+        {
+          value: "claude-sonnet-4-6",
+          displayName: "Claude Sonnet",
+          description: "Balanced",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high"],
+        },
+      ];
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      const effortOption = response.configOptions.find((o) => o.id === "effort");
+      expect(effortOption).toBeDefined();
+      // "max" is not in sonnet's levels, so should fall back to "default" (no effort override)
+      expect(effortOption?.currentValue).toBe("default");
+      // SDK should be told to clear the effort override
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null });
+    });
+
+    it("preserves effort value when new model supports the same level", async () => {
+      // Set effort to "low"
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "low",
+      });
+
+      // Switch model — both support "low"
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      const effortOption = response.configOptions.find((o) => o.id === "effort");
+      expect(effortOption?.currentValue).toBe("low");
+      // applyFlagSettings was called once for the effort change, but not again for the model switch
+      expect(applyFlagSettingsSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("seeds effort from the new model's persisted modelSettings entry on an unpinned switch", async () => {
+      // The CLI persists /effort per model (settings.modelSettings); with no
+      // user pin this session, the picker should show what the CLI will
+      // actually run on the new model, not drag the old model's value along.
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.settingsManager = {
+        getSettings: () => ({
+          effortLevel: "high",
+          modelSettings: { "claude-sonnet-4-6": { effortLevel: "low" } },
+        }),
+      };
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      const effortOption = response.configOptions.find((o) => o.id === "effort");
+      expect(effortOption?.currentValue).toBe("low");
+      // Display-only: the CLI resolves persisted effort itself; pinning it at
+      // the flag layer would shadow the per-model values on later switches.
+      expect(applyFlagSettingsSpy).not.toHaveBeenCalled();
+    });
+
+    it("falls back to the top-level settings effort when the new model has no per-model entry", async () => {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.settingsManager = {
+        getSettings: () => ({ effortLevel: "medium" }),
+      };
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      const effortOption = response.configOptions.find((o) => o.id === "effort");
+      expect(effortOption?.currentValue).toBe("medium");
+      expect(applyFlagSettingsSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("bidirectional consistency", () => {
+    beforeEach(() => {
+      populateSession();
+    });
+
+    it("setSessionConfigOption for mode also calls underlying setPermissionMode", async () => {
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "mode",
+        value: "acceptEdits",
+      });
+
+      expect(setPermissionModeSpy).toHaveBeenCalledWith("acceptEdits");
+    });
+
+    it("setSessionConfigOption for model also calls underlying setModel", async () => {
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-6");
+    });
+
+    // Option entries carry no resolvedModel, so alias resolution must consult
+    // session.modelInfos — otherwise a full model id in either hint spelling
+    // ("[1m]"/"-1m") falls to the substring tier and lands on the bare 200k
+    // sibling, silently downgrading the session's context lane.
+    it("resolves a full model id onto its hinted row via session.modelInfos", async () => {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.models = {
+        currentModelId: "sonnet",
+        availableModels: [
+          { modelId: "sonnet", name: "Sonnet", description: "" },
+          { modelId: "sonnet[1m]", name: "Sonnet", description: "" },
+        ],
+      };
+      session.modelInfos = [
+        {
+          value: "sonnet",
+          resolvedModel: "claude-sonnet-5",
+          displayName: "Sonnet",
+          description: "",
+        },
+        {
+          value: "sonnet[1m]",
+          resolvedModel: "claude-sonnet-5[1m]",
+          displayName: "Sonnet",
+          description: "",
+        },
+      ];
+      session.configOptions = session.configOptions.map((o: { id: string }) =>
+        o.id === "model"
+          ? {
+              ...o,
+              currentValue: "sonnet",
+              options: [
+                { value: "sonnet", name: "Sonnet" },
+                { value: "sonnet[1m]", name: "Sonnet" },
+              ],
+            }
+          : o,
+      );
+
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-5[1m]",
+      });
+      expect(setModelSpy).toHaveBeenCalledWith("sonnet[1m]");
+
+      setModelSpy.mockClear();
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-5-1m",
+      });
+      expect(setModelSpy).toHaveBeenCalledWith("sonnet[1m]");
+    });
+
+    // A session can run a model with no picker entry (resumed onto a model
+    // excluded by the availableModels allowlist, or a refusal fallback). The
+    // model option lists it while it is current, so a client can send it back,
+    // and drops it once the session switches to a listed model.
+    it("lists an off-list current model until the session switches away", async () => {
+      const { buildModelConfigOption } = await import("../../session-model.js");
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.models = { ...session.models, currentModelId: "claude-offlist-9" };
+      session.modelInfos = [
+        ...session.modelInfos,
+        { value: "claude-offlist-9", displayName: "claude-offlist-9", description: "" },
+      ];
+      session.configOptions = session.configOptions.map((o: { id: string }) =>
+        o.id === "model" ? buildModelConfigOption(session.models, session.modelInfos, false) : o,
+      );
+      const modelValues = (options: any[] | undefined) =>
+        options?.find((o) => o.id === "model")?.options.map((o: { value: string }) => o.value);
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-offlist-9",
+      });
+
+      expect(setModelSpy).toHaveBeenCalledWith("claude-offlist-9");
+      expect(response.configOptions?.find((o) => o.id === "model")?.currentValue).toBe(
+        "claude-offlist-9",
+      );
+      expect(modelValues(response.configOptions)).toEqual([
+        "claude-opus-4-5",
+        "claude-sonnet-4-6",
+        "claude-offlist-9",
+      ]);
+
+      const switched = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+      expect(modelValues(switched.configOptions)).toEqual(["claude-opus-4-5", "claude-sonnet-4-6"]);
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: SESSION_ID,
+          configId: "model",
+          value: "claude-offlist-9",
+        }),
+      ).rejects.toThrow("Invalid value");
+    });
+
+    it("setSessionMode also syncs configOptions", async () => {
+      await agent.setSessionMode({ sessionId: SESSION_ID, modeId: "plan" });
+
+      const session = (
+        agent as unknown as {
+          sessions: Record<string, { configOptions: typeof MOCK_CONFIG_OPTIONS }>;
+        }
+      ).sessions[SESSION_ID];
+      expect(session.configOptions.find((o) => o.id === "mode")?.currentValue).toBe("plan");
+    });
+
+    it("setSessionConfigOption(model) also syncs configOptions", async () => {
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      const session = (
+        agent as unknown as {
+          sessions: Record<string, { configOptions: typeof MOCK_CONFIG_OPTIONS }>;
+        }
+      ).sessions[SESSION_ID];
+      expect(session.configOptions.find((o) => o.id === "model")?.currentValue).toBe(
+        "claude-sonnet-4-6",
+      );
+    });
+  });
+
+  describe("context window on model change", () => {
+    beforeEach(() => {
+      populateSession();
+    });
+
+    function getSession() {
+      return (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+    }
+
+    it("seeds the default window on model switch, then replaces it in the background", async () => {
+      const session = getSession();
+      // The window learned for the previous model.
+      session.contextWindowSize = 200000;
+      let answer!: (usage: { rawMaxTokens: number }) => void;
+      session.query.getContextUsage = vi.fn(
+        () => new Promise<{ rawMaxTokens: number }>((resolve) => (answer = resolve)),
+      );
+
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      // The switch resolved without waiting for getContextUsage.
+      expect(session.query.getContextUsage).toHaveBeenCalledOnce();
+      expect(session.query.getContextUsage).toHaveBeenCalledWith({ detail: "summary" });
+      expect(session.contextWindowSize).toBe(1_000_000);
+      expect(session.contextWindowAuthoritative).toBe(false);
+
+      answer({ rawMaxTokens: 967000 });
+      await vi.waitFor(() => expect(session.contextWindowSize).toBe(967000));
+      expect(session.contextWindowAuthoritative).toBe(true);
+    });
+
+    it("drops a background answer that arrives after another switch", async () => {
+      const session = getSession();
+      let answer!: (usage: { rawMaxTokens: number }) => void;
+      session.query.getContextUsage = vi.fn(
+        () => new Promise<{ rawMaxTokens: number }>((resolve) => (answer = resolve)),
+      );
+
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+      const staleAnswer = answer;
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-opus-4-5",
+      });
+      const windowAfterSecondSwitch = session.contextWindowSize;
+
+      staleAnswer({ rawMaxTokens: 967000 });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(session.contextWindowSize).toBe(windowAfterSecondSwitch);
+      expect(session.contextWindowAuthoritative).toBe(false);
+    });
+
+    it("keeps the learned window when re-asserting the current model", async () => {
+      const session = getSession();
+      session.contextWindowSize = 500_000;
+      session.query.getContextUsage = vi.fn(async () => ({ rawMaxTokens: 200000 }));
+
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-opus-4-5",
+      });
+
+      expect(session.query.getContextUsage).not.toHaveBeenCalled();
+      expect(session.contextWindowSize).toBe(500_000);
+    });
+  });
+
+  describe("auto mode availability per model", () => {
+    /**
+     * Augment the session populated by `populateSession()` with a Haiku entry
+     * (no `supportsAutoMode`), Opus + Sonnet entries with `supportsAutoMode:
+     * true`, and seed `availableModes` so it currently includes `auto`. This
+     * exercises the per-model recomputation done by `applyConfigOptionValue`
+     * on a model switch.
+     */
+    function setupHaikuOpusSession(currentModeId: string = "default") {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.modelInfos = [
+        {
+          value: "claude-opus-4-5",
+          displayName: "Claude Opus",
+          description: "Most capable",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high"],
+          supportsAutoMode: true,
+        },
+        {
+          value: "claude-sonnet-4-6",
+          displayName: "Claude Sonnet",
+          description: "Balanced",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high"],
+          supportsAutoMode: true,
+        },
+        {
+          value: "claude-haiku-4-5",
+          displayName: "Claude Haiku",
+          description: "Fast",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high"],
+          // supportsAutoMode intentionally omitted
+        },
+      ];
+      session.models = {
+        currentModelId: "claude-opus-4-5",
+        availableModels: [
+          { modelId: "claude-opus-4-5", name: "Claude Opus", description: "Most capable" },
+          { modelId: "claude-sonnet-4-6", name: "Claude Sonnet", description: "Balanced" },
+          { modelId: "claude-haiku-4-5", name: "Claude Haiku", description: "Fast" },
+        ],
+      };
+      session.modes = {
+        currentModeId,
+        availableModes: [
+          {
+            id: "default",
+            name: "Manual",
+            description: "Always ask before making changes",
+          },
+          {
+            id: "acceptEdits",
+            name: "Accept edits",
+            description: "Automatically accept all file edits",
+          },
+          {
+            id: "plan",
+            name: "Plan",
+            description: "Create a plan before making changes",
+          },
+          {
+            id: "auto",
+            name: "Auto",
+            description: "Claude handles permission decisions",
+          },
+        ],
+      };
+      // Reflect the seeded availableModes/availableModels in configOptions so
+      // the pre-state matches what `createSession` would have produced for
+      // Opus, and `setSessionConfigOption` validation can accept the seeded
+      // model ids (notably the new Haiku entry).
+      session.configOptions = session.configOptions.map((o: any) => {
+        if (o.id === "mode") {
+          return {
+            ...o,
+            currentValue: currentModeId,
+            options: session.modes.availableModes.map((m: any) => ({
+              value: m.id,
+              name: m.name,
+              description: m.description,
+            })),
+          };
+        }
+        if (o.id === "model") {
+          return {
+            ...o,
+            currentValue: session.models.currentModelId,
+            options: session.models.availableModels.map((m: any) => ({
+              value: m.modelId,
+              name: m.name,
+              description: m.description,
+            })),
+          };
+        }
+        return o;
+      });
+      return session;
+    }
+
+    beforeEach(() => {
+      populateSession();
+    });
+
+    it("keeps the stable mode catalog when switching to Haiku", async () => {
+      setupHaikuOpusSession("default");
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-haiku-4-5",
+      });
+
+      const modeOption = response.configOptions.find((o) => o.id === "mode");
+      expect(modeOption).toBeDefined();
+      const modeValues = (modeOption as any).options.map((o: any) => o.value);
+      expect(modeValues).toEqual(
+        expect.arrayContaining(["default", "acceptEdits", "plan", "auto"]),
+      );
+      expect(modeValues).not.toContain("dontAsk");
+    });
+
+    it("keeps the same mode catalog when switching from Haiku back to Opus", async () => {
+      const session = setupHaikuOpusSession("default");
+      // Pretend Haiku is the current model; its catalog still advertises Auto.
+      session.models.currentModelId = "claude-haiku-4-5";
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-opus-4-5",
+      });
+
+      const modeOption = response.configOptions.find((o) => o.id === "mode");
+      expect(modeOption).toBeDefined();
+      const modeValues = (modeOption as any).options.map((o: any) => o.value);
+      expect(modeValues).toContain("auto");
+
+      // The current mode ("default") is still valid on Opus, so no
+      // current_mode_update should have been emitted by the model switch.
+      const modeUpdates = sessionUpdates.filter(
+        (n) => n.update.sessionUpdate === "current_mode_update",
+      );
+      expect(modeUpdates).toHaveLength(0);
+    });
+
+    it("preserves the current mode when it remains valid after a model switch", async () => {
+      setupHaikuOpusSession("plan");
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-haiku-4-5",
+      });
+
+      // `plan` is in availableModes for both Opus and Haiku, so no clamp.
+      expect(setPermissionModeSpy).not.toHaveBeenCalledWith("default");
+
+      const modeUpdates = sessionUpdates.filter(
+        (n) => n.update.sessionUpdate === "current_mode_update",
+      );
+      expect(modeUpdates).toHaveLength(0);
+
+      const modeOption = response.configOptions.find((o) => o.id === "mode");
+      expect((modeOption as any).currentValue).toBe("plan");
+    });
+
+    it("falls back to Accept edits and emits current_mode_update on a Haiku switch", async () => {
+      // Switching Opus(auto) → Haiku changes only the effective mode. The
+      // `current_mode_update` side effect must fire so clients learn about the
+      // clamp even though the request/response API returns the new
+      // configOptions rather than emitting a config_option_update.
+      setupHaikuOpusSession("auto");
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-haiku-4-5",
+      });
+
+      expect(setPermissionModeSpy).toHaveBeenCalledWith("acceptEdits");
+
+      const modeUpdates = sessionUpdates.filter(
+        (n) => n.update.sessionUpdate === "current_mode_update",
+      );
+      expect(modeUpdates).toHaveLength(1);
+      expect((modeUpdates[0].update as any).currentModeId).toBe("acceptEdits");
+
+      // setSessionConfigOption is a request/response API: it returns the new
+      // configOptions in the response rather than emitting a
+      // config_option_update notification.
+      const configUpdates = sessionUpdates.filter(
+        (n) => n.update.sessionUpdate === "config_option_update",
+      );
+      expect(configUpdates).toHaveLength(0);
+
+      const modeOption = response.configOptions.find((o: any) => o.id === "mode");
+      expect(modeOption).toBeDefined();
+      expect((modeOption as any).currentValue).toBe("acceptEdits");
+      expect((modeOption as any).options.map((o: any) => o.value)).toContain("auto");
+      expect(
+        sessionUpdates.filter(
+          (n) =>
+            n.update.sessionUpdate === "agent_message_chunk" &&
+            n.update.content.type === "text" &&
+            n.update.content.text.includes("Auto mode unavailable"),
+        ),
+      ).toHaveLength(1);
+    });
+  });
+});

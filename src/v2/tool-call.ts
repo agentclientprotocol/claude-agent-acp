@@ -1,6 +1,7 @@
 /**
- * The v2 form of the tool call reports that `ClaudeAcpAgent` sends as v1
- * `tool_call` and `tool_call_update` updates, and in permission requests.
+ * The v2 form of the tool call reports that the shared SDK-to-ACP mapping
+ * produces as v1 `tool_call` and `tool_call_update` updates, and of the tool
+ * calls of permission requests.
  */
 import type { ToolCall, ToolCallContent, ToolCallUpdate } from "@agentclientprotocol/sdk/unstable";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
@@ -83,6 +84,9 @@ function v2ToolCallContent(item: ToolCallContent): v2.ToolCallContent {
       // v2 content blocks are a superset of the v1 blocks.
       return item;
     case "terminal":
+      return item;
+    case "session":
+      // A reference to a session, such as a subagent's, is the same in v2.
       return item;
     default:
       if (isV2Diff(item)) return item;

@@ -20,7 +20,10 @@
  * reached the call is that message too: the sender's outgoing view, at the
  * call, and the child's incoming one, in the child's history. A child's
  * history follows its launch, so a call to a child from its parent is always
- * delivered first. Any other SendMessage call stays a tool call.
+ * delivered first. Any other SendMessage call stays a tool call. As live, a
+ * TaskStop or SendMessage call that the client is shown and that names a
+ * replayed child by its agent id carries the RFD's `session` reference to it
+ * (`ReplayTranscript.withTarget`).
  *
  * Right after its announcement, each child gets its `model` option: the model
  * of its first response, in its transcript. A later response with another
@@ -50,6 +53,8 @@ import {
   rfdLabels,
   sameDirectory,
   type SubagentModels,
+  targetAgentId,
+  withSessionReference,
   type WorkState,
 } from "./native-subagents.js";
 import { noticeUpdate } from "./session-notices.js";
@@ -84,7 +89,7 @@ export type ReplayChild = {
   responseModel?: string;
 };
 
-type SendMessageCall = {
+export type SendMessageCall = {
   toolUseId: string;
   to: string;
   message: string;
@@ -97,34 +102,47 @@ type SendMessageCall = {
   outgoingSent: boolean;
 };
 
-export class RfdSubagentReplay {
-  /** The children by the id of the tool use that launched each. */
-  private readonly children = new Map<string, ReplayChild>();
-  private readonly byAgentId = new Map<string, ReplayChild>();
-  private readonly sendMessages: SendMessageCall[] = [];
-  /** Launches without metadata, which the replay leaves out. */
-  private readonly omitted = new Set<string>();
-  /** Children whose transcript could not be read: only their association is replayed. */
-  private withoutHistory = 0;
-  /** The SubagentHandback calls, with their report and whether their result failed. */
-  private readonly handbacks = new Map<
-    string,
-    { message: string; failed: boolean; sent: boolean }
-  >();
+/** A SubagentHandback call: its report, whether its result failed, and whether the replay sent it. */
+type ReplayHandback = { message: string; failed: boolean; sent: boolean };
 
-  constructor(
-    private readonly history: SubagentHistory,
-    private readonly publish: Publish,
-    private readonly models?: SubagentModels,
-    /**
-     * Whether the replay maps a model to the session's model list as it goes.
-     * A load lacks the list until the CLI started, so it maps only in
-     * {@link currentStates}, after the load response.
-     */
-    private readonly mapsDuringReplay = true,
-    /** The working directory of the root session, which a child inherits unless it reports its own. */
-    private readonly rootCwd?: string,
-  ) {}
+/**
+ * What both replays read from the transcripts before they send anything: the
+ * children that launches with metadata started, the launches without metadata
+ * (left out), the SendMessage calls, and the SubagentHandback calls. It sends
+ * nothing; `RfdSubagentReplay` (v1) and `src/v2/subagent-replay.ts` send the
+ * replay from it.
+ */
+export class ReplayTranscript<Child extends ReplayChild = ReplayChild> {
+  /** The children by the id of the tool use that launched each. */
+  readonly children = new Map<string, Child>();
+  readonly byAgentId = new Map<string, Child>();
+  readonly sendMessages: SendMessageCall[] = [];
+  /** Launches without metadata, which the replay leaves out. */
+  readonly omitted = new Set<string>();
+  /** The SubagentHandback calls, by tool use id. */
+  readonly handbacks = new Map<string, ReplayHandback>();
+  /** The agent that each TaskStop or SendMessage call names (see `targetAgentId`), by tool use id. */
+  private readonly targets = new Map<string, string>();
+
+  constructor(private readonly history: SubagentHistory) {}
+
+  /**
+   * `notification`, a replayed tool call update that the client is shown on
+   * the session `shownOn`, with the RFD's `session` reference when the call
+   * names a child of another session by its agent id, as live
+   * (`NativeSubagentRuntime.withTarget`). Only a child that the replay
+   * announced before the update is referenced.
+   */
+  withTarget(notification: AcpSessionNotification, shownOn: string): AcpSessionNotification {
+    const { update } = notification;
+    if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") {
+      return notification;
+    }
+    const agentId = this.targets.get(update.toolCallId);
+    const child = agentId !== undefined ? this.byAgentId.get(agentId) : undefined;
+    if (!child?.announced || child.sessionId === shownOn) return notification;
+    return withSessionReference(notification, child.sessionId);
+  }
 
   /**
    * Registers the launches, the launch results, and the SendMessage calls in
@@ -134,6 +152,8 @@ export class RfdSubagentReplay {
     for (const message of messages) {
       for (const block of contentBlocks(message)) {
         if (block.type === "tool_use" && typeof block.id === "string") {
+          const agentId = targetAgentId(block.name, block.input);
+          if (agentId !== undefined) this.targets.set(block.id, agentId);
           if (isNativeSubagentControlTool(block.name)) {
             this.registerLaunch(block.id, inputOf(block), ownerSessionId);
           } else if (block.name === HANDBACK_TOOL) {
@@ -165,9 +185,69 @@ export class RfdSubagentReplay {
     }
   }
 
+  private registerLaunch(
+    toolUseId: string,
+    input: Record<string, unknown>,
+    parentSessionId: string,
+  ): void {
+    if (this.children.has(toolUseId)) return;
+    const record = this.history.agents.get(toolUseId);
+    if (!record) {
+      this.omitted.add(toolUseId);
+      return;
+    }
+    // A child type adds only optional fields, which a new child leaves unset.
+    const child = {
+      launchId: toolUseId,
+      sessionId: record.agentId,
+      record,
+      parentSessionId,
+      input,
+      announced: false,
+      promptSent: false,
+    } as Child;
+    this.children.set(toolUseId, child);
+    this.byAgentId.set(record.agentId, child);
+  }
+}
+
+export class RfdSubagentReplay {
+  private readonly transcript: ReplayTranscript;
+  /** Children whose transcript could not be read: only their association is replayed. */
+  private withoutHistory = 0;
+
+  constructor(
+    private readonly history: SubagentHistory,
+    private readonly publish: Publish,
+    private readonly models?: SubagentModels,
+    /**
+     * Whether the replay maps a model to the session's model list as it goes.
+     * A load lacks the list until the CLI started, so it maps only in
+     * {@link currentStates}, after the load response.
+     */
+    private readonly mapsDuringReplay = true,
+    /** The working directory of the root session, which a child inherits unless it reports its own. */
+    private readonly rootCwd?: string,
+  ) {
+    this.transcript = new ReplayTranscript(history);
+  }
+
+  /**
+   * Registers the launches, the launch results, and the SendMessage calls in
+   * `messages`, the transcript of the session `ownerSessionId`.
+   */
+  scan(messages: readonly SessionMessage[], ownerSessionId: string): void {
+    this.transcript.scan(messages, ownerSessionId);
+  }
+
   /** The child that the tool use `toolUseId` launched, when the replay shows it. */
+  /** See {@link ReplayTranscript.withTarget}. */
+  withTarget(notification: AcpSessionNotification, shownOn: string): AcpSessionNotification {
+    return this.transcript.withTarget(notification, shownOn);
+  }
+
   childOfLaunch(toolUseId: string): ReplayChild | undefined {
-    return this.children.get(toolUseId);
+    return this.transcript.children.get(toolUseId);
   }
 
   /**
@@ -211,11 +291,11 @@ export class RfdSubagentReplay {
    */
   private effectiveCwd(sessionId: string): string | undefined {
     const seen = new Set<string>();
-    let child = this.byAgentId.get(sessionId);
+    let child = this.transcript.byAgentId.get(sessionId);
     while (child && !seen.has(child.sessionId)) {
       if (child.cwd) return child.cwd;
       seen.add(child.sessionId);
-      child = this.byAgentId.get(child.parentSessionId);
+      child = this.transcript.byAgentId.get(child.parentSessionId);
     }
     return this.rootCwd;
   }
@@ -299,7 +379,9 @@ export class RfdSubagentReplay {
     if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") {
       return false;
     }
-    const sendMessage = this.sendMessages.find((call) => call.toolUseId === update.toolCallId);
+    const sendMessage = this.transcript.sendMessages.find(
+      (call) => call.toolUseId === update.toolCallId,
+    );
     if (sendMessage) {
       if (sendMessage.recipientSessionId === undefined) {
         sendMessage.shownAsToolCall = true;
@@ -317,7 +399,7 @@ export class RfdSubagentReplay {
       }
       return true;
     }
-    const handback = owner ? this.handbacks.get(update.toolCallId) : undefined;
+    const handback = owner ? this.transcript.handbacks.get(update.toolCallId) : undefined;
     if (owner && handback && !handback.failed) {
       if (!handback.sent) {
         handback.sent = true;
@@ -333,7 +415,7 @@ export class RfdSubagentReplay {
       }
       return true;
     }
-    const child = this.children.get(update.toolCallId);
+    const child = this.transcript.children.get(update.toolCallId);
     if (!child) return false;
     if (
       update.status === "completed" &&
@@ -352,41 +434,31 @@ export class RfdSubagentReplay {
    * its task id is the agent id.
    */
   taskNotification(taskId: string, status: string): boolean {
-    const child = this.byAgentId.get(taskId);
+    const child = this.transcript.byAgentId.get(taskId);
     if (!child) return false;
     child.notified = nativeSubagentState(status) ?? child.notified;
     return true;
   }
 
   /**
-   * Sends the end of every announced child (see `endState`), and a notice when
+   * Sends the end of every announced child (see `replayEndState`), and a notice when
    * subagent history is missing.
    */
   async finish(supportsNotices: boolean, rootSessionId: string): Promise<void> {
-    for (const child of [...this.children.values()].reverse()) {
+    for (const child of [...this.transcript.children.values()].reverse()) {
       if (!child.announced) continue;
       await this.publish({
         sessionId: child.parentSessionId,
         update: {
           sessionUpdate: "subagent_update",
           sessionId: child.sessionId,
-          state: endState(child),
+          state: replayEndState(child),
         },
       });
     }
-    const missing = this.omitted.size + this.withoutHistory;
+    const missing = this.transcript.omitted.size + this.withoutHistory;
     if (missing > 0 && supportsNotices) {
-      await this.publish({
-        sessionId: rootSessionId,
-        update: noticeUpdate({
-          severity: "info",
-          title: "Some subagent history is not available",
-          description:
-            missing === 1
-              ? "The history of 1 subagent of this session could not be restored."
-              : `The history of ${missing} subagents of this session could not be restored.`,
-        }),
-      });
+      await this.publish({ sessionId: rootSessionId, update: missingHistoryNotice(missing) });
     }
   }
 
@@ -409,12 +481,14 @@ export class RfdSubagentReplay {
     live: (sessionId: string) => WorkState["state"] | undefined,
     liveConfiguration?: (sessionId: string) => SessionConfigOption[] | undefined,
   ): AcpSessionNotification[] {
-    return [...this.children.values()]
+    return [...this.transcript.children.values()]
       .filter((child) => child.announced)
       .flatMap((child): AcpSessionNotification[] => {
         const liveState = live(child.sessionId);
         const state: WorkState =
-          liveState === undefined || liveState === "idle" ? endState(child) : { state: liveState };
+          liveState === undefined || liveState === "idle"
+            ? replayEndState(child)
+            : { state: liveState };
         // The session's model list may be known only now, after the load response.
         const entry = responseModelEntry(child.responseModel, this.models);
         const replayed = child.model ? JSON.stringify([childModelOption(child.model)]) : undefined;
@@ -443,30 +517,6 @@ export class RfdSubagentReplay {
             : []),
         ];
       });
-  }
-
-  private registerLaunch(
-    toolUseId: string,
-    input: Record<string, unknown>,
-    parentSessionId: string,
-  ): void {
-    if (this.children.has(toolUseId)) return;
-    const record = this.history.agents.get(toolUseId);
-    if (!record) {
-      this.omitted.add(toolUseId);
-      return;
-    }
-    const child: ReplayChild = {
-      launchId: toolUseId,
-      sessionId: record.agentId,
-      record,
-      parentSessionId,
-      input,
-      announced: false,
-      promptSent: false,
-    };
-    this.children.set(toolUseId, child);
-    this.byAgentId.set(record.agentId, child);
   }
 
   /** The prompt of the launch, with the launch's id, to the parent and the child, as live. */
@@ -498,12 +548,10 @@ export class RfdSubagentReplay {
     message: SessionMessage,
     text: string,
   ): Promise<void> {
-    const names = [child.sessionId, child.record.name, child.input.name];
-    const call = this.sendMessages.find(
-      (candidate) =>
-        candidate.recipientSessionId === undefined &&
-        names.includes(candidate.to) &&
-        text.includes(candidate.message.trim()),
+    const call = deliveredCall(
+      this.transcript.sendMessages,
+      [child.sessionId, child.record.name, child.input.name],
+      text,
     );
     if (call) {
       call.recipientSessionId = child.sessionId;
@@ -565,7 +613,7 @@ export function replaySubagentTerminalState(
  * `cancelled` for a child the user stopped, else the result of its foreground
  * launch, else `idle` with no stop reason.
  */
-function endState(child: ReplayChild): WorkState {
+export function replayEndState(child: ReplayChild): WorkState {
   const end = child.notified ?? (child.record.stoppedByUser ? "cancelled" : child.launchEnd);
   return end ? rfdEndState(end, undefined) : { state: "idle" };
 }
@@ -598,7 +646,7 @@ function inputOf(block: Record<string, unknown>): Record<string, unknown> {
 }
 
 /** The text of user message content: a string, or its text blocks. */
-function textOf(content: unknown): string {
+export function textOf(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   return content
@@ -610,7 +658,7 @@ function textOf(content: unknown): string {
 }
 
 /** Whether `dir` is an existing directory. */
-function isDirectory(dir: string): boolean {
+export function isDirectory(dir: string): boolean {
   try {
     return statSync(dir).isDirectory();
   } catch {
@@ -619,6 +667,38 @@ function isDirectory(dir: string): boolean {
 }
 
 /** A message that a SendMessage call delivered to the child. */
-function isDelivery(message: SessionMessage): boolean {
+export function isDelivery(message: SessionMessage): boolean {
   return (message as { origin?: { kind?: unknown } | null }).origin?.kind === "coordinator";
+}
+
+/**
+ * The SendMessage call of `calls` that a delivered message `text` came from,
+ * for the child that `names` names (its agent id, its name). Claude Code
+ * frames the message for the child's model ("The coordinator sent a message
+ * while you were working:", then the message, then an instruction), so it is
+ * the first undelivered call to the child whose message the text contains.
+ */
+export function deliveredCall<
+  T extends { to: string; message: string; recipientSessionId?: string },
+>(calls: readonly T[], names: readonly unknown[], text: string): T | undefined {
+  return calls.find(
+    (call) =>
+      call.recipientSessionId === undefined &&
+      names.includes(call.to) &&
+      text.includes(call.message.trim()),
+  );
+}
+
+/** The notice that the history of `missing` subagents of a replayed session is not available. */
+export function missingHistoryNotice(
+  missing: number,
+): Extract<AcpSessionNotification["update"], { sessionUpdate: "notice" }> {
+  return noticeUpdate({
+    severity: "info",
+    title: "Some subagent history is not available",
+    description:
+      missing === 1
+        ? "The history of 1 subagent of this session could not be restored."
+        : `The history of ${missing} subagents of this session could not be restored.`,
+  }) as Extract<AcpSessionNotification["update"], { sessionUpdate: "notice" }>;
 }

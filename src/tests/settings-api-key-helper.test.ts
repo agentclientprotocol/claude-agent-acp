@@ -38,3 +38,62 @@ describe("SettingsManager.getApiKeyHelper", () => {
     manager.dispose();
   });
 });
+
+describe("SettingsManager.getCompactionSettings", () => {
+  it("ranks managed settings over the --settings override over the files, env entry by entry", async () => {
+    const manager = await managerResolving({
+      effective: {
+        idleCompaction: true,
+        autoCompactEnabled: false,
+        env: {
+          DISABLE_COMPACT: "1",
+          DISABLE_AUTO_COMPACT: "1",
+          CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS: "1",
+        },
+      },
+      provenance: {},
+      sources: [
+        { source: "userSettings", settings: { autoCompactEnabled: false } },
+        {
+          source: "managed",
+          settings: { idleCompaction: true, env: { DISABLE_AUTO_COMPACT: "1" } },
+        },
+      ],
+    });
+    expect(
+      manager.getCompactionSettings({
+        idleCompaction: false,
+        autoCompactEnabled: true,
+        env: { DISABLE_COMPACT: "0", DISABLE_AUTO_COMPACT: "0" },
+      }),
+    ).toEqual({
+      idleCompaction: true,
+      autoCompactEnabled: true,
+      env: {
+        DISABLE_COMPACT: "0",
+        DISABLE_AUTO_COMPACT: "1",
+        CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS: "1",
+      },
+    });
+    manager.dispose();
+  });
+
+  it("keeps the files' value for a key the override sets to undefined", async () => {
+    const manager = await managerResolving({
+      effective: { idleCompaction: false, env: { DISABLE_COMPACT: "1" } },
+      provenance: {},
+      sources: [],
+    });
+    expect(
+      manager.getCompactionSettings({
+        idleCompaction: undefined,
+        env: { DISABLE_COMPACT: undefined as unknown as string },
+      }),
+    ).toEqual({
+      idleCompaction: false,
+      autoCompactEnabled: undefined,
+      env: { DISABLE_COMPACT: "1" },
+    });
+    manager.dispose();
+  });
+});

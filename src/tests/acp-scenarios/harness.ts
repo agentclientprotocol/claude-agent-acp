@@ -94,6 +94,7 @@ export const PROFILES: Record<Profile["name"], Profile> = {
 type QueryOptions = {
   sessionId?: string;
   resume?: string;
+  env?: Record<string, string | undefined>;
   canUseTool?: (
     toolName: string,
     input: Record<string, unknown>,
@@ -234,6 +235,16 @@ export function mockedQuery(args: { prompt: AsyncIterable<any>; options: QueryOp
       );
     },
   };
+  // With `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS`, Claude Code reports that it
+  // works once it takes a prompt in, and that it is idle after the result.
+  const stateEvents = options.env?.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS === "1";
+  const state = (value: "running" | "idle") => ({
+    type: "system",
+    subtype: "session_state_changed",
+    state: value,
+    uuid: `state-${value}`,
+    session_id: sessionId,
+  });
   async function* run() {
     const iterator = args.prompt[Symbol.asyncIterator]();
     for (const turn of script.scenario.turns) {
@@ -241,6 +252,7 @@ export function mockedQuery(args: { prompt: AsyncIterable<any>; options: QueryOp
       if (next.done) return;
       const user = next.value;
       ctx.promptUuid = user.uuid;
+      if (stateEvents) yield state("running");
       yield {
         type: "user",
         message: user.message,
@@ -250,6 +262,7 @@ export function mockedQuery(args: { prompt: AsyncIterable<any>; options: QueryOp
         isReplay: true,
       };
       yield* turn(ctx);
+      if (stateEvents) yield state("idle");
     }
     // Stay open like a live Claude Code process.
     await iterator.next();
@@ -360,6 +373,8 @@ export async function runScenario(
     async extNotification(method: string, params: unknown) {
       record("extNotification", { method, params });
     },
+    // Not recorded: no scenario reads the auth status.
+    async authStatusUpdate() {},
     async readTextFile() {
       return { content: "" };
     },
@@ -546,7 +561,8 @@ export async function runScenarioV2(
       "_auth/status_update",
       (params) => params,
       () => {},
-    );
+    )
+    .onNotification(v2.methods.client.auth.statusUpdate, () => {});
 
   try {
     await client.connectWith(

@@ -4,9 +4,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { deriveActivity, selectCost, type ActivityState } from "../session-index/activity.js";
 import { LiveSessionRegistry, type LiveRecord } from "../session-index/live-registry.js";
+import { isSessionId } from "../paths.js";
 import {
   encodeProjectPath,
-  isSessionId,
   pathAndAncestors,
   projectDirMatches,
 } from "../session-index/project-dirs.js";

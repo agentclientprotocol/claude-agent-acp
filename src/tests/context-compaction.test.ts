@@ -4,6 +4,7 @@ import {
   ContextCompactionLifecycle,
   clientSupportsCompactionUpdates,
   compactionSummaryText,
+  contextCompactionMetadataFromBoundary,
   isCompactSummaryMessage,
 } from "../context-compaction.js";
 
@@ -127,6 +128,17 @@ describe("compactionSummaryText", () => {
     expect(compactionSummaryText(PERSISTED_SUMMARY)).toBe(
       "1. Primary Request and Intent:\n   Count upward.\n\n2. Optional Next Step:\n   None.",
     );
+  });
+
+  it("strips the framing when other content sits before the Summary line", () => {
+    expect(
+      compactionSummaryText(
+        "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n" +
+          "<system-reminder>\n<tools-used-before-summary>Read, Bash</tools-used-before-summary>\n</system-reminder>\n" +
+          "Summary:\n1. Primary Request and Intent:\n   Count upward.\n\n" +
+          "Continue the conversation from where it left off without asking the user any further questions.",
+      ),
+    ).toBe("1. Primary Request and Intent:\n   Count upward.");
   });
 
   it("strips the older tagged transcript framing", () => {
@@ -634,4 +646,21 @@ describe("ContextCompactionLifecycle (tool_call)", () => {
       },
     ]);
   });
+});
+
+describe("contextCompactionMetadataFromBoundary", () => {
+  /** An adapter-sent compaction is `idle` only when the CLI calls it manual; the CLI's own auto trigger stays `automatic`. */
+  it.each([
+    { cli: "manual", idleCompaction: false, expected: "manual" },
+    { cli: "manual", idleCompaction: true, expected: "idle" },
+    { cli: "auto", idleCompaction: true, expected: "automatic" },
+  ] as const)(
+    "reports $expected for a $cli boundary (idleCompaction: $idleCompaction)",
+    ({ cli, idleCompaction, expected }) => {
+      expect(
+        contextCompactionMetadataFromBoundary({ trigger: cli, pre_tokens: 1 }, { idleCompaction })
+          .trigger,
+      ).toBe(expected);
+    },
+  );
 });
