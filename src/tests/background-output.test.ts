@@ -1,12 +1,14 @@
 import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { query } from "@anthropic-ai/claude-agent-sdk";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BACKGROUND_OUTPUT_MAX_BACKLOG_BYTES,
   BACKGROUND_OUTPUT_READ_BYTES,
   type BackgroundOutput,
   BackgroundOutputTail,
+  supportsTaskOutput,
   type TaskOutput,
   TaskOutputPoll,
 } from "../background-output.js";
@@ -232,5 +234,26 @@ describe("TaskOutputPoll", () => {
     expect(await poll!.finish()).toBe(false);
     await new Promise((resolve) => setTimeout(resolve, 700));
     expect(reads()).toBe(0);
+  });
+});
+
+describe("supportsTaskOutput", () => {
+  // The SDK's `Query` type does not declare `getTaskOutput`, so the compiler
+  // does not report an SDK update that drops it, and no poll would start.
+  it("finds getTaskOutput on a query of the installed SDK", () => {
+    // The CLI of this query exits at once: the check reads the query object only.
+    const sdkQuery = query({
+      prompt: "hi",
+      options: { pathToClaudeCodeExecutable: "/usr/bin/false" },
+    });
+    try {
+      expect(supportsTaskOutput(sdkQuery)).toBe(true);
+    } finally {
+      sdkQuery.close();
+    }
+  });
+
+  it("finds none on a query without the method", () => {
+    expect(supportsTaskOutput({ interrupt: async () => {} })).toBe(false);
   });
 });
