@@ -255,12 +255,45 @@ export function configOptionValue(
 }
 
 /**
- * Switches `query` to the model that {@link configOptionValue} selected. Claude
- * Code's `setModel` refuses an id it does not know ("Model 'gpt-4' not found")
- * or that settings restrict (an `availableModels` allowlist, a managed
- * `deniedModels` entry). For an `unlisted` value that refusal is invalid
- * params with Claude Code's reason, as for a listed value the option lacks;
- * for a listed value it stays the internal error it is.
+ * The codes with which Claude Code's `setModel` refuses a model id that the
+ * session cannot use: an id it does not know (`not_found`,
+ * `catalog_unknown`), one that settings restrict (`restricted_by_org`: an
+ * `availableModels` allowlist, a managed `deniedModels` entry), one the
+ * account or this CLI does not offer, and a `[1m]` form that is turned off or
+ * that the model lacks.
+ *
+ * Claude Code sends the code as `error_code` of its answer and the SDK
+ * (0.3.325) copies it to `errorCode` of the error that `setModel()` rejects
+ * with. The SDK's types do not declare it.
+ */
+const UNUSABLE_MODEL_ERROR_CODES: ReadonlySet<string> = new Set([
+  "not_found",
+  "catalog_unknown",
+  "restricted_by_org",
+  "unavailable_for_account",
+  "not_offered",
+  "alias_1m_disabled",
+  "alias_1m_unsupported",
+]);
+
+/** Whether `setModel()` rejected with `error` because the session cannot use the model id. */
+function refusesModelId(error: unknown): error is Error {
+  if (!(error instanceof Error)) return false;
+  const code = (error as { errorCode?: unknown }).errorCode;
+  return typeof code === "string" && UNUSABLE_MODEL_ERROR_CODES.has(code);
+}
+
+/**
+ * Switches `query` to the model that {@link configOptionValue} selected.
+ *
+ * When Claude Code refuses an `unlisted` id as one the session cannot use
+ * (see {@link UNUSABLE_MODEL_ERROR_CODES}), that is invalid params with Claude
+ * Code's reason ("Model 'gpt-4' not found"), as for a value the option lacks.
+ * Every other failure is thrown as it is and reaches the client as an
+ * internal error: a failed switch to a listed value, and a failure that does
+ * not judge the id, such as `auth_failed`, `rate_limit`, `check_unreachable`
+ * (the API did not answer), `blocked_by_hook`, a closed query, or a refusal
+ * without a code.
  */
 export async function setSelectedModel(
   query: Pick<Query, "setModel">,
@@ -269,11 +302,10 @@ export async function setSelectedModel(
   try {
     await query.setModel(selected.value);
   } catch (error) {
-    if (!selected.unlisted) throw error;
-    const reason = error instanceof Error ? error.message : String(error);
+    if (!selected.unlisted || !refusesModelId(error)) throw error;
     throw RequestError.invalidParams(
       undefined,
-      `Invalid value for config option ${MODEL_CONFIG_ID}: ${selected.value}. ${reason}`,
+      `Invalid value for config option ${MODEL_CONFIG_ID}: ${selected.value}. ${error.message}`,
     );
   }
 }

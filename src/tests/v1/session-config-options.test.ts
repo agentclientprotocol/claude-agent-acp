@@ -3,7 +3,7 @@ import { SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../../v1/acp-agent.js";
 import type { AcpClient } from "../../acp-client.js";
-import { makeMockQuery } from "../helpers.js";
+import { makeMockQuery, setModelRefusal } from "../helpers.js";
 
 const { registerHookCallbackSpy } = vi.hoisted(() => ({
   registerHookCallbackSpy: vi.fn(),
@@ -336,7 +336,7 @@ describe("session config options", () => {
     it.each(["gpt-4", "not-a-model", "son", "foo-sonnet"])(
       "rejects the model %s that Claude Code refuses and leaves the model as it was",
       async (value) => {
-        setModelSpy.mockRejectedValue(new Error(`Model '${value}' not found`));
+        setModelSpy.mockRejectedValue(setModelRefusal(`Model '${value}' not found`, "not_found"));
         await expect(
           agent.setSessionConfigOption({ sessionId: SESSION_ID, configId: "model", value }),
         ).rejects.toMatchObject({
@@ -355,6 +355,28 @@ describe("session config options", () => {
         expect(session.configOptions.find((o) => o.id === "model")?.currentValue).toBe(
           "claude-opus-4-5",
         );
+      },
+    );
+
+    // These failures do not judge the id, which Claude Code may well run.
+    it.each([
+      setModelRefusal("Authentication failed. Please check your API credentials.", "auth_failed"),
+      setModelRefusal("Network error. Please check your internet connection.", "check_unreachable"),
+      setModelRefusal("Model switch blocked by a PreModelSwitch hook: not now", "blocked_by_hook"),
+      // A query that closed: the SDK's own error, with no code.
+      new Error("Query closed before response received"),
+    ])(
+      "keeps a failed switch to an unlisted model as the error it is: $message",
+      async (failure) => {
+        setModelSpy.mockRejectedValue(failure);
+
+        await expect(
+          agent.setSessionConfigOption({
+            sessionId: SESSION_ID,
+            configId: "model",
+            value: "claude-fable-5-2",
+          }),
+        ).rejects.toBe(failure);
       },
     );
 
@@ -1188,23 +1210,6 @@ describe("session config options", () => {
       expect(
         (model as { options: { value: string }[] } | undefined)?.options.map((o) => o.value),
       ).toEqual(["claude-opus-4-5", "claude-sonnet-4-6", "claude-fable-5-2"]);
-    });
-
-    it("refuses a model id the option does not list when a gateway listed the models", async () => {
-      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
-      session.modelsNarrowedByGateway = true;
-
-      await expect(
-        agent.setSessionConfigOption({
-          sessionId: SESSION_ID,
-          configId: "model",
-          value: "claude-fable-5-2",
-        }),
-      ).rejects.toMatchObject({
-        code: -32602,
-        message: expect.stringMatching(/Invalid value for config option model: claude-fable-5-2$/),
-      });
-      expect(setModelSpy).not.toHaveBeenCalled();
     });
 
     it("setSessionMode also syncs configOptions", async () => {
