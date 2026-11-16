@@ -5,7 +5,8 @@ export type IdleCompactionHost = {
   isBusy(): boolean;
   /** Context size after the last main-thread request, or undefined if unknown. */
   contextTokens(): number | undefined;
-  /** Current merged Claude Code settings. */
+  /** Current Claude Code settings, the client's `settings` option included
+   *  (`SettingsManager.getCompactionSettings`). */
   settings(): {
     idleCompaction?: boolean;
     autoCompactEnabled?: boolean;

@@ -285,7 +285,16 @@ export class SessionModeManager<S extends SessionMode> {
     return true;
   }
 
-  async selectMode(sessionId: string, modeId: string): Promise<PermissionMode> {
+  /**
+   * Sets the mode on the query. `auto` on a model without Auto runs as its
+   * fallback, with the warning. With `deferWarning`, the warning waits for
+   * the next prompt (see {@link deferFallbackWarning}).
+   */
+  async selectMode(
+    sessionId: string,
+    modeId: string,
+    deferWarning = false,
+  ): Promise<PermissionMode> {
     const session = this.requireOpenSession(sessionId);
     const requestedMode = this.parseMode(modeId);
     if (!this.isAvailable(session.modes.availableModes, requestedMode)) {
@@ -308,7 +317,8 @@ export class SessionModeManager<S extends SessionMode> {
     }
 
     if (effectiveMode !== requestedMode) {
-      await this.publishFallbackWarning(sessionId, session);
+      if (deferWarning) this.deferFallbackWarning(session);
+      else await this.publishFallbackWarning(sessionId, session);
     }
     return effectiveMode;
   }
@@ -350,6 +360,16 @@ export class SessionModeManager<S extends SessionMode> {
       // the successful mode change into a failed request.
       this.options.logError(`Failed to publish Auto mode fallback warning: ${error}`);
     }
+  }
+
+  /**
+   * Leaves the Auto fallback's warning for the next prompt
+   * (`autoModeFallbackWarningPending`), as a session's start does. For a
+   * fallback during session setup: the client cannot place an update of a
+   * session before the setup response names it.
+   */
+  deferFallbackWarning(session: SessionMode): void {
+    if (!session.autoModeFallbackWarningShown) session.autoModeFallbackWarningPending = true;
   }
 
   async publishFallbackState(sessionId: string, session: SessionMode): Promise<void> {

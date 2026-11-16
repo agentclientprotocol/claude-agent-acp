@@ -28,16 +28,9 @@ export function fastModeStateEnabled(state: FastModeState): boolean {
   return state !== "off";
 }
 
-/** User-facing explanations for the SDK's `fast_mode_disabled_reason` values
- *  that a user can act on (or at least wants to know about). Deliberately
- *  partial — the omitted reasons are not worth surfacing:
- *   - `sdk_opt_in_required`: every SDK session starts here (the toggle IS the
- *     opt-in), so it describes the default, not a problem.
- *   - `preference`: the user turned Fast mode off themselves.
- *   - `pending`: eligibility is still resolving; the next report supersedes it.
- *   - `unknown`: nothing meaningful to say.
- *  Unknown future reasons fall through the same way (open set — the SDK's docs
- *  say to ignore values you don't handle). */
+/** User-facing explanations for the SDK's `fast_mode_disabled_reason` values.
+ *  Every reason is explained except the two in {@link FAST_MODE_UNEXPLAINED_REASONS};
+ *  a code missing here gets the generic text from {@link explainFastModeDisabledReason}. */
 const FAST_MODE_UNAVAILABLE_EXPLANATIONS: Partial<Record<FastModeDisabledReason, string>> = {
   free: "not available on the free plan",
   extra_usage_disabled: "requires extra usage to be enabled for this account",
@@ -45,17 +38,38 @@ const FAST_MODE_UNAVAILABLE_EXPLANATIONS: Partial<Record<FastModeDisabledReason,
   not_first_party: "not available on this API provider",
   disabled_by_env: "disabled by environment configuration",
   network_error: "eligibility could not be verified (network error)",
+  preference: "not enabled for your organization or API gateway",
+  unknown: "currently unavailable",
 };
 
+/** Reasons that are never explained:
+ *   - `sdk_opt_in_required`: every SDK session starts here (the toggle IS the
+ *     opt-in), so it describes the default, not a problem.
+ *   - `pending`: eligibility is still resolving; the next report supersedes it. */
+const FAST_MODE_UNEXPLAINED_REASONS: ReadonlySet<FastModeDisabledReason> = new Set([
+  "sdk_opt_in_required",
+  "pending",
+]);
+
+/** The user-facing explanation of a `fast_mode_disabled_reason`: `undefined`
+ *  for no reason, `sdk_opt_in_required` or `pending`; the table text when there
+ *  is one; else a generic text naming the code (a reason a newer SDK added). */
+export function explainFastModeDisabledReason(
+  reason: FastModeDisabledReason | undefined,
+): string | undefined {
+  if (reason === undefined || FAST_MODE_UNEXPLAINED_REASONS.has(reason)) return undefined;
+  return FAST_MODE_UNAVAILABLE_EXPLANATIONS[reason] ?? `not available (${reason})`;
+}
+
 /** Normalize an SDK-reported `fast_mode_disabled_reason` to the one we retain:
- *  a reason we have an explanation for, else `undefined`. Keeping only
- *  explainable reasons means state comparisons (see `fastModeStateChange`) track
- *  exactly what the user can see, so routine reports like
- *  `sdk_opt_in_required` never churn the config option. */
+ *  a reason {@link explainFastModeDisabledReason} explains (including codes a
+ *  newer SDK adds), else `undefined`. State comparisons (see
+ *  `fastModeStateChange`) then track exactly what the user can see, so
+ *  `sdk_opt_in_required` and `pending` never churn the config option. */
 export function normalizeFastModeDisabledReason(
   reason: FastModeDisabledReason | undefined,
 ): FastModeDisabledReason | undefined {
-  return reason && FAST_MODE_UNAVAILABLE_EXPLANATIONS[reason] ? reason : undefined;
+  return explainFastModeDisabledReason(reason) !== undefined ? reason : undefined;
 }
 
 /** Build the Fast mode config option. When the Client supports boolean config
@@ -73,9 +87,7 @@ export function createFastModeConfigOption(
   useBooleanOption: boolean,
   disabledReason?: FastModeDisabledReason,
 ): SessionConfigOption {
-  const explanation = enabled
-    ? undefined
-    : disabledReason && FAST_MODE_UNAVAILABLE_EXPLANATIONS[disabledReason];
+  const explanation = enabled ? undefined : explainFastModeDisabledReason(disabledReason);
   const base = {
     id: FAST_MODE_CONFIG_ID,
     name: "Fast mode",
@@ -118,6 +130,27 @@ export function resolveFastModeEnabled(params: SetSessionConfigOptionRequest): b
   );
 }
 
+/** Set the Fast mode flag on Claude Code, through `applyFlagSettings`.
+ *
+ *  Turning it on sends `fastMode: false` first, a workaround for Claude Code
+ *  (CLI 2.1.325): it acts on `fastMode: true` only when its flag does not hold
+ *  `true` already, and ignores a repeat. Its flag stays `true` while it stops
+ *  serving Fast mode at a model switch (Fable 5.2 and Mythos 5.2 take only a
+ *  Fast mode that was turned on while they were selected) and reports
+ *  `fast_mode_state: "off"`. Without the reset, turning the toggle back on
+ *  changes nothing there, and the next `system`/init turns it off again.
+ *
+ *  A refusal of the reset changes nothing. If Claude Code takes the reset and
+ *  refuses `true`, it is left off; the caller's option keeps its value, and the
+ *  next `system`/init turns off an option that reads on. */
+export async function applyFastModeFlag(
+  applyFlagSettings: (settings: { fastMode: boolean }) => Promise<void>,
+  enabled: boolean,
+): Promise<void> {
+  if (enabled) await applyFlagSettings({ fastMode: false });
+  await applyFlagSettings({ fastMode: enabled });
+}
+
 /** Per-model Fast mode state threaded into `buildConfigOptions`. The
  *  option is only surfaced when the current model `supported`s fast mode. */
 export type FastModeOptionState = {
@@ -141,15 +174,19 @@ export type FastModeOptionState = {
  *  off), or the same state with the same explainable reason.
  *
  *  `reason` is the SDK's `fast_mode_disabled_reason`, reported alongside the
- *  state. Only explainable reasons are retained (see
- *  {@link normalizeFastModeDisabledReason}), so a routine
- *  `sdk_opt_in_required` report on every turn's result can't churn the
- *  option, while a real blocker updates the description even when the
+ *  state. Every reason except `sdk_opt_in_required` and `pending` is retained
+ *  (see {@link normalizeFastModeDisabledReason}; unknown future codes get the
+ *  generic text), so `sdk_opt_in_required` on every turn's result can't churn
+ *  the option, while a real blocker updates the description even when the
  *  toggle's own value is unchanged.
  *
  *  `notice` is set when the user had Fast mode on and the SDK turned it off
- *  for an explainable reason: the description carries the same explanation,
- *  but a toggle silently snapping back is worth saying out loud once. */
+ *  with a retained reason: the description carries the same explanation, but a
+ *  toggle silently snapping back is worth saying out loud once. Off with no
+ *  reason, `sdk_opt_in_required` or `pending` stays quiet: a report can carry
+ *  the flag as it was before a request of ours (see
+ *  {@link fastModeResultIsNews}), so a notice there would falsely say "turned
+ *  off". */
 export function fastModeStateChange(
   current: { enabled: boolean; disabledReason?: FastModeDisabledReason },
   state: FastModeState | undefined,
@@ -163,8 +200,7 @@ export function fastModeStateChange(
   // so it can't decorate the option the next time fast mode goes off.
   const disabledReason = enabled ? undefined : normalizeFastModeDisabledReason(reason);
   if (enabled === current.enabled && disabledReason === current.disabledReason) return undefined;
-  const explanation =
-    disabledReason !== undefined ? FAST_MODE_UNAVAILABLE_EXPLANATIONS[disabledReason] : undefined;
+  const explanation = explainFastModeDisabledReason(disabledReason);
   if (!current.enabled || enabled || explanation === undefined) {
     return { enabled, disabledReason };
   }
@@ -180,6 +216,41 @@ export function fastModeStateChange(
       transcript: `**Fast mode turned off:** ${explanation}.`,
     },
   };
+}
+
+/** A Fast mode report of Claude Code: the `fast_mode_state` and
+ *  `fast_mode_disabled_reason` of a `system`/init or of a result. */
+export type FastModeReport = {
+  state: FastModeState | undefined;
+  reason: FastModeDisabledReason | undefined;
+};
+
+/** Whether a result's Fast mode report says something that `init`, the report
+ *  of its turn's `system`/init, did not.
+ *
+ *  Claude Code (CLI 2.1.325) reads the `fastMode` flag once when a turn starts
+ *  and builds that turn's init and result from the one reading. A result that
+ *  repeats its init therefore predates a `session/set_config_option` that
+ *  arrived in between: mirroring it would turn the toggle back, until the next
+ *  turn's init. What a result adds is what Claude Code evaluates when it sends
+ *  it: a refusal by the account or the model, or the end of one.
+ *
+ *  Reasons compare as retained ({@link normalizeFastModeDisabledReason}):
+ *  turning Fast mode on mid-turn drops `sdk_opt_in_required` from the result,
+ *  which is no news. True without an init, as for a result whose turn sent none.
+ *
+ *  Not covered: a request that Claude Code applies after it read the flag and
+ *  before it sent the init. That init reports the earlier value too, and the
+ *  next turn's init corrects the toggle. */
+export function fastModeResultIsNews(
+  init: FastModeReport | undefined,
+  result: FastModeReport,
+): boolean {
+  if (init === undefined) return true;
+  return (
+    result.state !== init.state ||
+    normalizeFastModeDisabledReason(result.reason) !== normalizeFastModeDisabledReason(init.reason)
+  );
 }
 
 /** The notice of Fast mode that the SDK turned off, and its transcript line

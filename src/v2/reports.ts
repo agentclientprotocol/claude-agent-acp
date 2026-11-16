@@ -21,6 +21,7 @@ import type {
   SDKMessage,
   SDKPartialAssistantMessage,
   SDKResultMessage,
+  Settings,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "../logger.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
@@ -46,7 +47,6 @@ import {
 import {
   DEFAULT_CONTEXT_WINDOW,
   getMatchingModelUsage,
-  inferContextWindowFromModel,
   snapshotFromUsage,
   totalTokens,
   ZERO_USAGE,
@@ -78,7 +78,9 @@ export interface ReportsHost {
 /** What the session's query was started with (see {@link SessionReports.configure}). */
 export interface ReportsSetup {
   /** The session's live Claude Code settings, disposed with the reports. */
-  settings: Pick<SettingsManager, "getSettings" | "dispose">;
+  settings: Pick<SettingsManager, "getCompactionSettings" | "dispose">;
+  /** The client's `settings` option, which the query got as `--settings`. */
+  configuredSettings: Settings | undefined;
   /** The query's environment. */
   env: Record<string, string | undefined>;
   /** The names of the client's MCP servers. */
@@ -172,7 +174,7 @@ export class SessionReports {
       {
         isBusy: () => this.host.isBusy(),
         contextTokens: () => this.contextUsed,
-        settings: () => setup.settings.getSettings(),
+        settings: () => setup.settings.getCompactionSettings(setup.configuredSettings),
         compact: () => this.host.compact(),
         // The logger has no debug level.
         log: (message) => this.host.logger.log(message),
@@ -386,9 +388,6 @@ export class SessionReports {
       if (model && model !== "<synthetic>") {
         this.lastModel = model;
         this.idleCompaction?.noteRequest(event.message.usage, event.message.id || undefined);
-        if (!this.contextWindowAuthoritative && this.contextWindow === DEFAULT_CONTEXT_WINDOW) {
-          this.contextWindow = inferContextWindowFromModel(model) ?? this.contextWindow;
-        }
       }
     } else if (event.type === "message_delta") {
       const usage = event.usage;
@@ -537,8 +536,8 @@ export class SessionReports {
 
   /**
    * The window of model `id` without IPC: one learned from a result of this
-   * or another session on the same backend, else a guess from the model's
-   * names. A guess is then read from Claude Code in the background
+   * or another session on the same backend, else the default. The default is
+   * then replaced by what Claude Code reports in the background
    * (`readContextWindow`), until a result reports the window.
    */
   private seedContextWindow(id: string, info: ModelInfo | undefined): void {

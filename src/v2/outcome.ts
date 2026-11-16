@@ -12,11 +12,12 @@ import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type {
   SDKAssistantMessage,
   SDKAssistantMessageError,
+  SDKRateLimitInfo,
   SDKResultMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { AUTONOMOUS_RESULT_ORIGINS } from "../result-end.js";
 import { isSyntheticLoginMessage } from "../message-filters.js";
-import { resultEnd } from "../result-end.js";
+import { resultEnd, turnErrorData } from "../result-end.js";
 import { assistantMessageText, providerFailureCategory } from "../session-failure-extension.js";
 import {
   getMatchingModelUsage,
@@ -91,8 +92,12 @@ export function idleOutcome(
       providerFailureCategory(kind) === "auth_required");
   return failed(
     authFailure
-      ? RequestError.authRequired()
-      : RequestError.internalError(kind ? { errorKind: kind } : undefined, ended.error),
+      ? // Claude Code's `/login` instruction is for its terminal, so that text
+        // is left out. Any other says why the login failed, e.g. "Failed to
+        // authenticate: this login reached its time limit and cannot be
+        // renewed."
+        RequestError.authRequired(undefined, ended.loginRequired ? undefined : ended.error)
+      : RequestError.internalError(turnErrorData(kind, report?.rateLimit), ended.error),
   );
 }
 
@@ -114,6 +119,8 @@ function failed(error: RequestError): IdleOutcome {
  */
 export class TurnReport {
   errorKind: SDKAssistantMessageError | undefined;
+  /** The turn's latest `rate_limit_event` info (see `turnErrorData`). */
+  rateLimit: SDKRateLimitInfo | undefined;
   /** Claude Code showed its sign-in message ("Not logged in · Please run /login"). */
   loginRequired = false;
   /** The explanation of the turn's refusal. */
@@ -132,8 +139,9 @@ export class TurnReport {
    * - Claude Code's sign-in message. Its `/login` instruction is for Claude
    *   Code's terminal, and the turn's idle fails with `authRequired` instead.
    * - The message that Claude Code wrote for a failed API request (`error` on
-   *   a `<synthetic>` message). The turn's idle carries it when the turn
-   *   fails, and a notice otherwise (see {@link takeApiError}).
+   *   a `<synthetic>` message). A notice carries it where the turn goes on
+   *   past it. At the turn's end, the idle carries it when the turn fails,
+   *   and a notice otherwise (see {@link takeApiError}).
    */
   assistant(message: SDKAssistantMessage): boolean {
     if (message.error) this.errorKind = message.error;
@@ -176,6 +184,7 @@ export class TurnReport {
 
   reset(): void {
     this.errorKind = undefined;
+    this.rateLimit = undefined;
     this.loginRequired = false;
     this.refusalExplanation = undefined;
     this.apiError = undefined;

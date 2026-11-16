@@ -58,8 +58,9 @@ function check(ok, label, detail) {
 
 // ---------------------------------------------------------------- basic
 
-function runSync(args, [cmd, ...cmdArgs] = [command, ...commandArgs]) {
+function runSync(args, [cmd, ...cmdArgs] = [command, ...commandArgs], cwd) {
   const result = spawnSync(cmd, [...cmdArgs, ...args], {
+    cwd,
     encoding: "utf8",
     timeout: 60_000,
   });
@@ -100,6 +101,26 @@ if (positionals.length === 0) {
       String(missing.error).includes("The Claude CLI is missing"),
       "without claude next to it, says the CLI is missing",
       missing.stdout || missing.error,
+    );
+
+    // Started in a project directory, the executable must not read the
+    // project's dotenv files or bunfig.toml. Node stands in for `claude`, to
+    // print the environment the CLI is spawned with.
+    copyFileSync(process.execPath, join(scratch, `claude${exe}`));
+    const project = join(scratch, "project");
+    mkdirSync(project);
+    writeFileSync(join(project, ".env"), "ACP_SMOKE_DOTENV=leaked\n");
+    writeFileSync(join(project, ".env.local"), "ACP_SMOKE_DOTENV_LOCAL=leaked\n");
+    writeFileSync(join(project, "bunfig.toml"), "= not toml\n");
+    const probe = runSync(
+      ["--cli", "-p", "[process.env.ACP_SMOKE_DOTENV, process.env.ACP_SMOKE_DOTENV_LOCAL].join()"],
+      [alone],
+      project,
+    );
+    check(
+      probe.stdout === ",",
+      "ignores .env, .env.local and bunfig.toml in the working directory",
+      probe.stdout || probe.error,
     );
   } finally {
     rmSync(scratch, { recursive: true, force: true });

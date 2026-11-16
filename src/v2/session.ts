@@ -142,6 +142,14 @@ export class V2Session implements RequestTarget {
   private foreground = false;
   /** The prompt whose `started` frame came last in the open turn. */
   private turnCommand: string | undefined;
+  /**
+   * Whether a cycle of Claude Code runs in the open turn: one started (see
+   * {@link openTurn}) and its result has not come. Claude Code folds a prompt
+   * that starts meanwhile into that cycle.
+   */
+  private cycleOpen = false;
+  /** The prompt that started the running cycle, if one did. */
+  private cycleCommand: string | undefined;
   /** The state the client was told last. */
   private reportedState: ForegroundState = "idle";
   /** The open permission requests and elicitations of the session. */
@@ -628,6 +636,22 @@ export class V2Session implements RequestTarget {
     if (heldTurn) this.closeTurn();
   }
 
+  /**
+   * Sets the initial values of a setup request's `configOptions` (see
+   * `SessionConfig.setInitial`), and has the reports follow the model they
+   * leave. It sends nothing, on a session that a `session/resume` found
+   * active too: the setup response carries the options to the connection
+   * that asked, and a session is active on one connection only.
+   */
+  async setInitialConfigOptions(
+    entries: readonly v2.SetSessionConfigOptionRequest[],
+  ): Promise<void> {
+    if (entries.length === 0) return;
+    await this.config.setInitial(entries);
+    // Nothing changes for the same model.
+    this.modelChangedReports();
+  }
+
   async setConfigOption(
     params: v2.SetSessionConfigOptionRequest,
   ): Promise<v2.SessionConfigOption[]> {
@@ -822,12 +846,16 @@ export class V2Session implements RequestTarget {
     this.reports.modelChanged(id, info);
   }
 
-  /** Claude Code reported a Fast mode state, on `system`/init or a result. */
-  private fastModeReported(message: {
-    fast_mode_state?: FastModeState;
-    fast_mode_disabled_reason?: FastModeDisabledReason;
-  }): void {
-    if (this.config.fastModeReported(message.fast_mode_state, message.fast_mode_disabled_reason)) {
+  /** Claude Code reported a Fast mode state, on a `system`/init or on a result (`from`). */
+  private fastModeReported(
+    message: {
+      fast_mode_state?: FastModeState;
+      fast_mode_disabled_reason?: FastModeDisabledReason;
+    },
+    from: "init" | "result",
+  ): void {
+    const report = { state: message.fast_mode_state, reason: message.fast_mode_disabled_reason };
+    if (this.config.fastModeReported(report, from)) {
       this.send({ sessionUpdate: "config_option_update", configOptions: this.config.options() });
     }
   }
@@ -894,6 +922,7 @@ export class V2Session implements RequestTarget {
       this.tasks.toolResults(this.output, message);
       return;
     }
+    this.wentOnPastApiError();
     // The rewrite applies to the updates of this message only.
     this.output.rewrite = this.clearContext.toolResults(message);
     try {
@@ -926,6 +955,7 @@ export class V2Session implements RequestTarget {
         if (this.stopped.drops(message)) return;
         if (message.parent_tool_use_id === null) {
           this.outputStarts();
+          this.wentOnPastApiError();
           this.reports.streamEvent(message);
         }
         this.output.streamEvent(message);
@@ -938,6 +968,7 @@ export class V2Session implements RequestTarget {
           // request are not shown as Claude's text (see `TurnReport`).
           if (this.turnReport.assistant(message)) return;
           this.outputStarts();
+          this.wentOnPastApiError();
           this.reports.assistant(message);
         }
         this.output.assistant(message);
@@ -970,7 +1001,7 @@ export class V2Session implements RequestTarget {
             if (message.capabilities?.includes("msg_lifecycle_v1")) this.lifecycleFrames = true;
             this.elicitations.init(message.capabilities);
             // A fresh init (such as after a reinitialize) can carry another Fast mode state.
-            this.fastModeReported(message);
+            this.fastModeReported(message, "init");
             this.reports.handle(message);
             // Its terminal-bound commands leave the list.
             if (this.commands.init(message)) this.resendCommands();
@@ -996,6 +1027,7 @@ export class V2Session implements RequestTarget {
             return;
           case "model_refusal_fallback": {
             // Claude Code retried a refused turn on the fallback model.
+            this.output.closeRetracted(message);
             const fallback = modelRefusalFallback(message);
             this.output.emitV1([
               { sessionId: this.sessionId, update: noticeUpdate(fallback.notice) },
@@ -1031,6 +1063,7 @@ export class V2Session implements RequestTarget {
    * output (see {@link SessionReports}).
    */
   private report(message: SDKMessage): void {
+    if (message.type === "rate_limit_event") this.turnReport.rateLimit = message.rate_limit_info;
     if (message.type === "tool_progress") {
       this.output.toolProgress(message);
       return;
@@ -1074,9 +1107,13 @@ export class V2Session implements RequestTarget {
         );
         return;
       case "completed":
-        // Comes after the turn's result. A turn that ended without one ends here.
+        // Claude Code sends it after the result for the prompt that started
+        // the cycle, so a cycle that ended without a result ends here. For a
+        // prompt folded into the cycle it sends it before the result, which
+        // then ends the turn. Nothing but Claude Code's order tells the two
+        // apart.
         this.stopped.promptEnded(uuid);
-        if (uuid === this.turnCommand) this.closeTurn();
+        if (uuid === this.cycleCommand) this.closeTurn();
         return;
       default:
         // `queued`: the prompt waits in Claude Code's queue.
@@ -1139,10 +1176,14 @@ export class V2Session implements RequestTarget {
     if (interrupted) this.cancelledWork = true;
     // A result with no open turn: a turn that sent nothing before it.
     this.openTurn(undefined);
+    // The result ends the cycle. A prompt that starts next in the open turn,
+    // such as the `/clear` of a fresh context, starts its own.
+    this.cycleOpen = false;
+    this.cycleCommand = undefined;
     // A cycle that Claude Code started on its own leaves its Fast mode state
     // to the next result of a prompt.
     if (!(message.origin && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind))) {
-      this.fastModeReported(message);
+      this.fastModeReported(message, "result");
     }
     this.reports.result(message);
     // Before the result's text below, which can repeat the failed request's.
@@ -1199,10 +1240,21 @@ export class V2Session implements RequestTarget {
   }
 
   /**
-   * Sends the text of a failed API request that Claude Code wrote into the
-   * conversation (see `TurnReport.assistant`) as a notice. A turn whose idle
-   * fails sends none: its error carries the failure. `end` is the turn's
-   * result, if it has one.
+   * The turn went on past a failed API request: Claude Code kept the tool
+   * calls of a response that broke off ("Connection lost mid-response. The
+   * response above may be incomplete.") and ran them. Its notice goes out
+   * here, after the output it is about, and not at the turn's end.
+   */
+  private wentOnPastApiError(): void {
+    const text = this.turnReport.takeApiError();
+    if (text) this.reports.apiError(text);
+  }
+
+  /**
+   * At the turn's end, sends the text of a failed API request that Claude
+   * Code wrote into the conversation (see `TurnReport.assistant`) as a
+   * notice. A turn whose idle fails sends none: its error carries the
+   * failure. `end` is the turn's result, if it has one.
    */
   private reportApiError(end: TurnEnd | undefined): void {
     const text = this.turnReport.takeApiError();
@@ -1284,8 +1336,8 @@ export class V2Session implements RequestTarget {
   // --- State ---------------------------------------------------------------
 
   /**
-   * Opens a turn, if none is open. `command` is the prompt that started it,
-   * if one did.
+   * Opens a turn, if none is open, and starts a cycle in it, if none runs
+   * there. `command` is the prompt that started it, if one did.
    */
   private openTurn(command: string | undefined): void {
     if (command !== undefined) {
@@ -1293,6 +1345,10 @@ export class V2Session implements RequestTarget {
       const local = this.localCommands.get(command);
       this.localCommands.delete(command);
       if (local) this.turnLocalCommand = { command: local, abort: new AbortController() };
+    }
+    if (!this.cycleOpen) {
+      this.cycleOpen = true;
+      this.cycleCommand = command;
     }
     if (this.foreground) return;
     this.foreground = true;
@@ -1331,6 +1387,8 @@ export class V2Session implements RequestTarget {
     this.output.cancelled = false;
     this.lastEnd = undefined;
     this.turnCommand = undefined;
+    this.cycleOpen = false;
+    this.cycleCommand = undefined;
     this.turnReport.reset();
     const ownCommandDone = this.ownCommandDone;
     this.ownCommandDone = undefined;

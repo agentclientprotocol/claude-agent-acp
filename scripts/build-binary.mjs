@@ -74,9 +74,24 @@ try {
   process.exit(1);
 }
 
+// By default a compiled executable loads `.env`, `.env.local` and `bunfig.toml`
+// from its working directory at startup. That directory is the user's project:
+// its dotenv values would reach Claude and every Bash command as real
+// environment variables (overriding the project's own `.env.test`), and a
+// `bunfig.toml` that fails to parse would stop the agent from starting.
 const bun = spawnSync(
   "bun",
-  ["build", "src/binary-entry.ts", "--compile", "--target", target, "--outfile", outfile],
+  [
+    "build",
+    "src/binary-entry.ts",
+    "--compile",
+    "--no-compile-autoload-dotenv",
+    "--no-compile-autoload-bunfig",
+    "--target",
+    target,
+    "--outfile",
+    outfile,
+  ],
   { cwd: repoRoot, stdio: "inherit", shell: process.platform === "win32" },
 );
 if (bun.error) {

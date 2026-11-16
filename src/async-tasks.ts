@@ -879,7 +879,7 @@ function recordPublished(task: AsyncTask, fields: Record<string, unknown>): void
  * its tool result. The text of a tool result never gives a task id: a
  * foreground command can print any text.
  *
- * Claude Code sends no `tool_use_result` with a subagent's tool results. For
+ * Claude Code sends no `tool_use_result` with a subagent's Bash results. For
  * those, `startedTaskOf` gives the background `local_bash` task whose
  * `task_started` named the Bash call, which comes before the result.
  */

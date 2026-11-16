@@ -151,7 +151,7 @@ The v2 core (`src/v2/`) serves an AIR client only the extensions that ACP v2 doe
 Its `initialize` response lists `agentFileChangeReport` and `recommendedValue`.
 It also serves the [permission presentation](#permission-presentation), the [question custom answers](#question-custom-answers), the [predicted follow-up prompt](#predicted-follow-up-prompt), and [load replay end](#load-replay-end).
 The [agent file-change report](#agent-file-change-report) goes out at the end of the turn that serves the prompt, before the turn's idle `state_update`, because a v2 `session/prompt` is answered when Claude Code takes the prompt in.
-ACP v2 covers subagents, background work, file plans, patches, compaction, the system prompt, and turn failures itself, so the v2 core serves no `nativeSubagentSessions`, `backgroundSubagents`, `asyncTasks`, `planFile`, `diffPatch`, `contextCompaction`, `customInstructions`, or `sessionFailure`.
+ACP v2 covers subagents, background work, plans, patches, compaction, the system prompt, and turn failures itself, so the v2 core serves no `nativeSubagentSessions`, `backgroundSubagents`, `asyncTasks`, `planFile`, `diffPatch`, `contextCompaction`, `customInstructions`, or `sessionFailure`.
 It does not serve the [tool call contract](#tool-call-contract) yet.
 
 ### Capabilities
@@ -228,7 +228,7 @@ The adapter keeps them where they are.
 
 ## Auth source display
 
-The connection-scoped `_auth/status_update` continues to report agent-owned authentication, not client-owned `providers/set` routing. The adapter also reports the same identity through the ACP `auth/status` method and `auth/status_update` notification (advertised as `auth.status`), with `kind`, `detail` and `plan` under the account's `_meta.claudeCode`. The account's `label` also carries a `detail` in parentheses, e.g. `Anthropic API key (ANTHROPIC_API_KEY)`. Each notification is sent when its own payload changed. `auth/status` answers with the identity last reported and starts a new read, whose change arrives as a notification. When the active key source is `apiKeyHelper`, the adapter reads the effective helper command through SDK `resolveSettings` / the session's `SettingsManager`, including programmatic settings overrides.
+The connection-scoped `_auth/status_update` continues to report agent-owned authentication, not client-owned `providers/set` routing. The adapter also reports the same identity through the ACP `auth/status` method and `auth/status_update` notification (advertised as `auth.status`), with `kind`, `detail` and `plan` under the account's `_meta.claudeCode`. The account's `description` carries the `detail` too, e.g. `label: "Anthropic API key"` with `description: "ANTHROPIC_API_KEY"`. Each notification is sent when its own payload changed. `auth/status` answers with the identity last reported and starts a new read, whose change arrives as a notification. When the active key source is `apiKeyHelper`, the adapter reads the effective helper command through SDK `resolveSettings` / the session's `SettingsManager`, including programmatic settings overrides.
 
 A command containing the whole word `central` and the word sequence `proxy start` is displayed as:
 
@@ -1732,8 +1732,9 @@ A client that is not AIR gets neither key.
 
 ## Load replay end
 
-ACP has no signal that the history replay of `session/load` is over, other than the response.
+ACP v1 has no signal that the history replay of `session/load` is over, other than the response.
 The adapter replays the transcript while the Claude Code CLI starts, so the history can arrive long before the response.
+ACP v2 has the `replay_complete` update for this, which the adapter sends to every v2 client.
 
 The client declares `loadReplayEnd` in its capabilities. The agent does not advertise it.
 After the history replay of the loaded session, the agent then sends one more update for that session:
@@ -1751,7 +1752,7 @@ After the history replay of the loaded session, the agent then sends one more up
 - The update has no `title` and no `updatedAt`. A `null` there would clear the value.
 - It comes after every replayed update, the subagent history that the replay sends to the child sessions included, and before the `session/load` response.
 - It comes also for an empty history.
-- It comes for `session/load` of a new or an already live session, and for the ACP v2 `session/resume` with `replayFrom: {type: "start"}`.
+- It comes for `session/load` of a new or an already live session, and for the ACP v2 `session/resume` with `replayFrom: {type: "start"}`. On v2 it comes right after the session's `replay_complete`, which marks the same point.
 - It does not come when the replay stops or fails. The replay stops when the CLI start fails during the replay.
 - It does not come for a live update, and it does not come to a client without the capability.
 - The `session/load` can still fail after it, for example when the CLI start fails after the replay. The event means that the recorded history arrived whole. The client decides what to do with the failed load.

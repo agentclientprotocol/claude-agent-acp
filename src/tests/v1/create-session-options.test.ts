@@ -5,16 +5,19 @@ import {
   SessionNotification,
 } from "@agentclientprotocol/sdk/unstable";
 import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
-import { getSessionMessages, type Options } from "@anthropic-ai/claude-agent-sdk";
+import { forkSession, getSessionMessages, type Options } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../../v1/acp-agent.js";
 import type { AcpClient } from "../../acp-client.js";
 import type { AcpSessionNotification } from "../../acp-subagents.js";
 import { ALLOW_BYPASS } from "../../permissions/modes.js";
 import { NativeSubagentRuntime } from "../../native-subagents.js";
-import { startupFailure } from "../helpers.js";
+import { setModelRefusal, startupFailure } from "../helpers.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+
+/** The session that the mocked SDK `forkSession` makes. */
+const FORK_ID = "3d0f7a52-9b1e-4c7d-8e2a-6f4b5c1d0e9a";
 
 let capturedOptions: Options | undefined;
 let contextUsageResult: (() => Promise<{ rawMaxTokens: number; model?: string }>) | undefined;
@@ -43,9 +46,19 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
     ...actual,
     query: (args: { prompt: unknown; options: Options }) => {
       capturedOptions = args.options;
+      // Like Claude Code's, the stream stays open until the query is closed.
+      let streamClosed = () => {};
+      const closed = new Promise<void>((resolve) => (streamClosed = resolve));
       return makeMockQuery({
         interrupt: () => (interruptImpl ? interruptImpl() : Promise.resolve(undefined)),
-        close: () => closeSpy(),
+        close: () => {
+          closeSpy();
+          streamClosed();
+        },
+        next: async () => {
+          await closed;
+          return { done: true as const, value: undefined };
+        },
         initializationResult: async () => {
           await initGate;
           if (initError) throw initError;
@@ -61,6 +74,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
       });
     },
     getSessionMessages: vi.fn(() => sessionMessagesResult()),
+    forkSession: vi.fn(async () => ({ sessionId: FORK_ID })),
   };
 });
 
@@ -105,6 +119,7 @@ describe("createSession options merging", () => {
     sessionMessages = [];
     sessionMessagesResult = async () => sessionMessages;
     vi.mocked(getSessionMessages).mockClear();
+    vi.mocked(forkSession).mockClear();
     initModels = undefined;
     initGate = undefined;
     initError = undefined;
@@ -1365,6 +1380,253 @@ describe("createSession options merging", () => {
     });
   });
 
+  describe("session options", () => {
+    const cwd = process.cwd();
+    const TWO_MODELS = [
+      {
+        value: "claude-sonnet-4-6",
+        displayName: "Claude Sonnet",
+        description: "Fast",
+        supportsAutoMode: true,
+        supportsEffort: true,
+        supportedEffortLevels: ["low", "medium", "high"],
+      },
+      {
+        value: "claude-haiku-4-5",
+        displayName: "Claude Haiku",
+        description: "Faster",
+        supportsEffort: true,
+        supportedEffortLevels: ["low", "medium"],
+      },
+    ];
+    let updates: SessionNotification[];
+
+    const values = (response: { configOptions?: { id: string; currentValue: unknown }[] | null }) =>
+      Object.fromEntries((response.configOptions ?? []).map((o) => [o.id, o.currentValue]));
+
+    beforeEach(() => {
+      initModels = TWO_MODELS;
+      updates = [];
+      vi.spyOn(agent.client, "sessionUpdate").mockImplementation(async (notification) => {
+        updates.push(notification as SessionNotification);
+      });
+    });
+
+    it("advertises session/options", async () => {
+      const response = await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      expect(response.agentCapabilities?.sessionCapabilities?.options).toEqual({});
+    });
+
+    it("answers session/options with what session/new returns, from a query that it closes", async () => {
+      const options = await agent.sessionOptions({ cwd, additionalDirectories: ["/extra"] });
+
+      expect(capturedOptions).toMatchObject({
+        cwd,
+        additionalDirectories: ["/extra"],
+        mcpServers: {},
+        persistSession: false,
+      });
+      expect(capturedOptions!.resume).toBeUndefined();
+      expect(closeSpy).toHaveBeenCalledTimes(1);
+      expect(agent.sessions).toEqual({});
+      expect(updates).toEqual([]);
+
+      const { sessionId, ...created } = await agent.newSession({ cwd, mcpServers: [] });
+      expect(sessionId).toBeDefined();
+      expect(capturedOptions!.persistSession).toBeUndefined();
+      expect(options).toEqual(created);
+    });
+
+    it("answers session/options of a held session with its current options, without a query", async () => {
+      const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+      const { configOptions } = await agent.setSessionConfigOption({
+        sessionId,
+        configId: "model",
+        value: "claude-haiku-4-5",
+      });
+      capturedOptions = undefined;
+
+      const options = await agent.sessionOptions({ cwd, sessionId });
+
+      expect(capturedOptions).toBeUndefined();
+      expect(options).toEqual({ modes: agent.sessions[sessionId]!.modes, configOptions });
+      expect(values(options).model).toBe("claude-haiku-4-5");
+    });
+
+    it("answers session/options of a stored session from a query that resumes it", async () => {
+      const sessionId = "7f1c5b0e-3c53-4c0c-9d0a-0d6c1f0a2b11";
+      await agent.sessionOptions({ cwd, sessionId });
+
+      expect(capturedOptions).toMatchObject({ resume: sessionId, persistSession: false });
+      expect(capturedOptions!.sessionId).toBeUndefined();
+      expect(closeSpy).toHaveBeenCalledTimes(1);
+      expect(agent.sessions).toEqual({});
+    });
+
+    it("fails session/options of an unknown session with -32002", async () => {
+      const sessionId = "7f1c5b0e-3c53-4c0c-9d0a-0d6c1f0a2b11";
+      initError = new Error(`No conversation found with session ID: ${sessionId}`);
+
+      await expect(agent.sessionOptions({ cwd, sessionId })).rejects.toMatchObject({
+        code: RequestError.sessionNotFound(sessionId).code,
+        data: { sessionId },
+      });
+      expect(closeSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("starts a new session with the request's configOptions, in list order, without an update", async () => {
+      const setModels: string[] = [];
+      setModelImpl = async (model) => void setModels.push(model);
+
+      const response = await agent.newSession({
+        cwd,
+        mcpServers: [],
+        configOptions: [
+          { configId: "model", value: "claude-haiku-4-5" },
+          // Haiku offers no "high": the entry is checked against the options the model left.
+          { configId: "effort", value: "high" },
+          { configId: "mode", value: "plan" },
+        ],
+      });
+
+      expect(setModels).toEqual(["claude-haiku-4-5"]);
+      expect(values(response)).toMatchObject({ model: "claude-haiku-4-5", mode: "plan" });
+      expect(values(response).effort).not.toBe("high");
+      expect(response.modes?.currentModeId).toBe("plan");
+      expect(response.configOptions).toEqual(agent.sessions[response.sessionId]!.configOptions);
+      expect(updates.filter((u) => u.sessionId === response.sessionId)).toEqual([]);
+      // A restart of the query restores the session's choices, not the request's.
+      expect(agent.sessions[response.sessionId]!.creationParams).not.toHaveProperty(
+        "configOptions",
+      );
+    });
+
+    it.each([
+      ["an unknown configId", { configId: "nope", value: "x" }],
+      ["a boolean for a select", { configId: "model", type: "boolean" as const, value: true }],
+      ["a model Claude Code does not know", { configId: "model", value: "gpt-4" }],
+    ])("skips an entry with %s and sets the entries after it", async (_name, entry) => {
+      const plain = await agent.newSession({ cwd, mcpServers: [] });
+      // An id the option does not list goes to Claude Code, which refuses an unknown one.
+      setModelImpl = async (model) => {
+        throw setModelRefusal(`Model '${model}' not found`, "not_found");
+      };
+
+      const response = await agent.newSession({
+        cwd,
+        mcpServers: [],
+        configOptions: [entry, { configId: "mode", value: "plan" }],
+      });
+
+      expect(values(response)).toEqual({ ...values(plain), mode: "plan" });
+    });
+
+    it("skips an entry that Claude Code refuses", async () => {
+      setModelImpl = async () => {
+        throw new Error("model refused");
+      };
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const response = await agent.newSession({
+        cwd,
+        mcpServers: [],
+        configOptions: [
+          { configId: "model", value: "claude-haiku-4-5" },
+          { configId: "mode", value: "plan" },
+        ],
+      });
+
+      expect(values(response)).toMatchObject({ model: "claude-sonnet-4-6", mode: "plan" });
+      expect(errors).toHaveBeenCalledWith(
+        "Could not set the initial value of config option model:",
+        expect.any(Error),
+      );
+      errors.mockRestore();
+    });
+
+    it.each(["newSession", "loadSession", "resumeSession", "unstable_forkSession"] as const)(
+      "%s rejects two entries of one configId before it starts a query",
+      async (method) => {
+        await expect(
+          agent[method]({
+            sessionId: "7f1c5b0e-3c53-4c0c-9d0a-0d6c1f0a2b11",
+            cwd,
+            mcpServers: [],
+            configOptions: [
+              { configId: "mode", value: "plan" },
+              { configId: "mode", value: "default" },
+            ],
+          }),
+        ).rejects.toMatchObject({
+          code: RequestError.invalidParams().code,
+          data: { configId: "mode" },
+        });
+        expect(capturedOptions).toBeUndefined();
+        // A fork copies no transcript either.
+        expect(forkSession).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(["loadSession", "resumeSession"] as const)(
+      "%s sets the request's configOptions on the session, a held one too",
+      async (method) => {
+        const sessionId = "7f1c5b0e-3c53-4c0c-9d0a-0d6c1f0a2b11";
+        const started = await agent[method]({
+          sessionId,
+          cwd,
+          mcpServers: [],
+          configOptions: [{ configId: "mode", value: "plan" }],
+        });
+        expect(values(started).mode).toBe("plan");
+        expect(started.modes?.currentModeId).toBe("plan");
+
+        const held = await agent[method]({
+          sessionId,
+          cwd,
+          mcpServers: [],
+          configOptions: [{ configId: "model", value: "claude-haiku-4-5" }],
+        });
+        expect(values(held)).toMatchObject({ mode: "plan", model: "claude-haiku-4-5" });
+        expect(updates.map((u) => u.update.sessionUpdate)).not.toContain("current_mode_update");
+        expect(updates.map((u) => u.update.sessionUpdate)).not.toContain("config_option_update");
+      },
+    );
+
+    it("sets the configOptions of a session/fork on the fork, without an update", async () => {
+      const response = await agent.unstable_forkSession({
+        sessionId: "7f1c5b0e-3c53-4c0c-9d0a-0d6c1f0a2b11",
+        cwd,
+        mcpServers: [],
+        configOptions: [
+          { configId: "model", value: "claude-haiku-4-5" },
+          { configId: "mode", value: "plan" },
+        ],
+      });
+
+      expect(response.sessionId).toBe(FORK_ID);
+      expect(capturedOptions).toMatchObject({ resume: FORK_ID });
+      expect(values(response)).toMatchObject({ model: "claude-haiku-4-5", mode: "plan" });
+      expect(response.modes?.currentModeId).toBe("plan");
+      expect(updates.filter((u) => u.sessionId === FORK_ID)).toEqual([]);
+    });
+
+    it("leaves the warning of an Auto mode fallback for the first prompt", async () => {
+      const response = await agent.newSession({
+        cwd,
+        mcpServers: [],
+        configOptions: [
+          { configId: "mode", value: "auto" },
+          // Haiku cannot serve Auto.
+          { configId: "model", value: "claude-haiku-4-5" },
+        ],
+      });
+
+      expect(values(response)).toMatchObject({ mode: "acceptEdits", model: "claude-haiku-4-5" });
+      expect(updates.filter((u) => u.sessionId === response.sessionId)).toEqual([]);
+      expect(agent.sessions[response.sessionId]!.autoModeFallbackWarningPending).toBe(true);
+    });
+  });
+
   describe("cwd validation", () => {
     it("rejects a relative cwd with invalidParams", async () => {
       await expect(
@@ -1570,14 +1832,11 @@ describe("createSession options merging", () => {
       const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
       expect(ctxSpy).toHaveBeenCalledOnce();
-      expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);
+      expect(sessionFor(response.sessionId).contextWindowSize).toBe(1_000_000);
       expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(false);
     });
 
-    it("refines a guessed window from getContextUsage in the background", async () => {
-      // The mock model ("claude-sonnet-4-6" / "Claude Sonnet" / "Fast") carries
-      // no "1m" token anywhere, so inference misses and the seed is the default
-      // until the background getContextUsage answers.
+    it("replaces the default window with the one getContextUsage reports, in the background", async () => {
       contextUsageResult = async () => ({ rawMaxTokens: 967000 });
 
       const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
@@ -1595,7 +1854,7 @@ describe("createSession options merging", () => {
       await vi.waitFor(() => expect(contextUsageCalls).toEqual([{ detail: "summary" }]));
     });
 
-    it("keeps the guessed window when getContextUsage reports a non-positive size", async () => {
+    it("keeps the default window when getContextUsage reports a non-positive size", async () => {
       const ctxSpy = vi.fn(async () => ({ rawMaxTokens: 0 }));
       contextUsageResult = ctxSpy;
 
@@ -1603,7 +1862,7 @@ describe("createSession options merging", () => {
       await vi.waitFor(() => expect(ctxSpy).toHaveBeenCalled());
       await new Promise((resolve) => setImmediate(resolve));
 
-      expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);
+      expect(sessionFor(response.sessionId).contextWindowSize).toBe(1_000_000);
       expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(false);
     });
 

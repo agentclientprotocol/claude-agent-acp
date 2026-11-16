@@ -2012,6 +2012,164 @@ describe("NativeSubagentRuntime in the RFD form", () => {
     expect(states(published).at(-1)).toEqual({ state: "unknown" });
   });
 
+  it("reports a child that may go on working unobserved as unknown, without its cancel, and keeps an idle one", async () => {
+    const { runtime, published } = await runningWorker();
+    await runtime.route(launch("launch-2", { description: "Read the docs" }), async () => {});
+    await runtime.taskStarted(
+      { taskId: "worker-2", toolUseId: "launch-2", subagentType: "Explore" },
+      async () => {},
+    );
+    await runtime.finishTask("worker-2", "completed", async () => {}, "launch-2");
+    published.length = 0;
+
+    // A conversation reset: Claude Code can keep the children running.
+    await runtime.finishAll("failed", async () => {}, { mayStillRun: true });
+    expect(published.map(({ update }) => update)).toEqual([
+      {
+        sessionUpdate: "subagent_update",
+        sessionId: "worker-1",
+        capabilities: null,
+        state: { state: "unknown" },
+      },
+    ]);
+  });
+
+  describe("a tool call that operates on a child", () => {
+    const toolCall = (
+      toolCallId: string,
+      toolName: string,
+      rawInput: Record<string, unknown>,
+      parentToolUseId?: string,
+    ): AcpSessionNotification =>
+      ({
+        sessionId: "root",
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId,
+          title: toolName,
+          status: "pending",
+          rawInput,
+          content: [{ type: "content", content: { type: "text", text: "input" } }],
+          _meta: {
+            claudeCode: { toolName, ...(parentToolUseId ? { parentToolUseId } : {}) },
+          },
+        },
+      }) as AcpSessionNotification;
+    const toolResult = (
+      toolCallId: string,
+      toolName: string,
+      content?: unknown[],
+    ): AcpSessionNotification =>
+      ({
+        sessionId: "root",
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId,
+          status: "completed",
+          ...(content ? { content } : {}),
+          _meta: { claudeCode: { toolName } },
+        },
+      }) as AcpSessionNotification;
+    const text = { type: "content", content: { type: "text", text: "Stopped" } };
+    const reference = { type: "session", sessionId: "worker-1" };
+    const contentOf = (notification: AcpSessionNotification | null) =>
+      (notification?.update as { content?: unknown[] } | undefined)?.content;
+
+    it("references the announced child that a TaskStop call names by its agent id", async () => {
+      const { runtime } = await runningWorker();
+
+      expect(
+        contentOf(
+          await runtime.route(
+            toolCall("stop-1", "TaskStop", { task_id: "worker-1" }),
+            async () => {},
+          ),
+        ),
+      ).toEqual([{ type: "content", content: { type: "text", text: "input" } }, reference]);
+      // An update without content would replace nothing, so it carries none.
+      const progress = toolResult("stop-1", "TaskStop");
+      (progress.update as { status?: string }).status = "in_progress";
+      expect(contentOf(await runtime.route(progress, async () => {}))).toBeUndefined();
+      // The result's content replaces the first report's, so it has the reference again.
+      expect(
+        contentOf(await runtime.route(toolResult("stop-1", "TaskStop", [text]), async () => {})),
+      ).toEqual([text, reference]);
+    });
+
+    it.each([
+      ["a task that is no child", "TaskStop", { task_id: "bash_1" }],
+      ["a child named by its name, which Claude Code resolves", "TaskStop", { task_id: "builder" }],
+      ["another tool with the same input", "Monitor", { task_id: "worker-1" }],
+    ])("references nothing for %s", async (_, toolName, input) => {
+      const { runtime } = await runningWorker({ name: "builder" });
+
+      expect(
+        contentOf(await runtime.route(toolCall("call-1", toolName, input), async () => {})),
+      ).toEqual([{ type: "content", content: { type: "text", text: "input" } }]);
+    });
+
+    it("references no child that is not announced yet, as the RFD requires", async () => {
+      const { runtime } = await runningWorker();
+      // A nested child whose launch frame, which names its parent, has not come.
+      await runtime.taskStarted(
+        { taskId: "worker-2", toolUseId: "launch-2", subagentType: "Explore" },
+        async () => {},
+      );
+      await runtime.route(launch("launch-2", { description: "Dig" }, "launch-9"), async () => {});
+
+      expect(
+        contentOf(
+          await runtime.route(
+            toolCall("stop-2", "TaskStop", { task_id: "worker-2" }),
+            async () => {},
+          ),
+        ),
+      ).toEqual([{ type: "content", content: { type: "text", text: "input" } }]);
+    });
+
+    it("references the child from a SendMessage call to it that stays a tool call", async () => {
+      const { runtime } = await runningWorker();
+
+      // The message resumes no child, so the call is shown at its end.
+      await expect(
+        runtime.route(toolCall("send-1", "SendMessage", { to: "worker-1" }), async () => {}),
+      ).resolves.toBeNull();
+      const shown = await runtime.route(
+        toolResult("send-1", "SendMessage", [text]),
+        async () => {},
+      );
+      expect(shown).toMatchObject({ sessionId: "root", update: { sessionUpdate: "tool_call" } });
+      expect(contentOf(shown)).toEqual([text, reference]);
+    });
+
+    it("references the child from its launch call that a permission request showed", async () => {
+      const { runtime } = await runningWorker();
+
+      const shown = await runtime.route(
+        launchResult("launch-1", "completed", "Done"),
+        async () => {},
+        "root",
+      );
+      expect(contentOf(shown)).toEqual([
+        { type: "content", content: { type: "text", text: "Done" } },
+        reference,
+      ]);
+    });
+
+    it("references nothing in AIR's draft", async () => {
+      const runtime = new NativeSubagentRuntime(
+        "air",
+        "root",
+        sessionWith(child({ sessionId: "worker-1", announced: true })),
+        async () => {},
+        { log: () => {} },
+      );
+      const call = toolCall("stop-1", "TaskStop", { task_id: "worker-1" });
+
+      await expect(runtime.route(call, async () => {})).resolves.toEqual(call);
+    });
+  });
+
   it("reports a child as requires_action while its requests are open", async () => {
     const { runtime, published } = await runningWorker();
     const first = Promise.withResolvers<string>();

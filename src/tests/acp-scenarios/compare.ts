@@ -34,6 +34,10 @@
  * - The `initialize` response also advertises
  *   `agentCapabilities.sessionCapabilities.title`, which origin/main did not:
  *   the agent now serves `session/set_title`.
+ * - The `initialize` response also advertises
+ *   `agentCapabilities.sessionCapabilities.options`, which origin/main did
+ *   not: the agent now serves `session/options` and takes `configOptions` on
+ *   session setup requests.
  * - A SandboxNetworkAccess tool call is settled by a `tool_call_update` with
  *   only its final `status` once its permission request is answered. The
  *   callback runs nothing, so origin/main never settled the call (see
@@ -278,7 +282,7 @@ export function compareWithBaseline(baseline: Recorded[], traffic: Recorded[]): 
   const current = withoutSandboxNetworkSettlements(
     traffic.map((record) =>
       withoutAuthStatusCapability(
-        withoutSessionCapabilities(record, ["systemPrompt", "status", "title"]),
+        withoutSessionCapabilities(record, ["systemPrompt", "status", "title", "options"]),
       ),
     ),
   );

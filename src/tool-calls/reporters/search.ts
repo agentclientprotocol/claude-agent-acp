@@ -1,17 +1,19 @@
 import type { GlobInput, GrepInput } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
+import { inputString } from "../content.js";
 import type { ToolReporter, ToolUseFacts } from "../facts.js";
 
 /** Glob: the file list is the result to show. */
 export class GlobReporter implements ToolReporter {
   toolUse(input: unknown): ToolUseFacts {
     const glob = input as GlobInput | undefined;
+    const searchPath = inputString(input, "path");
     let label = "Find";
-    if (glob?.path) label += ` \`${glob.path}\``;
+    if (searchPath) label += ` \`${searchPath}\``;
     if (glob?.pattern) label += ` \`${glob.pattern}\``;
     return {
       title: label,
       kind: "search",
-      locations: glob?.path ? [{ path: glob.path }] : [],
+      locations: searchPath ? [{ path: searchPath }] : [],
     };
   }
 }

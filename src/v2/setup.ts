@@ -11,6 +11,7 @@ import {
   type ModelInfo,
   type Options,
   type Query,
+  type Settings,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "../logger.js";
 import type { NewSessionMeta } from "../new-session-meta.js";
@@ -67,17 +68,19 @@ export async function sessionModels(
   resumed: { model?: string } | undefined,
   sessionId: string,
   logger: Logger,
+  configuredSettings?: Settings,
 ): Promise<{
   models: SessionModelState;
   modelInfos: ModelInfo[];
   currentModelInfo: ModelInfo | undefined;
   allowlistedModelInfo: ModelInfo | undefined;
 }> {
-  const { availableModels, modelOverrides } = settings.getSettings();
+  const { availableModels, modelOverrides } =
+    settings.getModelSelectionSettings(configuredSettings);
   // A resumed Fable 5.2 session lists Fable 5.2 as `fable`, as a new session does.
   const listed = aliasResumedModelRow(sdkModels, resumed?.model);
   const allowed = Array.isArray(availableModels)
-    ? applyAvailableModelsAllowlist(
+    ? await applyAvailableModelsAllowlist(
         listed,
         availableModels,
         modelOverrides,
@@ -100,8 +103,16 @@ export async function sessionModels(
 }
 
 /**
- * The update that ends a replay, for a client that declares AIR's
- * `loadReplayEnd` capability, as v1 sends it.
+ * The update that ends the history replay of a `session/resume` with
+ * `replayFrom`, on the resumed session and on each subagent session that the
+ * replay announced.
+ */
+export const REPLAY_COMPLETE: v2.SessionUpdate = { sessionUpdate: "replay_complete" };
+
+/**
+ * AIR's own mark of the end of a replay, for a client that declares AIR's
+ * `loadReplayEnd` capability, as v1 sends it. It is not history, so on v2 it
+ * follows {@link REPLAY_COMPLETE}.
  */
 export function replayEndUpdate(
   capabilities: v2.ClientCapabilities | null | undefined,

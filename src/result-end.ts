@@ -8,8 +8,25 @@
 import type {
   SDKMessage,
   SDKMessageOrigin,
+  SDKRateLimitInfo,
   SDKResultMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+
+/**
+ * The `data` of the error that fails a turn, for clients to dispatch on
+ * without matching its text: the assistant message's `errorKind`, and for a
+ * `rate_limit` failure the turn's latest `rate_limit_event` info as
+ * `rateLimit`, whose `resetsAt` says when the account can run again. A turn
+ * refused before its first usage sends no `usage_update` to carry that info.
+ * `undefined` without an error kind.
+ */
+export function turnErrorData<K extends string>(
+  errorKind: K | undefined,
+  rateLimit: SDKRateLimitInfo | undefined,
+): { errorKind: K; rateLimit?: SDKRateLimitInfo } | undefined {
+  if (!errorKind) return undefined;
+  return errorKind === "rate_limit" && rateLimit ? { errorKind, rateLimit } : { errorKind };
+}
 
 export type ResultEnd =
   | { stopReason: "refusal" | "max_tokens" | "end_turn" | "max_turn_requests" }

@@ -1,6 +1,13 @@
-import { getSessionMessages, type SessionMessage } from "@anthropic-ai/claude-agent-sdk";
+import {
+  getSessionMessages,
+  importSessionToStore,
+  type SessionMessage,
+  type SessionStore,
+  type SessionStoreEntry,
+} from "@anthropic-ai/claude-agent-sdk";
 import { access, open, readdir } from "node:fs/promises";
 import path from "node:path";
+import { isCompactSummaryMessage } from "./context-compaction.js";
 import { claudeConfigDir } from "./paths.js";
 import { SessionTiming } from "./session-timing.js";
 
@@ -66,6 +73,97 @@ export async function readResumedSession(
     logger?.error(`Failed to read transcript for resumed session ${sessionId}:`, error);
     return {};
   }
+}
+
+/**
+ * Read the messages of a session from its first prompt on, given the
+ * `getSessionMessages` chain of the session.
+ *
+ * `getSessionMessages` follows `parentUuid` links. Claude Code writes each
+ * `compact_boundary` with `parentUuid: null`, so after a compaction the chain
+ * starts at its summary. The boundary keeps the last message before it in
+ * `logicalParentUuid`. For a chain that starts at a summary, this links each
+ * boundary to that message and reads the transcript through
+ * `getSessionMessages` again. For a session compacted twice, the result has
+ * both summaries and the messages before, between and after them. The result
+ * ends at the last message of `messages`. Any other chain is returned as it
+ * is, and so is the chain when the read fails or when its result does not
+ * reach that last message (e.g. the transcript changed between the reads).
+ *
+ * `dir` is the project directory of the first read: both reads then resolve
+ * the same transcript file. Without it, all project directories are searched.
+ *
+ * The preserved-message metadata of each boundary is dropped. With it,
+ * `getSessionMessages` moves the messages that a compaction kept to after the
+ * summary, and the relinked boundary then leads from them back to the summary:
+ * the chain loops and ends there. Without it, the kept messages stay where
+ * they were said, before the boundary.
+ */
+export async function readHistoryAcrossCompactions(
+  sessionId: string,
+  messages: SessionMessage[],
+  logger?: ResumeLogger,
+  dir?: string,
+): Promise<SessionMessage[]> {
+  if (!isCompactSummaryMessage(messages[0])) return messages;
+  try {
+    const entries = (await loadFullSessionHistory(sessionId, dir)).map(linkCompactBoundary);
+    const history = await getSessionMessages(sessionId, {
+      dir,
+      sessionStore: { append: async () => {}, load: async () => entries },
+    });
+    const leaf = messages.at(-1)?.uuid;
+    const end = history.findIndex((message) => message.uuid === leaf);
+    if (end < 0) {
+      logger?.error(
+        `The history before the last compaction of session ${sessionId} does not reach message ${leaf}: replaying the messages after it`,
+      );
+      return messages;
+    }
+    return history.slice(0, end + 1);
+  } catch (error) {
+    logger?.error(
+      `Failed to read the history before the last compaction of session ${sessionId}:`,
+      error,
+    );
+    return messages;
+  }
+}
+
+/** Every record of a session's transcript, including the inactive branches
+ *  and the history before a compaction that `getSessionMessages` leaves out.
+ *  Without `dir`, all project directories are searched. */
+export async function loadFullSessionHistory(
+  sessionId: string,
+  dir?: string,
+): Promise<SessionStoreEntry[]> {
+  const entries: SessionStoreEntry[] = [];
+  const store: SessionStore = {
+    append: async (_key, batch) => {
+      entries.push(...batch);
+    },
+    load: async () => null,
+  };
+  await importSessionToStore(sessionId, store, { dir, includeSubagents: false });
+  return entries;
+}
+
+/** The record unchanged, or a compaction boundary linked to the message before it. */
+function linkCompactBoundary(entry: SessionStoreEntry): SessionStoreEntry {
+  if (
+    entry.type !== "system" ||
+    entry.subtype !== "compact_boundary" ||
+    typeof entry.logicalParentUuid !== "string"
+  ) {
+    return entry;
+  }
+  const compactMetadata: Record<string, unknown> =
+    typeof entry.compactMetadata === "object" && entry.compactMetadata !== null
+      ? { ...entry.compactMetadata }
+      : {};
+  delete compactMetadata.preservedSegment;
+  delete compactMetadata.preservedMessages;
+  return { ...entry, parentUuid: entry.logicalParentUuid, compactMetadata };
 }
 
 /** What a resume restores from the end of the local transcript. */

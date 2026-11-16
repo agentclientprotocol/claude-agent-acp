@@ -30,7 +30,14 @@ export const ZERO_USAGE = Object.freeze({
   cache_creation_input_tokens: 0,
 });
 
-export const DEFAULT_CONTEXT_WINDOW = 200000;
+/**
+ * The context window reported for a model until Claude Code says what it is
+ * (see `context-window.ts`): 1M, the window Claude Code itself assumes for a
+ * model id it does not know (since 2.1.323). Claude Code reports 200K for an
+ * older model such as `claude-sonnet-4-5`, and for every model under
+ * `CLAUDE_CODE_DISABLE_1M_CONTEXT=1`.
+ */
+export const DEFAULT_CONTEXT_WINDOW = 1_000_000;
 
 /** `_meta.quota` for work that spent `usage` in its main agent loop and
  *  `modelUsage` by model (see `turnQuotaMeta` in `v1/acp-agent.ts`). */
@@ -210,26 +217,6 @@ function commonPrefixLength(a: string, b: string) {
     i++;
   }
   return i;
-}
-
-/** Best-effort first guess of a model's context window, used to seed the
- *  window synchronously (via `immediateContextWindow`) until a `result` message
- *  arrives with the authoritative `modelUsage` value.
- *
- *  Anthropic 1M-context variants encode "1m" as a distinct token in the SDK
- *  model ID (e.g., "claude-opus-4-6-1m"), which `\b1m\b` catches without also
- *  matching things like "10m" or embedded substrings. Semantic aliases like
- *  `default` carry no such token in the ID, but their `resolvedModel` and the
- *  SDK's human-facing `displayName`/`description` can (e.g.
- *  "claude-opus-4-8[1m]", "Opus 4.7 (1M context)"), so callers pass those too.
- *  This text scan can't catch every model — some resolve to extended-context
- *  models with no "1m" anywhere (e.g. `sonnet` → claude-sonnet-5, natively
- *  ~1M). Such a miss falls back to the default window, is refined by the
- *  background `getContextUsage` (`refreshContextWindowInBackground`), and is
- *  corrected by `result.modelUsage` (and cached) within one turn. */
-export function inferContextWindowFromModel(...texts: Array<string | undefined>): number | null {
-  if (texts.some((text) => text != null && /\b1m\b/i.test(text))) return 1_000_000;
-  return null;
 }
 
 export function getMatchingModelUsage(
