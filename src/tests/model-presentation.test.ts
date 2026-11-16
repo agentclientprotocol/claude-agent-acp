@@ -168,7 +168,7 @@ describe("versioned model display names", () => {
       { value: "haiku", displayName: "Haiku", description: "Fast" },
     ];
     const ids = ["claude-opus-5-5[1m]", "claude-opus-5-5", "opus[1m]", "opus", "haiku"];
-    const models = applyAvailableModelsAllowlist(sdkModels, ids);
+    const models = await applyAvailableModelsAllowlist(sdkModels, ids);
     const setModel = vi.fn();
     const state = await getAvailableModels(
       { setModel } as unknown as Query,

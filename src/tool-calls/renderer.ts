@@ -41,6 +41,38 @@ export function isFinalToolCallStatus(status: ToolCallStatus | null | undefined)
   return status === "completed" || status === "failed" || status === V2_CANCELLED;
 }
 
+/**
+ * The tool call that a `tool_progress` beat reports on, of the calls the
+ * client holds (`held`), or undefined for a beat to drop.
+ *
+ * Not every beat reports under the id of a call the client has seen: a tool's
+ * heartbeat derives `<tool_use_id>-heartbeat-<n>`, and the `agent_api_retry`
+ * beats behind `subagentRetry` report under `agent_<assistant_message_id>`.
+ * Forwarding those ids leaves the client resolving a call it was never told
+ * about (#851). The SDK stamps `parent_tool_use_id` with the id of the
+ * executing tool on them, so they go to that call. A beat under the id of a
+ * held call keeps it: a subagent's `bash_progress`, whose parent is the Agent
+ * call that spawned it.
+ *
+ * Dropped:
+ * - a beat for a call the client does not hold: never announced, or returned
+ *   (an id leaves `held` at its tool result, so a late beat cannot reopen it);
+ * - the heartbeat of a hook that runs long (`hook-<event>-<id>-heartbeat-<n>`,
+ *   since Claude Code 2.1.323). Its `tool_name` is the hook event and its
+ *   elapsed time is the hook's. For a PreToolUse or PostToolUse hook its
+ *   `parent_tool_use_id` is the tool call, which is not running then: sent on,
+ *   it would name the call `PreToolUse` and restart its elapsed time.
+ */
+export function progressToolCallId(
+  beat: { tool_use_id: string; parent_tool_use_id: string | null },
+  held: ReadonlySet<string>,
+): string | undefined {
+  if (held.has(beat.tool_use_id)) return beat.tool_use_id;
+  if (beat.tool_use_id.startsWith("hook-")) return undefined;
+  const parent = beat.parent_tool_use_id;
+  return parent !== null && held.has(parent) ? parent : undefined;
+}
+
 /** The `_meta` of a tool call report. */
 export type ToolUpdateMeta = {
   claudeCode?: {
@@ -654,21 +686,31 @@ export class AcpToolCallRenderer {
    * client `failed`, since v1 has no `cancelled`. If Claude Code ran it but
    * returned no result, it failed, unless a `session/cancel` ended the turn
    * (`cancelled`): the cancel stopped the run, so a v2 client gets `cancelled`
-   * for it too. The report does not end the call's terminal: see {@link terminalExit}.
+   * for it too. The same goes for a call that Claude Code stopped when it took
+   * back the message that made it (`retracted`, see `RetractedToolCalls`),
+   * which closes when that is known, before the turn ends. The report does not
+   * end the call's terminal: see {@link terminalExit}.
    */
-  unfinished(call: { toolCallId: string; ran: boolean; cancelled?: boolean }): ToolCallUpdate {
-    const stopped = !call.ran || call.cancelled === true;
+  unfinished(call: {
+    toolCallId: string;
+    ran: boolean;
+    cancelled?: boolean;
+    retracted?: boolean;
+  }): ToolCallUpdate {
+    const stopped = !call.ran || call.cancelled === true || call.retracted === true;
     return {
       sessionUpdate: "tool_call_update",
       toolCallId: call.toolCallId,
       status: stopped && this.capabilities.v2 ? V2_CANCELLED : "failed",
       content: [
         textContent(
-          !call.ran
-            ? "Claude stopped this tool call before it ran."
-            : call.cancelled
-              ? "The turn was cancelled before this tool call returned a result."
-              : "Claude ended the turn without returning a result for this tool.",
+          call.retracted
+            ? "Claude Code replaced the response that made this tool call, and stopped the call. If it had started, some of its effects may have happened."
+            : !call.ran
+              ? "Claude stopped this tool call before it ran."
+              : call.cancelled
+                ? "The turn was cancelled before this tool call returned a result."
+                : "Claude ended the turn without returning a result for this tool.",
         ),
       ],
     };

@@ -76,6 +76,7 @@ import {
   Query,
   query,
   SDKAssistantMessageError,
+  SDKRateLimitInfo,
   SDKActiveGoalMessage,
   SDKMessage,
   SDKMessageOrigin,
@@ -313,9 +314,7 @@ import {
 } from "../tools.js";
 import {
   addModelUsage,
-  DEFAULT_CONTEXT_WINDOW,
   getMatchingModelUsage,
-  inferContextWindowFromModel,
   modelUsageIncrement,
   normalizeModelUsage,
   quotaMeta,
@@ -332,10 +331,12 @@ import { previewPatchContent } from "../diff.js";
 import { backgroundedBashToolCall, withRunningTerminal } from "../tool-calls/background.js";
 import { ChangedMetaClient, ClientConnection } from "./client-connection.js";
 import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
+import { RetractedToolCalls } from "../tool-calls/retracted.js";
 import { ClientCapabilities as ToolCallClientCapabilities } from "../tool-calls/client-capabilities.js";
 import {
   AcpToolCallRenderer,
   isFinalToolCallStatus,
+  progressToolCallId,
   type ToolCallUpdate,
 } from "../tool-calls/renderer.js";
 import { messageLoopYielder, Pushable, raceTimeoutAndAbort, unreachable } from "../utils.js";
@@ -421,7 +422,7 @@ import {
   providerCacheKeyFor,
   readContextWindow,
 } from "../context-window.js";
-import { isLoginRequiredText, resultEnd } from "../result-end.js";
+import { isLoginRequiredText, resultEnd, turnErrorData } from "../result-end.js";
 import { STARTUP_FAILURE_RESULTS_ENV, startupFailureError } from "../startup-failure.js";
 import { recordStreamedDelta, unstreamedRemainder, type StreamedBlock } from "../streamed-text.js";
 import { subagentHookOptions } from "../subagent-configuration.js";
@@ -1097,9 +1098,9 @@ export type Session = {
   /** Context window size of the session's current model, carried across
    *  prompts so mid-stream usage_update notifications report a correct `size`
    *  before the turn's first result message arrives. Seeded synchronously at
-   *  session creation and on model switches from the per-model cache or the
-   *  text heuristic (DEFAULT_CONTEXT_WINDOW when both miss), refined by a
-   *  background `getContextUsage` when that seed was a guess (see
+   *  session creation and on model switches from the per-model cache
+   *  (DEFAULT_CONTEXT_WINDOW on a miss), refined by a background
+   *  `getContextUsage` when that seed was the default (see
    *  `refreshContextWindowInBackground`), then confirmed — and the cache
    *  populated — by each result's modelUsage. No awaited IPC is on these
    *  paths (see the seeding call sites and `contextWindowCache`). */
@@ -1107,10 +1108,9 @@ export type Session = {
   contextUsedTokens?: number;
   /** Whether `contextWindowSize` came from an authoritative source (the
    *  cross-session cache, a `result.modelUsage`, or the background
-   *  `getContextUsage`) rather than the text heuristic / default. Guards the
-   *  mid-stream `message_start` heuristic upgrade: an authoritative window that
-   *  happens to equal DEFAULT_CONTEXT_WINDOW must not be mistaken for "unseeded"
-   *  and clobbered by a "1m" text match. */
+   *  `getContextUsage`) rather than the default. The background read runs only
+   *  while it is false: the flag, not the value, tells, because an
+   *  authoritative window can equal DEFAULT_CONTEXT_WINDOW. */
   contextWindowAuthoritative: boolean;
   /** Stable identifier of the LLM backend this session's query was created
    *  against, derived from the routing-relevant vars of the exact `env` handed
@@ -1174,6 +1174,10 @@ export type Session = {
    *  `tool_call_update` resends only the fields that changed. Created lazily
    *  by {@link toolCallFieldsOf}. */
   toolCallFields?: ToolCallFieldTracker;
+  /** The tool uses of the assistant messages, to end the tool calls of a
+   *  message that Claude Code takes back. Created lazily by
+   *  {@link retractedToolCallsOf}. */
+  retractedToolCalls?: RetractedToolCalls;
   /** ACP session affinity for calls emitted eagerly by permission handling. */
   eagerToolCallSessions?: Map<string, string>;
   /** ExitPlanMode denial that intentionally interrupts the current Claude
@@ -2028,10 +2032,13 @@ export class ClaudeAcpAgent {
    * Copies the session's transcript into a new session, then starts that
    * session, so the client can prompt it as soon as the response arrives, as
    * the schema requires of a fork. It starts like a resumed session: from the
-   * copied transcript, with the model and the permission mode it records. A
-   * later load or resume with the same settings reuses it.
+   * copied transcript, with the model and the permission mode it records,
+   * and then the request's `configOptions`. A later load or resume with the
+   * same settings reuses it.
    */
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
+    // Before the copy: two entries with the same `configId` fork nothing.
+    const initial = initialConfigOptions(params.configOptions);
     while (this.providerUpdate) await this.providerUpdate;
     // Reject a bad `cwd` or prompt before copying the transcript.
     await this.validateCwd(params.cwd, params.additionalDirectories);
@@ -2044,14 +2051,17 @@ export class ClaudeAcpAgent {
     // The fork row can lack `forkedFrom`: the scan reads it from the first
     // 64 KB of the transcript only. So the fork is held back by its id too.
     this.sessionIndex.onForkCreated(params.sessionId, sessionId);
-    const { modes, configOptions } = await this.getOrCreateSession({
-      sessionId,
-      cwd: params.cwd,
-      mcpServers: params.mcpServers,
-      additionalDirectories: params.additionalDirectories,
-      systemPrompt: params.systemPrompt,
-      _meta: params._meta,
-    });
+    const { modes, configOptions } = await this.withInitialConfigOptions(
+      await this.getOrCreateSession({
+        sessionId,
+        cwd: params.cwd,
+        mcpServers: params.mcpServers,
+        additionalDirectories: params.additionalDirectories,
+        systemPrompt: params.systemPrompt,
+        _meta: params._meta,
+      }),
+      initial,
+    );
     this.afterSetupResponse(sessionId, params.mcpServers ?? []);
     return { sessionId, modes, configOptions };
   }
@@ -3091,6 +3101,8 @@ export class ClaudeAcpAgent {
     let lastAssistantModel: string | null = null;
     // A rate_limit_event that came before the turn had any usage to report.
     let pendingRateLimit: unknown = null;
+    // The turn's latest rate_limit_event info, for its failure (see `turnErrorData`).
+    let turnRateLimit: SDKRateLimitInfo | undefined;
     // When the Claude SDK classifies a turn as failed (e.g. rate limit, auth
     // problem, billing), it sets a categorical `error` field on the
     // `SDKAssistantMessage` that precedes the final `result` message. We capture
@@ -3458,6 +3470,7 @@ export class ClaudeAcpAgent {
       lastAssistantUsage = null;
       lastAssistantModel = null;
       lastAssistantError = undefined;
+      turnRateLimit = undefined;
       lastAssistantWasUsageLimit = false;
       lastAssistantFailureTitle = undefined;
       lastRefusalExplanation = null;
@@ -3759,6 +3772,13 @@ export class ClaudeAcpAgent {
      *  the autonomous stretch-close guard. */
     const firstUnsettledQueuedTurn = () => (session.turnQueue ?? []).find((t) => !t.settled);
 
+    /** Whether no turn can own what the stream carries now: nothing is
+     *  cancelled, active or queued. Output then belongs to a cycle that Claude
+     *  Code started on its own, such as a scheduler fire, and so does its
+     *  result, whatever its origin says. */
+    const noTurnOwnsCycle = () =>
+      !session.cancelled && !session.activeTurn && !firstUnsettledQueuedTurn();
+
     /** Claim the structured replacement for the turn currently producing a
      * local-command output. Undefined means this is not a structured
      * local-command turn (or its request failed), null means another SDK
@@ -3941,25 +3961,37 @@ export class ClaudeAcpAgent {
       parentToolUseId !== null && runsInBackground(parentToolUseId);
 
     /** Ends the open tool calls that `include` accepts, with the report of a call
-     *  that a cancel stopped and sent no result for. `include` gets the Agent/Task
-     *  call of the subagent that made the tool call, if a subagent did. */
+     *  that was stopped and sent no result: by a cancel, or (`stoppedBy`
+     *  `retracted`) by Claude Code when it took back the message that made the
+     *  call. `include` gets the Agent/Task call of the subagent that made the
+     *  tool call, if a subagent did, and the tool call. */
     const closeOpenToolCalls = async (
-      include: (parentToolUseId: string | undefined) => boolean,
+      include: (parentToolUseId: string | undefined, toolCallId: string) => boolean,
+      stoppedBy: "cancelled" | "retracted" = "cancelled",
     ): Promise<void> => {
       const renderer = new AcpToolCallRenderer(this.toolCallCapabilities);
       for (const toolCallId of [...session.emittedToolCalls]) {
         const parentToolUseId = session.toolCallParents?.get(toolCallId);
-        if (!include(parentToolUseId)) continue;
+        if (!include(parentToolUseId, toolCallId)) continue;
         const report = renderer.unfinished({
           toolCallId,
           ran: session.dispatchedToolCalls?.has(toolCallId) === true,
-          cancelled: true,
+          cancelled: stoppedBy === "cancelled",
+          retracted: stoppedBy === "retracted",
         });
         // Named as the call's other updates are: the subagent runtime routes the
         // report with them, to the child session, or to none that has ended.
         if (parentToolUseId !== undefined) stampParentToolUseId(report, parentToolUseId);
         await closeToolCall(toolCallId, report);
       }
+    };
+
+    /** Ends the open tool calls of the messages that `message` says Claude
+     *  Code took back (see `RetractedToolCalls`). No result comes for them. */
+    const closeRetractedToolCalls = async (message: SDKMessage): Promise<void> => {
+      const retracted = new Set(retractedToolCallsOf(session).retractedBy(message));
+      if (retracted.size === 0) return;
+      await closeOpenToolCalls((_parent, toolCallId) => retracted.has(toolCallId), "retracted");
     };
 
     /** Whether the closing at the end of the work a cancel stopped takes a tool
@@ -4525,13 +4557,7 @@ export class ClaudeAcpAgent {
               // open, it starts an autonomous turn: name the fire as its cause,
               // whether `session_state_changed` already opened the task or not.
               const cause = scheduledFireCause(frame);
-              if (
-                cause &&
-                asyncTasks.enabled &&
-                !session.cancelled &&
-                !session.activeTurn &&
-                !firstUnsettledQueuedTurn()
-              ) {
+              if (cause && asyncTasks.enabled && noTurnOwnsCycle()) {
                 await asyncTasks.autonomousTurnStarted(cause);
               }
               // Remember dispatch on the live turn so a cancel() that orphans
@@ -4645,9 +4671,7 @@ export class ClaudeAcpAgent {
           !asyncTasks.autonomousTurnOpen &&
           (message.type === "assistant" || message.type === "stream_event") &&
           message.parent_tool_use_id === null &&
-          !session.cancelled &&
-          !session.activeTurn &&
-          !firstUnsettledQueuedTurn()
+          noTurnOwnsCycle()
         ) {
           await asyncTasks.autonomousTurnStarted();
         }
@@ -5386,6 +5410,7 @@ export class ClaudeAcpAgent {
                 // state sync the client's model picker (and the model-dependent
                 // options rebuilt from it) keeps advertising a model the
                 // session is no longer running (see `modelRefusalFallback`).
+                await closeRetractedToolCalls(message);
                 const fallback = modelRefusalFallback(message);
                 const { summary: fallbackSummary, explanation } = fallback;
                 // A silent model swap is a session-level advisory, not something the model said.
@@ -5516,10 +5541,20 @@ export class ClaudeAcpAgent {
             const startedByClaudeCode =
               message.origin != null && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind);
             const isAutonomousResult = startedByClaudeCode && !answersPendingPrompt(message);
+            // A result with no turn to claim it also ends the cycle that
+            // Claude Code started on its own, whatever its origin says. A
+            // scheduler fire (a ScheduleWakeup or cron prompt) is one: its
+            // result has no origin, so it takes the user lane, where it owes a
+            // trailing idle. That idle is absorbed before the idle check for an
+            // autonomous cycle sees a zero debt, so only this result can end
+            // the task. The user lane is otherwise unchanged: the owed idle
+            // and the #825 detector, which needs an unsettled turn, work as
+            // before.
+            const endsOwnCycle = isAutonomousResult || noTurnOwnsCycle();
             // A placeholder result (`num_turns: 0`, see below) comes before
             // the followup that answers it, so the autonomous turn goes on.
             if (
-              isAutonomousResult &&
+              endsOwnCycle &&
               asyncTasks.autonomousTurnOpen &&
               (message.num_turns > 0 || message.is_error)
             ) {
@@ -6063,7 +6098,10 @@ export class ClaudeAcpAgent {
                     }
                     await failActiveWithSessionFailure(
                       providerFailureCategory(lastAssistantError, lastAssistantWasUsageLimit),
-                      internalErrorForClient(errorKindData(lastAssistantError), ended.error),
+                      internalErrorForClient(
+                        turnErrorData(lastAssistantError, turnRateLimit),
+                        ended.error,
+                      ),
                       lastAssistantFailureTitle ?? ended.error,
                     );
                     break;
@@ -6123,7 +6161,10 @@ export class ClaudeAcpAgent {
                   if ("error" in ended) {
                     await failActiveWithSessionFailure(
                       providerFailureCategory(lastAssistantError, lastAssistantWasUsageLimit),
-                      internalErrorForClient(errorKindData(lastAssistantError), ended.error),
+                      internalErrorForClient(
+                        turnErrorData(lastAssistantError, turnRateLimit),
+                        ended.error,
+                      ),
                       lastAssistantFailureTitle ?? ended.error,
                     );
                     break;
@@ -6136,7 +6177,10 @@ export class ClaudeAcpAgent {
                   if ("error" in ended) {
                     await failActiveWithSessionFailure(
                       LIMIT_FAILURE_CATEGORY[message.subtype],
-                      internalErrorForClient(errorKindData(lastAssistantError), ended.error),
+                      internalErrorForClient(
+                        turnErrorData(lastAssistantError, turnRateLimit),
+                        ended.error,
+                      ),
                       ended.error,
                     );
                     break;
@@ -6260,23 +6304,6 @@ export class ClaudeAcpAgent {
                     message.event.message.usage,
                     message.event.message.id || undefined,
                   );
-                  // Only upgrade from the heuristic default — once we have an
-                  // authoritative window (cache-seeded at session creation or
-                  // on a model switch, read from the resumed session on
-                  // session/load, confirmed by each `result`), trust it over
-                  // the heuristic. The flag, not the value, is the sentinel: an
-                  // authoritative window can legitimately equal
-                  // DEFAULT_CONTEXT_WINDOW (e.g. a backend serving a 200k lane
-                  // under a "[1m]"-spelled id) and must not be clobbered.
-                  if (
-                    !session.contextWindowAuthoritative &&
-                    session.contextWindowSize === DEFAULT_CONTEXT_WINDOW
-                  ) {
-                    const inferred = inferContextWindowFromModel(model);
-                    if (inferred !== null) {
-                      session.contextWindowSize = inferred;
-                    }
-                  }
                 }
               } else {
                 const usage = message.event.usage;
@@ -6396,6 +6423,8 @@ export class ClaudeAcpAgent {
           case "user":
           case "assistant": {
             if (message.type === "assistant") {
+              await closeRetractedToolCalls(message);
+              retractedToolCallsOf(session).sent(message);
               recordDispatchedToolUses(session, message.message.content);
               // A tool use that did not stream is reached here first.
               const content = message.message.content;
@@ -6904,25 +6933,8 @@ export class ClaudeAcpAgent {
             break;
           }
           case "tool_progress": {
-            // Not every beat reports under the id of a tool call the client has
-            // seen: heartbeats derive `<tool_use_id>-heartbeat-<n>`, and the
-            // `agent_api_retry` beats behind `subagentRetry` report under
-            // `agent_<assistant_message_id>`. Forwarding those verbatim leaves the
-            // client resolving an id it has never been told about (the same trap
-            // `ensureToolCallEmitted` documents for #851). The SDK stamps
-            // `parent_tool_use_id` with the executing tool's real id whenever the
-            // beat doesn't carry one of its own, so fall back to it rather than
-            // pattern-matching each synthetic id shape. Beats that do report a real
-            // id (a subagent's `bash_progress`, whose parent is the spawning Agent
-            // call) keep resolving to that id.
-            const toolCallId = session.emittedToolCalls.has(message.tool_use_id)
-              ? message.tool_use_id
-              : message.parent_tool_use_id;
-            // Ids leave `emittedToolCalls` at `tool_result`, so this also stops a
-            // beat that races past completion from reopening a finished call.
-            if (toolCallId === null || !session.emittedToolCalls.has(toolCallId)) {
-              break;
-            }
+            const toolCallId = progressToolCallId(message, session.emittedToolCalls);
+            if (toolCallId === undefined) break;
             // The beat is in the subagent whose Agent call is
             // `parent_tool_use_id`, unless it reports on that Agent call
             // itself: the Agent call's own heartbeat falls back to its id, and
@@ -6957,6 +6969,7 @@ export class ClaudeAcpAgent {
           }
           case "rate_limit_event": {
             session.idleCompaction?.noteRateLimit(message.rate_limit_info);
+            turnRateLimit = message.rate_limit_info;
             // With partial messages on, the SDK sends this before the turn's
             // first assistant frame, while there is no usage yet to send it with.
             if (lastAssistantTotalUsage === null) {
@@ -9224,7 +9237,7 @@ export class ClaudeAcpAgent {
    *
    * Call it in the same synchronous step as the handler's `return`: an
    * `await` between them would let the timer run before the response. The ACP
-   * SDK (2.6.0) gives a request handler no responder and no after-response
+   * SDK (2.7.0) gives a request handler no responder and no after-response
    * hook, so the order rests on two things that its source shows and its API
    * does not promise. `registerAppRequest` queues the response in the
    * microtask that follows the handler's return, with no macrotask in
@@ -9315,12 +9328,11 @@ export class ClaudeAcpAgent {
   }
 
   /**
-   * Refine a heuristic context window with `getContextUsage().rawMaxTokens`
-   * (`readContextWindow`), without blocking the caller. The text heuristic
-   * misses natively-1M models whose picker rows carry no "1m" token (e.g.
-   * `sonnet`, and since CLI 2.1.283 `opus`/`default`), so those would
-   * otherwise show 200k until the first result's modelUsage arrives. A later
-   * result still overwrites this.
+   * Replace the default context window with `getContextUsage().rawMaxTokens`
+   * (`readContextWindow`), without blocking the caller. Without it, a model
+   * with a 200K window (`claude-sonnet-4-5`, or any model under
+   * `CLAUDE_CODE_DISABLE_1M_CONTEXT=1`) would show the 1M default until the
+   * first result's modelUsage arrives. A later result still overwrites this.
    */
   private refreshContextWindowInBackground(sessionId: string, session: Session): void {
     if (session.contextWindowAuthoritative) return;
@@ -9358,21 +9370,18 @@ export class ClaudeAcpAgent {
       this.sessionModes.syncConfig(session, value);
     } else if (configId === MODEL_CONFIG_ID) {
       // `ModelInfo.supportsAutoMode` is the canonical SDK signal for applying
-      // the Auto fallback below; its `displayName`/`description` also let us infer the
-      // context window for semantic aliases (e.g. `default`) whose ID alone
-      // carries no "1m" token.
+      // the Auto fallback below.
       const newModelInfo = session.modelInfos.find((m) => m.value === value);
       const modelChanged = session.models.currentModelId !== value;
       if (modelChanged) {
         session.idleCompaction?.disarm("model change");
         // Seed the new model's context window WITHOUT awaited IPC on the
         // switch path: cached authoritative value if we've already learned it
-        // (from a prior turn's `result.modelUsage`), else the text heuristic,
-        // else the default. SDK control requests are serialized over one
-        // channel, so an awaited `getContextUsage` here would delay the rest
-        // of the switch (issues #886/#880); a guessed seed is instead refined
-        // in the background once the switch is done
-        // (`refreshContextWindowInBackground`).
+        // (from a prior turn's `result.modelUsage`), else the default. SDK
+        // control requests are serialized over one channel, so an awaited
+        // `getContextUsage` here would delay the rest of the switch (issues
+        // #886/#880); the default is instead replaced in the background once
+        // the switch is done (`refreshContextWindowInBackground`).
         const seeded = immediateContextWindow(session.providerCacheKey, value, newModelInfo);
         session.contextWindowSize = seeded.size;
         session.contextWindowAuthoritative = seeded.authoritative;
@@ -10261,7 +10270,7 @@ export class ClaudeAcpAgent {
         creationOpts.resume !== undefined ? resumedModel : undefined,
       );
       const settingsAllowedModels = Array.isArray(settingsAvailableModels)
-        ? applyAvailableModelsAllowlist(
+        ? await applyAvailableModelsAllowlist(
             sdkModels,
             settingsAvailableModels,
             settingsModelOverrides,
@@ -10391,21 +10400,16 @@ export class ClaudeAcpAgent {
       }
       // Seed the context window without awaited IPC. The cached authoritative
       // window from a prior turn wins (`result.modelUsage`, cross-session),
-      // then the text heuristic, then the default. A guessed seed is refined
-      // by a background getContextUsage once the session is registered
-      // (`refreshContextWindowInBackground`); the authoritative window then
-      // arrives on the first `result.modelUsage` and is cached from there.
+      // then the default. The default is replaced by a background
+      // getContextUsage once the session is registered
+      // (`refreshContextWindowInBackground`, issue #596); the authoritative
+      // window then arrives on the first `result.modelUsage` and is cached
+      // from there.
       //
-      // Text inference alone misses aliases that resolve to extended-context
-      // models with no "1m" token anywhere in their id or description (e.g.
-      // `sonnet` → claude-sonnet-5, and `opus`/`default` since CLI 2.1.283,
-      // all natively ~1M) — the background refresh covers those (issue #596).
-      //
-      // The inference fallback is deliberately keyed to the allowlisted entry: a
-      // fallback-resolved sibling's resolvedModel/displayName/description can
-      // describe a different context lane than the verbatim live id (e.g. an
-      // "opus[1m]" row matched for a bare 200k id), so on the fallback path only
-      // the id itself is a trustworthy window signal.
+      // The cache lookup is deliberately keyed to the allowlisted entry: a
+      // fallback-resolved sibling's resolvedModel can name a different context
+      // lane than the verbatim live id (e.g. an "opus[1m]" row matched for a
+      // bare 200k id), so on the fallback path the lookup uses the id itself.
       const seededWindow = immediateContextWindow(
         providerCacheKey,
         models.currentModelId,
@@ -10986,6 +10990,13 @@ function toolCallFieldsOf(session: {
   toolCallFields?: ToolCallFieldTracker;
 }): ToolCallFieldTracker {
   return (session.toolCallFields ??= new ToolCallFieldTracker());
+}
+
+/** The record of a session's assistant tool uses, created on first use. */
+function retractedToolCallsOf(session: {
+  retractedToolCalls?: RetractedToolCalls;
+}): RetractedToolCalls {
+  return (session.retractedToolCalls ??= new RetractedToolCalls());
 }
 
 const MAX_RESOLVED_TOOL_NAMES = 1000;

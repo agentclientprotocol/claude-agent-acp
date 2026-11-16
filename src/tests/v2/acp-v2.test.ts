@@ -1493,20 +1493,7 @@ describe("ACP v2 sessions", () => {
     it("reports a refusal fallback with a notice and follows the model it swapped to", async () => {
       sdk.initializationResult = async () => ({ models: [OPUS, HAIKU] });
       scriptTurns(async function* (options) {
-        yield {
-          type: "system",
-          subtype: "model_refusal_fallback",
-          trigger: "refusal",
-          direction: "retry",
-          scope: "session",
-          original_model: "claude-opus-4-8",
-          fallback_model: "claude-haiku-4-5",
-          request_id: "req_1",
-          api_refusal_category: "cyber",
-          content: "banner",
-          uuid: randomUUID(),
-          session_id: options.sessionId,
-        };
+        yield refusalFallback(options);
         yield assistantText(options, "Done.");
         yield result(options);
         yield idleState(options);
@@ -1758,6 +1745,28 @@ function idleState(options: Options) {
     type: "system",
     subtype: "session_state_changed",
     state: "idle",
+    uuid: randomUUID(),
+    session_id: options.sessionId,
+  };
+}
+
+/**
+ * Claude Code's notice that it retried a refused response on the fallback
+ * model. `retracted` names the messages of that response, which it took back.
+ */
+function refusalFallback(options: Options, retracted?: string[]) {
+  return {
+    type: "system",
+    subtype: "model_refusal_fallback",
+    trigger: "refusal",
+    direction: "retry",
+    scope: "session",
+    original_model: "claude-opus-4-8",
+    fallback_model: "claude-haiku-4-5",
+    request_id: "req_1",
+    api_refusal_category: "cyber",
+    ...(retracted && { retracted_message_uuids: retracted }),
+    content: "banner",
     uuid: randomUUID(),
     session_id: options.sessionId,
   };
@@ -2351,8 +2360,9 @@ describe("ACP v2 prompts", () => {
       sessionId === "abc123" || sessionId === "response" ? [update] : [],
     );
     // The child's past `running` does not replay; its last state goes once,
-    // after the replay. That state is history to the client, so the child's
-    // current state follows the response: its process is gone, so it is idle.
+    // after the child's own `replay_complete`. That state is history to the
+    // client, so the child's current state follows the response: its process
+    // is gone, so it is idle.
     // The child's model, from its transcript, goes right after its
     // announcement. It does not go again after the response: it is unchanged.
     const model = expect.objectContaining({
@@ -2371,6 +2381,7 @@ describe("ACP v2 prompts", () => {
         messageId: "msg_child",
         content: text("Child report.")[0],
       }),
+      { sessionUpdate: "replay_complete" },
       { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn", background: [] },
       { sessionUpdate: "response" },
       { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn", background: [] },
@@ -2511,7 +2522,7 @@ describe("ACP v2 prompts", () => {
     ]);
   });
 
-  it("ends a resume with replay with one end event for a client with loadReplayEnd", async () => {
+  it("ends a resume with replay with one end event after replay_complete for a client with loadReplayEnd", async () => {
     const client = v2Client();
     const isEnd = (notification: v2.UpdateSessionNotification) =>
       (notification.update._meta as any)?.jetbrains?.air?.loadReplayEnd === true;
@@ -2543,13 +2554,15 @@ describe("ACP v2 prompts", () => {
       await client.authUpdate(1);
     });
 
-    // The end event closes the replay. v2 then requires the state snapshot
-    // after the replay and before the response.
+    // `replay_complete` closes the replay, and AIR's end event follows it:
+    // it is not history. v2 then requires the state snapshot after the replay
+    // and before the response.
     expect(atResponse.map(({ update }) => update.sessionUpdate)).toEqual([
       "user_message",
       "user_message_chunk",
       "agent_message",
       "agent_message_chunk",
+      "replay_complete",
       "session_info_update",
       "state_update",
     ]);
@@ -2750,6 +2763,7 @@ describe("ACP v2 prompts", () => {
           summary: text("1. Primary Request and Intent:\n   Count upward."),
         },
         { sessionUpdate: "agent_message", messageId: "msg_after", content: [] },
+        { sessionUpdate: "replay_complete" },
         { sessionUpdate: "state_update", state: "idle", background: [] },
       ]);
       await client.authUpdate(1);
@@ -2803,6 +2817,7 @@ describe("ACP v2 prompts", () => {
           messageId: "msg_answer",
           content: text("Hello!")[0],
         },
+        { sessionUpdate: "replay_complete" },
         // The current foreground state, after the replay and before the response.
         { sessionUpdate: "state_update", state: "idle", background: [] },
       ]);
@@ -2867,7 +2882,13 @@ describe("ACP v2 prompts", () => {
         replayFrom: { type: "start" },
       });
       expect(client.sessionUpdates.slice(before).map(({ update }) => update.sessionUpdate)).toEqual(
-        ["agent_message", "agent_message_chunk", "session_info_update", "state_update"],
+        [
+          "agent_message",
+          "agent_message_chunk",
+          "replay_complete",
+          "session_info_update",
+          "state_update",
+        ],
       );
       await client.authUpdate(1);
     });
@@ -3831,6 +3852,57 @@ describe("ACP v2 prompts", () => {
     expect(turnTrace(client.sessionUpdates).at(-1)).toBe("idle end_turn");
   });
 
+  /**
+   * Scenario:
+   * 1. Claude's response calls Read, and the model then refuses.
+   * 2. Claude Code takes the response back, stops the call without a result,
+   *    and retries on the fallback model. Its notice, or the first message of
+   *    the retry, names the message that it took back.
+   * Expected:
+   * - The call ends `cancelled` when it is named, before the retry's answer.
+   *   Nothing else ends a call that ran: it would stay open past the idle.
+   */
+  it.each<[string, { notice: boolean; retry: boolean }]>([
+    ["the fallback notice", { notice: true, retry: false }],
+    ["the first message of the retry", { notice: false, retry: true }],
+  ])(
+    "ends the tool call of a response that Claude Code took back, named by %s",
+    async (_name, names) => {
+      scriptTurns(async function* (options) {
+        const refused = toolUseMessage(options, "toolu_refused", "Read", { file_path: "/a.log" });
+        yield refused;
+        yield refusalFallback(options, names.notice ? [refused.uuid] : undefined);
+        yield {
+          ...assistantText(options, "The logs are clean."),
+          ...(names.retry && { supersedes: [refused.uuid] }),
+        };
+        yield result(options);
+      });
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+        await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+        await client.authUpdate(1);
+      });
+
+      const updates = client.sessionUpdates.map(({ update }) => update);
+      const closed = updates.findIndex(
+        (update) =>
+          update.sessionUpdate === "tool_call_update" &&
+          update.toolCallId === "toolu_refused" &&
+          update.status === "cancelled",
+      );
+      expect(JSON.stringify(updates[closed])).toContain(
+        "Claude Code replaced the response that made this tool call",
+      );
+      expect(closed).toBeLessThan(
+        updates.findIndex((update) => update.sessionUpdate === "agent_message_chunk"),
+      );
+    },
+  );
+
   it("reports a turn that fails after it was taken in as idle with the error stop reason", async () => {
     scriptTurns(async function* (options) {
       yield result(options, { is_error: true, result: "API Error: 529 Overloaded" });
@@ -4032,8 +4104,9 @@ describe("ACP v2 prompts", () => {
     }
 
     it("reports the window that Claude Code reads for the model", async () => {
-      sdk.contextUsage = async () => ({ totalTokens: 0, rawMaxTokens: 1_000_000 });
-      expect(await firstTurnSizes()).toEqual([1_000_000]);
+      // Neither the default (1M) nor what the base double reports (200K).
+      sdk.contextUsage = async () => ({ totalTokens: 0, rawMaxTokens: 967_000 });
+      expect(await firstTurnSizes()).toEqual([967_000]);
     });
 
     it("reports a window that another session's result reported for the model", async () => {
@@ -4429,6 +4502,37 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
       usage: { inputTokens: 7, outputTokens: 4, totalTokens: 11 },
       _meta: { quota: { token_count: { inputTokens: 7, outputTokens: 4, totalTokens: 11 } } },
     });
+  });
+
+  // The result of a cycle that a scheduler fire started has no `origin`. v2
+  // ends every cycle at its result, so unlike v1 it has no task left open.
+  it("ends a cycle that a scheduler fire started at its result, which has no origin", async () => {
+    scriptTurns(async function* (options) {
+      yield assistantText(options, "Started the build in the background.");
+      yield result(options);
+      // The overdue ScheduleWakeup fires before the prompt's idle.
+      yield {
+        type: "command_lifecycle",
+        command_uuid: "scheduler-fire",
+        state: "started",
+        wakeup_source: "loop_wakeup",
+        scheduled_for: 1_790_000_000_000,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield assistantText(options, "That wakeup was stale.", "msg_wakeup");
+      yield result(options);
+      // One idle covers both results.
+      yield idleState(options);
+    });
+    const client = await promptAndWait(2);
+
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      ...endedTurn,
+      "running",
+      "agent_message_chunk",
+      "idle end_turn",
+    ]);
   });
 
   it("closes a tool call that Claude dropped before it ran in a cycle as cancelled, before the cycle's idle", async () => {
@@ -8336,11 +8440,11 @@ describe("ACP v2 terminal of a command in the background", () => {
         });
       try {
         const client = await promptUntil("idle end_turn [toolu_bg]", async (_, __, client) => {
-          await vi.waitFor(() => expect(output(client)).toContain("output compiling\n"), {
+          await vi.waitFor(() => expect(output(client)).toContain("output compiling\r\n"), {
             timeout: 2000,
           });
           await appendFile(outputFile, "tests passed\n");
-          await vi.waitFor(() => expect(output(client)).toContain("chunk tests passed\n"), {
+          await vi.waitFor(() => expect(output(client)).toContain("chunk tests passed\r\n"), {
             timeout: 2000,
           });
           // The command writes its last line as it ends.
@@ -8351,9 +8455,9 @@ describe("ACP v2 terminal of a command in the background", () => {
 
         // The file's first text replaces the Bash result's placeholder.
         expect(output(client).slice(-4)).toEqual([
-          "output compiling\n",
-          "chunk tests passed\n",
-          "chunk done\n",
+          "output compiling\r\n",
+          "chunk tests passed\r\n",
+          "chunk done\r\n",
           "exit",
         ]);
       } finally {
@@ -9378,6 +9482,32 @@ describe("ACP v2 session translation", () => {
       _meta: { claudeCode: { toolResponse: { stdout: "build" } } },
     };
     expect(terminals.split("s", hook)).toEqual({ terminal: [], report: hook });
+  });
+
+  it("sends piped output with each line feed as CR LF, as a PTY would", () => {
+    const terminals = new V2Terminals();
+    const decoded = (data: unknown) => Buffer.from(String(data), "base64").toString();
+    terminals.split("s", {
+      sessionUpdate: "tool_call",
+      toolCallId: "toolu_bash",
+      title: "Terminal",
+      _meta: { terminal_info: { terminal_id: "term" } },
+    });
+    const [chunk] = terminals.split("s", {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_bash",
+      _meta: { terminal_output_delta: { terminal_id: "term", data: "a\nb\n" } },
+    }).terminal;
+    expect(chunk).toMatchObject({ sessionUpdate: "terminal_output_chunk" });
+    expect(decoded((chunk as { data: string }).data)).toBe("a\r\nb\r\n");
+    // The line discipline adds a CR before every LF, also one that a CR precedes.
+    const [snapshot] = terminals.split("s", {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_bash",
+      _meta: { terminal_output: { terminal_id: "term", data: "a\nb\r\n" } },
+    }).terminal;
+    expect(snapshot).toMatchObject({ sessionUpdate: "terminal_update" });
+    expect(decoded((snapshot as { output: { data: string } }).output.data)).toBe("a\r\nb\r\r\n");
   });
 
   it("leaves an exit code that the agent does not know out of the terminal's exit", () => {

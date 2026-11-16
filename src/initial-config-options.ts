@@ -8,7 +8,8 @@ import type { Logger } from "./logger.js";
 
 /**
  * What a core advertises as `options` in its session capabilities:
- * `session/options`, and `configOptions` on its setup requests.
+ * `session/options`, and `configOptions` on its setup requests, `session/fork`
+ * included.
  */
 export const SESSION_OPTIONS_CAPABILITY = {};
 

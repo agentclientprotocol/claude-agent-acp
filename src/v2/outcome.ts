@@ -12,11 +12,12 @@ import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type {
   SDKAssistantMessage,
   SDKAssistantMessageError,
+  SDKRateLimitInfo,
   SDKResultMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { AUTONOMOUS_RESULT_ORIGINS } from "../result-end.js";
 import { isSyntheticLoginMessage } from "../message-filters.js";
-import { resultEnd } from "../result-end.js";
+import { resultEnd, turnErrorData } from "../result-end.js";
 import { assistantMessageText, providerFailureCategory } from "../session-failure-extension.js";
 import {
   getMatchingModelUsage,
@@ -96,7 +97,7 @@ export function idleOutcome(
         // authenticate: this login reached its time limit and cannot be
         // renewed."
         RequestError.authRequired(undefined, ended.loginRequired ? undefined : ended.error)
-      : RequestError.internalError(kind ? { errorKind: kind } : undefined, ended.error),
+      : RequestError.internalError(turnErrorData(kind, report?.rateLimit), ended.error),
   );
 }
 
@@ -118,6 +119,8 @@ function failed(error: RequestError): IdleOutcome {
  */
 export class TurnReport {
   errorKind: SDKAssistantMessageError | undefined;
+  /** The turn's latest `rate_limit_event` info (see `turnErrorData`). */
+  rateLimit: SDKRateLimitInfo | undefined;
   /** Claude Code showed its sign-in message ("Not logged in · Please run /login"). */
   loginRequired = false;
   /** The explanation of the turn's refusal. */
@@ -181,6 +184,7 @@ export class TurnReport {
 
   reset(): void {
     this.errorKind = undefined;
+    this.rateLimit = undefined;
     this.loginRequired = false;
     this.refusalExplanation = undefined;
     this.apiError = undefined;

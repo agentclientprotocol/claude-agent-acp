@@ -550,7 +550,55 @@ function stringFields(text: string, key: string): string[] {
   return values;
 }
 
-const lastField = (text: string, key: string) => stringFields(text, key).at(-1) || undefined;
+/** The string `field` of the JSON record `line`, which is of `type` when one
+ *  is given. `null` when the line is no JSON. */
+function recordField(line: string, field: string, type?: string): string | null | undefined {
+  let record: unknown;
+  try {
+    record = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (typeof record !== "object" || record === null) return undefined;
+  if (type !== undefined && (record as Entry).type !== type) return undefined;
+  const value = (record as Entry)[field];
+  return typeof value === "string" ? value : undefined;
+}
+
+/**
+ * The top-level string `field` of the last record of `text` that has one,
+ * as the SDK reads a session's metadata since 0.3.323: it parses each line
+ * that names the field, from the last one back. A `"customTitle":"…"` inside
+ * a message, such as a tool result that shows a transcript, is no title.
+ *
+ * With `type`, only a record of that `type` counts, and a line that names
+ * the type but is no JSON is read from its last `{"type":"<type>"` that does
+ * not follow `:`, `,` or `[`: a record appended to a line whose write was cut
+ * off. The record that the start of the tail window cuts has no such start
+ * in the window, and is not read.
+ *
+ * Undefined when the field of that record is empty: older records are not
+ * searched.
+ */
+function lastRecordField(text: string, field: string, type?: string): string | undefined {
+  const fieldMarker = `"${field}":`;
+  const typeMarkers = type === undefined ? undefined : [`"type":"${type}"`, `"type": "${type}"`];
+  const lines = text.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    if (!line.includes(fieldMarker)) continue;
+    if (typeMarkers && !typeMarkers.some((marker) => line.includes(marker))) continue;
+    let value = recordField(line, field, type);
+    if (value === null && typeMarkers) {
+      const start = line.lastIndexOf(`{${typeMarkers[0]}`);
+      if (start > 0 && !":,[".includes(line[start - 1]!)) {
+        value = recordField(line.slice(start), field, type);
+      }
+    }
+    if (typeof value === "string") return value || undefined;
+  }
+  return undefined;
+}
 
 /** Whether the first record of the transcript is a sidechain one, which the
  *  SDK never lists. */
@@ -560,9 +608,10 @@ export function isSidechainTranscript(head: string): boolean {
   return first.includes('"isSidechain":true') || first.includes('"isSidechain": true');
 }
 
-/** The last `customTitle` of the tail, as the SDK reads it. */
+/** The title of the last `custom-title` record of the tail, as the SDK reads
+ *  it (see {@link lastRecordField}). */
 export function tailCustomTitle({ tail, sdkTail }: HeadTail): string | undefined {
-  return lastField(sdkTail ?? tail, "customTitle");
+  return lastRecordField(sdkTail ?? tail, "customTitle", "custom-title");
 }
 
 /** The last non-blank top-level `agentName` of the records of `text`, the
@@ -607,22 +656,23 @@ export function sdkTitles(
 ): SdkTitles {
   const tail = sdkTail ?? wholeLines;
   const customTitle =
-    lastField(tail, "customTitle") ??
+    lastRecordField(tail, "customTitle", "custom-title") ??
     sidecarTitle ??
-    lastField(head, "customTitle") ??
-    lastField(tail, "aiTitle") ??
-    lastField(head, "aiTitle");
+    lastRecordField(head, "customTitle", "custom-title") ??
+    lastRecordField(tail, "aiTitle", "ai-title") ??
+    lastRecordField(head, "aiTitle", "ai-title");
   return { customTitle, summary: customTitle ?? generatedTitle({ head, tail }) };
 }
 
 /** The title of a transcript without a custom title, in the SDK's order: AI
- *  title, last prompt, summary, first prompt. */
+ *  title, last prompt, summary, first prompt. The last prompt and the summary
+ *  are the field of a record of any type. */
 export function generatedTitle({ head, tail }: HeadTail): string | undefined {
   return (
-    lastField(tail, "aiTitle") ??
-    lastField(head, "aiTitle") ??
-    lastField(tail, "lastPrompt") ??
-    lastField(tail, "summary") ??
+    lastRecordField(tail, "aiTitle", "ai-title") ??
+    lastRecordField(head, "aiTitle", "ai-title") ??
+    lastRecordField(tail, "lastPrompt") ??
+    lastRecordField(tail, "summary") ??
     (firstPrompt(head) || mediaPrompt(head) || undefined)
   );
 }
