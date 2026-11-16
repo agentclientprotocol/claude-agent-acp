@@ -63,11 +63,14 @@ import {
   type EffortState,
 } from "../session-effort.js";
 import {
+  applyFastModeFlag,
   createFastModeConfigOption,
   FAST_MODE_CONFIG_ID,
+  fastModeResultIsNews,
   fastModeStateChange,
   fastModeStateEnabled,
   normalizeFastModeDisabledReason,
+  type FastModeReport,
 } from "../session-fast-mode.js";
 import {
   MODEL_CONFIG_ID,
@@ -131,6 +134,8 @@ export class SessionConfig {
   private effort: EffortState;
   private fastModeEnabled: boolean;
   private fastModeDisabledReason: FastModeDisabledReason | undefined;
+  /** The Fast mode report of the last `system`/init, until a result of a prompt takes it. */
+  private fastModeInitReport: FastModeReport | undefined;
   private ultracodeEnabled: boolean;
   private readonly ultracodeWorkflowsEnabled: boolean | undefined;
   /** The end of the last change (see the module doc). */
@@ -546,22 +551,28 @@ export class SessionConfig {
   }
 
   /**
-   * Claude Code reported a Fast mode state (`system`/init, a result). Returns
-   * whether the option changed. Without a Fast mode option the model does not
-   * support it, and the state says nothing of the user's intent, which stays
-   * for a model that does (see `fastModeStateChange`).
+   * Claude Code reported a Fast mode state, on a `system`/init or on a result
+   * (`from`). Returns whether the option changed. A result that repeats the
+   * init of its turn changes nothing (see `fastModeResultIsNews`). Without a
+   * Fast mode option the model does not support it, and the state says nothing
+   * of the user's intent, which stays for a model that does (see
+   * `fastModeStateChange`).
    */
-  fastModeReported(
-    state: FastModeState | undefined,
-    reason: FastModeDisabledReason | undefined,
-  ): boolean {
+  fastModeReported(report: FastModeReport, from: "init" | "result"): boolean {
+    if (from === "init") {
+      this.fastModeInitReport = report;
+    } else {
+      const init = this.fastModeInitReport;
+      this.fastModeInitReport = undefined;
+      if (!fastModeResultIsNews(init, report)) return false;
+    }
     if (!this.session.configOptions.some((option) => option.id === FAST_MODE_CONFIG_ID)) {
       return false;
     }
     const change = fastModeStateChange(
       { enabled: this.fastModeEnabled, disabledReason: this.fastModeDisabledReason },
-      state,
-      reason,
+      report.state,
+      report.reason,
     );
     if (!change) return false;
     this.fastModeEnabled = change.enabled;
@@ -600,9 +611,12 @@ export class SessionConfig {
     this.setCurrentValue(AGENT_CONFIG_ID, value);
   }
 
-  /** Applied first, so a rejected control request leaves the option as it was. */
+  /**
+   * Applied first, so a rejected control request leaves the option as it was
+   * (see `applyFastModeFlag` for a refusal after its reset).
+   */
   private async setFastMode(enabled: boolean): Promise<void> {
-    await this.session.query.applyFlagSettings({ fastMode: enabled });
+    await applyFastModeFlag((settings) => this.session.query.applyFlagSettings(settings), enabled);
     this.fastModeEnabled = enabled;
     this.refreshFastModeOption();
   }

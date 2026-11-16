@@ -77,6 +77,11 @@ const API_KEY_SOURCES_ABOVE_SUBSCRIPTION: ReadonlySet<string> = new Set([
   "/login managed key",
 ]);
 
+/** `none` is the SDK's explicit no-token source. */
+function hasTokenSource(account: AccountInfo): boolean {
+  return Boolean(account.tokenSource && account.tokenSource !== "none");
+}
+
 /**
  * True when a turn on this account is paid by a claude.ai subscription.
  *
@@ -85,8 +90,8 @@ const API_KEY_SOURCES_ABOVE_SUBSCRIPTION: ReadonlySet<string> = new Set([
  * proves it, and an unknown value keeps the guard on.
  *
  * - `subscriptionType` must be set. Without it the CLI reports no subscription.
- * - `tokenSource` must be absent. The CLI sets it in place of the subscription
- *   when a bearer or OAuth environment token pays for the turn.
+ * - `tokenSource` must be absent, empty, or `none`. A bearer or OAuth
+ *   environment token takes precedence over the subscription.
  * - `apiProvider` must be absent or `firstParty`. The SDK documents that the
  *   Anthropic OAuth login applies only to `firstParty`; for a third-party
  *   backend such as `bedrock`, `vertex`, `foundry` or `gateway` the other
@@ -99,7 +104,7 @@ export function billsClaudeSubscription(account: AccountInfo | undefined): boole
   if (!account?.subscriptionType) {
     return false;
   }
-  if (account.tokenSource) {
+  if (hasTokenSource(account)) {
     return false;
   }
   if (account.apiProvider !== undefined && account.apiProvider !== "firstParty") {
@@ -125,7 +130,7 @@ export function holdsNonSubscriptionCredential(account: AccountInfo | undefined)
   if (account.apiProvider !== undefined && account.apiProvider !== "firstParty") {
     return true;
   }
-  if (account.tokenSource) {
+  if (hasTokenSource(account)) {
     return true;
   }
   return API_KEY_SOURCES_ABOVE_SUBSCRIPTION.has(account.apiKeySource ?? "");

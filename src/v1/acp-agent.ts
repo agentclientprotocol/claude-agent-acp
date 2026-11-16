@@ -409,12 +409,15 @@ import {
   discoverCustomAgents,
 } from "../session-config-options.js";
 import {
+  applyFastModeFlag,
   createFastModeConfigOption,
   FAST_MODE_CONFIG_ID,
+  fastModeResultIsNews,
   fastModeStateChange,
   fastModeStateEnabled,
   normalizeFastModeDisabledReason,
   type FastModeOptionState,
+  type FastModeReport,
 } from "../session-fast-mode.js";
 import {
   cacheResultContextWindow,
@@ -1071,11 +1074,15 @@ export type Session = {
   /** Why the SDK currently can't serve Fast mode: the last
    *  `fast_mode_disabled_reason` that `explainFastModeDisabledReason` explains.
    *  {@link normalizeFastModeDisabledReason} drops the two it doesn't,
-   *  `sdk_opt_in_required` and `pending`, to `undefined`. Refreshed from every
-   *  `fast_mode_disabled_reason` the SDK reports on `system`/init and user-turn
-   *  `result`s; surfaced in the Fast mode option's description so a toggle that
-   *  snaps back off explains itself. */
+   *  `sdk_opt_in_required` and `pending`, to `undefined`. Refreshed from the
+   *  `fast_mode_disabled_reason` the SDK reports on every `system`/init, and on
+   *  a user-turn `result` that does not repeat its init; surfaced in the Fast
+   *  mode option's description so a toggle that snaps back off explains itself. */
   fastModeDisabledReason?: FastModeDisabledReason;
+  /** The Fast mode report of the last `system`/init, until a result of a
+   *  prompt takes it: a result that repeats it is not mirrored (see
+   *  {@link fastModeResultIsNews}). */
+  fastModeInitReport?: FastModeReport;
   abortController: AbortController;
   /** Signal the consumer races `query.next()` against. Aborted by cancel()
    *  (after a grace period) to force the active turn to settle "cancelled" when
@@ -2480,8 +2487,10 @@ export class ClaudeAcpAgent {
       }
       // Once Remote Control is on, other clients can start turns or send
       // messages on their own. Something has to read the query stream for
-      // those to reach this client, and a command that answers without a turn
-      // would otherwise leave the stream unread until the next prompt.
+      // those to reach this client. The reader starts after the session's
+      // setup response and after a query restart; a command that comes before
+      // the setup's timer ran (see `afterSetupResponse`) answers without a
+      // turn and would leave the stream unread until that timer.
       this.ensureConsumer(session, params.sessionId);
       // Answered by the adapter without a model turn.
       events.inserted(randomUUID());
@@ -3076,7 +3085,9 @@ export class ClaudeAcpAgent {
   }
 
   /** Lazily start the per-session consumer that drains the SDK query stream for
-   *  the session's whole life. Idempotent: only the first `prompt()` starts it. */
+   *  the session's whole life. Idempotent: the first caller starts it, a
+   *  session setup (see `afterSetupResponse`), a query restart (see
+   *  `replaceSessionQuery`) or a `prompt()`. */
   private ensureConsumer(session: Session, sessionId: string): void {
     if (session.consumer) {
       return;
@@ -3776,6 +3787,13 @@ export class ClaudeAcpAgent {
      *  spelling of "a prompt is pending" shared by the head promotion and
      *  the autonomous stretch-close guard. */
     const firstUnsettledQueuedTurn = () => (session.turnQueue ?? []).find((t) => !t.settled);
+
+    /** Whether no turn can own what the stream carries now: nothing is
+     *  cancelled, active or queued. Output then belongs to a cycle that Claude
+     *  Code started on its own, such as a scheduler fire, and so does its
+     *  result, whatever its origin says. */
+    const noTurnOwnsCycle = () =>
+      !session.cancelled && !session.activeTurn && !firstUnsettledQueuedTurn();
 
     /** Claim the structured replacement for the turn currently producing a
      * local-command output. Undefined means this is not a structured
@@ -4555,13 +4573,7 @@ export class ClaudeAcpAgent {
               // open, it starts an autonomous turn: name the fire as its cause,
               // whether `session_state_changed` already opened the task or not.
               const cause = scheduledFireCause(frame);
-              if (
-                cause &&
-                asyncTasks.enabled &&
-                !session.cancelled &&
-                !session.activeTurn &&
-                !firstUnsettledQueuedTurn()
-              ) {
+              if (cause && asyncTasks.enabled && noTurnOwnsCycle()) {
                 await asyncTasks.autonomousTurnStarted(cause);
               }
               // Remember dispatch on the live turn so a cancel() that orphans
@@ -4675,9 +4687,7 @@ export class ClaudeAcpAgent {
           !asyncTasks.autonomousTurnOpen &&
           (message.type === "assistant" || message.type === "stream_event") &&
           message.parent_tool_use_id === null &&
-          !session.cancelled &&
-          !session.activeTurn &&
-          !firstUnsettledQueuedTurn()
+          noTurnOwnsCycle()
         ) {
           await asyncTasks.autonomousTurnStarted();
         }
@@ -4702,6 +4712,10 @@ export class ClaudeAcpAgent {
                 // A fresh `system`/init (e.g. after reinitialize) can carry an
                 // updated Fast mode state; reconcile it with what we seeded at
                 // session creation.
+                session.fastModeInitReport = {
+                  state: message.fast_mode_state,
+                  reason: message.fast_mode_disabled_reason,
+                };
                 await this.syncFastModeState(
                   params.sessionId,
                   session,
@@ -5547,10 +5561,20 @@ export class ClaudeAcpAgent {
             const startedByClaudeCode =
               message.origin != null && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind);
             const isAutonomousResult = startedByClaudeCode && !answersPendingPrompt(message);
+            // A result with no turn to claim it also ends the cycle that
+            // Claude Code started on its own, whatever its origin says. A
+            // scheduler fire (a ScheduleWakeup or cron prompt) is one: its
+            // result has no origin, so it takes the user lane, where it owes a
+            // trailing idle. That idle is absorbed before the idle check for an
+            // autonomous cycle sees a zero debt, so only this result can end
+            // the task. The user lane is otherwise unchanged: the owed idle
+            // and the #825 detector, which needs an unsettled turn, work as
+            // before.
+            const endsOwnCycle = isAutonomousResult || noTurnOwnsCycle();
             // A placeholder result (`num_turns: 0`, see below) comes before
             // the followup that answers it, so the autonomous turn goes on.
             if (
-              isAutonomousResult &&
+              endsOwnCycle &&
               asyncTasks.autonomousTurnOpen &&
               (message.num_turns > 0 || message.is_error)
             ) {
@@ -5559,17 +5583,27 @@ export class ClaudeAcpAgent {
             const pendingExitPlanModeInterruption = session.pendingExitPlanModeInterruption;
             const pendingExitPlanContextReset = session.pendingExitPlanContextReset;
             try {
-              // Reconcile the Fast mode toggle with the SDK's reported state.
+              // Reconcile the Fast mode toggle with the SDK's reported state,
+              // unless the result repeats its turn's init (see
+              // `fastModeResultIsNews`).
               // Gated to user-driven turns like every other side effect below;
               // an autonomous cycle's state lands on the next user turn's
               // result. Runs even when the turn errors or was cancelled.
               if (!isAutonomousResult) {
-                await this.syncFastModeState(
-                  params.sessionId,
-                  session,
-                  message.fast_mode_state,
-                  message.fast_mode_disabled_reason,
-                );
+                const fastModeInitReport = session.fastModeInitReport;
+                session.fastModeInitReport = undefined;
+                const fastModeReport = {
+                  state: message.fast_mode_state,
+                  reason: message.fast_mode_disabled_reason,
+                };
+                if (fastModeResultIsNews(fastModeInitReport, fastModeReport)) {
+                  await this.syncFastModeState(
+                    params.sessionId,
+                    session,
+                    message.fast_mode_state,
+                    message.fast_mode_disabled_reason,
+                  );
+                }
               }
 
               // A user-turn result needs an active turn so its stop reason is
@@ -9235,9 +9269,9 @@ export class ClaudeAcpAgent {
   }
 
   /**
-   * The work that follows a session setup response: the session's commands,
-   * the current states of the subagents a load replayed, and MCP server
-   * authentication.
+   * The work that follows a session setup response: reading the session's
+   * query, the session's commands, the current states of the subagents a load
+   * replayed, and MCP server authentication.
    *
    * Call it in the same synchronous step as the handler's `return`: an
    * `await` between them would let the timer run before the response. The ACP
@@ -9252,6 +9286,14 @@ export class ClaudeAcpAgent {
    */
   private afterSetupResponse(sessionId: string, mcpServers: McpServer[]): void {
     setTimeout(() => {
+      // Claude Code can run cycles of its own before the first prompt, for
+      // example a cron prompt or a finished background task of a session that a
+      // bridge restart resumed. Output that nothing reads waits in the stream,
+      // and the first prompt would take the first result in it as its answer.
+      // After the load's replay, so live output does not interleave with the
+      // replayed history.
+      const session = this.sessions[sessionId];
+      if (session && !session.queryClosed) this.ensureConsumer(session, sessionId);
       this.sendAvailableCommandsUpdate(sessionId);
       void this.publishCurrentSubagentStates(sessionId);
       startMcpAuthentication(this, sessionId, mcpServers);
@@ -9573,8 +9615,9 @@ export class ClaudeAcpAgent {
    *  option is guaranteed to be present in `configOptions`. */
   private async applyFastMode(session: Session, enabled: boolean): Promise<void> {
     // Apply the SDK flag first so a rejected control request leaves both the
-    // session state and the config option untouched (no UI/SDK desync).
-    await session.query.applyFlagSettings({ fastMode: enabled });
+    // session state and the config option untouched (see `applyFastModeFlag`
+    // for a refusal after its reset).
+    await applyFastModeFlag((settings) => session.query.applyFlagSettings(settings), enabled);
     session.fastModeEnabled = enabled;
     this.refreshFastModeOption(session, enabled);
   }
@@ -10610,7 +10653,7 @@ export class ClaudeAcpAgent {
     }
   }
 
-  /** Recreates the session's query and restores its choices and reported MCP servers, unless it was closed meanwhile. */
+  /** Recreates the session's query, restores its choices and reported MCP servers, and starts reading it, unless it was closed meanwhile. */
   private async replaceSessionQuery(
     sessionId: string,
     session: Session,
@@ -10643,6 +10686,12 @@ export class ClaudeAcpAgent {
           error,
         );
       });
+    // The reader of the old query ended with that query. Claude Code can run
+    // cycles of its own on the new one before the next prompt, for example a
+    // cron prompt or the follow-up to a finished background task, and that
+    // prompt would take the first unread result as its answer. After the
+    // choices are restored, so the reader reports against the restored state.
+    if (!recreated.queryClosed) this.ensureConsumer(recreated, sessionId);
   }
 
   /** Re-applies the choices of `previous` to the session that replaced it; a choice the new query rejects is logged. */

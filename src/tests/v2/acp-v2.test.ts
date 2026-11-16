@@ -1221,9 +1221,11 @@ describe("ACP v2 sessions", () => {
           { value: "reviewer", name: "reviewer", description: "Reviews changes" },
         ],
       });
-      // Each value goes to Claude Code before the option shows it.
+      // Each value goes to Claude Code before the option shows it. Fast mode
+      // goes off first: Claude Code ignores a `true` while its flag holds `true`.
       expect(sdk.flagSettings).toEqual([
         { effortLevel: "high" },
+        { fastMode: false },
         { fastMode: true },
         { ultracode: true },
         { agent: "reviewer" },
@@ -1467,6 +1469,7 @@ describe("ACP v2 sessions", () => {
       expect(sdk.queryOptions[1].effort).toBeUndefined();
       expect(sdk.flagSettings).toEqual([
         { ultracode: true },
+        { fastMode: false },
         { fastMode: true },
         { effortLevel: "low", ultracode: true },
         { agent: "reviewer" },
@@ -1556,6 +1559,48 @@ describe("ACP v2 sessions", () => {
         description:
           "Faster responses on supported models — not enabled for your organization or API gateway",
       });
+    });
+
+    /**
+     * Scenario:
+     * 1. A turn's `system`/init reports Fast mode off (`sdk_opt_in_required`: no opt-in yet).
+     * 2. The client turns Fast mode on while the turn runs.
+     * 3. The turn's result reports Fast mode off without a reason: Claude Code
+     *    read the flag when the turn started.
+     * Expected:
+     * - The `fast` option stays on: the only update is the one that turned it on.
+     */
+    it("keeps a Fast mode that the client turned on during the turn", async () => {
+      const initHandled = Promise.withResolvers<void>();
+      const turnedOn = Promise.withResolvers<void>();
+      scriptTurns(async function* (options) {
+        yield fastModeInit(options, "off", "sdk_opt_in_required");
+        initHandled.resolve();
+        await turnedOn.promise;
+        yield assistantText(options, "Done.");
+        yield result(options, { fast_mode_state: "off" });
+        yield idleState(options);
+      });
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+        await initHandled.promise;
+        await agent.request(v2.methods.agent.session.setConfigOption, {
+          sessionId,
+          configId: "fast",
+          type: "boolean",
+          value: true,
+        });
+        turnedOn.resolve();
+        await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+        await client.authUpdate(1);
+      });
+
+      const updates = client.updates("config_option_update");
+      expect(updates).toHaveLength(1);
+      expect(fastOption(updates[0])).toMatchObject({ currentValue: true });
     });
 
     it("reports a refusal fallback with a notice and follows the model it swapped to", async () => {
@@ -4572,6 +4617,37 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
     });
   });
 
+  // The result of a cycle that a scheduler fire started has no `origin`. v2
+  // ends every cycle at its result, so unlike v1 it has no task left open.
+  it("ends a cycle that a scheduler fire started at its result, which has no origin", async () => {
+    scriptTurns(async function* (options) {
+      yield assistantText(options, "Started the build in the background.");
+      yield result(options);
+      // The overdue ScheduleWakeup fires before the prompt's idle.
+      yield {
+        type: "command_lifecycle",
+        command_uuid: "scheduler-fire",
+        state: "started",
+        wakeup_source: "loop_wakeup",
+        scheduled_for: 1_790_000_000_000,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield assistantText(options, "That wakeup was stale.", "msg_wakeup");
+      yield result(options);
+      // One idle covers both results.
+      yield idleState(options);
+    });
+    const client = await promptAndWait(2);
+
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      ...endedTurn,
+      "running",
+      "agent_message_chunk",
+      "idle end_turn",
+    ]);
+  });
+
   it("closes a tool call that Claude dropped before it ran in a cycle as cancelled, before the cycle's idle", async () => {
     scriptTurns(async function* (options) {
       yield assistantText(options, "Started the build in the background.");
@@ -4608,6 +4684,69 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
       "state idle",
     ]);
     expect(turnTrace(client.sessionUpdates).at(-1)).toBe("idle end_turn");
+  });
+
+  // A resumed session can run cycles before its first prompt, for example a
+  // cron prompt. v2 reads the query from the start of the session, so that
+  // output is reported as it comes and does not answer the prompt.
+  it("reports a cycle that a resumed session runs before the first prompt, apart from the prompt's turn", async () => {
+    sdk.run = async function* (prompts, options) {
+      const input = prompts[Symbol.asyncIterator]();
+      if (!options.resume) {
+        while (!(await input.next()).done);
+        return;
+      }
+      // A cron prompt: its result has no origin.
+      yield assistantText(options, "Checked the build.", "msg_cron");
+      yield result(options, { usage: { ...result(options).usage, input_tokens: 111 } });
+      yield idleState(options);
+      const { value } = await input.next();
+      yield {
+        type: "user",
+        message: value!.message,
+        parent_tool_use_id: null,
+        uuid: value!.uuid,
+        session_id: options.sessionId,
+        isReplay: true,
+      };
+      yield assistantText(options, "Here is the answer.");
+      yield result(options, { usage: { ...result(options).usage, input_tokens: 7 } });
+      yield idleState(options);
+      while (!(await input.next()).done);
+    };
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.close, { sessionId });
+      await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates)).toContain("agent_message_chunk"),
+      );
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() =>
+        expect(
+          turnTrace(client.sessionUpdates).filter((state) => state.startsWith("idle end")),
+        ).toHaveLength(2),
+      );
+      await client.authUpdate(1);
+    });
+    // Without the `idle` that the resume reports.
+    expect(turnTrace(client.sessionUpdates).filter((state) => state !== "idle")).toEqual([
+      "running",
+      "agent_message_chunk",
+      "idle end_turn",
+      "user_message",
+      "running",
+      "agent_message_chunk",
+      "idle end_turn",
+    ]);
+    expect(
+      client
+        .updates("state_update")
+        .filter((update: any) => update.stopReason)
+        .map((update: any) => update.usage.inputTokens),
+    ).toEqual([111, 7]);
   });
 
   it("ends the tool call that a cancelled cycle runs with Claude Code's result, before idle cancelled", async () => {
@@ -8477,11 +8616,11 @@ describe("ACP v2 terminal of a command in the background", () => {
         });
       try {
         const client = await promptUntil("idle end_turn [toolu_bg]", async (_, __, client) => {
-          await vi.waitFor(() => expect(output(client)).toContain("output compiling\n"), {
+          await vi.waitFor(() => expect(output(client)).toContain("output compiling\r\n"), {
             timeout: 2000,
           });
           await appendFile(outputFile, "tests passed\n");
-          await vi.waitFor(() => expect(output(client)).toContain("chunk tests passed\n"), {
+          await vi.waitFor(() => expect(output(client)).toContain("chunk tests passed\r\n"), {
             timeout: 2000,
           });
           // The command writes its last line as it ends.
@@ -8492,9 +8631,9 @@ describe("ACP v2 terminal of a command in the background", () => {
 
         // The file's first text replaces the Bash result's placeholder.
         expect(output(client).slice(-4)).toEqual([
-          "output compiling\n",
-          "chunk tests passed\n",
-          "chunk done\n",
+          "output compiling\r\n",
+          "chunk tests passed\r\n",
+          "chunk done\r\n",
           "exit",
         ]);
       } finally {
@@ -8607,7 +8746,12 @@ describe("ACP v2 terminal of a command in the background", () => {
     describe("a task that a tool call started", () => {
       // Claude Code marks every live-update watcher ambient, a requested
       // Monitor's task included.
-      const monitor = {
+      const monitor: {
+        task_id: string;
+        task_type: string;
+        description: string;
+        ambient?: boolean;
+      } = {
         task_id: "mon1",
         task_type: "local_monitor",
         description: "Watch the logs",
@@ -8617,10 +8761,10 @@ describe("ACP v2 terminal of a command in the background", () => {
       /** A Monitor call whose task `mon1` runs on after the call returns. The
        *  tool starts the task, which joins the level before its
        *  `task_started`, and returns. */
-      async function* monitorStarts(options: Options) {
+      async function* monitorStarts(options: Options, task: typeof monitor = monitor) {
         yield toolUseMessage(options, "toolu_mon", "Monitor", { command: "tail -f app.log" });
-        yield level(options, [monitor]);
-        yield taskEvent(options, "task_started", { ...monitor, tool_use_id: "toolu_mon" });
+        yield level(options, [task]);
+        yield taskEvent(options, "task_started", { ...task, tool_use_id: "toolu_mon" });
         yield {
           ...toolResultMessage(options, "toolu_mon", { content: "Monitor started (task mon1)." }),
           tool_use_result: { taskId: "mon1", timeoutMs: 0, persistent: true },
@@ -8679,6 +8823,43 @@ describe("ACP v2 terminal of a command in the background", () => {
           "idle end_turn [toolu_mon]",
           "paused",
           "in_progress",
+          "completed",
+          "no cancel",
+          "idle []",
+        ]);
+      });
+
+      it("keeps the call in_progress and listed when Claude Code reports the Monitor's task as local_bash, not ambient", async () => {
+        // What Claude Code sends for a requested Monitor in practice: the task
+        // type of a shell command and no `ambient` flag. The call, not a
+        // terminal, is the task's entity, as `Monitor` is in TASK_TOOLS.
+        const localBashMonitor = {
+          task_id: "mon1",
+          task_type: "local_bash",
+          description: "Watch the logs",
+        };
+        scriptTurns(async function* (options) {
+          yield* monitorStarts(options, localBashMonitor);
+          yield result(options);
+          yield idleState(options);
+          yield monitorEvent(options, "task_notification", {
+            tool_use_id: "toolu_mon",
+            status: "completed",
+            output_file: "/tmp/tasks/mon1.output",
+            summary: "Done",
+          });
+          yield level(options, []);
+        });
+        const client = await promptUntil("idle end_turn [toolu_mon]");
+        await vi.waitFor(() => expect(toolCallTrace(client)).toContain("idle []"));
+
+        expect(toolCallTrace(client)).toEqual([
+          "running []",
+          "pending",
+          "in_progress",
+          "cancel",
+          "running [toolu_mon]",
+          "idle end_turn [toolu_mon]",
           "completed",
           "no cancel",
           "idle []",
@@ -9521,6 +9702,32 @@ describe("ACP v2 session translation", () => {
     expect(terminals.split("s", hook)).toEqual({ terminal: [], report: hook });
   });
 
+  it("sends piped output with each line feed as CR LF, as a PTY would", () => {
+    const terminals = new V2Terminals();
+    const decoded = (data: unknown) => Buffer.from(String(data), "base64").toString();
+    terminals.split("s", {
+      sessionUpdate: "tool_call",
+      toolCallId: "toolu_bash",
+      title: "Terminal",
+      _meta: { terminal_info: { terminal_id: "term" } },
+    });
+    const [chunk] = terminals.split("s", {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_bash",
+      _meta: { terminal_output_delta: { terminal_id: "term", data: "a\nb\n" } },
+    }).terminal;
+    expect(chunk).toMatchObject({ sessionUpdate: "terminal_output_chunk" });
+    expect(decoded((chunk as { data: string }).data)).toBe("a\r\nb\r\n");
+    // The line discipline adds a CR before every LF, also one that a CR precedes.
+    const [snapshot] = terminals.split("s", {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_bash",
+      _meta: { terminal_output: { terminal_id: "term", data: "a\nb\r\n" } },
+    }).terminal;
+    expect(snapshot).toMatchObject({ sessionUpdate: "terminal_update" });
+    expect(decoded((snapshot as { output: { data: string } }).output.data)).toBe("a\r\nb\r\r\n");
+  });
+
   it("leaves an exit code that the agent does not know out of the terminal's exit", () => {
     const terminals = new V2Terminals();
     terminals.split("s", {
@@ -9960,6 +10167,36 @@ describe("ACP v2 providers", () => {
     });
   });
 
+  // The new query of a restart can run a cycle before the next prompt, for
+  // example a cron prompt. v2 reads every query from its start, so the cycle
+  // is reported as it comes.
+  it("reports a cycle that the new query of a restart runs before the next prompt", async () => {
+    sdk.run = async function* (prompts, options) {
+      if (options.resume) {
+        // A cron prompt: its result has no origin.
+        yield assistantText(options, "Checked the build.", "msg_cron");
+        yield result(options);
+        yield idleState(options);
+      }
+      const input = prompts[Symbol.asyncIterator]();
+      while (!(await input.next()).done);
+    };
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      await agent.request(v2.methods.agent.session.new, { cwd });
+      await setGateway(agent);
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates)).toEqual([
+          "running",
+          "agent_message_chunk",
+          "idle end_turn",
+        ]),
+      );
+      await client.authUpdate(1);
+    });
+  });
+
   it("routes only the sessions started after a gateway login", async () => {
     const client = v2Client();
     await client.app.connectWith(connectRouter(), async (agent) => {
@@ -10149,7 +10386,7 @@ describe("ACP v2 subscription guard (--hide-claude-auth)", () => {
   });
 
   /** Each query caches the next of `accounts` at its start, and the last one after them. */
-  function accountsAtStart(...accounts: Array<Record<string, unknown>>) {
+  function accountsAtStart(...accounts: Array<Record<string, unknown> | undefined>) {
     let started = 0;
     sdk.initializationResult = async () => ({
       ...(await sdkDefaults.initializationResult()),
@@ -10160,6 +10397,12 @@ describe("ACP v2 subscription guard (--hide-claude-auth)", () => {
   it.each([
     ["a subscription would pay", SUBSCRIPTION, NOT_SUPPORTED],
     ["the account holds no credential", {}, { code: -32000, data: undefined }],
+    [
+      "the SDK reports no token",
+      { tokenSource: "none", apiProvider: "firstParty" },
+      { code: -32000, data: undefined },
+    ],
+    ["a subscription has no token", { ...SUBSCRIPTION, tokenSource: "none" }, NOT_SUPPORTED],
   ])("refuses session/new when %s", async (_case, account, refusal) => {
     accountsAtStart(account);
     const client = v2Client();
@@ -10171,16 +10414,45 @@ describe("ACP v2 subscription guard (--hide-claude-auth)", () => {
     });
   });
 
-  it("refuses a prompt before insertion when the cached account bills a subscription", async () => {
+  it.each([
+    ["an API key", { ...API_KEY, tokenSource: "none" }],
+    ["an API key helper", { apiKeySource: "apiKeyHelper", tokenSource: "none" }],
+    ["a Console key", { apiKeySource: "/login managed key", tokenSource: "none" }],
+    ["a bearer token", { tokenSource: "ANTHROPIC_AUTH_TOKEN" }],
+    ["a setup token", { tokenSource: "CLAUDE_CODE_OAUTH_TOKEN" }],
+    ["external credentials", { apiProvider: "bedrock", tokenSource: "none" }],
+    ["an unavailable account", undefined],
+  ])("allows session/new with %s", async (_case, account) => {
+    accountsAtStart(account);
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      await expect(agent.request(v2.methods.agent.session.new, { cwd })).resolves.toMatchObject({
+        sessionId: expect.any(String),
+      });
+    });
+  });
+
+  it.each([
+    [SUBSCRIPTION, NOT_SUPPORTED],
+    [
+      { tokenSource: "none", apiProvider: "firstParty" },
+      { code: -32000, data: undefined },
+    ],
+    [{ ...SUBSCRIPTION, tokenSource: "none" }, NOT_SUPPORTED],
+  ])("refuses a prompt before insertion for account %j", async (account, refusal) => {
     accountsAtStart(API_KEY);
+    scriptTurns(async function* (options) {
+      yield result(options);
+    });
     const client = v2Client();
     await client.app.connectWith(connectRouter(), async (agent) => {
       await initializeV2(agent);
       const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
-      sdk.accountInfo = async () => SUBSCRIPTION;
+      sdk.accountInfo = async () => account;
       await expect(
         agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") }),
-      ).rejects.toMatchObject(NOT_SUPPORTED);
+      ).rejects.toMatchObject(refusal);
       await client.authUpdate(1);
     });
 

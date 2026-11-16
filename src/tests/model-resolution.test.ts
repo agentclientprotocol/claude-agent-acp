@@ -178,6 +178,27 @@ describe("resolveModelPreference - resolvedModel matching", () => {
     // Bare preferences still land on the bare row via the substring tier.
     expect(resolveModelPreference(models, "claude-sonnet-5")?.value).toBe("sonnet");
   });
+
+  // An `availableModels` allowlist of dated and versioned ids, oldest first,
+  // as `applyAvailableModelsAllowlist` gives it with `settings.model: "opus[1m]"`.
+  // `my-opus` has no version, so it ranks below each versioned row.
+  const VERSIONED_MODELS: ModelInfo[] = [
+    "my-opus",
+    "claude-sonnet-4-5-20250929",
+    "claude-opus-4-5-20251101",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "claude-opus-5-5",
+    "claude-sonnet-5",
+  ].map((value) => ({ value, resolvedModel: value, displayName: value, description: "" }));
+
+  it.each([
+    ["opus[1m]", "claude-opus-5-5"],
+    ["opus", "claude-opus-5-5"],
+    ["sonnet", "claude-sonnet-5"],
+  ])("resolves %s to the newest listed row of its family, %s", (preference, value) => {
+    expect(resolveModelPreference(VERSIONED_MODELS, preference)?.value).toBe(value);
+  });
 });
 
 describe("matchResumedModel", () => {
