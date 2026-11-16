@@ -1221,9 +1221,11 @@ describe("ACP v2 sessions", () => {
           { value: "reviewer", name: "reviewer", description: "Reviews changes" },
         ],
       });
-      // Each value goes to Claude Code before the option shows it.
+      // Each value goes to Claude Code before the option shows it. Fast mode
+      // goes off first: Claude Code ignores a `true` while its flag holds `true`.
       expect(sdk.flagSettings).toEqual([
         { effortLevel: "high" },
+        { fastMode: false },
         { fastMode: true },
         { ultracode: true },
         { agent: "reviewer" },
@@ -1399,6 +1401,7 @@ describe("ACP v2 sessions", () => {
       expect(sdk.queryOptions[1].effort).toBeUndefined();
       expect(sdk.flagSettings).toEqual([
         { ultracode: true },
+        { fastMode: false },
         { fastMode: true },
         { effortLevel: "low", ultracode: true },
         { agent: "reviewer" },
@@ -1488,6 +1491,48 @@ describe("ACP v2 sessions", () => {
         description:
           "Faster responses on supported models — not enabled for your organization or API gateway",
       });
+    });
+
+    /**
+     * Scenario:
+     * 1. A turn's `system`/init reports Fast mode off (`sdk_opt_in_required`: no opt-in yet).
+     * 2. The client turns Fast mode on while the turn runs.
+     * 3. The turn's result reports Fast mode off without a reason: Claude Code
+     *    read the flag when the turn started.
+     * Expected:
+     * - The `fast` option stays on: the only update is the one that turned it on.
+     */
+    it("keeps a Fast mode that the client turned on during the turn", async () => {
+      const initHandled = Promise.withResolvers<void>();
+      const turnedOn = Promise.withResolvers<void>();
+      scriptTurns(async function* (options) {
+        yield fastModeInit(options, "off", "sdk_opt_in_required");
+        initHandled.resolve();
+        await turnedOn.promise;
+        yield assistantText(options, "Done.");
+        yield result(options, { fast_mode_state: "off" });
+        yield idleState(options);
+      });
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+        await initHandled.promise;
+        await agent.request(v2.methods.agent.session.setConfigOption, {
+          sessionId,
+          configId: "fast",
+          type: "boolean",
+          value: true,
+        });
+        turnedOn.resolve();
+        await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+        await client.authUpdate(1);
+      });
+
+      const updates = client.updates("config_option_update");
+      expect(updates).toHaveLength(1);
+      expect(fastOption(updates[0])).toMatchObject({ currentValue: true });
     });
 
     it("reports a refusal fallback with a notice and follows the model it swapped to", async () => {

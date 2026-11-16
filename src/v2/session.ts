@@ -839,12 +839,16 @@ export class V2Session implements RequestTarget {
     this.reports.modelChanged(id, info);
   }
 
-  /** Claude Code reported a Fast mode state, on `system`/init or a result. */
-  private fastModeReported(message: {
-    fast_mode_state?: FastModeState;
-    fast_mode_disabled_reason?: FastModeDisabledReason;
-  }): void {
-    if (this.config.fastModeReported(message.fast_mode_state, message.fast_mode_disabled_reason)) {
+  /** Claude Code reported a Fast mode state, on a `system`/init or on a result (`from`). */
+  private fastModeReported(
+    message: {
+      fast_mode_state?: FastModeState;
+      fast_mode_disabled_reason?: FastModeDisabledReason;
+    },
+    from: "init" | "result",
+  ): void {
+    const report = { state: message.fast_mode_state, reason: message.fast_mode_disabled_reason };
+    if (this.config.fastModeReported(report, from)) {
       this.send({ sessionUpdate: "config_option_update", configOptions: this.config.options() });
     }
   }
@@ -990,7 +994,7 @@ export class V2Session implements RequestTarget {
             if (message.capabilities?.includes("msg_lifecycle_v1")) this.lifecycleFrames = true;
             this.elicitations.init(message.capabilities);
             // A fresh init (such as after a reinitialize) can carry another Fast mode state.
-            this.fastModeReported(message);
+            this.fastModeReported(message, "init");
             this.reports.handle(message);
             // Its terminal-bound commands leave the list.
             if (this.commands.init(message)) this.resendCommands();
@@ -1172,7 +1176,7 @@ export class V2Session implements RequestTarget {
     // A cycle that Claude Code started on its own leaves its Fast mode state
     // to the next result of a prompt.
     if (!(message.origin && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind))) {
-      this.fastModeReported(message);
+      this.fastModeReported(message, "result");
     }
     this.reports.result(message);
     // Before the result's text below, which can repeat the failed request's.

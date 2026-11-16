@@ -1,6 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
 import type { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk/unstable";
-import type { FastModeDisabledReason, ModelInfo } from "@anthropic-ai/claude-agent-sdk";
+import type {
+  FastModeDisabledReason,
+  FastModeState,
+  ModelInfo,
+} from "@anthropic-ai/claude-agent-sdk";
 import { ClaudeAcpAgent } from "../../v1/acp-agent.js";
 import {
   buildConfigOptions,
@@ -8,6 +12,7 @@ import {
 } from "../../session-config-options.js";
 import {
   createFastModeConfigOption,
+  fastModeResultIsNews,
   fastModeStateEnabled,
   normalizeFastModeDisabledReason,
   resolveFastModeEnabled,
@@ -197,6 +202,30 @@ describe("normalizeFastModeDisabledReason", () => {
   );
 });
 
+describe("fastModeResultIsNews", () => {
+  type Report = [FastModeState | undefined, FastModeDisabledReason | undefined];
+
+  it.each([
+    ["has no init to repeat", undefined, ["off", undefined], true],
+    ["repeats its init", ["off", undefined], ["off", undefined], false],
+    // Turning Fast mode on mid-turn drops `sdk_opt_in_required` from the result.
+    [
+      "differs only by an unexplained reason",
+      ["off", "sdk_opt_in_required"],
+      ["off", undefined],
+      false,
+    ],
+    ["adds a refusal", ["off", undefined], ["off", "extra_usage_disabled"], true],
+    ["reports another state", ["off", "network_error"], ["on", undefined], true],
+  ] as [string, Report | undefined, Report, boolean][])(
+    "tells whether a result that %s is news",
+    (_case, init, result, news) => {
+      const report = ([state, reason]: Report) => ({ state, reason });
+      expect(fastModeResultIsNews(init && report(init), report(result))).toBe(news);
+    },
+  );
+});
+
 describe("buildConfigOptions Fast mode", () => {
   it("omits the Fast mode option when the model does not support it", () => {
     const options = buildConfigOptions(MODES, MODELS, MODEL_INFOS, undefined, [], "default", {
@@ -271,7 +300,8 @@ describe("setSessionConfigOption Fast mode toggle", () => {
       type: "boolean",
       value: true,
     });
-    expect(applyFlagSettings).toHaveBeenCalledWith({ fastMode: true });
+    // Off first: Claude Code ignores a `true` while its flag holds `true`.
+    expect(applyFlagSettings.mock.calls).toEqual([[{ fastMode: false }], [{ fastMode: true }]]);
     expect(onResponse.configOptions).toContainEqual(createFastModeConfigOption(true, true));
     expect(
       (agent as unknown as { sessions: Record<string, { fastModeEnabled: boolean }> }).sessions[
@@ -285,7 +315,7 @@ describe("setSessionConfigOption Fast mode toggle", () => {
       type: "boolean",
       value: false,
     });
-    expect(applyFlagSettings).toHaveBeenLastCalledWith({ fastMode: false });
+    expect(applyFlagSettings.mock.calls.slice(2)).toEqual([[{ fastMode: false }]]);
     expect(offResponse.configOptions).toContainEqual(createFastModeConfigOption(false, true));
   });
 
@@ -569,12 +599,18 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
   });
 });
 
-describe("Fast mode that Claude Code refuses during a turn", () => {
+describe("Fast mode that Claude Code reports during a turn", () => {
   const SESSION_ID = "test-session";
 
   /** A session whose Claude Code answers the first prompt with a `system`/init
-   *  that reports Fast mode off with `reason`, as it does on every turn. */
-  async function setupTurn(reason: FastModeDisabledReason) {
+   *  that reports Fast mode off with `reason`, as it does on every turn, and
+   *  then with a result that carries the `result` fields. `duringTurn` runs
+   *  between the two, once the adapter has handled the init. */
+  async function setupTurn(
+    reason: FastModeDisabledReason,
+    result: Record<string, unknown> = {},
+    duringTurn: (agent: ClaudeAcpAgent) => Promise<unknown> = async () => {},
+  ) {
     const updates: SessionNotification[] = [];
     const client = {
       sessionUpdate: async (n: SessionNotification) => {
@@ -595,7 +631,8 @@ describe("Fast mode that Claude Code refuses during a turn", () => {
         fast_mode_disabled_reason: reason,
         session_id: SESSION_ID,
       };
-      yield successfulResultMessage();
+      await duringTurn(agent);
+      yield successfulResultMessage(result);
       yield { type: "system", subtype: "session_state_changed", state: "idle" };
     }
     const query = Object.assign(wrapQuery(messages()), { applyFlagSettings: async () => {} });
@@ -653,4 +690,41 @@ describe("Fast mode that Claude Code refuses during a turn", () => {
       },
     ]);
   });
+
+  /**
+   * Scenario:
+   * 1. A turn's init reports Fast mode off (`sdk_opt_in_required`: no opt-in yet).
+   * 2. The client turns Fast mode on while the turn runs.
+   * 3. The turn's result reports Fast mode off: Claude Code read the flag when
+   *    the turn started. It carries no reason, or the account's refusal.
+   * Expected:
+   * - Without a reason the result repeats the init: `fast` stays on, with no update.
+   * - With `extra_usage_disabled`, `fast` reads off again.
+   */
+  it.each([
+    ["keeps", "repeats the init", {}, true],
+    ["turns off", "adds a refusal", { fast_mode_disabled_reason: "extra_usage_disabled" }, false],
+  ])(
+    "%s a Fast mode that the client turned on during the turn when the result %s",
+    async (_outcome, _result, reported, enabled) => {
+      const { agent, updates } = await setupTurn(
+        "sdk_opt_in_required",
+        { fast_mode_state: "off", ...reported },
+        (agent) =>
+          agent.setSessionConfigOption({
+            sessionId: SESSION_ID,
+            configId: "fast",
+            type: "boolean",
+            value: true,
+          }),
+      );
+
+      await agent.prompt({ sessionId: SESSION_ID, prompt: [{ type: "text", text: "hi" }] });
+
+      expect(agent.sessions[SESSION_ID].fastModeEnabled).toBe(enabled);
+      expect(updates.filter((n) => n.update.sessionUpdate === "config_option_update")).toHaveLength(
+        enabled ? 0 : 1,
+      );
+    },
+  );
 });
