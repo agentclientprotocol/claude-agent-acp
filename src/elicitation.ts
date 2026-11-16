@@ -1,13 +1,18 @@
 import { randomUUID } from "node:crypto";
-import { CreateElicitationResponse } from "@agentclientprotocol/sdk/unstable";
 import type {
   CreateElicitationRequest,
-  ElicitationAcceptAction,
+  CreateElicitationResponse,
   ElicitationPropertySchema,
   ElicitationSchema,
   EnumOption,
 } from "@agentclientprotocol/sdk/unstable";
-import type { ElicitationRequest, ElicitationResult } from "@anthropic-ai/claude-agent-sdk";
+import type {
+  ElicitationRequest,
+  ElicitationResult,
+  PermissionResult,
+  UserDialogRequest,
+  UserDialogResult,
+} from "@anthropic-ai/claude-agent-sdk";
 import type {
   AskUserQuestionInput,
   AskUserQuestionOutput,
@@ -75,17 +80,22 @@ export function mcpElicitationToCreateRequest(
 }
 
 /**
- * Content of an accepted elicitation response.
+ * Content of an accepted elicitation response, or `{}` when the response is
+ * no accept or its `content` is no JSON object.
  *
- * Uses the SDK's validating guard rather than an `action === "accept"` check:
- * the guard both narrows past the union's custom/future variant and validates
- * the payload, so a malformed accept (right tag, ill-typed content) yields
- * empty content — the same classification the SDK's wire validators apply.
+ * The values are not checked. v1 allows a string, number, boolean, or string
+ * array; v2 also allows any other JSON value, such as an object. An MCP
+ * server checks the content against its own `requestedSchema`, so it gets the
+ * content as the client sent it: before, an accept whose content held an
+ * object reached the server as `{ action: "accept", content: {} }`. Callers
+ * that read a field must check its type.
  */
-function acceptedElicitationContent(
-  response: CreateElicitationResponse,
-): NonNullable<ElicitationAcceptAction["content"]> {
-  return CreateElicitationResponse.isAccept(response) ? (response.content ?? {}) : {};
+function acceptedElicitationContent(response: CreateElicitationResponse): Record<string, unknown> {
+  if (response.action !== "accept") return {};
+  const content: unknown = (response as { content?: unknown }).content;
+  return content !== null && typeof content === "object" && !Array.isArray(content)
+    ? (content as Record<string, unknown>)
+    : {};
 }
 
 /**
@@ -97,7 +107,11 @@ export function createElicitationResponseToElicitResult(
 ): ElicitationResult {
   switch (response.action) {
     case "accept":
-      return { action: "accept", content: acceptedElicitationContent(response) };
+      // `ElicitResult` types the values as v1 does. The MCP server checks them.
+      return {
+        action: "accept",
+        content: acceptedElicitationContent(response) as ElicitationResult["content"],
+      };
     case "decline":
       return { action: "decline" };
     case "cancel":
@@ -280,14 +294,37 @@ function joinMultiSelectAnswer(items: string[]): string {
  * cannot make the selection disappear. Decline yields empty answers (the model
  * is told the user skipped rather than the turn aborting); cancel — and any
  * custom/future action we don't understand — aborts the tool call.
+ *
+ * With `reportUnanswered` set (the session's `system/init` listed
+ * `ask_user_question_unanswered_v1`), each question left without an answer
+ * also gets `annotations[question].unanswered`: `"dismissed"` for every
+ * question when the user declined the form, `"skipped"` for a question left
+ * blank in an accepted form. The model does not see this field; the tool
+ * result carries it for clients and transcripts. A CLI without the capability
+ * can refuse the whole answer over it, so it is left out there.
  */
 export function applyAskElicitationResponse(
   response: CreateElicitationResponse,
   toolInput: Record<string, unknown>,
   questions: AskUserQuestion[],
+  options: { reportUnanswered?: boolean } = {},
 ): AskUserQuestionOutcome {
+  // Typed against the output schema: as of SDK 0.3.319 only it lists
+  // `unanswered`, though the tool reads the same annotations from its input.
+  const annotations: NonNullable<AskUserQuestionOutput["annotations"]> = {};
+  const withAnnotations = (answers: AskUserQuestionOutput["answers"]) => ({
+    ...toolInput,
+    answers,
+    ...(Object.keys(annotations).length > 0 ? { annotations } : {}),
+  });
+
   if (response.action === "decline") {
-    return { action: "answered", updatedInput: { ...toolInput, answers: {} } };
+    if (options.reportUnanswered) {
+      for (const question of questions) {
+        annotations[question.question] = { unanswered: "dismissed" };
+      }
+    }
+    return { action: "answered", updatedInput: withAnnotations({}) };
   }
 
   if (response.action !== "accept") {
@@ -298,18 +335,17 @@ export function applyAskElicitationResponse(
   // Typed against the tool's own output schema so the answer/response shapes
   // stay in sync with what the built-in tool's call() expects to read back.
   const answers: AskUserQuestionOutput["answers"] = {};
-  const annotations: NonNullable<AskUserQuestionInput["annotations"]> = {};
   questions.forEach((question, index) => {
     const custom = content[questionCustomFieldKey(index)];
     const customText = typeof custom === "string" ? custom.trim() : "";
 
+    // A pick is a string, number, or boolean. Other values, such as an object
+    // that a v2 client may send, are dropped instead of read as "[object Object]".
     const value = content[questionFieldKey(index)];
-    const picks: string[] =
-      value === undefined || value === null
-        ? []
-        : Array.isArray(value)
-          ? value.filter((item) => item !== undefined && item !== null && item !== "").map(String)
-          : [String(value)];
+    const picks: string[] = (Array.isArray(value) ? value : [value])
+      .filter(isElicitationScalar)
+      .map(String)
+      .filter((item) => item !== "");
 
     // A multi-select is additive, and the form offers the selection and the
     // custom box as independent fields — a user who fills both means both, so
@@ -341,20 +377,27 @@ export function applyAskElicitationResponse(
     }
   });
 
-  return {
-    action: "answered",
-    updatedInput: {
-      ...toolInput,
-      answers,
-      ...(Object.keys(annotations).length > 0 ? { annotations } : {}),
-    },
-  };
+  if (options.reportUnanswered) {
+    for (const question of questions) {
+      if (answers[question.question] === undefined) {
+        annotations[question.question] = { unanswered: "skipped" };
+      }
+    }
+  }
+
+  return { action: "answered", updatedInput: withAnnotations(answers) };
+}
+
+function isElicitationScalar(value: unknown): value is string | number | boolean {
+  return typeof value === "string" || typeof value === "number" || typeof value === "boolean";
 }
 
 /**
  * Coerce an arbitrary MCP `requestedSchema` into an ACP `ElicitationSchema`.
  * The two are structurally compatible JSON Schemas; we just guarantee the
- * `type: "object"` discriminator is present.
+ * `type: "object"` discriminator and a `properties` map are present. The v2
+ * schema requires both, so a client on SDK 2.2.0 or later rejects an MCP
+ * schema such as `{ type: "object" }` that has no `properties`.
  */
 function normalizeElicitationSchema(
   schema: Record<string, unknown> | undefined,
@@ -362,7 +405,8 @@ function normalizeElicitationSchema(
   if (!schema || typeof schema !== "object") {
     return { type: "object", properties: {} };
   }
-  return { ...(schema as ElicitationSchema), type: "object" };
+  const { properties } = schema as Partial<ElicitationSchema>;
+  return { ...(schema as ElicitationSchema), type: "object", properties: properties ?? {} };
 }
 
 /**
@@ -473,4 +517,157 @@ export function refusalFallbackToCreateRequest(
 export function refusalFallbackResultFromResponse(response: CreateElicitationResponse): string {
   const choice = acceptedElicitationContent(response)[REFUSAL_FALLBACK_CHOICE_KEY];
   return choice === RETRY_FALLBACK_RESULT ? RETRY_FALLBACK_RESULT : KEEP_REFUSAL_RESULT;
+}
+
+/**
+ * What became of an elicitation: the client's response, or `withdrawn` when
+ * its signal aborted first (Claude Code withdrew the request, or a cancel or
+ * close of the session did). A response that comes after the abort counts as
+ * withdrawn too.
+ */
+export type ElicitationOutcome = { response: CreateElicitationResponse } | { withdrawn: true };
+
+/**
+ * Sends an elicitation with `send` and reads what became of it. A rejection
+ * while `signal` is not aborted, such as the client's -32602 for a form it
+ * cannot render, is rethrown.
+ */
+export async function elicitUnlessWithdrawn(
+  signal: AbortSignal,
+  send: (signal: AbortSignal) => Promise<CreateElicitationResponse>,
+): Promise<ElicitationOutcome> {
+  try {
+    const response = await send(signal);
+    return signal.aborted ? { withdrawn: true } : { response };
+  } catch (error) {
+    if (signal.aborted) return { withdrawn: true };
+    throw error;
+  }
+}
+
+/** Sends a built elicitation to the client (see {@link elicitUnlessWithdrawn}). */
+export type Elicit = (request: CreateElicitationRequest) => Promise<ElicitationOutcome>;
+
+type ElicitationLogger = { error: (...args: unknown[]) => void };
+
+/**
+ * Answers an MCP server's elicitation (the SDK's `onElicitation`) through
+ * `elicit`. Only the user's own decline reaches the MCP server as `decline`.
+ * A request the user never saw, because the client did not advertise its
+ * mode, it cannot be represented, the client answered with an error, or it
+ * was withdrawn, is a `cancel`.
+ */
+export async function answerMcpElicitation(
+  request: ElicitationRequest,
+  {
+    sessionId,
+    support,
+    elicit,
+    logger,
+  }: { sessionId: string; support: ElicitationSupport; elicit: Elicit; logger: ElicitationLogger },
+): Promise<ElicitationResult> {
+  const isUrl = request.mode === "url";
+  if ((isUrl && !support.url) || (!isUrl && !support.form)) {
+    return { action: "cancel" };
+  }
+  const createRequest = mcpElicitationToCreateRequest(request, sessionId);
+  if (!createRequest) {
+    return { action: "cancel" };
+  }
+  try {
+    const outcome = await elicit(createRequest);
+    if ("withdrawn" in outcome) return { action: "cancel" };
+    return createElicitationResponseToElicitResult(outcome.response);
+  } catch (error) {
+    // The client answered with an error, e.g. -32602 for a form it cannot
+    // render, so the user never saw the request. MCP's `decline` means the
+    // user refused; `cancel` means they made no explicit choice.
+    logger.error(`Failed to forward MCP elicitation: ${error}`);
+    return { action: "cancel" };
+  }
+}
+
+/**
+ * Presents the AskUserQuestion tool's questions as a form elicitation of
+ * `sessionId` through `elicit`, and returns the answers as the tool's
+ * `updatedInput`. A withdrawn question, or one the user cancelled, aborts the
+ * tool use. `reportUnanswered` is read once the answer is in (see
+ * {@link applyAskElicitationResponse}).
+ */
+export async function answerAskUserQuestion(
+  toolInput: Record<string, unknown>,
+  {
+    sessionId,
+    toolUseID,
+    airClient = false,
+    reportUnanswered,
+    elicit,
+    logger,
+  }: {
+    sessionId: string;
+    toolUseID: string;
+    airClient?: boolean;
+    reportUnanswered: () => boolean;
+    elicit: Elicit;
+    logger: ElicitationLogger;
+  },
+): Promise<PermissionResult> {
+  const questions = extractAskUserQuestions(toolInput);
+  if (!questions) {
+    return { behavior: "deny", message: "AskUserQuestion called with no valid questions." };
+  }
+  const createRequest = askUserQuestionsToCreateRequest(questions, sessionId, toolUseID, airClient);
+  let outcome: ElicitationOutcome;
+  try {
+    outcome = await elicit(createRequest);
+  } catch (error) {
+    logger.error(`Failed to present AskUserQuestion elicitation: ${error}`);
+    return { behavior: "deny", message: "Could not present the question to the user." };
+  }
+  if ("withdrawn" in outcome) {
+    throw new Error("Tool use aborted");
+  }
+  const answer = applyAskElicitationResponse(outcome.response, toolInput, questions, {
+    reportUnanswered: reportUnanswered(),
+  });
+  if (answer.action === "cancel") {
+    throw new Error("Tool use aborted");
+  }
+  return { behavior: "allow", updatedInput: answer.updatedInput };
+}
+
+/**
+ * Answers a `request_user_dialog` of Claude Code (the SDK's `onUserDialog`).
+ * Only kinds declared in `supportedDialogKinds` are ever emitted; everything
+ * unexpected is answered `cancelled` (the required answer for unrecognized
+ * kinds), which applies the dialog's default behavior CLI-side. The only
+ * declared kind is the refusal-fallback consent prompt, rendered as a form
+ * elicitation. A failed or withdrawn elicitation is `cancelled` too: the CLI
+ * then keeps the refusal rather than switching models without consent.
+ */
+export async function answerUserDialog(
+  request: UserDialogRequest,
+  { sessionId, elicit, logger }: { sessionId: string; elicit: Elicit; logger: ElicitationLogger },
+): Promise<UserDialogResult> {
+  if (request.dialogKind !== REFUSAL_FALLBACK_DIALOG_KIND) {
+    return { behavior: "cancelled" };
+  }
+  const prompt = extractRefusalFallbackPrompt(request.payload);
+  if (!prompt) {
+    logger.error(
+      `refusal_fallback_prompt payload had an unexpected shape; cancelling the dialog: ${JSON.stringify(request.payload)}`,
+    );
+    return { behavior: "cancelled" };
+  }
+  let outcome: ElicitationOutcome;
+  try {
+    outcome = await elicit(refusalFallbackToCreateRequest(prompt, sessionId));
+  } catch (error) {
+    logger.error(`Failed to present refusal fallback elicitation: ${error}`);
+    return { behavior: "cancelled" };
+  }
+  if ("withdrawn" in outcome) {
+    return { behavior: "cancelled" };
+  }
+  return { behavior: "completed", result: refusalFallbackResultFromResponse(outcome.response) };
 }

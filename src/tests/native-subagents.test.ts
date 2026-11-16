@@ -1002,6 +1002,129 @@ describe("NativeSubagentRuntime in the RFD form", () => {
     ]);
   });
 
+  describe("a child's working directory", () => {
+    const worktree = "/project/.claude/worktrees/agent-1";
+    function cwdRuntime(form: "rfd" | "air" = "rfd") {
+      const published: AcpSessionNotification[] = [];
+      const runtime = new NativeSubagentRuntime(
+        form,
+        "root",
+        { cwd: "/project" },
+        async (notification) => {
+          published.push(notification);
+        },
+        { log: () => {} },
+      );
+      const deliver = async (notification: AcpSessionNotification) => {
+        const routed = await runtime.route(notification, deliver);
+        if (routed) published.push(routed);
+      };
+      const toolCall = (toolCallId: string, parentToolUseId: string): AcpSessionNotification =>
+        ({
+          sessionId: "root",
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId,
+            title: "Read",
+            status: "pending",
+            _meta: { claudeCode: { toolName: "Read", parentToolUseId } },
+          },
+        }) as AcpSessionNotification;
+      return { runtime, published, deliver, toolCall };
+    }
+    const trace = (published: AcpSessionNotification[]) =>
+      published.map(({ sessionId, update }) => {
+        const u = update as any;
+        return update.sessionUpdate === "subagent_update"
+          ? `${sessionId} subagent_update ${u.sessionId}` +
+              ("cwd" in u ? ` cwd=${JSON.stringify(u.cwd)}` : "")
+          : `${sessionId} ${update.sessionUpdate}`;
+      });
+
+    it("announces a worktree child with its cwd, before its first tool call", async () => {
+      const { runtime, published, deliver, toolCall } = cwdRuntime();
+      // The child's SubagentStart hook can come before its task_started.
+      await runtime.reportCwd("worker-1", worktree);
+      expect(published).toEqual([]);
+      await runtime.taskStarted(
+        { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+        deliver,
+      );
+      await deliver(toolCall("read-1", "launch-1"));
+      await deliver(launch("launch-1", {}));
+      expect(trace(published)).toEqual([
+        `root subagent_update worker-1 cwd="${worktree}"`,
+        "worker-1 tool_call",
+      ]);
+      // Later hooks of the same directory report nothing new.
+      await runtime.reportCwd("worker-1", worktree);
+      expect(published).toHaveLength(2);
+    });
+
+    it("reports the cwd of an announced child at once, and null when it is back in its parent's", async () => {
+      const { runtime, published, deliver, toolCall } = cwdRuntime();
+      await runtime.taskStarted(
+        { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+        deliver,
+      );
+      await deliver(launch("launch-1", {}));
+      await runtime.reportCwd("worker-1", worktree);
+      await deliver(toolCall("read-1", "launch-1"));
+      await runtime.reportCwd("worker-1", "/project/");
+      expect(trace(published)).toEqual([
+        "root subagent_update worker-1",
+        `root subagent_update worker-1 cwd="${worktree}"`,
+        "worker-1 tool_call",
+        "root subagent_update worker-1 cwd=null",
+      ]);
+    });
+
+    it("omits the cwd of a child in its parent's directory, also for a nested child in its parent's worktree", async () => {
+      const { runtime, published, deliver } = cwdRuntime();
+      await runtime.reportCwd("worker-1", "/project");
+      await deliver(launch("launch-1", {}));
+      await runtime.taskStarted(
+        { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+        deliver,
+      );
+      await runtime.reportCwd("outer", worktree);
+      await deliver(launch("launch-outer", {}));
+      await runtime.taskStarted(
+        { taskId: "outer", toolUseId: "launch-outer", subagentType: "Explore" },
+        deliver,
+      );
+      await runtime.reportCwd("inner", worktree);
+      await deliver(launch("launch-inner", {}, "launch-outer"));
+      await runtime.taskStarted(
+        { taskId: "inner", toolUseId: "launch-inner", subagentType: "Explore" },
+        deliver,
+      );
+      expect(
+        trace(published).filter(
+          (line) =>
+            line.startsWith("root subagent_update") || line.startsWith("outer subagent_update"),
+        ),
+      ).toEqual([
+        "root subagent_update worker-1",
+        `root subagent_update outer cwd="${worktree}"`,
+        "outer subagent_update inner",
+      ]);
+    });
+
+    it("reports no cwd in AIR's draft, whose subagent_spawned has no such field", async () => {
+      const { runtime, published, deliver } = cwdRuntime("air");
+      await runtime.reportCwd("worker-1", worktree);
+      await deliver(launch("launch-1", {}));
+      await runtime.taskStarted(
+        { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+        deliver,
+      );
+      await runtime.reportCwd("worker-1", "/elsewhere");
+      expect(published.map(({ update }) => update.sessionUpdate)).toEqual(["subagent_spawned"]);
+      expect(JSON.stringify(published)).not.toContain("cwd");
+    });
+  });
+
   it("serializes concurrent config publications and retries a failed snapshot", async () => {
     const started = deferred();
     const release = deferred();
@@ -1087,8 +1210,8 @@ describe("NativeSubagentRuntime in the RFD form", () => {
         update: {
           sessionUpdate: "subagent_update",
           sessionId: "worker-1",
-          title: "builder (Explore)",
-          description: "Fix the build",
+          title: "builder",
+          description: "Explore",
           capabilities: { cancel: {} },
           state: { state: "running" },
         },
@@ -1297,10 +1420,10 @@ describe("NativeSubagentRuntime in the RFD form", () => {
     expect(published).toEqual([]);
   });
 
-  it("titles a child without a name by its role", async () => {
+  it("titles a child without a name by its task, and describes it by its role", async () => {
     const { published } = await runningWorker();
 
-    expect(published[0]?.update).toMatchObject({ title: "Explore", description: "Fix the build" });
+    expect(published[0]?.update).toMatchObject({ title: "Fix the build", description: "Explore" });
   });
 
   it("keeps the session of an idle child, which a resume runs again", async () => {
@@ -1569,8 +1692,8 @@ describe("NativeSubagentRuntime in the RFD form", () => {
           update: {
             sessionUpdate: "subagent_update",
             sessionId: "echoer-1",
-            title: "echoer (Explore)",
-            description: "Echo a word",
+            title: "echoer",
+            description: "Explore",
             capabilities: { cancel: {} },
             state: { state: "running" },
           },
@@ -1623,8 +1746,8 @@ describe("NativeSubagentRuntime in the RFD form", () => {
       expect(published[0]?.update).toEqual({
         sessionUpdate: "subagent_update",
         sessionId: "coordinator-1",
-        title: "coordinator (general-purpose)",
-        description: "Coordinate",
+        title: "coordinator",
+        description: "general-purpose",
       });
     });
 
@@ -1825,7 +1948,7 @@ describe("NativeSubagentRuntime in the RFD form", () => {
     });
   });
 
-  it("keeps the role in the title when a late frame names the child", async () => {
+  it("titles the child by the name a late frame gives it, and keeps its role", async () => {
     const published: AcpSessionNotification[] = [];
     const runtime = new NativeSubagentRuntime(
       "rfd",
@@ -1842,7 +1965,7 @@ describe("NativeSubagentRuntime in the RFD form", () => {
     );
     await runtime.route(launch("launch-1", { name: "builder" }), async () => {});
 
-    expect(published[0]?.update).toMatchObject({ title: "builder (Explore)" });
+    expect(published[0]?.update).toMatchObject({ title: "builder", description: "Explore" });
   });
 
   it("reports nothing when the parent is cancelled, until the SDK ends the child", async () => {
@@ -1887,6 +2010,164 @@ describe("NativeSubagentRuntime in the RFD form", () => {
 
     await runtime.finishTask("worker-1", "disconnected", async () => {});
     expect(states(published).at(-1)).toEqual({ state: "unknown" });
+  });
+
+  it("reports a child that may go on working unobserved as unknown, without its cancel, and keeps an idle one", async () => {
+    const { runtime, published } = await runningWorker();
+    await runtime.route(launch("launch-2", { description: "Read the docs" }), async () => {});
+    await runtime.taskStarted(
+      { taskId: "worker-2", toolUseId: "launch-2", subagentType: "Explore" },
+      async () => {},
+    );
+    await runtime.finishTask("worker-2", "completed", async () => {}, "launch-2");
+    published.length = 0;
+
+    // A conversation reset: Claude Code can keep the children running.
+    await runtime.finishAll("failed", async () => {}, { mayStillRun: true });
+    expect(published.map(({ update }) => update)).toEqual([
+      {
+        sessionUpdate: "subagent_update",
+        sessionId: "worker-1",
+        capabilities: null,
+        state: { state: "unknown" },
+      },
+    ]);
+  });
+
+  describe("a tool call that operates on a child", () => {
+    const toolCall = (
+      toolCallId: string,
+      toolName: string,
+      rawInput: Record<string, unknown>,
+      parentToolUseId?: string,
+    ): AcpSessionNotification =>
+      ({
+        sessionId: "root",
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId,
+          title: toolName,
+          status: "pending",
+          rawInput,
+          content: [{ type: "content", content: { type: "text", text: "input" } }],
+          _meta: {
+            claudeCode: { toolName, ...(parentToolUseId ? { parentToolUseId } : {}) },
+          },
+        },
+      }) as AcpSessionNotification;
+    const toolResult = (
+      toolCallId: string,
+      toolName: string,
+      content?: unknown[],
+    ): AcpSessionNotification =>
+      ({
+        sessionId: "root",
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId,
+          status: "completed",
+          ...(content ? { content } : {}),
+          _meta: { claudeCode: { toolName } },
+        },
+      }) as AcpSessionNotification;
+    const text = { type: "content", content: { type: "text", text: "Stopped" } };
+    const reference = { type: "session", sessionId: "worker-1" };
+    const contentOf = (notification: AcpSessionNotification | null) =>
+      (notification?.update as { content?: unknown[] } | undefined)?.content;
+
+    it("references the announced child that a TaskStop call names by its agent id", async () => {
+      const { runtime } = await runningWorker();
+
+      expect(
+        contentOf(
+          await runtime.route(
+            toolCall("stop-1", "TaskStop", { task_id: "worker-1" }),
+            async () => {},
+          ),
+        ),
+      ).toEqual([{ type: "content", content: { type: "text", text: "input" } }, reference]);
+      // An update without content would replace nothing, so it carries none.
+      const progress = toolResult("stop-1", "TaskStop");
+      (progress.update as { status?: string }).status = "in_progress";
+      expect(contentOf(await runtime.route(progress, async () => {}))).toBeUndefined();
+      // The result's content replaces the first report's, so it has the reference again.
+      expect(
+        contentOf(await runtime.route(toolResult("stop-1", "TaskStop", [text]), async () => {})),
+      ).toEqual([text, reference]);
+    });
+
+    it.each([
+      ["a task that is no child", "TaskStop", { task_id: "bash_1" }],
+      ["a child named by its name, which Claude Code resolves", "TaskStop", { task_id: "builder" }],
+      ["another tool with the same input", "Monitor", { task_id: "worker-1" }],
+    ])("references nothing for %s", async (_, toolName, input) => {
+      const { runtime } = await runningWorker({ name: "builder" });
+
+      expect(
+        contentOf(await runtime.route(toolCall("call-1", toolName, input), async () => {})),
+      ).toEqual([{ type: "content", content: { type: "text", text: "input" } }]);
+    });
+
+    it("references no child that is not announced yet, as the RFD requires", async () => {
+      const { runtime } = await runningWorker();
+      // A nested child whose launch frame, which names its parent, has not come.
+      await runtime.taskStarted(
+        { taskId: "worker-2", toolUseId: "launch-2", subagentType: "Explore" },
+        async () => {},
+      );
+      await runtime.route(launch("launch-2", { description: "Dig" }, "launch-9"), async () => {});
+
+      expect(
+        contentOf(
+          await runtime.route(
+            toolCall("stop-2", "TaskStop", { task_id: "worker-2" }),
+            async () => {},
+          ),
+        ),
+      ).toEqual([{ type: "content", content: { type: "text", text: "input" } }]);
+    });
+
+    it("references the child from a SendMessage call to it that stays a tool call", async () => {
+      const { runtime } = await runningWorker();
+
+      // The message resumes no child, so the call is shown at its end.
+      await expect(
+        runtime.route(toolCall("send-1", "SendMessage", { to: "worker-1" }), async () => {}),
+      ).resolves.toBeNull();
+      const shown = await runtime.route(
+        toolResult("send-1", "SendMessage", [text]),
+        async () => {},
+      );
+      expect(shown).toMatchObject({ sessionId: "root", update: { sessionUpdate: "tool_call" } });
+      expect(contentOf(shown)).toEqual([text, reference]);
+    });
+
+    it("references the child from its launch call that a permission request showed", async () => {
+      const { runtime } = await runningWorker();
+
+      const shown = await runtime.route(
+        launchResult("launch-1", "completed", "Done"),
+        async () => {},
+        "root",
+      );
+      expect(contentOf(shown)).toEqual([
+        { type: "content", content: { type: "text", text: "Done" } },
+        reference,
+      ]);
+    });
+
+    it("references nothing in AIR's draft", async () => {
+      const runtime = new NativeSubagentRuntime(
+        "air",
+        "root",
+        sessionWith(child({ sessionId: "worker-1", announced: true })),
+        async () => {},
+        { log: () => {} },
+      );
+      const call = toolCall("stop-1", "TaskStop", { task_id: "worker-1" });
+
+      await expect(runtime.route(call, async () => {})).resolves.toEqual(call);
+    });
   });
 
   it("reports a child as requires_action while its requests are open", async () => {

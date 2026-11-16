@@ -72,3 +72,27 @@ export function withRunningTerminal(
   if (Object.keys(meta).length === 0) delete next._meta;
   return { ...notification, update: next };
 }
+
+/**
+ * Keeps the tool call of a task that went on in the background running: the
+ * tool result update of a tool call in `toolCallIds` reports `in_progress`
+ * instead of `completed`.
+ *
+ * A Monitor or Workflow call returns as soon as its task starts. The consumer
+ * reports the task's end, or its pause, on the tool call (see
+ * `Session.backgroundToolCalls`).
+ */
+export function withRunningToolCall(
+  notification: SessionNotification,
+  toolCallIds: ReadonlySet<string>,
+): SessionNotification {
+  const update = notification.update;
+  if (
+    update.sessionUpdate !== "tool_call_update" ||
+    !toolCallIds.has(update.toolCallId) ||
+    update.status !== "completed"
+  ) {
+    return notification;
+  }
+  return { ...notification, update: { ...update, status: "in_progress" } };
+}

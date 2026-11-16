@@ -2,7 +2,7 @@
  * `--hide-claude-auth`: this integration must never bill a claude.ai
  * subscription. Under the flag the agent hides the claude.ai login method from
  * `initialize`, and refuses with `authRequired` every session and every turn
- * that a subscription would pay for. `acp-agent.ts` decides when the guard
+ * that a subscription would pay for. `v1/acp-agent.ts` decides when the guard
  * applies (flag on, no provider override); this module decides what it refuses.
  *
  * The guard judges the `AccountInfo` that the SDK caches at `initialize`. That
@@ -35,8 +35,10 @@
 import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import type { AccountInfo, Query } from "@anthropic-ai/claude-agent-sdk";
 
+export const HIDE_CLAUDE_AUTH_FLAG = "--hide-claude-auth";
+
 export function shouldHideClaudeAuth(): boolean {
-  return process.argv.includes("--hide-claude-auth");
+  return process.argv.includes(HIDE_CLAUDE_AUTH_FLAG);
 }
 
 /**
@@ -75,6 +77,11 @@ const API_KEY_SOURCES_ABOVE_SUBSCRIPTION: ReadonlySet<string> = new Set([
   "/login managed key",
 ]);
 
+/** `none` is the SDK's explicit no-token source. */
+function hasTokenSource(account: AccountInfo): boolean {
+  return Boolean(account.tokenSource && account.tokenSource !== "none");
+}
+
 /**
  * True when a turn on this account is paid by a claude.ai subscription.
  *
@@ -83,8 +90,8 @@ const API_KEY_SOURCES_ABOVE_SUBSCRIPTION: ReadonlySet<string> = new Set([
  * proves it, and an unknown value keeps the guard on.
  *
  * - `subscriptionType` must be set. Without it the CLI reports no subscription.
- * - `tokenSource` must be absent. The CLI sets it in place of the subscription
- *   when a bearer or OAuth environment token pays for the turn.
+ * - `tokenSource` must be absent, empty, or `none`. A bearer or OAuth
+ *   environment token takes precedence over the subscription.
  * - `apiProvider` must be absent or `firstParty`. The SDK documents that the
  *   Anthropic OAuth login applies only to `firstParty`; for a third-party
  *   backend such as `bedrock`, `vertex`, `foundry` or `gateway` the other
@@ -97,7 +104,7 @@ export function billsClaudeSubscription(account: AccountInfo | undefined): boole
   if (!account?.subscriptionType) {
     return false;
   }
-  if (account.tokenSource) {
+  if (hasTokenSource(account)) {
     return false;
   }
   if (account.apiProvider !== undefined && account.apiProvider !== "firstParty") {
@@ -123,7 +130,7 @@ export function holdsNonSubscriptionCredential(account: AccountInfo | undefined)
   if (account.apiProvider !== undefined && account.apiProvider !== "firstParty") {
     return true;
   }
-  if (account.tokenSource) {
+  if (hasTokenSource(account)) {
     return true;
   }
   return API_KEY_SOURCES_ABOVE_SUBSCRIPTION.has(account.apiKeySource ?? "");
@@ -208,14 +215,14 @@ type GuardOptions = {
  * covers a session created under a provider override that `providers/disable`
  * later removed, so the create-time check never ran for the routing in force
  * now. A sign-out ends the query (see `markSessionForSignOutRespawn` in
- * `acp-agent.ts`), so the next turn recreates it and `initialize` reports the
+ * `v1/acp-agent.ts`), so the next turn recreates it and `initialize` reports the
  * real account. This guard does not see the residual case the module header
  * names either.
  *
  * A turn is refused when the account bills a subscription, and also when it
  * holds nothing this integration accepts, which is the user signing out in
  * mid-session. The refusal mirrors the signed-out path exactly (see
- * `failActiveWithSessionFailure` for `auth_required` in `acp-agent.ts`): every
+ * `failActiveWithSessionFailure` for `auth_required` in `v1/acp-agent.ts`): every
  * client gets the `authRequired` JSON-RPC rejection that starts its own auth
  * flow. The guard sends no separate access message.
  *

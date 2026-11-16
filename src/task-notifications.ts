@@ -1,6 +1,6 @@
 /**
  * The `<task-notification>` inputs that Claude Code writes to a transcript
- * when a background task stops. The replay of a session (`acp-agent.ts`) and
+ * when a background task stops. The replay of a session (`v1/acp-agent.ts`) and
  * the session index (`session-index/background-tasks.ts`) read them here, so
  * both read the same fields.
  */

@@ -36,7 +36,10 @@ const TERMINAL_KEYS = [
 /** The terminal updates of the tool call reports of one v2 connection. */
 export class V2Terminals {
   /** The terminal and the last reported command of each running command, by session and tool call. */
-  private readonly running = new Map<string, { terminalId: string; command?: string }>();
+  private readonly running = new Map<
+    string,
+    { terminalId: string; command?: string; cancellable?: boolean }
+  >();
 
   /**
    * The terminal updates that a tool call report carries in the extension's
@@ -53,7 +56,15 @@ export class V2Terminals {
   ): { terminal: v2.SessionUpdate[]; report: V1ToolCallReport | undefined } {
     const meta = (report._meta ?? {}) as TerminalMeta;
     const key = `${sessionId} ${report.toolCallId}`;
-    if (meta.terminal_info) this.running.set(key, { terminalId: meta.terminal_info.terminal_id });
+    // A replay of a command that still runs, such as one in the background,
+    // names its terminal again: the running entry keeps its command and
+    // `cancellable`.
+    if (
+      meta.terminal_info &&
+      this.running.get(key)?.terminalId !== meta.terminal_info.terminal_id
+    ) {
+      this.running.set(key, { terminalId: meta.terminal_info.terminal_id });
+    }
     const terminal: v2.SessionUpdate[] = [];
     const running = this.running.get(key);
     if (running) {
@@ -66,13 +77,15 @@ export class V2Terminals {
           sessionUpdate: "terminal_update",
           terminalId: running.terminalId,
           ...(newCommand ? { command } : {}),
-          ...(output ? { output: { data: base64(output.data) } } : {}),
+          ...(output ? { output: { data: terminalBytes(output.data) } } : {}),
           ...(exit
             ? {
                 exitStatus: {
                   ...(exit.exit_code != null ? { exitCode: exit.exit_code } : {}),
                   ...(exit.signal != null ? { signal: exit.signal } : {}),
                 },
+                // An exited terminal can no longer be cancelled.
+                ...(running.cancellable ? { capabilities: null } : {}),
               }
             : {}),
         });
@@ -81,12 +94,36 @@ export class V2Terminals {
         terminal.push({
           sessionUpdate: "terminal_output_chunk",
           terminalId: running.terminalId,
-          data: base64(delta.data),
+          data: terminalBytes(delta.data),
         });
       }
       if (exit) this.running.delete(key);
     }
     return { terminal, report: withoutTerminalKeys(report) };
+  }
+
+  /**
+   * The `terminal_update` that lets the client cancel the running terminal
+   * `terminalId` of the session `sessionId` with `terminal/cancel`, with its
+   * command, or undefined when the terminal is not running. `again` sends it
+   * also when the terminal advertises the capability already, as the current
+   * state of the terminal.
+   */
+  advertiseCancel(
+    sessionId: string,
+    terminalId: string,
+    again = false,
+  ): v2.SessionUpdate | undefined {
+    // The agent names a command's terminal after its tool call.
+    const running = this.running.get(`${sessionId} ${terminalId}`);
+    if (!running || (running.cancellable && !again)) return undefined;
+    running.cancellable = true;
+    return {
+      sessionUpdate: "terminal_update",
+      terminalId,
+      ...(running.command !== undefined ? { command: running.command } : {}),
+      capabilities: { cancel: {} },
+    };
   }
 
   /** Forgets the terminals of a session. */
@@ -124,7 +161,13 @@ function commandOf(rawInput: unknown): string | undefined {
   return typeof command === "string" && command.length > 0 ? command : undefined;
 }
 
-/** The output bytes, base64-encoded as a v2 terminal carries them. */
-function base64(text: string): string {
-  return Buffer.from(text, "utf8").toString("base64");
+/**
+ * The output as the bytes a PTY would have delivered, base64-encoded as a v2
+ * terminal carries them. A v2 terminal carries the bytes a terminal emulator
+ * receives, but Claude Code runs a command with its output piped, so no line
+ * discipline turned each LF into CR LF (`ONLCR`). Without the CR, an emulator
+ * moves down a row and keeps the column: "a\nb" draws "b" under the end of "a".
+ */
+function terminalBytes(text: string): string {
+  return Buffer.from(text.replaceAll("\n", "\r\n"), "utf8").toString("base64");
 }

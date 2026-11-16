@@ -22,14 +22,14 @@ import {
   BetaBashCodeExecutionResultBlock,
   BetaBashCodeExecutionToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/beta.mjs";
-import { AcpClient, toAcpNotifications, ToolUseCache, Logger } from "../acp-agent.js";
+import { AcpClient } from "../acp-client.js";
+import { toAcpNotifications, ToolUseCache } from "../sdk-to-acp.js";
+import { Logger } from "../logger.js";
 import {
-  toolUpdateFromToolResult,
   createPostToolUseHook,
   createTaskHook,
   clearHookCallbacks,
   registerHookCallback,
-  toolInfoFromToolUse,
   planEntries,
   applyTaskCreate,
   applyTaskList,
@@ -41,6 +41,7 @@ import {
 } from "../tools.js";
 import { ClientCapabilities as ToolCallCapabilities } from "../tool-calls/client-capabilities.js";
 import { AcpToolCallRenderer } from "../tool-calls/renderer.js";
+import { toolInfoFromToolUse, toolUpdateFromToolResult } from "./tool-render.js";
 
 /** An AIR client: it gets the ACP tool call contract (`docs/air-extensions.md`). */
 const AIR_CLIENT: ClientCapabilities = {
@@ -2448,6 +2449,18 @@ describe("toolInfoFromToolUse - ExitPlanMode", () => {
   });
 });
 
+describe("toolInfoFromToolUse - EnterPlanMode", () => {
+  it("reports a mode switch", () => {
+    const info = toolInfoFromToolUse(
+      { name: "EnterPlanMode", id: "toolu_enter", input: {} },
+      false,
+    );
+
+    expect(info.kind).toBe("switch_mode");
+    expect(info.title).toBe("EnterPlanMode");
+  });
+});
+
 describe("toolInfoFromToolUse - Write input aliases", () => {
   it.each([
     ["path + file_text", { path: "/repo/a.ts", file_text: "x" }],
@@ -2672,6 +2685,102 @@ describe("toAcpNotifications - TodoWrite with undefined input regression", () =>
     const planUpdates = notifications.filter((n) => (n.update as any).sessionUpdate === "plan");
     expect(planUpdates).toHaveLength(1);
   });
+
+  it.each([
+    {
+      todos: [{ content: "Do X", status: "pending", activeForm: "Doing X" }],
+      expected: {
+        sessionUpdate: "plan_update",
+        plan: {
+          type: "items",
+          planId: "plan",
+          entries: [{ content: "Do X", status: "pending", priority: "medium" }],
+        },
+      },
+    },
+    { todos: [], expected: { sessionUpdate: "plan_removed", planId: "plan" } },
+  ])(
+    "sends $todos.length todos as a plan operation to a client with plan operations",
+    ({ todos, expected }) => {
+      const notifications = toAcpNotifications(
+        [{ type: "tool_use" as const, id: "toolu_todo", name: "TodoWrite", input: { todos } }],
+        "assistant",
+        "test-session",
+        {},
+        mockClient,
+        mockLogger,
+        { clientCapabilities: { plan: {} } },
+      );
+
+      expect(notifications.map(({ update }) => update)).toEqual([expected]);
+    },
+  );
+
+  const subagentTodos = [{ content: "Do Y", status: "pending", activeForm: "Doing Y" }];
+  const subagentEntries = [{ content: "Do Y", status: "pending", priority: "medium" }];
+  const subagentMeta = { claudeCode: { parentToolUseId: "toolu_agent" } };
+
+  it.each([
+    {
+      client: "a client with plan operations",
+      clientCapabilities: { plan: {} },
+      todos: subagentTodos,
+      shownBefore: [],
+      expected: {
+        sessionUpdate: "plan_update",
+        plan: { type: "items", planId: "plan:toolu_agent", entries: subagentEntries },
+        _meta: subagentMeta,
+      },
+      shownAfter: ["plan:toolu_agent"],
+    },
+    {
+      client: "a client with plan operations",
+      clientCapabilities: { plan: {} },
+      todos: [],
+      shownBefore: ["plan:toolu_agent", "plan:toolu_other"],
+      expected: { sessionUpdate: "plan_removed", planId: "plan:toolu_agent", _meta: subagentMeta },
+      shownAfter: ["plan:toolu_other"],
+    },
+    {
+      // The update goes to the subagent's own session, which holds no other checklist.
+      client: "a client with native subagent sessions",
+      clientCapabilities: { plan: {}, subagents: {} },
+      todos: subagentTodos,
+      shownBefore: [],
+      expected: {
+        sessionUpdate: "plan_update",
+        plan: { type: "items", planId: "plan", entries: subagentEntries },
+        _meta: subagentMeta,
+      },
+      shownAfter: [],
+    },
+    {
+      // The client holds one plan per session.
+      client: "a client without plan operations",
+      clientCapabilities: {},
+      todos: subagentTodos,
+      shownBefore: [],
+      expected: { sessionUpdate: "plan", entries: subagentEntries, _meta: subagentMeta },
+      shownAfter: [],
+    },
+  ])(
+    "sends $todos.length todos of a subagent to $client",
+    ({ clientCapabilities, todos, shownBefore, expected, shownAfter }) => {
+      const shown = new Set(shownBefore);
+      const notifications = toAcpNotifications(
+        [{ type: "tool_use" as const, id: "toolu_todo", name: "TodoWrite", input: { todos } }],
+        "assistant",
+        "test-session",
+        {},
+        mockClient,
+        mockLogger,
+        { clientCapabilities, parentToolUseId: "toolu_agent", subagentChecklists: shown },
+      );
+
+      expect(notifications.map(({ update }) => update)).toEqual([expected]);
+      expect([...shown]).toEqual(shownAfter);
+    },
+  );
 });
 
 describe("parseTaskCreateOutput", () => {
@@ -2723,6 +2832,19 @@ describe("applyTaskCreate / applyTaskUpdate", () => {
       subject: "Write tests",
       status: "pending",
       activeForm: "Writing tests",
+      description: "Cover Task* flow",
+    });
+  });
+
+  it("takes the subject and description from the output, which holds the task as saved", () => {
+    const state: TaskState = new Map();
+    applyTaskCreate(
+      state,
+      { subject: "Write tsets", description: "Cover Task*", activeForm: "Writing tests" },
+      { task: { id: "1", subject: "Write tests", description: "Cover Task* flow" } },
+    );
+    expect(state.get("1")).toMatchObject({
+      subject: "Write tests",
       description: "Cover Task* flow",
     });
   });
@@ -2897,6 +3019,59 @@ describe("toAcpNotifications - Task* tools", () => {
     expect(notifications).toHaveLength(0);
     expect(taskState.size).toBe(0);
   });
+
+  // Claude Code shares one task list between the agents of a session, so a
+  // subagent's Task* call shows the same checklist as the main conversation's.
+  it.each([
+    { caller: "the main conversation", parentToolUseId: undefined, meta: {} },
+    {
+      caller: "a subagent",
+      parentToolUseId: "toolu_agent",
+      meta: { _meta: { claudeCode: { parentToolUseId: "toolu_agent" } } },
+    },
+  ])(
+    "sends the task snapshot of $caller as the checklist plan operation to a client with plan operations",
+    ({ parentToolUseId, meta }) => {
+      const toolUseCache: ToolUseCache = {
+        "1": { type: "tool_use", id: "1", name: "TaskCreate", input: { subject: "First" } },
+      };
+      const subagentChecklists = new Set<string>();
+      const created = toAcpNotifications(
+        [
+          {
+            type: "tool_result",
+            tool_use_id: "1",
+            content: JSON.stringify({ task: { id: "1", subject: "First" } }),
+            is_error: false,
+          },
+        ] as any,
+        "user",
+        "test-session",
+        toolUseCache,
+        mockClient,
+        mockLogger,
+        {
+          taskState: new Map(),
+          clientCapabilities: { plan: {} },
+          parentToolUseId,
+          subagentChecklists,
+        },
+      );
+
+      expect(created.map(({ update }) => update)).toEqual([
+        {
+          sessionUpdate: "plan_update",
+          plan: {
+            type: "items",
+            planId: "plan",
+            entries: [{ content: "First", status: "pending", priority: "medium" }],
+          },
+          ...meta,
+        },
+      ]);
+      expect(subagentChecklists.size).toBe(0);
+    },
+  );
 
   it("emits a plan snapshot after a TaskCreate tool_result and accumulates state", () => {
     const toolUseCache: ToolUseCache = {};
@@ -4935,9 +5110,9 @@ describe("toAcpNotifications - the plan of an approved ExitPlanMode", () => {
       .map(({ update }) => update);
   }
 
-  const markdownPlan = (content: string) => ({
+  const markdownPlan = (content: string, planId = "plan-mode") => ({
     sessionUpdate: "plan_update",
-    plan: { type: "markdown", planId: "plan-mode", content },
+    plan: { type: "markdown", planId, content },
   });
 
   it("shows the plan of the structured result, which includes the user's edits", () => {
@@ -4954,6 +5129,24 @@ describe("toAcpNotifications - the plan of an approved ExitPlanMode", () => {
   it("shows the plan of the input when the structured result has none", () => {
     const toolUseResult = { plan: null, isAgent: false };
     expect(planUpdates({}, { toolUseResult })).toEqual([markdownPlan("Implement it")]);
+  });
+
+  it.each([false, true])("links an AIR plan by ID with planFile=%s", (planFile) => {
+    const clientCapabilities: ClientCapabilities = {
+      plan: {},
+      _meta: {
+        jetbrains: { air: { version: 1, capabilities: planFile ? ["planFile"] : [] } },
+      },
+    };
+    expect(
+      planUpdates(
+        {},
+        { clientCapabilities, toolUseResult: { plan: "Edited plan", isAgent: false } },
+      ),
+    ).toEqual([markdownPlan("Edited plan", "plan-mode:toolu_plan")]);
+    expect(planUpdates({}, { clientCapabilities }, { plan: "\nOriginal plan\n" })).toEqual([
+      markdownPlan("Original plan", "plan-mode:toolu_plan"),
+    ]);
   });
 
   it("shows the plan after the tool call's result", () => {

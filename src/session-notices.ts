@@ -50,9 +50,33 @@ export function noticeOrTranscriptUpdate(
   if (supportsNotices) return noticeUpdate(notice);
   return {
     sessionUpdate: "agent_message_chunk",
-    content: { type: "text", text: transcriptText },
+    content: { type: "text", text: transcriptBlock(transcriptText) },
     ...(transcriptMeta ? { _meta: transcriptMeta } : {}),
   };
+}
+
+/** Clients render consecutive agent_message_chunks as one markdown stream, so
+ *  a bare `**Notice:** …` chunk lands mid-sentence: "…all done.**Notice:** Stop
+ *  says: …". Put it in its own blockquote paragraph, blank lines on both sides,
+ *  so it starts on a new line and Claude's next chunk does not continue the
+ *  quote. */
+export function transcriptBlock(text: string): string {
+  const lines = text.trim().split(/\r?\n/);
+  return `\n\n${lines.map((line) => (line ? `> ${line}` : ">")).join("\n")}\n\n`;
+}
+
+const HOOK_SPEAKER = /^[^\n:]{1,80} says: /;
+
+/** Claude Code prefixes every line of a hook's `systemMessage` with
+ *  "<HookEvent> says: ", so a two-line message reads "Stop says: a\nStop says:
+ *  b". Keep the prefix on the first line only when every line repeats it. */
+export function collapseHookSpeaker(text: string): string {
+  const lines = text.split(/\r?\n/);
+  const prefix = lines[0].match(HOOK_SPEAKER)?.[0];
+  if (!prefix || lines.length < 2 || !lines.every((line) => line.startsWith(prefix))) {
+    return text;
+  }
+  return [lines[0], ...lines.slice(1).map((line) => line.slice(prefix.length))].join("\n");
 }
 
 /** Fragments that read on after a bold label stand alone as a notice
@@ -93,4 +117,99 @@ export function splitNoticeText(
     return { title: fallbackTitle, description: trimmed };
   }
   return rest ? { title: firstLine, description: rest } : { title: firstLine };
+}
+
+/** The notice of Claude Code's `informational` message (e.g. why a Stop hook
+ *  blocked continuation): a warning at level `warning`, else info. */
+export function informationalNotice(message: { level: string; content: string }): SessionNotice {
+  const severity = message.level === "warning" ? "warning" : "info";
+  return {
+    severity,
+    ...splitNoticeText(
+      message.content,
+      severity === "warning" ? "Claude reported a warning" : "Claude reported a notice",
+    ),
+  };
+}
+
+/** The notice of a client MCP server that the `system/init` lists as not
+ *  started: `failed`, or `needs-auth` when the client cannot run the OAuth
+ *  flow (`oauthAvailable`). Undefined for any other status. */
+export function mcpServerStartupNotice(
+  server: { name: string; status: string },
+  oauthAvailable: boolean,
+): SessionNotice | undefined {
+  if (server.status === "failed") {
+    return {
+      severity: "warning",
+      title: `MCP server "${server.name}" failed to start`,
+      description: "Its tools are unavailable in this session. Run /mcp for the error.",
+    };
+  }
+  if (server.status === "needs-auth" && !oauthAvailable) {
+    return {
+      severity: "info",
+      title: `MCP server "${server.name}" needs authentication`,
+      description: "Its tools are unavailable until the server is authenticated.",
+    };
+  }
+  return undefined;
+}
+
+/**
+ * What Claude Code's `model_refusal_fallback` tells the user: the SDK retried
+ * a refused turn on the fallback model.
+ *
+ * Current CLIs only emit direction "retry", a swap that lasts for the
+ * session. "revert"/"sticky" are retained in the SDK enum for older CLIs,
+ * where "revert" marked a turn-only fallback: the session stays on the
+ * original model. `scope` (CLI 2.1.232+) "local" means a subagent,
+ * side-question or background fork response fell back and the session model
+ * is unchanged. Absent scope means an older CLI, where every retry was a
+ * session-level swap. `persistent` is whether the session now runs
+ * `fallback_model`, so its model option must follow.
+ */
+export function modelRefusalFallback(message: {
+  original_model: string;
+  fallback_model: string;
+  direction?: string;
+  scope?: string;
+  api_refusal_category?: string | null;
+  api_refusal_explanation?: string | null;
+}): {
+  persistent: boolean;
+  /** The one-line summary. */
+  summary: string;
+  explanation: string | undefined;
+  /** The notice: the summary as its title when it is short enough, else a
+   *  generic title with everything in the description. */
+  notice: SessionNotice;
+  /** The transcript line for a client without `notice` updates. */
+  transcript: string;
+} {
+  const local = message.scope === "local";
+  const persistent = message.direction !== "revert" && !local;
+  const category = message.api_refusal_category ? ` (${message.api_refusal_category})` : "";
+  const outcome = persistent
+    ? `The session will continue on ${message.fallback_model}.`
+    : local
+      ? `Only that response came from ${message.fallback_model}; the session stays on ${message.original_model}.`
+      : `The session stays on ${message.original_model}.`;
+  const summary =
+    `${message.original_model} declined this request${category}; ` +
+    `retried with ${message.fallback_model}. ${outcome}`;
+  const explanation = message.api_refusal_explanation || undefined;
+  const full = explanation ? `${summary}\n\n${explanation}` : summary;
+  return {
+    persistent,
+    summary,
+    explanation,
+    notice: {
+      severity: "warning",
+      ...(summary.length > MAX_NOTICE_TITLE_LENGTH
+        ? { title: "Model fallback", description: full }
+        : { title: summary, ...(explanation ? { description: explanation } : {}) }),
+    },
+    transcript: `**Model fallback:** ${full}`,
+  };
 }

@@ -25,6 +25,19 @@
  * - The `initialize` response also advertises
  *   `agentCapabilities.sessionCapabilities.systemPrompt`, which origin/main
  *   did not: the agent now applies the `systemPrompt` of session requests.
+ * - The `initialize` response also advertises `agentCapabilities.auth.status`,
+ *   which origin/main did not: the agent now answers `auth/status` and sends
+ *   `auth/status_update`.
+ * - The `initialize` response also advertises
+ *   `agentCapabilities.sessionCapabilities.status`, which origin/main did
+ *   not: the agent now serves `session/status`.
+ * - The `initialize` response also advertises
+ *   `agentCapabilities.sessionCapabilities.title`, which origin/main did not:
+ *   the agent now serves `session/set_title`.
+ * - The `initialize` response also advertises
+ *   `agentCapabilities.sessionCapabilities.options`, which origin/main did
+ *   not: the agent now serves `session/options` and takes `configOptions` on
+ *   session setup requests.
  * - A SandboxNetworkAccess tool call is settled by a `tool_call_update` with
  *   only its final `status` once its permission request is answered. The
  *   callback runs nothing, so origin/main never settled the call (see
@@ -226,19 +239,30 @@ function isMeta(key: string): boolean {
   return key.startsWith("_meta.");
 }
 
-/** `record` without the session capability `key`, when it is an `initialize` response. */
-function withoutSessionCapability(record: Recorded, key: string): Recorded {
+/** `record` without the session capabilities `keys`, when it is an `initialize` response. */
+function withoutSessionCapabilities(record: Recorded, keys: readonly string[]): Recorded {
   if (record.kind !== "initialize") return record;
   const payload = record.payload as Json;
   const agent = payload.agentCapabilities as Json | undefined;
   const session = agent?.sessionCapabilities as Json | undefined;
-  if (!session || !(key in session)) return record;
+  if (!session || !keys.some((key) => key in session)) return record;
+  const remaining = keys.reduce((rest, key) => without(rest, key), session);
   return {
     ...record,
-    payload: {
-      ...payload,
-      agentCapabilities: { ...agent, sessionCapabilities: without(session, key) },
-    },
+    payload: { ...payload, agentCapabilities: { ...agent, sessionCapabilities: remaining } },
+  } as Recorded;
+}
+
+/** `record` without `agentCapabilities.auth.status`, when it is an `initialize` response. */
+function withoutAuthStatusCapability(record: Recorded): Recorded {
+  if (record.kind !== "initialize") return record;
+  const payload = record.payload as Json;
+  const agent = payload.agentCapabilities as Json | undefined;
+  const auth = agent?.auth as Json | undefined;
+  if (!auth || !("status" in auth)) return record;
+  return {
+    ...record,
+    payload: { ...payload, agentCapabilities: { ...agent, auth: without(auth, "status") } },
   } as Recorded;
 }
 
@@ -248,13 +272,19 @@ function withoutSessionCapability(record: Recorded, key: string): Recorded {
  */
 export function compareWithBaseline(baseline: Recorded[], traffic: Recorded[]): string[] {
   const expected = baseline
-    .map((record) => withoutSessionCapability(withoutAirOnlyKeys(record) as Recorded, "subagents"))
+    .map((record) =>
+      withoutSessionCapabilities(withoutAirOnlyKeys(record) as Recorded, ["subagents"]),
+    )
     .filter((record) => {
       const update = updateOf(record);
       return !(update?.sessionUpdate === "session_info_update" && Object.keys(update).length === 1);
     });
   const current = withoutSandboxNetworkSettlements(
-    traffic.map((record) => withoutSessionCapability(record, "systemPrompt")),
+    traffic.map((record) =>
+      withoutAuthStatusCapability(
+        withoutSessionCapabilities(record, ["systemPrompt", "status", "title", "options"]),
+      ),
+    ),
   );
   const violations: string[] = [];
   const state = new Map<string, Map<string, string>>();

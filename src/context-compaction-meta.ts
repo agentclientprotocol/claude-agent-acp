@@ -2,7 +2,7 @@ import { AIR_CONTEXT_COMPACTION_KEY, withAirMeta } from "./air-extension.js";
 
 export const CONTEXT_COMPACTION_META_VERSION = 1;
 
-export type ContextCompactionTrigger = "manual" | "automatic";
+export type ContextCompactionTrigger = "manual" | "automatic" | "idle";
 
 export interface ContextCompactionMetadata {
   version: typeof CONTEXT_COMPACTION_META_VERSION;

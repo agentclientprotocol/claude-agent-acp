@@ -28,7 +28,11 @@ export class ReadReporter implements ToolReporter {
     return {
       title: "Read " + displayPath + limit,
       kind: "read",
-      locations: read?.file_path ? [{ path: read.file_path, line: read.offset ?? 1 }] : [],
+      // Read offsets are 1-based. ACP lines are too, so `offset: 0` (read from
+      // the start) becomes line 1.
+      locations: read?.file_path
+        ? [{ path: read.file_path, line: Math.max(read.offset ?? 1, 1) }]
+        : [],
     };
   }
 

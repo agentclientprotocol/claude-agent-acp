@@ -2,7 +2,7 @@
 
 import { Readable, Writable } from "node:stream";
 import { WritableStream, ReadableStream } from "node:stream/web";
-import { Logger } from "./acp-agent.js";
+import { Logger } from "./logger.js";
 
 // Useful for bridging push-based and async-iterator-based code.
 export class Pushable<T> implements AsyncIterable<T> {

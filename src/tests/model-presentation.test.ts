@@ -168,7 +168,7 @@ describe("versioned model display names", () => {
       { value: "haiku", displayName: "Haiku", description: "Fast" },
     ];
     const ids = ["claude-opus-5-5[1m]", "claude-opus-5-5", "opus[1m]", "opus", "haiku"];
-    const models = applyAvailableModelsAllowlist(sdkModels, ids);
+    const models = await applyAvailableModelsAllowlist(sdkModels, ids);
     const setModel = vi.fn();
     const state = await getAvailableModels(
       { setModel } as unknown as Query,
@@ -216,6 +216,76 @@ describe("versioned model display names", () => {
       { modelId: "provider-a", name: "My model (provider-a)", description: "First endpoint" },
       { modelId: "provider-b", name: "My model (provider-b)", description: "Second endpoint" },
     ]);
+  });
+});
+
+describe("model option currentValue is one of its options", () => {
+  const DEFAULT: ModelInfo = { ...OPUS, value: "default", displayName: "Default (recommended)" };
+  const SONNET: ModelInfo = {
+    value: "sonnet",
+    resolvedModel: "claude-sonnet-5",
+    displayName: "Sonnet 5",
+    description: "Sonnet",
+  };
+  const listed = [DEFAULT, OPUS, SONNET];
+  const availableModels = listed.map((model) => ({
+    modelId: model.value,
+    name: model.displayName,
+    description: model.description,
+  }));
+  const values = (option: ReturnType<typeof buildModelConfigOption>) =>
+    option.type === "select"
+      ? option.options.map((entry) => ("value" in entry ? entry.value : entry.group))
+      : [];
+
+  it("lists an off-list current model after the listed models", () => {
+    const offList: ModelInfo = {
+      value: "claude-opus-4-1",
+      displayName: "claude-opus-4-1",
+      description: "",
+    };
+    for (const useRecommendedValue of [false, true]) {
+      const option = buildModelConfigOption(
+        { availableModels, currentModelId: offList.value },
+        [...listed, offList],
+        useRecommendedValue,
+      );
+      expect(option.currentValue).toBe("claude-opus-4-1");
+      expect(option.type === "select" && option.options.at(-1)).toEqual({
+        value: "claude-opus-4-1",
+        name: "claude-opus-4-1",
+        description: undefined,
+      });
+    }
+  });
+
+  it("names an off-list current model with no model info by its id", () => {
+    const option = buildModelConfigOption(
+      { availableModels, currentModelId: "claude-haiku-9" },
+      listed,
+      false,
+    );
+    expect(option.currentValue).toBe("claude-haiku-9");
+    expect(values(option)).toEqual(["default", "opus[1m]", "sonnet", "claude-haiku-9"]);
+  });
+
+  it("adds no entry while the current model is listed", () => {
+    const option = buildModelConfigOption(
+      { availableModels, currentModelId: "sonnet" },
+      listed,
+      false,
+    );
+    expect(values(option)).toEqual(["default", "opus[1m]", "sonnet"]);
+  });
+
+  it("maps a current default onto the listed recommended model", () => {
+    const option = buildModelConfigOption(
+      { availableModels, currentModelId: "default" },
+      listed,
+      true,
+    );
+    expect(option.currentValue).toBe("opus[1m]");
+    expect(values(option)).toEqual(["opus[1m]", "sonnet"]);
   });
 });
 
