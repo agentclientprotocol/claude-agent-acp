@@ -1161,6 +1161,41 @@ describe("tool calls of a background subagent that a cancel stops", () => {
   });
 });
 
+// The model can write an input that Claude Code rejects when it runs the tool,
+// after the adapter reported the tool use (issue #1308).
+describe("a tool use whose input Claude Code rejects", () => {
+  it("reports a Read with a number for file_path as failed, and ends the turn", async () => {
+    const id = "toolu_number_path";
+    const error =
+      "InputValidationError: Read failed due to the following issue:\n" +
+      "The parameter `file_path` type is expected as `string` but provided as `number`";
+    const { prompt, updates, logError } = createTestSession(async function* (prompts) {
+      yield* echoNextPrompt(prompts);
+      yield toolUse(id, null, "Read", { file_path: 12345 });
+      yield {
+        ...toolResult(id),
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: id, is_error: true, content: error }],
+        },
+      };
+      yield successfulResultMessage();
+    });
+
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+
+    const reports = updates.filter((update) => update.toolCallId === id);
+    expect(reports[0]).toMatchObject({
+      sessionUpdate: "tool_call",
+      title: "Read File",
+      locations: [],
+      rawInput: { file_path: 12345 },
+    });
+    expect(reports.at(-1)).toMatchObject({ status: "failed" });
+    expect(logError).not.toHaveBeenCalled();
+  });
+});
+
 function toolStart(id = toolCallId, parent: string | null = null, name = "Bash") {
   return {
     type: "stream_event",

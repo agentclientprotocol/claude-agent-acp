@@ -2498,6 +2498,25 @@ describe("toolInfoFromToolUse - Write input aliases", () => {
   });
 });
 
+// The input is what the model wrote. Claude Code rejects a field of the wrong
+// type when it runs the tool, after the adapter reported the tool use.
+describe("toolInfoFromToolUse - an input field of the wrong type", () => {
+  it.each([
+    ["Read", { file_path: 12345 }, "Read File", toolInfoFromToolUse],
+    ["Edit", { file_path: 12345, old_string: "a", new_string: "b" }, "Edit", toolInfoFromToolUse],
+    // Only an AIR client gets the notebook's path.
+    ["NotebookEdit", { notebook_path: 12345, new_source: "x" }, "Edit notebook", airToolInfo],
+    ["Glob", { path: 12345, pattern: "*.ts" }, "Find `*.ts`", toolInfoFromToolUse],
+    ["Bash", { command: 12345 }, "Terminal", toolInfoFromToolUse],
+  ])("reports %s %j as %j, without a location or a diff", (name, input, title, toolInfo) => {
+    const info = toolInfo({ name, id: "toolu_wrong_type", input }, false, "/repo");
+
+    expect(info.title).toBe(title);
+    expect(info.locations ?? []).toEqual([]);
+    expect(info.content).not.toContainEqual(expect.objectContaining({ type: "diff" }));
+  });
+});
+
 describe("toolInfoFromToolUse - undefined input regression", () => {
   it("Read with undefined input should not throw", () => {
     const toolUse = { name: "Read", id: "toolu_read_undef", input: undefined };

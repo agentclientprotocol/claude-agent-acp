@@ -1,6 +1,6 @@
-import type { BashInput, BashOutput } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
+import type { BashOutput } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import type { BetaBashCodeExecutionResultBlock } from "@anthropic-ai/sdk/resources/beta.mjs";
-import { structuredResult, textContent, toAcpContentUpdate } from "../content.js";
+import { inputString, structuredResult, textContent, toAcpContentUpdate } from "../content.js";
 import type { ToolReporter, ToolResultContext, ToolResultFacts, ToolUseFacts } from "../facts.js";
 
 /**
@@ -19,10 +19,9 @@ export function shellDescription(input: unknown): string | undefined {
 /** Bash and PowerShell: a command whose output goes to the terminal channel. */
 export class BashReporter implements ToolReporter {
   toolUse(input: unknown): ToolUseFacts {
-    const bash = input as BashInput | undefined;
     const description = shellDescription(input);
     return {
-      title: bash?.command ? bash.command : "Terminal",
+      title: inputString(input, "command") ?? "Terminal",
       kind: "execute",
       command: true,
       ...(description ? { display: [textContent(description)] } : {}),
