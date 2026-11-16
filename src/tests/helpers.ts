@@ -63,6 +63,19 @@ export function startupFailure(reason: string, cliMessage: string): Error {
 }
 
 /**
+ * The error `setModel()` rejects with when Claude Code refuses the switch, as
+ * SDK 0.3.325 builds it from the CLI's answer: `errorCode` is the answer's
+ * `error_code`, such as `not_found` for "Model 'gpt-4' not found".
+ */
+export function setModelRefusal(message: string, errorCode: string): Error {
+  return Object.assign(new Error(message), {
+    telemetryMessage: "Claude Code control request failed (set_model)",
+    errorClass: "control_request_failed",
+    errorCode,
+  });
+}
+
+/**
  * Declares the client capabilities through `initialize`, as a real client
  * does. The agent reads its capability choices only there.
  */

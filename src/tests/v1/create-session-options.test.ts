@@ -11,7 +11,7 @@ import type { AcpClient } from "../../acp-client.js";
 import type { AcpSessionNotification } from "../../acp-subagents.js";
 import { ALLOW_BYPASS } from "../../permissions/modes.js";
 import { NativeSubagentRuntime } from "../../native-subagents.js";
-import { startupFailure } from "../helpers.js";
+import { setModelRefusal, startupFailure } from "../helpers.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -1504,9 +1504,13 @@ describe("createSession options merging", () => {
     it.each([
       ["an unknown configId", { configId: "nope", value: "x" }],
       ["a boolean for a select", { configId: "model", type: "boolean" as const, value: true }],
-      ["a value the option does not offer", { configId: "model", value: "gpt-4" }],
+      ["a model Claude Code does not know", { configId: "model", value: "gpt-4" }],
     ])("skips an entry with %s and sets the entries after it", async (_name, entry) => {
       const plain = await agent.newSession({ cwd, mcpServers: [] });
+      // An id the option does not list goes to Claude Code, which refuses an unknown one.
+      setModelImpl = async (model) => {
+        throw setModelRefusal(`Model '${model}' not found`, "not_found");
+      };
 
       const response = await agent.newSession({
         cwd,

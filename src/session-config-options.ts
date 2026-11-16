@@ -192,12 +192,20 @@ export function buildConfigOptions(
  * a fallback for resolutions that don't map back onto a selectable option
  * (e.g. a fuzzy hit on an out-of-picker verbatim entry). `value` is then the
  * canonical option value, the model id rather than the alias.
+ *
+ * With `passUnlisted`, a model value that resolves to none of the entries is
+ * returned as it is, marked `unlisted`, for Claude Code to decide: the CLI's
+ * picker leaves out models it runs, such as `claude-fable-5-2` before a CLI
+ * lists it, or `claude-opus-4-6` once a newer Opus replaces it.
+ * {@link setSelectedModel} refuses it with invalid params when Claude Code
+ * does. Without it, such a value is refused here.
  */
 export function configOptionValue(
   option: SessionConfigOption,
   params: SetSessionConfigOptionRequest,
   modelInfos: ModelInfo[],
-): { enabled: boolean } | { value: string } {
+  passUnlisted = false,
+): { enabled: boolean } | { value: string; unlisted?: true } {
   const expectedType = option.type === "boolean" ? "boolean" : "string";
   if (typeof params.value !== expectedType) {
     throw RequestError.invalidParams(
@@ -233,6 +241,9 @@ export function configOptionValue(
       }));
       validValue = toOptionValue(resolveModelPreference(optionInfos, requested));
     }
+    if (!validValue && passUnlisted && requested.trim() !== "") {
+      return { value: requested.trim(), unlisted: true };
+    }
   }
   if (!validValue) {
     throw RequestError.invalidParams(
@@ -241,4 +252,60 @@ export function configOptionValue(
     );
   }
   return { value: validValue.value };
+}
+
+/**
+ * The codes with which Claude Code's `setModel` refuses a model id that the
+ * session cannot use: an id it does not know (`not_found`,
+ * `catalog_unknown`), one that settings restrict (`restricted_by_org`: an
+ * `availableModels` allowlist, a managed `deniedModels` entry), one the
+ * account or this CLI does not offer, and a `[1m]` form that is turned off or
+ * that the model lacks.
+ *
+ * Claude Code sends the code as `error_code` of its answer and the SDK
+ * (0.3.325) copies it to `errorCode` of the error that `setModel()` rejects
+ * with. The SDK's types do not declare it.
+ */
+const UNUSABLE_MODEL_ERROR_CODES: ReadonlySet<string> = new Set([
+  "not_found",
+  "catalog_unknown",
+  "restricted_by_org",
+  "unavailable_for_account",
+  "not_offered",
+  "alias_1m_disabled",
+  "alias_1m_unsupported",
+]);
+
+/** Whether `setModel()` rejected with `error` because the session cannot use the model id. */
+function refusesModelId(error: unknown): error is Error {
+  if (!(error instanceof Error)) return false;
+  const code = (error as { errorCode?: unknown }).errorCode;
+  return typeof code === "string" && UNUSABLE_MODEL_ERROR_CODES.has(code);
+}
+
+/**
+ * Switches `query` to the model that {@link configOptionValue} selected.
+ *
+ * When Claude Code refuses an `unlisted` id as one the session cannot use
+ * (see {@link UNUSABLE_MODEL_ERROR_CODES}), that is invalid params with Claude
+ * Code's reason ("Model 'gpt-4' not found"), as for a value the option lacks.
+ * Every other failure is thrown as it is and reaches the client as an
+ * internal error: a failed switch to a listed value, and a failure that does
+ * not judge the id, such as `auth_failed`, `rate_limit`, `check_unreachable`
+ * (the API did not answer), `blocked_by_hook`, a closed query, or a refusal
+ * without a code.
+ */
+export async function setSelectedModel(
+  query: Pick<Query, "setModel">,
+  selected: { value: string; unlisted?: true },
+): Promise<void> {
+  try {
+    await query.setModel(selected.value);
+  } catch (error) {
+    if (!selected.unlisted || !refusesModelId(error)) throw error;
+    throw RequestError.invalidParams(
+      undefined,
+      `Invalid value for config option ${MODEL_CONFIG_ID}: ${selected.value}. ${error.message}`,
+    );
+  }
 }

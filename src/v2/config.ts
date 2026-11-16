@@ -51,6 +51,7 @@ import {
   AGENT_CONFIG_ID,
   buildConfigOptions,
   configOptionValue,
+  setSelectedModel,
   discoverCustomAgents,
 } from "../session-config-options.js";
 import {
@@ -119,6 +120,8 @@ export interface ConfigSetup {
   effortSettings(): Settings;
   /** The client declared AIR's `recommendedValue` (see the module doc). */
   recommendedValue: boolean;
+  /** A `providers/set` gateway listed the models, so only those can run. */
+  narrowsModels: boolean;
 }
 
 export class SessionConfig {
@@ -137,6 +140,8 @@ export class SessionConfig {
   private readonly ultracodeWorkflowsEnabled: boolean | undefined;
   /** The end of the last change (see the module doc). */
   private changes: Promise<void> = Promise.resolve();
+  /** A model id the option does not list goes to Claude Code (`configOptionValue`), unless a gateway listed the models. */
+  private readonly passUnlistedModels: boolean;
 
   private constructor(
     private readonly sessionId: string,
@@ -162,7 +167,9 @@ export class SessionConfig {
     private readonly notify: (notification: SessionNotification) => void,
     private readonly logger: Logger,
     autoModeFallbackWarningPending: boolean,
+    narrowsModels: boolean,
   ) {
+    this.passUnlistedModels = !narrowsModels;
     this.session = {
       query,
       modes,
@@ -299,6 +306,7 @@ export class SessionConfig {
       notify,
       logger,
       autoModeFallbackWarningPending,
+      setup.narrowsModels,
     );
   }
 
@@ -384,7 +392,8 @@ export class SessionConfig {
       };
       const select = (configId: string, value: string) =>
         restore(`${configId} "${value}"`, () =>
-          this.apply({ sessionId: this.sessionId, configId, type: "id", value }),
+          // A model the new query does not list falls back: it may be one the new provider cannot serve.
+          this.apply({ sessionId: this.sessionId, configId, type: "id", value }, false, true),
         );
       const model = previous.session.models.currentModelId;
       if (this.session.models.currentModelId !== model) await select(MODEL_CONFIG_ID, model);
@@ -430,10 +439,15 @@ export class SessionConfig {
     return result;
   }
 
-  /** `duringSetup`: see {@link setInitial}. */
+  /**
+   * `duringSetup`: see {@link setInitial}. `restoring`: the value is the
+   * previous query's ({@link restoreFrom}), so a model id the option does not
+   * list is refused rather than passed to Claude Code.
+   */
   private async apply(
     params: v2.SetSessionConfigOptionRequest,
     duringSetup = false,
+    restoring = false,
   ): Promise<void> {
     const request = v1SetSessionConfigOptionRequest(params);
     const option = this.session.configOptions.find((entry) => entry.id === request.configId);
@@ -443,7 +457,12 @@ export class SessionConfig {
         `Unknown config option: ${request.configId}`,
       );
     }
-    const selected = configOptionValue(option, request, this.modelInfos);
+    const selected = configOptionValue(
+      option,
+      request,
+      this.modelInfos,
+      this.passUnlistedModels && !restoring,
+    );
     if ("enabled" in selected) {
       if (request.configId === FAST_MODE_CONFIG_ID) await this.setFastMode(selected.enabled);
       else await this.setUltracode(selected.enabled);
@@ -455,7 +474,7 @@ export class SessionConfig {
         await this.applyMode(value as PermissionMode, duringSetup);
         return;
       case MODEL_CONFIG_ID:
-        await this.session.query.setModel(value);
+        await setSelectedModel(this.session.query, selected);
         await this.recordModel(value, duringSetup);
         return;
       case EFFORT_CONFIG_ID:
