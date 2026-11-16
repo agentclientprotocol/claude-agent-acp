@@ -8631,6 +8631,7 @@ export class ClaudeAcpAgent {
       params.toolCall.toolCallId,
       toolInput,
       parentToolUseId,
+      agentID,
       signal,
       params.sessionId,
       previewContent,
@@ -8719,13 +8720,17 @@ export class ClaudeAcpAgent {
    *  always resolve. Since the streamed path never completes those calls, they
    *  are resolved at tool_result time instead (see `toAcpNotifications`).
    *  `parentToolUseId` attributes a subagent's tool call to the Agent/Task call
-   *  that spawned it, matching the streamed path's `_meta`. */
+   *  that spawned it, matching the streamed path's `_meta`. `agentID` is
+   *  `canUseTool`'s, set for every subagent's tool call, including a workflow
+   *  agent's, which has no `parentToolUseId`. Such a call is not recorded as
+   *  the turn's foreground work. */
   private async ensureToolCallEmitted(
     sessionId: string,
     toolName: string,
     toolCallId: string,
     toolInput: unknown,
     parentToolUseId?: string,
+    agentID?: string,
     signal?: AbortSignal,
     notificationSessionId: string = sessionId,
     previewContent?: ToolCallContent[],
@@ -8749,13 +8754,11 @@ export class ClaudeAcpAgent {
     }
     session.emittedToolCalls.add(toolCallId);
     if (parentToolUseId) recordToolCallParent(session, toolCallId, parentToolUseId);
-    // SandboxNetworkAccess is a permission-only callback, not an executing
-    // tool: the SDK does not send a tool_result for its synthetic id.
-    if (
-      !parentToolUseId &&
-      notificationSessionId === sessionId &&
-      toolName !== "SandboxNetworkAccess"
-    ) {
+    // A subagent's tool call is not the turn's foreground work, even when no
+    // parent was found for it: a workflow agent's tool_result never streams on
+    // the root query. SandboxNetworkAccess is a permission-only callback, not
+    // an executing tool: the SDK does not send a tool_result for its synthetic id.
+    if (!agentID && toolName !== "SandboxNetworkAccess") {
       recordForegroundToolCall(session, toolCallId);
     }
     (session.eagerToolCallSessions ??= new Map()).set(toolCallId, notificationSessionId);
@@ -8790,7 +8793,8 @@ export class ClaudeAcpAgent {
    * emitted tool call and of its requests: the subagent's child session once
    * it is announced, else the root session. In the rare SDK ordering where
    * the callback beats the spawning Agent/Task frame, the root keeps it; the
-   * later frame announces the child with its correct nested lineage.
+   * later frame announces the child with its correct nested lineage. A
+   * workflow agent gets no task_started, so the root always keeps its tool use.
    */
   private toolUseOwner(
     session: Session,
@@ -8905,7 +8909,8 @@ export class ClaudeAcpAgent {
         // defines a subagent's `agent_id` as its task id). Should the consumer
         // lose the race with task_started, the lookup misses and the request
         // goes out unattributed; log it so the miss is observable rather than
-        // silent.
+        // silent. A workflow agent's request always misses: it has no
+        // task_started.
         this.logger.log(
           `[claude-agent-acp] No parent tool_use recorded for subagent ${agentID}; ` +
             `sending the ${toolName} permission request unattributed`,
@@ -8925,6 +8930,7 @@ export class ClaudeAcpAgent {
           toolUseID,
           toolInput,
           parentToolUseId,
+          agentID,
           signal,
           permissionSessionId,
         );
