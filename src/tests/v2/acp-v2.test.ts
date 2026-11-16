@@ -10054,6 +10054,36 @@ describe("ACP v2 providers", () => {
     });
   });
 
+  // The new query of a restart can run a cycle before the next prompt, for
+  // example a cron prompt. v2 reads every query from its start, so the cycle
+  // is reported as it comes.
+  it("reports a cycle that the new query of a restart runs before the next prompt", async () => {
+    sdk.run = async function* (prompts, options) {
+      if (options.resume) {
+        // A cron prompt: its result has no origin.
+        yield assistantText(options, "Checked the build.", "msg_cron");
+        yield result(options);
+        yield idleState(options);
+      }
+      const input = prompts[Symbol.asyncIterator]();
+      while (!(await input.next()).done);
+    };
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      await agent.request(v2.methods.agent.session.new, { cwd });
+      await setGateway(agent);
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates)).toEqual([
+          "running",
+          "agent_message_chunk",
+          "idle end_turn",
+        ]),
+      );
+      await client.authUpdate(1);
+    });
+  });
+
   it("routes only the sessions started after a gateway login", async () => {
     const client = v2Client();
     await client.app.connectWith(connectRouter(), async (agent) => {

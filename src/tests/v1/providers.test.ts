@@ -4,20 +4,28 @@ import { AcpClient } from "../../acp-client.js";
 import { loggableBaseUrl } from "../../providers.js";
 
 const mockQuery = vi.hoisted(() =>
-  vi.fn(() => ({
-    initializationResult: vi.fn().mockResolvedValue({
-      models: [
-        { value: "id", displayName: "name", description: "description", supportsAutoMode: true },
-      ],
-    }),
-    setModel: vi.fn(),
-    setPermissionMode: vi.fn(),
-    supportedCommands: vi.fn().mockResolvedValue([]),
-    close: vi.fn(),
-    interrupt: vi.fn().mockResolvedValue(undefined),
-    getContextUsage: vi.fn().mockResolvedValue({ totalTokens: 0, rawMaxTokens: 200000 }),
-    [Symbol.asyncIterator]: async function* () {},
-  })),
+  vi.fn(() => {
+    // Like Claude Code's, the stream stays open until the query is closed.
+    const closed = Promise.withResolvers<void>();
+    return {
+      initializationResult: vi.fn().mockResolvedValue({
+        models: [
+          { value: "id", displayName: "name", description: "description", supportsAutoMode: true },
+        ],
+      }),
+      setModel: vi.fn(),
+      setPermissionMode: vi.fn(),
+      supportedCommands: vi.fn().mockResolvedValue([]),
+      close: vi.fn(() => closed.resolve()),
+      interrupt: vi.fn().mockResolvedValue(undefined),
+      getContextUsage: vi.fn().mockResolvedValue({ totalTokens: 0, rawMaxTokens: 200000 }),
+      next: async () => {
+        await closed.promise;
+        return { done: true as const, value: undefined };
+      },
+      [Symbol.asyncIterator]: async function* () {},
+    };
+  }),
 );
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => ({
