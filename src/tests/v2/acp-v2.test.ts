@@ -4512,7 +4512,10 @@ describe("ACP v2 prompts", () => {
       });
       await client.app.connectWith(connectRouter(), async (agent) => {
         await initializeV2(agent);
-        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, {
+          cwd,
+          _meta: { claudeCode: { options: { settings: { showClearContextOnPlanAccept: true } } } },
+        });
         await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("plan") });
         await vi.waitFor(() =>
           expect(turnTrace(client.sessionUpdates)).toContain("idle max_tokens"),

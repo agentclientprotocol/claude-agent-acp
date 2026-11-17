@@ -5379,6 +5379,7 @@ describe("permission request cancellation", () => {
       settingsManager: {
         dispose: vi.fn(),
         getApiKeyHelper: () => undefined,
+        getShowClearContextOnPlanAccept: () => false,
         getCwd: () => "/test",
       } as any,
       accumulatedUsage: {
@@ -6020,6 +6021,7 @@ describe("permission request cancellation", () => {
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
     const session = injectSession(agent, "session-1");
+    session.settingsManager.getShowClearContextOnPlanAccept = () => true;
     session.modes.availableModes = [
       { id: "default", name: "Manual" },
       { id: "acceptEdits", name: "Accept edits" },
@@ -15501,6 +15503,7 @@ describe("session/close", () => {
       settingsManager: {
         dispose: vi.fn(),
         getApiKeyHelper: () => undefined,
+        getShowClearContextOnPlanAccept: () => false,
         getCwd: () => "/test",
       } as any,
       accumulatedUsage: {
@@ -15625,6 +15628,7 @@ describe("session/delete", () => {
       settingsManager: {
         dispose: vi.fn(),
         getApiKeyHelper: () => undefined,
+        getShowClearContextOnPlanAccept: () => false,
         getCwd: () => "/test",
       } as any,
       accumulatedUsage: {
@@ -15790,6 +15794,7 @@ describe("getOrCreateSession param change detection", () => {
       settingsManager: {
         dispose: vi.fn(),
         getApiKeyHelper: () => undefined,
+        getShowClearContextOnPlanAccept: () => false,
         getCwd: () => "/test",
       } as any,
       accumulatedUsage: {
@@ -20152,6 +20157,7 @@ describe("post-error recovery", () => {
       settingsManager: {
         dispose: vi.fn(),
         getApiKeyHelper: () => undefined,
+        getShowClearContextOnPlanAccept: () => false,
         getCwd: () => "/test",
       } as any,
       accumulatedUsage: {
@@ -20528,6 +20534,7 @@ describe("post-error recovery", () => {
       {
         settingsManager: {
           getApiKeyHelper: () => undefined,
+          getShowClearContextOnPlanAccept: () => false,
           getCwd: () => "/test",
           dispose: vi.fn(() => {
             throw new Error("dispose boom");
@@ -24005,6 +24012,8 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
           return messageGenerator();
         });
         await declareBackgroundSubagents(agent);
+        agent.sessions["test-session"]!.settingsManager.getShowClearContextOnPlanAccept = () =>
+          true;
 
         const prompt = agent.prompt({
           sessionId: "test-session",
@@ -24119,6 +24128,8 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
           return messageGenerator();
         });
         await declareBackgroundSubagents(agent);
+        agent.sessions["test-session"]!.settingsManager.getShowClearContextOnPlanAccept = () =>
+          true;
         const session = agent.sessions["test-session"]!;
 
         const prompt = agent.prompt({
@@ -28800,6 +28811,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       settingsManager: {
         dispose: vi.fn(),
         getApiKeyHelper: () => undefined,
+        getShowClearContextOnPlanAccept: () => false,
         getCwd: () => "/test",
       } as any,
       accumulatedUsage: {
@@ -30710,6 +30722,7 @@ describe("agent selection config option", () => {
         settingsManager: {
           dispose: vi.fn(),
           getApiKeyHelper: () => undefined,
+          getShowClearContextOnPlanAccept: () => false,
           getCwd: () => "/test",
         } as any,
         accumulatedUsage: {

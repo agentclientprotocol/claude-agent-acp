@@ -19,6 +19,7 @@ import {
   getSessionInfo,
   getSessionMessages,
   type Options,
+  type Settings,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { acpProtocolRouter } from "../../serve.js";
@@ -292,13 +293,24 @@ function v2Client({
   };
 }
 
-async function openSession(agent: v2.ClientContext, capabilities: v2.ClientCapabilities = {}) {
+/** Claude Code's setting that offers clearing the context on plan approval. */
+const CLEAR_CONTEXT_SHOWN: Settings = { showClearContextOnPlanAccept: true };
+
+/** `settings` reaches the query as the client's `settings` option (`--settings`). */
+async function openSession(
+  agent: v2.ClientContext,
+  capabilities: v2.ClientCapabilities = {},
+  settings?: Settings,
+) {
   await agent.request(v2.methods.agent.initialize, {
     protocolVersion: v2.PROTOCOL_VERSION,
     info: { name: "v2-test-client", version: "1.0.0" },
     capabilities,
   });
-  const response = await agent.request(v2.methods.agent.session.new, { cwd });
+  const response = await agent.request(v2.methods.agent.session.new, {
+    cwd,
+    ...(settings && { _meta: { claudeCode: { options: { settings } } } }),
+  });
   return { response, claude: sdk.processes.at(-1)! };
 }
 
@@ -1532,7 +1544,7 @@ describe("ACP v2 core", () => {
       }),
     });
     await client.connect(async (agent) => {
-      const { response, claude } = await openSession(agent);
+      const { response, claude } = await openSession(agent, {}, CLEAR_CONTEXT_SHOWN);
       const sessionId = response.sessionId;
       const prompted = agent.request(v2.methods.agent.session.prompt, {
         sessionId,
@@ -1613,7 +1625,7 @@ describe("ACP v2 core", () => {
       }),
     });
     await client.connect(async (agent) => {
-      const { response, claude } = await openSession(agent);
+      const { response, claude } = await openSession(agent, {}, CLEAR_CONTEXT_SHOWN);
       const sessionId = response.sessionId;
       const prompted = agent.request(v2.methods.agent.session.prompt, {
         sessionId,
@@ -2961,10 +2973,32 @@ describe("ACP v2 core", () => {
     });
   });
 
-  it("offers clearing the context at 0% used after Claude Code mounted a fresh conversation", async () => {
+  it("offers no clearing of the context while Claude Code's showClearContextOnPlanAccept is off, its default", async () => {
     const client = v2Client();
     await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
+      // In a turn: a request out of a turn has no clear-context option either way.
+      const prompted = agent.request(v2.methods.agent.session.prompt, {
+        sessionId: response.sessionId,
+        prompt: PROMPT,
+      });
+      claude.send(echo(await claude.prompt(0)));
+      await prompted;
+      await askPermission(claude, "ExitPlanMode", { plan: "Fix it" });
+    });
+
+    expect(client.permissionRequests[0].options.map((option) => option.optionId)).toEqual([
+      "exit-plan-default",
+      "exit-plan-auto",
+      "exit-plan-bypass",
+      "reject",
+    ]);
+  });
+
+  it("offers clearing the context at 0% used after Claude Code mounted a fresh conversation", async () => {
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      const { response, claude } = await openSession(agent, {}, CLEAR_CONTEXT_SHOWN);
       const prompted = agent.request(v2.methods.agent.session.prompt, {
         sessionId: response.sessionId,
         prompt: PROMPT,
@@ -4434,7 +4468,11 @@ describe("ACP v2 core", () => {
         });
         const changed = path.join(await realpath(cwd), "src", "App.ts");
         const { claude, sessionId, plan } = await client.connect(async (agent) => {
-          const { response, claude } = await openSession(agent, air("agentFileChangeReport"));
+          const { response, claude } = await openSession(
+            agent,
+            air("agentFileChangeReport"),
+            CLEAR_CONTEXT_SHOWN,
+          );
           claude.rewindFiles.mockResolvedValue({ canRewind: true, filesChanged: [changed] });
           const answer = agent.request(v2.methods.agent.session.prompt, {
             sessionId: response.sessionId,

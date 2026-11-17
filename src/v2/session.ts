@@ -787,13 +787,16 @@ export class V2Session implements RequestTarget {
     return this.config.prePlanMode();
   }
 
-  /** A fresh context continues the open turn: only the root's plan in a turn offers it. */
+  /** A fresh context continues the open turn: only the root's plan in a turn
+   *  can use it, and only `showClearContextOnPlanAccept` shows it. */
   contextReset(agentId: string | undefined): {
     offered: boolean;
+    shown: boolean;
     usedPercent: number | undefined;
   } {
     return {
       offered: agentId === undefined && this.foreground,
+      shown: this.reports.showClearContextOnPlanAccept(),
       usedPercent: this.reports.contextUsedPercent(),
     };
   }
