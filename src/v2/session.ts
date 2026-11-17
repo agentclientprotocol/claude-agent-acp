@@ -1305,10 +1305,12 @@ export class V2Session implements RequestTarget {
     // Before the result's text below, which can repeat the failed request's.
     this.reportApiError(end);
     // The turn goes on in a fresh context (see `ClearContext`).
-    if (this.clearContext.holdsResult(message, end)) {
+    const disposition = this.clearContext.resultDisposition(message, end);
+    if (disposition === "held") {
       this.turnReport.reset();
       return;
     }
+    if (disposition === "rejected") this.cancelledWork = true;
     this.lastEnd = this.clearContext.turnEnd(end);
     const local = this.turnLocalCommand;
     if (message.stop_reason === "refusal") {
