@@ -267,6 +267,12 @@ describe("incomplete foreground tools", () => {
     await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
   });
 
+  it("does not claim a workflow agent's permission tool as a foreground tool", async () => {
+    const { prompt } = createTestSession(workflowAgentPermissionMessages);
+
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+  });
+
   it("does not treat a request to run in the background as a confirmed handoff", async () => {
     const { prompt } = createTestSession(unconfirmedBackgroundToolMessages);
 
@@ -1436,6 +1442,44 @@ async function* permissionOnlyToolMessages(input: Pushable<any>, agent: ClaudeAc
   yield* echoNextPrompt(input);
   await agent.canUseTool(sessionId)("Bash", { command: "echo test" }, {
     toolUseID: toolCallId,
+    signal: new AbortController().signal,
+    suggestions: [],
+  } as any);
+  yield successfulResultMessage();
+}
+
+/** A workflow agent asks for permission while the turn runs. The workflow's
+ *  task_started names the Workflow call, not the agent, and the agent's
+ *  tool_use and tool_result never stream on the root query. */
+async function* workflowAgentPermissionMessages(input: Pushable<any>, agent: ClaudeAcpAgent) {
+  yield* echoNextPrompt(input);
+  yield toolStart("workflow", null, "Workflow");
+  yield toolUse("workflow", null, "Workflow", { script: "await agent('Stamp the date')" });
+  yield {
+    type: "system",
+    subtype: "task_started",
+    session_id: sessionId,
+    task_id: "wzr1bosoo",
+    tool_use_id: "workflow",
+    description: "Stamp the date",
+    task_type: "local_workflow",
+  };
+  yield {
+    ...toolResult("workflow"),
+    message: {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "workflow",
+          content: "Workflow launched in background. Task ID: wzr1bosoo",
+        },
+      ],
+    },
+  };
+  await agent.canUseTool(sessionId)("Bash", { command: "date > stamp.txt; cat stamp.txt" }, {
+    toolUseID: toolCallId,
+    agentID: "a2a57f1ad0803996a",
     signal: new AbortController().signal,
     suggestions: [],
   } as any);
