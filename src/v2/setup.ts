@@ -132,7 +132,9 @@ export function replayEndUpdate(
  * Control notice belongs after it. The handler returns the response right
  * after this call, and the SDK writes it before a timer runs. Nothing else
  * orders the two. A restart calls it on the new query too: closing the old
- * one withdrew the old one's OAuth runs and ended its Remote Control.
+ * one withdrew the old one's OAuth runs. The restart starts Remote Control
+ * itself, before the prompts that wait for it (see `restarts.ts`), so the
+ * timer's connect finds the request used up then.
  */
 export function afterSetupResponse(session: V2Session, params: SetupParams): void {
   setTimeout(() => session.connectRemoteControlAtStartup(), 0);

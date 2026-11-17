@@ -12444,6 +12444,48 @@ describe("ACP v2 subscription guard (--hide-claude-auth)", () => {
     },
   );
 
+  it("starts Remote Control again on a sign-out's new query, before the prompt that waits for it", async () => {
+    accountsAtStart(API_KEY);
+    sdk.accountInfo = async () => API_KEY;
+    const initialization = sdk.initializationResult;
+    sdk.initializationResult = async () => ({
+      ...(await initialization()),
+      remote_control_auto_enable: true,
+    });
+    const enableRemoteControl = vi.fn(async () => ({
+      session_url: "https://claude.ai/code/session_123",
+    }));
+    sdk.enableRemoteControl = enableRemoteControl;
+    let turns = 0;
+    scriptTurns(async function* (options) {
+      turns += 1;
+      if (turns === 1) {
+        yield result(options, { is_error: true, result: "Not logged in · Please run /login" });
+        return;
+      }
+      // The prompt that waited for the restart keeps its turn open.
+      await new Promise<never>(() => {});
+    });
+    const connected = () =>
+      client.updates("notice").filter((notice) => notice.title === "Remote Control connected");
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await vi.waitFor(() => expect(connected()).toHaveLength(1));
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle error"));
+      // This prompt waits for the account restart that the sign-out started.
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("again") });
+      await vi.waitFor(() => expect(connected()).toHaveLength(2));
+      await client.authUpdate(1);
+    });
+
+    expect(sdk.queryOptions).toHaveLength(2);
+    expect(enableRemoteControl).toHaveBeenCalledTimes(2);
+    expect(enableRemoteControl).toHaveBeenLastCalledWith(true);
+  });
+
   it("restarts the query for a provider change only after the account restart that runs", async () => {
     accountsAtStart(API_KEY);
     sdk.accountInfo = async () => API_KEY;
