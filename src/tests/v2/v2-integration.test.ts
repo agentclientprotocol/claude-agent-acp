@@ -169,6 +169,35 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("v2 core with Claude Code", 
     expect(idle.usage?.totalTokens).toBeGreaterThan(0);
   }, 240_000);
 
+  // The chunks need two things of Claude Code that the SDK's `Query` type does
+  // not declare: a `task_started` frame for a foreground command (it comes
+  // about 3 s into the command) and `getTaskOutput` on the query. Without
+  // either, the command's result is the first output the client gets.
+  it("sends the output of a foreground command while the command runs", async () => {
+    const sessionId = await newSession("bypassPermissions");
+    await prompt(
+      sessionId,
+      "Run exactly this Bash command in the foreground (not run_in_background), with no other tool call, then reply with just: done\n" +
+        "for i in 1 2 3 4 5 6 7 8; do echo line$i; sleep 1; done",
+    );
+    await until(() => states(sessionId).some((update) => update.state === "idle"));
+    const text = (data: string) => Buffer.from(data, "base64").toString();
+    const output = updates.flatMap(({ update }) => {
+      if (update.sessionUpdate === "terminal_output_chunk") {
+        return [{ sent: "while running", text: text((update as v2.TerminalOutputChunk).data) }];
+      }
+      const whole =
+        update.sessionUpdate === "terminal_update" && (update as v2.TerminalUpdate).output;
+      return whole ? [{ sent: "with the result", text: text(whole.data) }] : [];
+    });
+    expect(output[0]).toEqual({ sent: "while running", text: expect.stringMatching(/^line1\r\n/) });
+    // The result then replaces the chunks with the whole output.
+    expect(output.at(-1)).toEqual({
+      sent: "with the result",
+      text: expect.stringMatching(/^line1\r\n[^]*line8/),
+    });
+  }, 240_000);
+
   it("fails a queued prompt with -32800 at a cancel and goes idle with cancelled", async () => {
     const sessionId = await newSession("bypassPermissions");
     await prompt(

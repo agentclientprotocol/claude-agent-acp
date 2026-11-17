@@ -66,6 +66,14 @@ const sdk = vi.hoisted(() => ({
   interrupt: async (): Promise<void> => {},
   /** Claude Code stops one task, as `cancel()` does for a child session. */
   stopTask: async (_taskId: string): Promise<void> => {},
+  /** Claude Code reads the end of a shell task's output (`get_task_output`). */
+  getTaskOutput: async (
+    _taskId: string,
+  ): Promise<{ output: string; total_bytes: number; truncated: boolean }> => ({
+    output: "",
+    total_bytes: 0,
+    truncated: false,
+  }),
   /** The query is closed, as `session/close` closes it. */
   close: (): void => {},
   initializationResult: async (): Promise<Record<string, unknown>> => ({
@@ -141,6 +149,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         mcpAuthenticate: (serverName: string) => sdk.mcpAuthenticate(serverName),
         interrupt: () => sdk.interrupt(),
         stopTask: (taskId: string) => sdk.stopTask(taskId),
+        getTaskOutput: (taskId: string) => sdk.getTaskOutput(taskId),
         close: () => sdk.close(),
         accountInfo: () => sdk.accountInfo(),
         setMcpServers: (servers: Record<string, unknown>) => sdk.setMcpServers(servers),
@@ -9509,6 +9518,241 @@ describe("ACP v2 terminal of a command in the background", () => {
         },
       ]);
     });
+  });
+});
+
+describe("ACP v2 output of a command in the foreground", () => {
+  /** Claude Code's result for a command that an interrupt stopped (CLI 2.1.325, shortened). */
+  const STOP_NOTICE =
+    "The user doesn't want to proceed with this tool use. The tool use was rejected. " +
+    "Correction to the text above: this call was stopped while running, not refused before it ran.";
+
+  /**
+   * Claude Code runs `make test` in the foreground until `done` resolves, as
+   * CLI 2.1.325 reports it: the command's task starts once it has run for
+   * about 3 s, and ends before its tool result, which comes once `resulted`
+   * resolves too. A command that an interrupt `stopped` has Claude Code's
+   * notice for the model as its result, stamped as not executed.
+   */
+  async function* foregroundCommand(
+    options: Options,
+    done: Promise<void>,
+    resulted: Promise<void>,
+    stopped = false,
+  ) {
+    yield toolUseMessage(options, "toolu_fg", "Bash", { command: "make test" });
+    const task = {
+      type: "system",
+      task_id: "fg1",
+      tool_use_id: "toolu_fg",
+      session_id: options.sessionId,
+    };
+    yield {
+      ...task,
+      subtype: "task_started",
+      task_type: "local_bash",
+      description: "make test",
+      is_backgrounded: false,
+      uuid: randomUUID(),
+    };
+    await done;
+    yield {
+      ...task,
+      subtype: "task_notification",
+      status: stopped ? "stopped" : "completed",
+      output_file: "",
+      summary: "",
+      uuid: randomUUID(),
+    };
+    await resulted;
+    yield stopped
+      ? {
+          ...toolResultMessage(
+            options,
+            "toolu_fg",
+            { content: STOP_NOTICE, is_error: true },
+            "user-rejected",
+          ),
+          tool_use_result: "User rejected tool use",
+        }
+      : {
+          ...toolResultMessage(options, "toolu_fg", { content: "line1\nline2" }),
+          tool_use_result: {
+            stdout: "line1\nline2",
+            stderr: "",
+            interrupted: false,
+            isImage: false,
+          },
+        };
+    yield result(options);
+    yield idleState(options);
+  }
+
+  /** What the client was sent for the terminal: appended chunks, and outputs that replace. */
+  const output = (client: ReturnType<typeof v2Client>) =>
+    client.sessionUpdates.flatMap(({ update }) => {
+      if (update.sessionUpdate === "terminal_output_chunk") {
+        return [`chunk ${Buffer.from(String(update.data), "base64").toString()}`];
+      }
+      if (update.sessionUpdate !== "terminal_update" || !update.output) return [];
+      return [
+        `output ${Buffer.from((update.output as { data: string }).data, "base64").toString()}`,
+      ];
+    });
+
+  it("sends the output as chunks while the command runs, then the result's output as the terminal's", async () => {
+    let written = "line1\n";
+    sdk.getTaskOutput = async () => ({
+      output: written,
+      total_bytes: Buffer.byteLength(written),
+      truncated: false,
+    });
+    const done = Promise.withResolvers<void>();
+    scriptTurns((options) => foregroundCommand(options, done.promise, done.promise));
+
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const prompt = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("hi"),
+      });
+      await vi.waitFor(() => expect(output(client)).toEqual(["chunk line1\r\n"]), {
+        timeout: 2000,
+      });
+      written = "line1\nline2";
+      await vi.waitFor(() => expect(output(client)).toHaveLength(2), { timeout: 2000 });
+      // Claude Code drops the output of a command that ended (CLI 2.1.325).
+      written = "";
+      done.resolve();
+      await prompt;
+      await vi.waitFor(() => expect(output(client)).toHaveLength(3), { timeout: 2000 });
+    });
+
+    // A v2 terminal's lines end in CR LF, as a PTY's do.
+    expect(output(client)).toEqual(["chunk line1\r\n", "chunk line2", "output line1\r\nline2"]);
+  });
+
+  // The result of a command that an interrupt stopped is Claude Code's notice
+  // for the model: it must not replace the output that the user was reading.
+  it("keeps what the terminal showed of a stopped command, and appends Claude Code's notice", async () => {
+    sdk.getTaskOutput = async () => ({ output: "line1\n", total_bytes: 6, truncated: false });
+    const done = Promise.withResolvers<void>();
+    scriptTurns((options) => foregroundCommand(options, done.promise, done.promise, true));
+
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const prompt = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("hi"),
+      });
+      await vi.waitFor(() => expect(output(client)).toHaveLength(1), { timeout: 2000 });
+      done.resolve();
+      await prompt;
+      await vi.waitFor(() => expect(output(client)).toHaveLength(2), { timeout: 2000 });
+    });
+
+    expect(output(client)).toEqual(["chunk line1\r\n", `chunk ${STOP_NOTICE}`]);
+  });
+
+  // A tool call that gets no result, such as one of a reply that Claude Code
+  // took back, must not be read until the query ends.
+  it("reads no more output once the command's task ended", async () => {
+    let reads = 0;
+    // The command prints nothing, so no read tells that it ended.
+    sdk.getTaskOutput = async () => {
+      reads++;
+      return { output: "", total_bytes: 0, truncated: false };
+    };
+    const done = Promise.withResolvers<void>();
+    const resulted = Promise.withResolvers<void>();
+    scriptTurns((options) => foregroundCommand(options, done.promise, resulted.promise));
+
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const prompt = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("hi"),
+      });
+      await vi.waitFor(() => expect(reads).toBeGreaterThan(0), { timeout: 2000 });
+      done.resolve();
+      // The task's end reaches the agent a few steps later.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const readsAtTaskEnd = reads;
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      expect(reads).toBe(readsAtTaskEnd);
+      resulted.resolve();
+      await prompt;
+    });
+  });
+
+  it("reads no task output for a command that Claude Code runs in the background", async () => {
+    const reads: string[] = [];
+    sdk.getTaskOutput = async (taskId) => {
+      reads.push(taskId);
+      return { output: "x", total_bytes: 1, truncated: false };
+    };
+    const done = Promise.withResolvers<void>();
+    scriptTurns(async function* (options) {
+      yield {
+        type: "assistant",
+        message: {
+          id: "msg_bg",
+          type: "message",
+          role: "assistant",
+          model: "claude-sonnet-4-6",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_bg",
+              name: "Bash",
+              input: { command: "make serve", run_in_background: true },
+            },
+          ],
+          stop_reason: "tool_use",
+          stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield {
+        type: "system",
+        subtype: "task_started",
+        task_id: "bg1",
+        task_type: "local_bash",
+        description: "make serve",
+        tool_use_id: "toolu_bg",
+        is_backgrounded: true,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      await done.promise;
+      yield result(options);
+      yield idleState(options);
+    });
+
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const prompt = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("hi"),
+      });
+      // Longer than a few polls (BACKGROUND_OUTPUT_POLL_MS).
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      done.resolve();
+      await prompt;
+    });
+
+    expect(reads).toEqual([]);
   });
 });
 

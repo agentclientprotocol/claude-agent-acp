@@ -325,7 +325,12 @@ import {
   type UsageSnapshot,
 } from "../session-usage.js";
 import { previewPatchContent } from "../diff.js";
-import { backgroundedBashToolCall, withRunningTerminal } from "../tool-calls/background.js";
+import {
+  backgroundedBashToolCall,
+  type StreamedTerminals,
+  withRunningTerminal,
+  withStreamedTerminal,
+} from "../tool-calls/background.js";
 import { ChangedMetaClient, ClientConnection } from "./client-connection.js";
 import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
 import { RetractedToolCalls } from "../tool-calls/retracted.js";
@@ -4075,6 +4080,12 @@ export class ClaudeAcpAgent {
       );
       if (results.length === 0) return;
       const resultCount = content.filter((block) => block.type === "tool_result").length;
+      const toolResultMeta = (message as { tool_result_meta?: unknown }).tool_result_meta;
+      // As for any tool result: the command's output is read no more, and the
+      // result's output replaces what the terminal showed, or follows it.
+      const streamedTerminals = await session.background.finishForeground(results, {
+        toolResultMeta,
+      });
       for (const notification of toAcpNotifications(
         results,
         "user",
@@ -4094,11 +4105,11 @@ export class ClaudeAcpAgent {
           messageId: messageIdForGrouping(message),
           // `tool_use_result` describes the one result of its message.
           toolUseResult: results.length === resultCount ? message.tool_use_result : undefined,
-          toolResultMeta: (message as { tool_result_meta?: unknown }).tool_result_meta,
+          toolResultMeta,
           cancelled: true,
         },
       )) {
-        await sendUpdate(notification);
+        await sendUpdate(withStreamedTerminal(notification, streamedTerminals));
       }
     };
 
@@ -5272,6 +5283,13 @@ export class ClaudeAcpAgent {
                   workflow_name: message.workflow_name,
                   skip_transcript: message.skip_transcript,
                   tool_use_id: message.tool_use_id,
+                });
+                // A foreground command's terminal shows its output as it runs.
+                session.background.followForeground(message, {
+                  owner: session,
+                  capabilities: this.toolCallCapabilities,
+                  send: sendUpdate,
+                  logger: this.logger,
                 });
                 break;
               case "task_notification":
@@ -6853,6 +6871,7 @@ export class ClaudeAcpAgent {
             const acceptedPlanToolUseId = observeExitPlanToolResults(message, content, session);
             let backgroundedToolCalls: ReadonlySet<string> = new Set();
             let runningTerminal: string | undefined;
+            let streamedTerminals: StreamedTerminals = new Map();
             if (message.type === "user") {
               rememberResolvedToolNames(session, content);
               recordSubagentFileEdits(
@@ -6879,6 +6898,12 @@ export class ClaudeAcpAgent {
                 },
               );
               if (backgroundBashTask) await asyncTasks.taskBackgrounded(backgroundBashTask);
+              // The result's output replaces what a foreground command's
+              // terminal showed as the command ran, or follows it.
+              streamedTerminals = await session.background.finishForeground(content, {
+                backgrounded: backgroundBashTask?.toolCallId,
+                toolResultMeta: (message as { tool_result_meta?: unknown }).tool_result_meta,
+              });
               // The command's terminal runs until its task ends, unless the
               // task has ended already (a fast command can end before the tool
               // result comes).
@@ -6961,10 +6986,13 @@ export class ClaudeAcpAgent {
               // meta and are excluded there.
               await sendUpdate(
                 withRunningTerminal(
-                  backgroundedBashToolCall(
-                    acceptedPlanToolResult(notification, acceptedPlanToolUseId),
-                    backgroundedToolCalls,
-                    asyncTasks.enabled,
+                  withStreamedTerminal(
+                    backgroundedBashToolCall(
+                      acceptedPlanToolResult(notification, acceptedPlanToolUseId),
+                      backgroundedToolCalls,
+                      asyncTasks.enabled,
+                    ),
+                    streamedTerminals,
                   ),
                   runningTerminal,
                 ),
@@ -7685,6 +7713,7 @@ export class ClaudeAcpAgent {
     session.contextCompaction = undefined;
     session.idleCompaction?.dispose();
     session.settingsManager.dispose();
+    session.background.queryClosed();
     session.input.end();
     session.query.close();
   }
