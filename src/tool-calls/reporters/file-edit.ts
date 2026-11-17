@@ -9,7 +9,7 @@ import {
   toolUpdateFromDiffToolResponse,
   v2UpdateFromDiffToolResponse,
 } from "../../diff.js";
-import { markdownEscape, resultText, textContent, toDisplayPath } from "../content.js";
+import { inputString, markdownEscape, resultText, textContent, toDisplayPath } from "../content.js";
 import type {
   ToolReporter,
   ToolResultContext,
@@ -97,21 +97,22 @@ export function normalizeWriteInput(input: unknown): NormalizedWriteInput | unde
 export class EditReporter implements ToolReporter {
   toolUse(input: unknown, { cwd, capabilities }: ToolUseContext): ToolUseFacts {
     const edit = input as FileEditInput | undefined;
-    const displayPath = edit?.file_path ? toDisplayPath(edit.file_path, cwd) : undefined;
+    const filePath = inputString(input, "file_path");
+    const displayPath = filePath ? toDisplayPath(filePath, cwd) : undefined;
     const facts: ToolUseFacts = {
       title: displayPath ? `Edit ${displayPath}` : "Edit",
       kind: "edit",
-      locations: edit?.file_path ? [{ path: edit.file_path }] : [],
+      locations: filePath ? [{ path: filePath }] : [],
     };
     // The standard diff, also for a client that negotiated patches: the input
     // holds a snippet, not the file, so a patch would need line numbers that
     // the adapter does not know here. A v2 diff cannot hold a snippet, so a v2
     // client gets the patch from the PostToolUse hook alone.
-    if (edit?.file_path && (edit.old_string || edit.new_string) && !capabilities.v2) {
+    if (filePath && (edit?.old_string || edit?.new_string) && !capabilities.v2) {
       facts.change = [
         {
           type: "diff",
-          path: edit.file_path,
+          path: filePath,
           oldText: edit.old_string || null,
           newText: edit.new_string ?? "",
         },
@@ -181,9 +182,8 @@ export class NotebookEditReporter implements ToolReporter {
   toolUse(input: unknown, { cwd, capabilities }: ToolUseContext): ToolUseFacts {
     if (!capabilities.air.client) return { title: "NotebookEdit", kind: "other" };
     const notebook = input as Partial<NotebookEditInput> | undefined;
-    const displayPath = notebook?.notebook_path
-      ? toDisplayPath(notebook.notebook_path, cwd)
-      : undefined;
+    const notebookPath = inputString(input, "notebook_path");
+    const displayPath = notebookPath ? toDisplayPath(notebookPath, cwd) : undefined;
     const cell = notebook?.cell_id ? ` ${notebook.cell_id}` : "";
     const verb =
       notebook?.edit_mode === "insert"
@@ -195,7 +195,7 @@ export class NotebookEditReporter implements ToolReporter {
     return {
       title: displayPath ? `${verb} cell${cell} in ${displayPath}` : "Edit notebook",
       kind: "edit",
-      locations: notebook?.notebook_path ? [{ path: notebook.notebook_path }] : [],
+      locations: notebookPath ? [{ path: notebookPath }] : [],
       ...(source ? { display: source } : {}),
     };
   }

@@ -36,7 +36,7 @@ import {
   v2ConfigOptions,
 } from "../../v2/session-requests.js";
 import { encodeProjectPath } from "../../session-index/project-dirs.js";
-import { startupFailure } from "../helpers.js";
+import { setModelRefusal, startupFailure } from "../helpers.js";
 import packageJson from "../../../package.json" with { type: "json" };
 
 const execFileSpy = vi.hoisted(() => vi.fn());
@@ -66,6 +66,14 @@ const sdk = vi.hoisted(() => ({
   interrupt: async (): Promise<void> => {},
   /** Claude Code stops one task, as `cancel()` does for a child session. */
   stopTask: async (_taskId: string): Promise<void> => {},
+  /** Claude Code reads the end of a shell task's output (`get_task_output`). */
+  getTaskOutput: async (
+    _taskId: string,
+  ): Promise<{ output: string; total_bytes: number; truncated: boolean }> => ({
+    output: "",
+    total_bytes: 0,
+    truncated: false,
+  }),
   /** The query is closed, as `session/close` closes it. */
   close: (): void => {},
   initializationResult: async (): Promise<Record<string, unknown>> => ({
@@ -141,6 +149,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         mcpAuthenticate: (serverName: string) => sdk.mcpAuthenticate(serverName),
         interrupt: () => sdk.interrupt(),
         stopTask: (taskId: string) => sdk.stopTask(taskId),
+        getTaskOutput: (taskId: string) => sdk.getTaskOutput(taskId),
         close: () => sdk.close(),
         accountInfo: () => sdk.accountInfo(),
         setMcpServers: (servers: Record<string, unknown>) => sdk.setMcpServers(servers),
@@ -1257,9 +1266,9 @@ describe("ACP v2 sessions", () => {
       ],
       // "a" is a substring of "claude": a substring match would pick Opus.
       [
-        "a model the session does not offer",
+        "a model Claude Code does not know",
         { configId: "model", type: "id", value: "not-a-model" },
-        "Invalid value for config option model: not-a-model",
+        "Invalid value for config option model: not-a-model. Model 'not-a-model' not found",
       ],
       [
         "a mode the session does not offer",
@@ -1276,6 +1285,10 @@ describe("ACP v2 sessions", () => {
       async (_case, request, message) => {
         const models: Array<string | undefined> = [];
         sdk.setModel = async (model) => {
+          // Claude Code refuses an id it does not know.
+          if (model === "not-a-model") {
+            throw setModelRefusal(`Model '${model}' not found`, "not_found");
+          }
           models.push(model);
         };
         const client = v2Client();
@@ -1301,6 +1314,140 @@ describe("ACP v2 sessions", () => {
         expect(values(listed.configOptions)).toEqual(values(created.configOptions));
       },
     );
+
+    it("passes a model id the option does not list to Claude Code, and lists it once Claude Code takes it", async () => {
+      const models: Array<string | undefined> = [];
+      sdk.setModel = async (model) => {
+        models.push(model);
+      };
+      const client = v2Client();
+      const response = await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        const response = await agent.request(v2.methods.agent.session.setConfigOption, {
+          sessionId,
+          configId: "model",
+          type: "id",
+          value: "claude-fable-5-2",
+        });
+        await client.authUpdate(1);
+        return response;
+      });
+
+      expect(models).toEqual(["claude-fable-5-2"]);
+      const model = response.configOptions.find((option) => option.configId === "model");
+      expect(model?.currentValue).toBe("claude-fable-5-2");
+      expect(
+        (model as { options: { value: string }[] } | undefined)?.options.map(
+          (entry) => entry.value,
+        ),
+      ).toContain("claude-fable-5-2");
+    });
+
+    it("refuses a model id the option does not list when a gateway listed the models", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => new Response(JSON.stringify({ data: [{ id: OPUS.value }] }))),
+      );
+      const models: Array<string | undefined> = [];
+      sdk.setModel = async (model) => {
+        models.push(model);
+      };
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        await agent.request(v2.methods.agent.providers.set, {
+          providerId: "main",
+          apiType: "anthropic",
+          baseUrl: "https://gateway.example.com",
+        });
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await expect(
+          agent.request(v2.methods.agent.session.setConfigOption, {
+            sessionId,
+            configId: "model",
+            type: "id",
+            value: "claude-fable-5-2",
+          }),
+        ).rejects.toMatchObject({
+          code: -32602,
+          message: expect.stringMatching(
+            /Invalid value for config option model: claude-fable-5-2$/,
+          ),
+        });
+        await client.authUpdate(1);
+      });
+
+      expect(models).not.toContain("claude-fable-5-2");
+    });
+
+    // The failure does not judge the id, which Claude Code may well run.
+    it("answers a failed switch to an unlisted model with an internal error when Claude Code did not refuse the id", async () => {
+      sdk.setModel = async () => {
+        throw setModelRefusal(
+          "Authentication failed. Please check your API credentials.",
+          "auth_failed",
+        );
+      };
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await expect(
+          agent.request(v2.methods.agent.session.setConfigOption, {
+            sessionId,
+            configId: "model",
+            type: "id",
+            value: "claude-fable-5-2",
+          }),
+        ).rejects.toMatchObject({ code: -32603 });
+        await client.authUpdate(1);
+      });
+    });
+
+    // The query of a restart may run on a provider that cannot serve the model
+    // of the query it replaces, though Claude Code would take the id.
+    it("does not pass the model of a replaced query to Claude Code when the new query does not list it", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          async () =>
+            new Response(JSON.stringify({ data: [{ id: OPUS.value }, { id: HAIKU.value }] })),
+        ),
+      );
+      const models: Array<string | undefined> = [];
+      sdk.setModel = async (model) => {
+        models.push(model);
+      };
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        await agent.request(v2.methods.agent.providers.set, {
+          providerId: "main",
+          apiType: "anthropic",
+          baseUrl: "https://gateway.example.com",
+        });
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.setConfigOption, {
+          sessionId,
+          configId: "model",
+          type: "id",
+          value: HAIKU.value,
+        });
+        // Without the gateway, the session's new query lists Opus only.
+        sdk.initializationResult = async () => ({ models: [OPUS] });
+        await agent.request(v2.methods.agent.providers.disable, { providerId: "main" });
+        await client.authUpdate(1);
+      });
+
+      expect(models).toEqual([HAIKU.value]);
+      expect(
+        client
+          .updates("config_option_update")
+          .at(-1)
+          ?.configOptions.find((option) => option.configId === "model"),
+      ).toMatchObject({ currentValue: OPUS.value });
+    });
 
     it("rebuilds the options for a model switch, and clears an effort the new model lacks", async () => {
       const client = v2Client();
@@ -3948,6 +4095,39 @@ describe("ACP v2 prompts", () => {
     },
   );
 
+  // The model can write an input that Claude Code rejects when it runs the
+  // tool, after the adapter reported the tool use (issue #1308).
+  it("reports a Read with a number for file_path as failed, and ends the turn", async () => {
+    scriptTurns(async function* (options) {
+      yield toolUseMessage(options, "toolu_number_path", "Read", { file_path: 12345 });
+      yield toolResultMessage(options, "toolu_number_path", {
+        is_error: true,
+        content:
+          "InputValidationError: Read failed due to the following issue:\n" +
+          "The parameter `file_path` type is expected as `string` but provided as `number`",
+      });
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      await client.authUpdate(1);
+    });
+
+    const reports = client.sessionUpdates
+      .map(({ update }) => update)
+      .filter((update) => "toolCallId" in update && update.toolCallId === "toolu_number_path");
+    expect(reports[0]).toMatchObject({
+      title: "Read File",
+      locations: [],
+      rawInput: { file_path: 12345 },
+    });
+    expect(reports.at(-1)).toMatchObject({ status: "failed" });
+  });
+
   it("reports a turn that fails after it was taken in as idle with the error stop reason", async () => {
     scriptTurns(async function* (options) {
       yield result(options, { is_error: true, result: "API Error: 529 Overloaded" });
@@ -4332,7 +4512,10 @@ describe("ACP v2 prompts", () => {
       });
       await client.app.connectWith(connectRouter(), async (agent) => {
         await initializeV2(agent);
-        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, {
+          cwd,
+          _meta: { claudeCode: { options: { settings: { showClearContextOnPlanAccept: true } } } },
+        });
         await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("plan") });
         await vi.waitFor(() =>
           expect(turnTrace(client.sessionUpdates)).toContain("idle max_tokens"),
@@ -9341,6 +9524,241 @@ describe("ACP v2 terminal of a command in the background", () => {
   });
 });
 
+describe("ACP v2 output of a command in the foreground", () => {
+  /** Claude Code's result for a command that an interrupt stopped (CLI 2.1.325, shortened). */
+  const STOP_NOTICE =
+    "The user doesn't want to proceed with this tool use. The tool use was rejected. " +
+    "Correction to the text above: this call was stopped while running, not refused before it ran.";
+
+  /**
+   * Claude Code runs `make test` in the foreground until `done` resolves, as
+   * CLI 2.1.325 reports it: the command's task starts once it has run for
+   * about 3 s, and ends before its tool result, which comes once `resulted`
+   * resolves too. A command that an interrupt `stopped` has Claude Code's
+   * notice for the model as its result, stamped as not executed.
+   */
+  async function* foregroundCommand(
+    options: Options,
+    done: Promise<void>,
+    resulted: Promise<void>,
+    stopped = false,
+  ) {
+    yield toolUseMessage(options, "toolu_fg", "Bash", { command: "make test" });
+    const task = {
+      type: "system",
+      task_id: "fg1",
+      tool_use_id: "toolu_fg",
+      session_id: options.sessionId,
+    };
+    yield {
+      ...task,
+      subtype: "task_started",
+      task_type: "local_bash",
+      description: "make test",
+      is_backgrounded: false,
+      uuid: randomUUID(),
+    };
+    await done;
+    yield {
+      ...task,
+      subtype: "task_notification",
+      status: stopped ? "stopped" : "completed",
+      output_file: "",
+      summary: "",
+      uuid: randomUUID(),
+    };
+    await resulted;
+    yield stopped
+      ? {
+          ...toolResultMessage(
+            options,
+            "toolu_fg",
+            { content: STOP_NOTICE, is_error: true },
+            "user-rejected",
+          ),
+          tool_use_result: "User rejected tool use",
+        }
+      : {
+          ...toolResultMessage(options, "toolu_fg", { content: "line1\nline2" }),
+          tool_use_result: {
+            stdout: "line1\nline2",
+            stderr: "",
+            interrupted: false,
+            isImage: false,
+          },
+        };
+    yield result(options);
+    yield idleState(options);
+  }
+
+  /** What the client was sent for the terminal: appended chunks, and outputs that replace. */
+  const output = (client: ReturnType<typeof v2Client>) =>
+    client.sessionUpdates.flatMap(({ update }) => {
+      if (update.sessionUpdate === "terminal_output_chunk") {
+        return [`chunk ${Buffer.from(String(update.data), "base64").toString()}`];
+      }
+      if (update.sessionUpdate !== "terminal_update" || !update.output) return [];
+      return [
+        `output ${Buffer.from((update.output as { data: string }).data, "base64").toString()}`,
+      ];
+    });
+
+  it("sends the output as chunks while the command runs, then the result's output as the terminal's", async () => {
+    let written = "line1\n";
+    sdk.getTaskOutput = async () => ({
+      output: written,
+      total_bytes: Buffer.byteLength(written),
+      truncated: false,
+    });
+    const done = Promise.withResolvers<void>();
+    scriptTurns((options) => foregroundCommand(options, done.promise, done.promise));
+
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const prompt = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("hi"),
+      });
+      await vi.waitFor(() => expect(output(client)).toEqual(["chunk line1\r\n"]), {
+        timeout: 2000,
+      });
+      written = "line1\nline2";
+      await vi.waitFor(() => expect(output(client)).toHaveLength(2), { timeout: 2000 });
+      // Claude Code drops the output of a command that ended (CLI 2.1.325).
+      written = "";
+      done.resolve();
+      await prompt;
+      await vi.waitFor(() => expect(output(client)).toHaveLength(3), { timeout: 2000 });
+    });
+
+    // A v2 terminal's lines end in CR LF, as a PTY's do.
+    expect(output(client)).toEqual(["chunk line1\r\n", "chunk line2", "output line1\r\nline2"]);
+  });
+
+  // The result of a command that an interrupt stopped is Claude Code's notice
+  // for the model: it must not replace the output that the user was reading.
+  it("keeps what the terminal showed of a stopped command, and appends Claude Code's notice", async () => {
+    sdk.getTaskOutput = async () => ({ output: "line1\n", total_bytes: 6, truncated: false });
+    const done = Promise.withResolvers<void>();
+    scriptTurns((options) => foregroundCommand(options, done.promise, done.promise, true));
+
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const prompt = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("hi"),
+      });
+      await vi.waitFor(() => expect(output(client)).toHaveLength(1), { timeout: 2000 });
+      done.resolve();
+      await prompt;
+      await vi.waitFor(() => expect(output(client)).toHaveLength(2), { timeout: 2000 });
+    });
+
+    expect(output(client)).toEqual(["chunk line1\r\n", `chunk ${STOP_NOTICE}`]);
+  });
+
+  // A tool call that gets no result, such as one of a reply that Claude Code
+  // took back, must not be read until the query ends.
+  it("reads no more output once the command's task ended", async () => {
+    let reads = 0;
+    // The command prints nothing, so no read tells that it ended.
+    sdk.getTaskOutput = async () => {
+      reads++;
+      return { output: "", total_bytes: 0, truncated: false };
+    };
+    const done = Promise.withResolvers<void>();
+    const resulted = Promise.withResolvers<void>();
+    scriptTurns((options) => foregroundCommand(options, done.promise, resulted.promise));
+
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const prompt = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("hi"),
+      });
+      await vi.waitFor(() => expect(reads).toBeGreaterThan(0), { timeout: 2000 });
+      done.resolve();
+      // The task's end reaches the agent a few steps later.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const readsAtTaskEnd = reads;
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      expect(reads).toBe(readsAtTaskEnd);
+      resulted.resolve();
+      await prompt;
+    });
+  });
+
+  it("reads no task output for a command that Claude Code runs in the background", async () => {
+    const reads: string[] = [];
+    sdk.getTaskOutput = async (taskId) => {
+      reads.push(taskId);
+      return { output: "x", total_bytes: 1, truncated: false };
+    };
+    const done = Promise.withResolvers<void>();
+    scriptTurns(async function* (options) {
+      yield {
+        type: "assistant",
+        message: {
+          id: "msg_bg",
+          type: "message",
+          role: "assistant",
+          model: "claude-sonnet-4-6",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_bg",
+              name: "Bash",
+              input: { command: "make serve", run_in_background: true },
+            },
+          ],
+          stop_reason: "tool_use",
+          stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield {
+        type: "system",
+        subtype: "task_started",
+        task_id: "bg1",
+        task_type: "local_bash",
+        description: "make serve",
+        tool_use_id: "toolu_bg",
+        is_backgrounded: true,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      await done.promise;
+      yield result(options);
+      yield idleState(options);
+    });
+
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const prompt = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("hi"),
+      });
+      // Longer than a few polls (BACKGROUND_OUTPUT_POLL_MS).
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      done.resolve();
+      await prompt;
+    });
+
+    expect(reads).toEqual([]);
+  });
+});
+
 describe("ACP v2 session translation", () => {
   it("renames the group id of grouped select options", () => {
     expect(
@@ -10335,6 +10753,11 @@ describe("ACP v2 subscription guard (--hide-claude-auth)", () => {
       { code: -32000, data: undefined },
     ],
     ["a subscription has no token", { ...SUBSCRIPTION, tokenSource: "none" }, NOT_SUPPORTED],
+    [
+      "a Claude Team plan would pay",
+      { ...SUBSCRIPTION, subscriptionType: "Claude Team" },
+      NOT_SUPPORTED,
+    ],
   ])("refuses session/new when %s", async (_case, account, refusal) => {
     accountsAtStart(account);
     const client = v2Client();
@@ -10353,6 +10776,7 @@ describe("ACP v2 subscription guard (--hide-claude-auth)", () => {
     ["a bearer token", { tokenSource: "ANTHROPIC_AUTH_TOKEN" }],
     ["a setup token", { tokenSource: "CLAUDE_CODE_OAUTH_TOKEN" }],
     ["external credentials", { apiProvider: "bedrock", tokenSource: "none" }],
+    ["a Claude Enterprise plan", { ...SUBSCRIPTION, subscriptionType: "Claude Enterprise" }],
     ["an unavailable account", undefined],
   ])("allows session/new with %s", async (_case, account) => {
     accountsAtStart(account);

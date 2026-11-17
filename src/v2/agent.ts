@@ -1186,6 +1186,7 @@ class V2Agent implements AgentHandle, SessionConnection {
           client,
           effortSettings: () => mergeEffortSettings(settings.getSettings(), configured),
           recommendedValue: this.air.recommendedValue,
+          narrowsModels: routing.narrowsModels,
         },
         (notification) => session.output.emitV1([notification]),
         this.logger,

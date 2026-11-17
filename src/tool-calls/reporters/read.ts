@@ -1,5 +1,6 @@
 import type { FileReadInput, FileReadOutput } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import {
+  inputString,
   markdownEscape,
   structuredResult,
   textContent,
@@ -18,21 +19,20 @@ import type {
 export class ReadReporter implements ToolReporter {
   toolUse(input: unknown, { cwd }: ToolUseContext): ToolUseFacts {
     const read = input as FileReadInput | undefined;
+    const filePath = inputString(input, "file_path");
     let limit = "";
     if (read?.limit && read.limit > 0) {
       limit = " (" + (read.offset ?? 1) + " - " + ((read.offset ?? 1) + read.limit - 1) + ")";
     } else if (read?.offset) {
       limit = " (from line " + read.offset + ")";
     }
-    const displayPath = read?.file_path ? toDisplayPath(read.file_path, cwd) : "File";
+    const displayPath = filePath ? toDisplayPath(filePath, cwd) : "File";
     return {
       title: "Read " + displayPath + limit,
       kind: "read",
       // Read offsets are 1-based. ACP lines are too, so `offset: 0` (read from
       // the start) becomes line 1.
-      locations: read?.file_path
-        ? [{ path: read.file_path, line: Math.max(read.offset ?? 1, 1) }]
-        : [],
+      locations: filePath ? [{ path: filePath, line: Math.max(read?.offset ?? 1, 1) }] : [],
     };
   }
 

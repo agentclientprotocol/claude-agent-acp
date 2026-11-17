@@ -1,12 +1,13 @@
 /**
  * The `--hide-claude-auth` subscription guard on the v2 core: this
- * integration never bills a claude.ai subscription. The policy is the v1
- * core's (`hide-claude-auth.ts`):
+ * integration never bills a claude.ai subscription other than Claude
+ * Enterprise. The policy is the v1 core's (`claudeAuthRefusal` in
+ * `hide-claude-auth.ts`):
  *
  * - It holds while the flag is on and no provider or gateway login routes
  *   the traffic away from the CLI's own login.
- * - A session does not start on an account that a subscription would pay
- *   for (`authRequired` with the `claude_subscription_not_supported`
+ * - A session does not start on an account that a Free, Pro, Max or Team
+ *   plan would pay for (`authRequired` with the `claude_subscription_not_supported`
  *   reason), or that holds no credential this integration accepts
  *   (`authRequired`).
  * - Each prompt reads the account that the query cached at its start, and is
@@ -23,11 +24,8 @@ import type { AccountInfo, Query } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "../logger.js";
 import { type AuthStatusKind, fromAccountInfo } from "../auth-status.js";
 import {
-  billsClaudeSubscription,
-  claudeLoginRequiredError,
+  claudeAuthRefusal,
   type ClaudeSubscriptionGuardState,
-  claudeSubscriptionNotSupportedError,
-  holdsNonSubscriptionCredential,
   refuseClaudeSubscriptionTurn,
   shouldHideClaudeAuth,
   warnClaudeSubscriptionGuardDegraded,
@@ -79,10 +77,9 @@ export class SubscriptionGuard {
           logger: this.logger,
           cause: "the CLI reported no account at initialize",
         });
-      } else if (billsClaudeSubscription(account)) {
-        throw claudeSubscriptionNotSupportedError();
-      } else if (!holdsNonSubscriptionCredential(account)) {
-        throw claudeLoginRequiredError();
+      } else {
+        const refusal = claudeAuthRefusal(account);
+        if (refusal) throw refusal;
       }
     }
     this.sessions.set(sessionId, session);

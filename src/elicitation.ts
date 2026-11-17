@@ -588,6 +588,17 @@ export async function answerMcpElicitation(
 }
 
 /**
+ * Whether `toolUseID` is the id of a question that Claude Code asks on its own
+ * (its `confirmWithUser`), such as whether to download a connector's file. It
+ * asks through `canUseTool` as AskUserQuestion under a `confirm_<uuid>` id,
+ * and reads the answer from the callback's result: no tool_use and no
+ * tool_result of the stream carry that id.
+ */
+export function isConfirmQuestion(toolUseID: string): boolean {
+  return toolUseID.startsWith("confirm_");
+}
+
+/**
  * Presents the AskUserQuestion tool's questions as a form elicitation of
  * `sessionId` through `elicit`, and returns the answers as the tool's
  * `updatedInput`. A withdrawn question, or one the user cancelled, aborts the

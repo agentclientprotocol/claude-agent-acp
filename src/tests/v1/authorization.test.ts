@@ -9,6 +9,7 @@ import { AcpClient } from "../../acp-client.js";
 import {
   billsClaudeSubscription,
   holdsNonSubscriptionCredential,
+  isClaudeEnterprisePlan,
   CLAUDE_LOGIN_REQUIRED_MESSAGE,
   CLAUDE_SUBSCRIPTION_NOT_SUPPORTED_MESSAGE,
   CLAUDE_SUBSCRIPTION_NOT_SUPPORTED_REASON,
@@ -466,6 +467,24 @@ describe("authorization", () => {
       });
     });
 
+    describe("isClaudeEnterprisePlan", () => {
+      it.each([
+        ["Claude Enterprise", true],
+        ["enterprise", true],
+        [" claude  ENTERPRISE ", true],
+        ["Claude Team", false],
+        ["Claude Max", false],
+        ["pro", false],
+        // A custom `plan_display_name` does not say which plan it belongs to.
+        ["Claude Enterprise Trial", false],
+        ["Claude Acme Enterprise", false],
+        ["", false],
+        [undefined, false],
+      ])("classifies subscriptionType %j", (subscriptionType, expected) => {
+        expect(isClaudeEnterprisePlan(subscriptionType)).toBe(expected);
+      });
+    });
+
     describe("fails closed at session creation", () => {
       /** What the flag does with an account at session creation. */
       type Verdict = "subscription" | "signedOut" | "allowed";
@@ -507,6 +526,16 @@ describe("authorization", () => {
           name: "a bearer token",
           account: { tokenSource: "ANTHROPIC_AUTH_TOKEN" },
           verdict: "allowed",
+        },
+        {
+          name: "a Claude Enterprise plan",
+          account: { subscriptionType: "Claude Enterprise", apiProvider: "firstParty" },
+          verdict: "allowed",
+        },
+        {
+          name: "a Claude Team plan",
+          account: { subscriptionType: "Claude Team", apiProvider: "firstParty" },
+          verdict: "subscription",
         },
         { name: "bedrock", account: { apiProvider: "bedrock" }, verdict: "allowed" },
         { name: "vertex", account: { apiProvider: "vertex" }, verdict: "allowed" },
@@ -938,10 +967,13 @@ describe("authorization", () => {
         expect(accountInfo).not.toHaveBeenCalled();
       });
 
-      it("lets the turn through when the live account is not a subscription", async () => {
+      it.each([
+        ["an API key", { apiKeySource: "ANTHROPIC_API_KEY" }],
+        ["a Claude Enterprise plan", { subscriptionType: "Claude Enterprise" }],
+      ])("lets the turn through when the live account is %s", async (_case, account) => {
         const [agent] = await createAgentMock();
         hideClaudeAuth();
-        const accountInfo = vi.fn(async () => ({ apiKeySource: "ANTHROPIC_API_KEY" }));
+        const accountInfo = vi.fn(async () => account);
         mockAccount(SIGNED_IN_WITH_KEY, { accountInfo });
         const { sessionId } = await agent.newSession(newSessionParams());
 

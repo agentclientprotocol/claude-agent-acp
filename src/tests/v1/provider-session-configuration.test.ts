@@ -345,6 +345,18 @@ describe("provider updates preserve session configuration", { timeout: 10_000 },
     expect(updates.at(-1).update.configOptions).toEqual(agent.sessions[sessionId].configOptions);
   });
 
+  // The gateway of `providers/set` listed the models, so only those can run
+  // there, though Claude Code would take the id.
+  it("refuses a model id the option does not list without asking Claude Code", async () => {
+    const { sessionId } = await newSession();
+
+    await expect(select(sessionId, "model", "claude-fable-5-2")).rejects.toMatchObject({
+      code: -32602,
+      message: expect.stringMatching(/Invalid value for config option model: claude-fable-5-2$/),
+    });
+    expect(lastQuery().setModel).not.toHaveBeenCalledWith("claude-fable-5-2");
+  });
+
   it("restores Auto once the restored model supports it", async () => {
     models = MODELS.map((model) =>
       model.value === "sonnet" ? { ...model, supportsAutoMode: false } : model,

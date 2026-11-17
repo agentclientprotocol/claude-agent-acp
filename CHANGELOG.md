@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.107.3](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.107.2...v0.107.3) (2026-11-16)
+
+
+### Bug Fixes
+
+* allow Claude Enterprise accounts under --hide-claude-auth ([#1641](https://github.com/agentclientprotocol/claude-agent-acp/issues/1641)) ([be2219c](https://github.com/agentclientprotocol/claude-agent-acp/commit/be2219cef1f5b2b93129d5eef4b80574f57bdb1b))
+* pass a model id the picker does not list to Claude Code ([#1630](https://github.com/agentclientprotocol/claude-agent-acp/issues/1630)) ([dc769c1](https://github.com/agentclientprotocol/claude-agent-acp/commit/dc769c132cacc8bbc7aff0d512e5ab587a1802e3))
+
 ## [0.107.2](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.107.1...v0.107.2) (2026-11-16)
 
 

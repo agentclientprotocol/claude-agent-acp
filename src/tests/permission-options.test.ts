@@ -30,6 +30,7 @@ describe("Claude permission options and response mapping", () => {
       availableModes,
       contextUsedPercent,
       prePlanMode,
+      showClearContextOnPlanAccept: true,
     });
 
   it("leads with the reject options when the CLI defaults the ask to no", () => {
@@ -586,6 +587,26 @@ describe("Claude permission options and response mapping", () => {
       expect(
         build("ExitPlanMode", undefined, { plan: "Implement it" }, undefined, true, modes, 73),
       ).toContainEqual(expect.objectContaining({ optionId, name }));
+    },
+  );
+
+  it.each([undefined, false])(
+    "does not offer clear-context ExitPlanMode when showClearContextOnPlanAccept is %s",
+    (showClearContextOnPlanAccept) => {
+      const optionIds = buildClaudePermissionOptions({
+        toolName: "ExitPlanMode",
+        input: { plan: "Implement it" },
+        cwd: "/workspace",
+        availableModes: ["auto", "bypassPermissions", "acceptEdits"],
+        contextUsedPercent: 73,
+        showClearContextOnPlanAccept,
+      }).map((option) => option.optionId);
+      expect(optionIds).toEqual([
+        PERMISSION_OPTION_ID.exitPlanDefault,
+        PERMISSION_OPTION_ID.exitPlanAuto,
+        PERMISSION_OPTION_ID.exitPlanBypass,
+        PERMISSION_OPTION_ID.reject,
+      ]);
     },
   );
 

@@ -60,6 +60,20 @@ export type ToolResultContent =
   | BetaTextEditorCodeExecutionToolResultError;
 
 /**
+ * The field `key` of a tool's input when it holds a non-empty string.
+ *
+ * The input is what the model wrote. Claude Code validates it when it runs the
+ * tool, after the adapter reported the tool use, so a field can hold any type:
+ * `Read {"file_path": 12345}`. A reporter must not pass such a value on as a
+ * path or a title.
+ */
+export function inputString(input: unknown, key: string): string | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  const value = (input as Record<string, unknown>)[key];
+  return typeof value === "string" && value !== "" ? value : undefined;
+}
+
+/**
  * Convert an absolute file path to a project-relative path for display.
  * Returns the original path if it's outside the project directory or if no cwd is provided.
  */

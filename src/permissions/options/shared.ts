@@ -33,6 +33,9 @@ export interface PermissionOptionContext {
   /** False when no ACP turn can continue an accepted plan in a fresh
    *  context. Then an ExitPlanMode request offers no clear-context option. */
   allowContextReset?: boolean;
+  /** Claude Code's `showClearContextOnPlanAccept` setting. An ExitPlanMode
+   *  request offers the clear-context option only when it is true. */
+  showClearContextOnPlanAccept?: boolean;
 }
 
 export function allowOnce(name = "Yes"): PermissionOption {

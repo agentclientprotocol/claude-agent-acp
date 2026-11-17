@@ -97,3 +97,32 @@ describe("SettingsManager.getCompactionSettings", () => {
     manager.dispose();
   });
 });
+
+describe("SettingsManager.getShowClearContextOnPlanAccept", () => {
+  it("ranks managed settings over the --settings override over the files, and is off by default", async () => {
+    const managed = await managerResolving({
+      effective: { showClearContextOnPlanAccept: false },
+      provenance: {},
+      sources: [{ source: "managed", settings: { showClearContextOnPlanAccept: false } }],
+    });
+    expect(managed.getShowClearContextOnPlanAccept({ showClearContextOnPlanAccept: true })).toBe(
+      false,
+    );
+    managed.dispose();
+
+    const files = await managerResolving({
+      effective: { showClearContextOnPlanAccept: true },
+      provenance: {},
+      sources: [{ source: "userSettings", settings: { showClearContextOnPlanAccept: true } }],
+    });
+    expect(files.getShowClearContextOnPlanAccept({ showClearContextOnPlanAccept: false })).toBe(
+      false,
+    );
+    expect(files.getShowClearContextOnPlanAccept()).toBe(true);
+    files.dispose();
+
+    const unset = await managerResolving({ effective: {}, provenance: {}, sources: [] });
+    expect(unset.getShowClearContextOnPlanAccept()).toBe(false);
+    unset.dispose();
+  });
+});
