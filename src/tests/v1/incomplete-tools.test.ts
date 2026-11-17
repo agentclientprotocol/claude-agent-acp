@@ -68,6 +68,25 @@ describe("incomplete foreground tools", () => {
     expect(updates).toContainEqual(expect.objectContaining({ toolCallId, status: "failed" }));
   });
 
+  it.each([
+    { client: "answers", response: { action: "accept", content: { question_0: "Download" } } },
+    { client: "declines", response: { action: "decline" } },
+    { client: "cancels", response: { action: "cancel" } },
+  ] as const)(
+    "ends the turn after a confirmWithUser question that the client $client",
+    async ({ response }) => {
+      const { agent, prompt } = createTestSession(confirmQuestionMessages, {
+        createElicitation: async () => response,
+      });
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { elicitation: { form: {} } },
+      });
+
+      await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+    },
+  );
+
   it("allows a completed tool with a late PostToolUse hook", async () => {
     const { prompt, logError } = createTestSession(completedToolMessages);
 
@@ -1294,6 +1313,7 @@ function toolResult(id = toolCallId, parent: string | null = null) {
 
 function createTestSession(
   createSdkMessages: (input: Pushable<any>, agent: ClaudeAcpAgent) => AsyncGenerator<any>,
+  client: Partial<AcpClient> = {},
 ) {
   const updates: any[] = [];
   const logError = vi.fn();
@@ -1306,6 +1326,7 @@ function createTestSession(
       requestPermission: async () => ({ outcome: { outcome: "selected", optionId: "allow-once" } }),
       extNotification: async () => {},
       authStatusUpdate: async () => {},
+      ...client,
     } as unknown as AcpClient,
     { log: () => {}, error: logError },
   );
@@ -1918,5 +1939,35 @@ async function* steeredAbandonedToolMessages(input: Pushable<any>, agent: Claude
   ).resolves.toEqual({ outcome: "injected" });
   yield userEcho((await messages.next()).value);
   yield assistantText("Done as you asked.");
+  yield successfulResultMessage();
+}
+
+/** How Claude Code's confirmWithUser asks the user: through AskUserQuestion,
+ *  under a synthetic `confirm_` id, with no tool_use or tool_result. */
+async function* confirmQuestionMessages(input: Pushable<any>, agent: ClaudeAcpAgent) {
+  yield* echoNextPrompt(input);
+  const questions = [
+    {
+      question: "Download report.pdf from Drive?",
+      header: "Download",
+      options: [
+        { label: "Download", description: "" },
+        { label: "Don't download", description: "" },
+      ],
+      multiSelect: false,
+    },
+  ];
+  // A question that the client cancelled rejects.
+  await agent
+    .canUseTool(sessionId)(
+      "AskUserQuestion",
+      { questions, metadata: { source: "mcp_connector_download" } },
+      {
+        toolUseID: "confirm_0b7c5f3e-5a7e-4d55-9a54-2f7f0a1c9e11",
+        signal: new AbortController().signal,
+        suggestions: [],
+      } as any,
+    )
+    .catch(() => {});
   yield successfulResultMessage();
 }

@@ -8806,7 +8806,9 @@ export class ClaudeAcpAgent {
     if (
       !parentToolUseId &&
       notificationSessionId === sessionId &&
-      toolName !== "SandboxNetworkAccess"
+      toolName !== "SandboxNetworkAccess" &&
+      // Neither does a confirmWithUser question, asked under a `confirm_` id.
+      !toolCallId.startsWith("confirm_")
     ) {
       recordForegroundToolCall(session, toolCallId);
     }
