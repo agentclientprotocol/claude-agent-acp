@@ -807,7 +807,7 @@ describe("providers", () => {
       );
     });
 
-    it("offers no model when the listing succeeds but matches none", async () => {
+    it("rejects incompatible provider models", async () => {
       const [agent, mockQuery] = await createAgentMock();
       const setModel = mockQueryWithModels(mockQuery);
       stubListing(["gpt-5"]);
@@ -818,9 +818,17 @@ describe("providers", () => {
         baseUrl: "https://gateway.example",
       });
 
-      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      await expect(agent.newSession({ cwd: process.cwd(), mcpServers: [] })).rejects.toMatchObject({
+        code: -32603,
+        message: expect.stringContaining(
+          "The selected provider offers no compatible Claude models.",
+        ),
+        data: { providerId: "main" },
+      });
 
-      expect(response.configOptions?.find((o: any) => o.id === "model")).toBeUndefined();
+      expect(Object.keys(agent.sessions)).toEqual([]);
+      const rejectedQuery = mockQuery.mock.results.at(-1)!.value;
+      expect(rejectedQuery.close).toHaveBeenCalledOnce();
       expect(setModel).not.toHaveBeenCalled();
     });
 

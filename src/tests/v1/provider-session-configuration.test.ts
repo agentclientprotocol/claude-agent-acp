@@ -7,7 +7,10 @@ import type { ModelInfo, Options } from "@anthropic-ai/claude-agent-sdk";
 import { ClaudeAcpAgent } from "../../v1/acp-agent.js";
 import { FAST_MODE_CONFIG_ID } from "../../session-fast-mode.js";
 import type { AcpClient } from "../../acp-client.js";
-import { AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY } from "../../air-extension.js";
+import {
+  AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
+  AIR_SESSION_FAILURE_CAPABILITY,
+} from "../../air-extension.js";
 import { initializeClient, makeMockQuery } from "../helpers.js";
 import { successfulResultMessage, userEcho } from "./session-doubles.js";
 
@@ -532,6 +535,38 @@ describe("provider updates preserve session configuration", { timeout: 10_000 },
       }
     },
   );
+
+  it("reports sessionFailure for an incompatible provider restart", async () => {
+    await initializeClient(agent, {
+      _meta: { jetbrains: { air: { version: 1, capabilities: [AIR_SESSION_FAILURE_CAPABILITY] } } },
+    });
+    const { sessionId } = await newSession();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Response.json({ data: [{ id: "gpt-5" }] })),
+    );
+
+    await agent.unstable_setProvider({ ...PROVIDER, baseUrl: "https://incompatible.example" });
+
+    expect(updates).toContainEqual(
+      expect.objectContaining({
+        sessionId,
+        update: expect.objectContaining({
+          _meta: expect.objectContaining({
+            jetbrains: expect.objectContaining({
+              air: expect.objectContaining({
+                sessionFailure: expect.objectContaining({
+                  details: expect.stringContaining(
+                    "The selected provider offers no compatible Claude models.",
+                  ),
+                }),
+              }),
+            }),
+          }),
+        }),
+      }),
+    );
+  });
 
   it("removes the old session when provider recreation fails", async () => {
     const { sessionId } = await newSession();
