@@ -2051,6 +2051,85 @@ describe("ACP v2 core", () => {
     ).toEqual([]);
   });
 
+  it.each([
+    ["tool_use", "cancelled"],
+    ["null", "error"],
+  ] as const)(
+    "handles a rejected plan diagnostic with stop_reason=%s",
+    async (reason, expected) => {
+      const client = v2Client({
+        answerPermission: () => ({ outcome: { outcome: "selected", optionId: "reject" } }),
+      });
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const sessionId = response.sessionId;
+        const prompted = agent.request(v2.methods.agent.session.prompt, {
+          sessionId,
+          prompt: PROMPT,
+        });
+        claude.send(echo(await claude.prompt(0)));
+        await prompted;
+        claude.send(
+          assistant("msg_plan", [
+            { type: "tool_use", id: "toolu_plan", name: "ExitPlanMode", input: { plan: "Do it" } },
+          ]),
+        );
+        const decision = await askPermission(
+          claude,
+          "ExitPlanMode",
+          { plan: "Do it" },
+          { toolUseID: "toolu_plan" },
+        );
+        expect(decision).toMatchObject({ behavior: "deny", interrupt: true });
+        claude.send({
+          type: "user",
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_plan",
+                content: "The user rejected this plan.",
+                is_error: true,
+              },
+            ],
+          },
+          tool_result_meta: [{ id: "toolu_plan", non_execution_kind: "user-rejected" }],
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+        });
+        claude.send(
+          result({
+            subtype: "error_during_execution",
+            is_error: true,
+            stop_reason: null,
+            errors: [
+              `[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=${reason}`,
+            ],
+          }),
+        );
+        await vi.waitFor(() => expect(client.states().at(-1)).toBe("idle"));
+        expect(client.sessionUpdates.at(-1)).toMatchObject({ state: "idle", stopReason: expected });
+        if (expected === "cancelled")
+          expect(client.sessionUpdates.at(-1)).not.toHaveProperty("error");
+
+        const followup = agent.request(v2.methods.agent.session.prompt, {
+          sessionId,
+          prompt: PROMPT,
+        });
+        claude.send(echo(await claude.prompt(1)));
+        await followup;
+        claude.send(result());
+        await vi.waitFor(() =>
+          expect(client.sessionUpdates.at(-1)).toMatchObject({
+            state: "idle",
+            stopReason: "end_turn",
+          }),
+        );
+      });
+    },
+  );
+
   it("ends a turn cancelled when a cancel comes while an approved plan waits for its fresh context", async () => {
     const client = v2Client({
       answerPermission: () => ({
