@@ -22,9 +22,8 @@ import {
   adapterRemoteControlCommand,
   isRemoteHumanMessage,
   parseRemoteControlCommand,
+  RemoteControlAtStartup,
   runRemoteControlCommand,
-  startRemoteControl,
-  supportsRemoteControl,
 } from "../remote-control.js";
 import type { SessionNotice } from "../session-notices.js";
 
@@ -52,34 +51,24 @@ export class SessionRemoteControl {
   private readonly sent = new Set<string>();
 
   /**
-   * Claude Code asked at `initialize` for Remote Control to start with the
-   * query (see `startsWithRemoteControl`). {@link connectAtStartup} clears it.
+   * Remote Control at the start of this query, which Claude Code can ask for
+   * at `initialize` (see `V2Session.setRemoteControlAtStartup`).
    */
-  atStartup = false;
+  atStartup = new RemoteControlAtStartup(false);
 
   constructor(private readonly host: RemoteControlHost) {}
 
   /**
    * Starts Remote Control after the setup response of a query that Claude
-   * Code asked to start with it, and reports how it went in a notice. It runs
-   * once per query, so a later load of the live session starts nothing, while
-   * a restart of the query (see `restarts.ts`), whose new query asks again,
-   * starts it again. While Claude is working, it starts nothing, as its notice
-   * would land inside that work; `/remote-control` still connects the session
-   * then. The session holds its prompts back until the notice is sent.
+   * Code asked to start with it, and reports how it went in a notice (see
+   * `RemoteControlAtStartup`). It runs once per query, so a later load of the
+   * live session starts nothing, while a restart of the query (see
+   * `restarts.ts`), whose new query asks again, starts it again. The session
+   * holds its prompts back until the notice is sent.
    */
   async connectAtStartup(): Promise<void> {
-    if (!this.atStartup) return;
-    this.atStartup = false;
-    const query = this.host.query();
-    if (!query || !supportsRemoteControl(query)) return;
-    if (this.host.working()) {
-      this.host.logger.log(
-        `Session ${this.host.sessionId}: Claude is working, so Remote Control does not start with the session. /remote-control starts it.`,
-      );
-      return;
-    }
-    this.host.notice(await startRemoteControl(query, this.host.logger));
+    const notice = this.atStartup.connect(this.host);
+    if (notice) this.host.notice(await notice);
   }
 
   /** Whether `prompt` may be the adapter's command, which {@link run} then decides. */

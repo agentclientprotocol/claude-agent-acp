@@ -15,6 +15,7 @@ import type {
   SDKUserMessageReplay,
   SlashCommand,
 } from "@anthropic-ai/claude-agent-sdk";
+import type { Logger } from "./logger.js";
 import type { SessionNotice } from "./session-notices.js";
 
 /** Runtime Remote Control control exposed by the pinned Agent SDK. Like
@@ -120,8 +121,9 @@ export async function runRemoteControlCommand(
 
 /** The `initialize` result with `remote_control_auto_enable`, which Claude Code
  *  resolves from `remoteControlAtStartup` in the settings, else the policy
- *  default, so that an SDK host can start Remote Control with the session as
- *  the terminal does. Like `enableRemoteControl`, it is not in the public
+ *  default, else a rollout, so it can be on although the user never turned it
+ *  on. An SDK host reads it to start Remote Control with the session as the
+ *  terminal does. Like `enableRemoteControl`, it is not in the public
  *  declaration yet. */
 type RemoteControlInitializeResponse = SDKControlInitializeResponse & {
   remote_control_auto_enable?: boolean;
@@ -164,6 +166,51 @@ export async function startRemoteControl(
       title: "Could not start Remote Control",
       description: error instanceof Error ? error.message : String(error),
     };
+  }
+}
+
+/** What starting Remote Control with a query needs of the query's session. */
+export type RemoteControlAtStartupSession = {
+  readonly sessionId: string;
+  readonly logger: Logger;
+  /** The session's query, or `undefined` once it is closed. */
+  query(): Query | undefined;
+  /** Whether the session is busy in its core's sense, such as Claude working. */
+  working(): boolean;
+};
+
+/**
+ * Remote Control at the start of a query that Claude Code asked to start with
+ * it (see {@link startsWithRemoteControl}). Each core keeps one per query and
+ * connects it after the query's setup response and after a restart, whose new
+ * query asks again: closing the old query ended its Remote Control. Holding
+ * prompts back and sending the notice are each core's own, as they follow the
+ * core's turn model.
+ */
+export class RemoteControlAtStartup {
+  constructor(private asked: boolean) {}
+
+  /**
+   * Starts Remote Control on the first call, and resolves the notice that
+   * tells the user how it went. When nothing starts, it returns `undefined`
+   * rather than a promise, so a core can hold its prompts back in the same
+   * synchronous step: Claude Code did not ask, an earlier call ran, the query
+   * is closed or has no Remote Control, or the session is busy, as the notice
+   * would land inside that work. `/remote-control` still connects the session
+   * then.
+   */
+  connect(session: RemoteControlAtStartupSession): Promise<SessionNotice> | undefined {
+    if (!this.asked) return undefined;
+    this.asked = false;
+    const query = session.query();
+    if (!query || !supportsRemoteControl(query)) return undefined;
+    if (session.working()) {
+      session.logger.log(
+        `Session ${session.sessionId} is busy, so Remote Control does not start with it. /remote-control starts it.`,
+      );
+      return undefined;
+    }
+    return startRemoteControl(query, session.logger);
   }
 }
 

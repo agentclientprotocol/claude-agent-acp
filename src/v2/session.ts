@@ -91,6 +91,7 @@ import { SessionReports } from "./reports.js";
 import { SessionElicitations } from "./elicitation.js";
 import { SessionOutput } from "./stream.js";
 import { SessionRemoteControl } from "./remote-control.js";
+import { RemoteControlAtStartup } from "../remote-control.js";
 import { SessionTasks, type RequestTarget, type RequestContext } from "./tasks.js";
 
 /** What a session needs of its connection. */
@@ -407,7 +408,7 @@ export class V2Session implements RequestTarget {
    * {@link connectRemoteControlAtStartup}.
    */
   setRemoteControlAtStartup(asked: boolean): void {
-    this.remoteControl.atStartup = asked;
+    this.remoteControl.atStartup = new RemoteControlAtStartup(asked);
   }
 
   /**

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Query } from "@anthropic-ai/claude-agent-sdk";
+import { RemoteControlAtStartup } from "../../remote-control.js";
 import type { SessionNotice } from "../../session-notices.js";
 import { type RemoteControlHost, SessionRemoteControl } from "../../v2/remote-control.js";
 
@@ -32,7 +33,7 @@ describe("Remote Control at the start of a v2 query", () => {
       session_url: "https://claude.ai/code/session_123",
     }));
     const { remoteControl, notices } = createRemoteControl(enableRemoteControl);
-    remoteControl.atStartup = true;
+    remoteControl.atStartup = new RemoteControlAtStartup(true);
 
     await remoteControl.connectAtStartup();
     await remoteControl.connectAtStartup();
@@ -52,7 +53,7 @@ describe("Remote Control at the start of a v2 query", () => {
     const { remoteControl, notices } = createRemoteControl(async () => {
       throw new Error("Remote Control is disabled by policy");
     });
-    remoteControl.atStartup = true;
+    remoteControl.atStartup = new RemoteControlAtStartup(true);
 
     await remoteControl.connectAtStartup();
 
@@ -73,7 +74,7 @@ describe("Remote Control at the start of a v2 query", () => {
     const { remoteControl, notices } = createRemoteControl(
       supported ? enableRemoteControl : undefined,
     );
-    remoteControl.atStartup = asked;
+    remoteControl.atStartup = new RemoteControlAtStartup(asked);
 
     await remoteControl.connectAtStartup();
 
@@ -84,14 +85,14 @@ describe("Remote Control at the start of a v2 query", () => {
   it("starts nothing while Claude is working, and says so in the log", async () => {
     const enableRemoteControl = vi.fn(async () => ({ session_url: "https://claude.ai/code/s" }));
     const { remoteControl, notices, logger } = createRemoteControl(enableRemoteControl, true);
-    remoteControl.atStartup = true;
+    remoteControl.atStartup = new RemoteControlAtStartup(true);
 
     await remoteControl.connectAtStartup();
 
     expect(enableRemoteControl).not.toHaveBeenCalled();
     expect(notices).toEqual([]);
     expect(logger.log).toHaveBeenCalledExactlyOnceWith(
-      "Session session-1: Claude is working, so Remote Control does not start with the session. /remote-control starts it.",
+      "Session session-1 is busy, so Remote Control does not start with it. /remote-control starts it.",
     );
   });
 });

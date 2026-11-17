@@ -282,13 +282,13 @@ import {
   adapterRemoteControlCommand,
   isRemoteHumanMessage,
   parseRemoteControlCommand,
+  RemoteControlAtStartup,
   type RemoteControlCommand,
   type RemoteControlQuery,
   runRemoteControlCommand,
-  startRemoteControl,
   startsWithRemoteControl,
-  supportsRemoteControl,
 } from "../remote-control.js";
+import { connectAtStartup, holdingPrompts } from "./remote-control.js";
 import {
   AGENT_FILE_CHANGE_REPORT_CAPABILITY,
   agentFileChangeReportMeta,
@@ -984,13 +984,14 @@ export type Session = {
    *  back yet. Claude Code stamps the echo with the same human origin as a
    *  message typed in another client, so the uuid is what tells the two apart. */
   sentUserUuids?: Set<string>;
-  /** The `/remote-control` command that is running, from its request to its
-   *  reply. Prompts wait for it, and a second command is refused meanwhile. */
+  /** The Remote Control change that is running, a `/remote-control` command or
+   *  Remote Control starting with the query, from its request to its answer.
+   *  Prompts wait for it, and a `/remote-control` command is refused
+   *  meanwhile (see `holdingPrompts`). */
   remoteControlCommand?: Promise<void>;
-  /** Claude Code asked at `initialize` for Remote Control to start with the
-   *  session (see {@link startsWithRemoteControl}). The first run of
-   *  {@link ClaudeAcpAgent.connectRemoteControlAtStartup} clears it. */
-  remoteControlAtStartup?: boolean;
+  /** Remote Control at the start of this query, which Claude Code can ask for
+   *  at `initialize` (see {@link ClaudeAcpAgent.connectRemoteControlAtStartup}). */
+  remoteControlAtStartup?: RemoteControlAtStartup;
   /** The resolved SKILL.md paths of the skill commands, keyed by the cwd and
    *  the command name. A `commands_changed` clears it, because the skill
    *  files can have changed then. */
@@ -1811,7 +1812,15 @@ export class ClaudeAcpAgent {
       sessionUpdate: (notification) => this.client.sessionUpdate(notification),
       supportsPlanOperations: () => this.clientCapabilities?.plan != null,
       isAirClient: () => this.toolCallCapabilities.air.client,
-      ensureConsumer: (session, id) => this.ensureConsumer(session, id),
+      // The last step of the restart, once the fresh query carries the turn.
+      ensureConsumer: (session, id) => {
+        this.ensureConsumer(session, id);
+        // Closing the old query ended its Remote Control. The plan goes on in
+        // the fresh query as the turn's work, so this starts nothing, but it
+        // spends the query's request, which a later load or resume of the live
+        // session would otherwise start.
+        void this.connectRemoteControlAtStartup(id);
+      },
       logError: (message, error) => this.logger.error(message, error),
       destroyReplacement: (id, session) => {
         disarmForceCancel(session);
@@ -2573,25 +2582,22 @@ export class ClaudeAcpAgent {
           "Remote Control is already being changed. Try again in a moment.",
         );
       }
-      // Once Remote Control is on, other clients can start turns or send
-      // messages on their own. Something has to read the query stream for
-      // those to reach this client. The reader starts after the session's
-      // setup response and after a query restart; a command that comes before
-      // the setup's timer ran (see `afterSetupResponse`) answers without a
-      // turn and would leave the stream unread until that timer.
-      this.ensureConsumer(session, params.sessionId);
-      // Answered by the adapter without a model turn.
-      events.inserted(randomUUID());
       // The request goes over the network. Until it and its reply are done,
-      // `remoteControlCommand` holds back the prompts that follow, which would
-      // otherwise start a turn that the reply lands in.
-      const command = this.runRemoteControlCommand(params.sessionId, remoteControl);
-      session.remoteControlCommand = command;
-      try {
-        await command;
-      } finally {
-        session.remoteControlCommand = undefined;
-      }
+      // the prompts that follow are held back, as they would otherwise start a
+      // turn that the reply lands in. The query stream's reader starts first:
+      // it also starts after the session's setup response and after a query
+      // restart, but a command that comes before the setup's timer ran (see
+      // `afterSetupResponse`) answers without a turn and would leave the
+      // stream unread until that timer.
+      await holdingPrompts(
+        session,
+        () => this.ensureConsumer(session, params.sessionId),
+        () => {
+          // Answered by the adapter without a model turn.
+          events.inserted(randomUUID());
+          return this.runRemoteControlCommand(params.sessionId, remoteControl);
+        },
+      );
       events.ended({ stopReason: "end_turn" });
       return;
     }
@@ -2715,43 +2721,29 @@ export class ClaudeAcpAgent {
   }
 
   /**
-   * Starts Remote Control after the setup response of a session that Claude
-   * Code asked to start with it (`remoteControlAtStartup` in the settings), and
-   * reports how it went in a notice. It runs once per session, so a later load
-   * or resume of the live session starts nothing. While a `/remote-control`
-   * command runs, it starts nothing and leaves Remote Control to that command.
-   * While Claude is working, it starts nothing either, as its notice would land
-   * inside that work; `/remote-control` still connects the session then. Like
-   * the command, it holds prompts back until the notice is sent.
+   * Starts Remote Control with the query of the session `sessionId` when
+   * Claude Code asked for it (`remoteControlAtStartup` in the settings), and
+   * reports how it went in a notice (see `connectAtStartup`). It runs once per
+   * query: after the setup response, and after each restart of the query, as
+   * closing the old query ended its Remote Control. A later load or resume of
+   * the live session starts nothing. The restart for a fresh context after a
+   * plan approval comes while Claude works, so it starts nothing then.
    */
   async connectRemoteControlAtStartup(sessionId: string): Promise<void> {
     const session = this.sessions[sessionId];
-    if (!session?.remoteControlAtStartup) return;
-    session.remoteControlAtStartup = false;
-    if (!supportsRemoteControl(session.query) || session.remoteControlCommand) return;
-    if (this.claudeIsWorking(sessionId, session)) {
-      this.logger.log(
-        `Session ${sessionId}: Claude is working, so Remote Control does not start with the session. /remote-control starts it.`,
-      );
-      return;
-    }
-    // Messages typed in other clients reach this one through the query stream,
-    // as after a `/remote-control` command.
-    this.ensureConsumer(session, sessionId);
-    const start = startRemoteControl(session.query, this.logger).then((notice) =>
-      this.client.sessionUpdate({
-        sessionId,
-        update: noticeOrTranscriptUpdate(notice, clientSupportsNotices(this.clientCapabilities)),
-      }),
-    );
-    session.remoteControlCommand = start;
-    try {
-      await start;
-    } catch (error) {
-      this.logger.error(`Session ${sessionId}: failed to send the Remote Control notice:`, error);
-    } finally {
-      session.remoteControlCommand = undefined;
-    }
+    if (!session) return;
+    await connectAtStartup(session, {
+      sessionId,
+      logger: this.logger,
+      query: () => (session.queryClosed ? undefined : session.query),
+      working: () => this.claudeIsWorking(sessionId, session),
+      readStream: () => this.ensureConsumer(session, sessionId),
+      notice: (notice) =>
+        this.client.sessionUpdate({
+          sessionId,
+          update: noticeOrTranscriptUpdate(notice, clientSupportsNotices(this.clientCapabilities)),
+        }),
+    });
   }
 
   /** `--hide-claude-auth` applies only to the CLI's own login. A provider
@@ -10962,7 +10954,9 @@ export class ClaudeAcpAgent {
         )?.kind,
         fileChangeReporter,
         promptSuggestions: PromptSuggestions.forClient(suggestionForms),
-        remoteControlAtStartup: startsWithRemoteControl(initializationResult),
+        remoteControlAtStartup: new RemoteControlAtStartup(
+          startsWithRemoteControl(initializationResult),
+        ),
       };
       this.mcp.sessionStarted(sessionId, servedMcpServers);
       const registered = this.sessions[sessionId];
@@ -11111,6 +11105,11 @@ export class ClaudeAcpAgent {
     // prompt would take the first unread result as its answer. After the
     // choices are restored, so the reader reports against the restored state.
     if (!recreated.queryClosed) this.ensureConsumer(recreated, sessionId);
+    // Closing the old query ended its Remote Control. A direct call, not
+    // `afterSetupResponse`: after a sign-out respawn, that timer would run
+    // once the waiting prompt queued its turn, and the connect would find
+    // Claude working. The direct call holds that prompt back instead.
+    void this.connectRemoteControlAtStartup(sessionId);
   }
 
   /** Re-applies the choices of `previous` to the session that replaced it; a choice the new query rejects is logged. */

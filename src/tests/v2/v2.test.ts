@@ -87,6 +87,8 @@ const sdk = vi.hoisted(() => ({
   startGate: undefined as Promise<void> | undefined,
   /** When set, the query serves Remote Control with it (`enableRemoteControl`). */
   enableRemoteControl: undefined as ((...args: unknown[]) => Promise<unknown>) | undefined,
+  /** Whether Claude Code asks at `initialize` for Remote Control to start with the query. */
+  remoteControlAtStartup: false,
 }));
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
@@ -160,7 +162,10 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
           if (sdk.mcpServersRefusal && Object.keys(options.mcpServers ?? {}).length > 0) {
             throw sdk.mcpServersRefusal;
           }
-          return { models: sdk.models };
+          return {
+            models: sdk.models,
+            ...(sdk.remoteControlAtStartup ? { remote_control_auto_enable: true } : {}),
+          };
         },
         supportedCommands: async () => [
           { name: "review", description: "Review a change", argumentHint: "<pull request>" },
@@ -245,6 +250,7 @@ beforeEach(async () => {
   sdk.flagRefusal = undefined;
   sdk.startGate = undefined;
   sdk.enableRemoteControl = undefined;
+  sdk.remoteControlAtStartup = false;
   vi.mocked(forkSession).mockClear();
 });
 
@@ -1043,6 +1049,28 @@ describe("ACP v2 core", () => {
           expect(withdrawn).toEqual([]);
         });
       });
+    });
+
+    it("starts Remote Control again on the new query of a restart, as the old one's ended", async () => {
+      sdk.remoteControlAtStartup = true;
+      const enableRemoteControl = vi.fn(async () => ({
+        session_url: "https://claude.ai/code/session_123",
+      }));
+      sdk.enableRemoteControl = enableRemoteControl;
+      const client = v2Client();
+      const notices = () =>
+        client.sessionUpdates.filter((update) => update.sessionUpdate === "notice");
+      await client.connect(async (agent) => {
+        await openSession(agent);
+        await vi.waitFor(() => expect(notices()).toHaveLength(1));
+        await setProvider(agent);
+        await vi.waitFor(() => expect(notices()).toHaveLength(2));
+      });
+
+      expect(sdk.processes).toHaveLength(2);
+      expect(enableRemoteControl).toHaveBeenCalledTimes(2);
+      expect(enableRemoteControl).toHaveBeenLastCalledWith(true);
+      expect(notices()[1]).toMatchObject({ title: "Remote Control connected" });
     });
 
     it("preserves an incompatible provider restart error and resumes after recovery", async () => {

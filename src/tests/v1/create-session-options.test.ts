@@ -2187,6 +2187,38 @@ describe("createSession options merging", () => {
       expect(startedAtResponse).toBe(0);
       expect(enableRemoteControl).toHaveBeenCalledExactlyOnceWith(true);
     });
+
+    it("starts again on the new query of a provider switch, and not at a later resume", async () => {
+      remoteControlAutoEnable = true;
+      const enableRemoteControl = vi.fn(async () => ({
+        session_url: "https://claude.ai/code/session_123",
+      }));
+      enableRemoteControlImpl = enableRemoteControl;
+      const sessionUpdate = vi.spyOn(agent.client, "sessionUpdate");
+      const notices = () =>
+        sessionUpdate.mock.calls.filter(([{ update }]) =>
+          JSON.stringify(update).includes("Remote Control connected"),
+        );
+      const params = { cwd: process.cwd(), mcpServers: [] };
+      const { sessionId } = await agent.newSession(params);
+      await vi.waitFor(() => expect(notices()).toHaveLength(1));
+
+      // Closing the old query ends its Remote Control.
+      await agent.unstable_setProvider({
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gw.example",
+        headers: {},
+      });
+      await vi.waitFor(() => expect(notices()).toHaveLength(2));
+      await agent.resumeSession({ sessionId, ...params });
+      // Past the timer of the resume's setup response, which runs the connect.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(enableRemoteControl).toHaveBeenCalledTimes(2);
+      expect(enableRemoteControl).toHaveBeenLastCalledWith(true);
+      expect(notices()).toHaveLength(2);
+    });
   });
 
   describe("context window seeding", () => {
