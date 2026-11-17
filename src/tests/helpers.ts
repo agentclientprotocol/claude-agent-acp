@@ -10,6 +10,7 @@ import {
   type InitializeRequest,
 } from "@agentclientprotocol/sdk/unstable";
 import { mkdir, writeFile } from "node:fs/promises";
+import { request } from "node:http";
 import path from "node:path";
 
 /** The context-usage report the base mock query returns: a 200K window, as
@@ -167,4 +168,83 @@ export async function writeTranscript(
     return JSON.stringify(line);
   });
   await writeFile(path.join(directory, `${sessionId}.jsonl`), lines.join("\n") + "\n");
+}
+
+/** The `_meta` of every MCP 2026-07-28 request of Claude Code 2.1.325, as its HTTP client sends it. */
+const CLAUDE_CODE_MCP_META = {
+  "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+  "io.modelcontextprotocol/clientInfo": {
+    name: "claude-code",
+    title: "Claude Code",
+    version: "2.1.325",
+    description: "Anthropic's agentic coding tool",
+    websiteUrl: "https://claude.com/claude-code",
+  },
+  "io.modelcontextprotocol/clientCapabilities": {
+    roots: { listChanged: true },
+    elicitation: { form: {}, url: {} },
+  },
+};
+
+/**
+ * Sends the MCP request `method` to the HTTP server of an SDK config, as
+ * Claude Code 2.1.325 sends it: one JSON-RPC request in a POST, with the
+ * headers that mirror its version, method and tool name. A `tools/call` has
+ * the tool use id and a progress token in `_meta`. `headers` replace the
+ * config's own, which carry the server's bearer token.
+ *
+ * Resolves with the HTTP status and the JSON-RPC messages of the response:
+ * the one message of a JSON body, or every message of an event stream. It
+ * uses `node:http`: the test setup stubs the global `fetch`.
+ */
+export function claudeCodeMcpRequest(
+  config: { url: string; headers?: Record<string, string> },
+  method: string,
+  params: Record<string, unknown> = {},
+  headers: Record<string, string> | undefined = config.headers,
+): Promise<{ status: number; messages: Array<Record<string, any>> }> {
+  const meta =
+    method === "tools/call"
+      ? { ...CLAUDE_CODE_MCP_META, "claudecode/toolUseId": "toolu_01", progressToken: 1 }
+      : CLAUDE_CODE_MCP_META;
+  const body = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method,
+    params: { ...params, _meta: meta },
+  });
+  return new Promise((resolve, reject) => {
+    const post = request(
+      config.url,
+      {
+        method: "POST",
+        headers: {
+          ...headers,
+          accept: "application/json, text/event-stream",
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(body),
+          "mcp-protocol-version": "2026-07-28",
+          "mcp-method": method,
+          ...(typeof params.name === "string" ? { "mcp-name": params.name } : {}),
+        },
+      },
+      (response) => {
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk: Buffer) => chunks.push(chunk));
+        response.on("error", reject);
+        response.on("end", () => {
+          const text = Buffer.concat(chunks).toString("utf8");
+          const messages = response.headers["content-type"]?.startsWith("text/event-stream")
+            ? text
+                .split("\n\n")
+                .flatMap((event) => event.split("\n").filter((line) => line.startsWith("data: ")))
+                .map((line) => JSON.parse(line.slice("data: ".length)))
+            : [JSON.parse(text)];
+          resolve({ status: response.statusCode ?? 0, messages });
+        });
+      },
+    );
+    post.on("error", reject);
+    post.end(body);
+  });
 }

@@ -20,6 +20,8 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("v2 core with Claude Code", 
   const updates: v2.UpdateSessionNotification[] = [];
   const waiters: Array<() => void> = [];
   let permissionAnswer: v2.PermissionOptionKind = "allow_once";
+  /** The MCP servers that the client serves over the connection (`mcp/message`). */
+  const mcp = new v2.McpOverAcpProvider();
 
   beforeAll(() => {
     if (spawnSync("npx", ["tsc"], { stdio: "inherit" }).status) {
@@ -49,6 +51,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("v2 core with Claude Code", 
           ? { outcome: { outcome: "selected", optionId: option.optionId } }
           : { outcome: { outcome: "cancelled" } };
       })
+      .onRequest(v2.methods.client.mcp.message, mcp.handleRequest)
       .connect(v2.ndJsonStream(nodeToWebWritable(child.stdin!), nodeToWebReadable(child.stdout!)));
     agent = connection.agent;
     await agent.request(v2.methods.agent.initialize, {
@@ -127,6 +130,36 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("v2 core with Claude Code", 
     expect(states(sessionId).map((update) => update.state)).toEqual(["running", "idle"]);
     expect(states(sessionId).at(-1)).toMatchObject({ stopReason: "end_turn" });
   }, 180_000);
+
+  // No prompt: it costs no API usage.
+  it("lists the tools of an MCP server that the client serves over ACP", async () => {
+    const served: string[] = [];
+    const tools = mcp.registerServer(agent, {
+      name: "tools",
+      handler: ({ method }) => {
+        served.push(method);
+        if (method === "server/discover") {
+          return {
+            result: {
+              resultType: "complete",
+              supportedVersions: ["2026-07-28"],
+              capabilities: { tools: {} },
+              _meta: { "io.modelcontextprotocol/serverInfo": { name: "tools", version: "1.0.0" } },
+            },
+          };
+        }
+        if (method === "tools/list") {
+          const echo = { name: "echo", inputSchema: { type: "object" } };
+          return { result: { resultType: "complete", tools: [echo] } };
+        }
+        throw new v2.McpProtocolError(-32601, `Method not found: ${method}`);
+      },
+    });
+    await agent.request(v2.methods.agent.session.new, { cwd, mcpServers: [tools.declaration] });
+    // Claude Code asks for the server's MCP revision first, not with `initialize`.
+    await until(() => served.includes("tools/list"), 30_000);
+    expect(served[0]).toBe("server/discover");
+  }, 60_000);
 
   it("reports requires_action while a permission request waits", async () => {
     const sessionId = await newSession("default");

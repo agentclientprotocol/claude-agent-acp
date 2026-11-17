@@ -17,7 +17,8 @@ import { SESSION_STATUS_CAPABILITY } from "../session-status.js";
  * - `session/delete`, `session/fork` (which returns a session the client can
  *   prompt at once), and `additionalDirectories`.
  * - The prompt content and MCP transports that the v1 `initialize` lists too:
- *   images, embedded context, and HTTP servers. v2 has no SSE transport.
+ *   images, embedded context, HTTP servers, and servers that the client
+ *   serves over the ACP connection (`acp`). v2 has no SSE transport.
  * - `systemPrompt`, in `append` and `override` mode.
  * - `session/status` (unstable), with the foreground state of an open session.
  * - `session/options` (unstable), and `configOptions` on `session/new` and
@@ -25,7 +26,7 @@ import { SESSION_STATUS_CAPABILITY } from "../session-status.js";
  */
 export const V2_SESSION_CAPABILITIES: v2.SessionCapabilities = {
   prompt: { image: {}, embeddedContext: {} },
-  mcp: { stdio: {}, http: {} },
+  mcp: { stdio: {}, http: {}, acp: {} },
   delete: {},
   fork: {},
   additionalDirectories: {},
