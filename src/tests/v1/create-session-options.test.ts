@@ -615,6 +615,19 @@ describe("createSession options merging", () => {
     expect(capturedOptions!.promptSuggestions).toBe(false);
   });
 
+  it.each([
+    { name: "sends MCP servers on the command line", delivery: undefined },
+    { name: "lets a caller choose the MCP delivery", delivery: "initialize" as const },
+  ])("$name", async ({ delivery }) => {
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      ...(delivery && { _meta: { claudeCode: { options: { mcpServersDelivery: delivery } } } }),
+    });
+
+    expect(capturedOptions!.mcpServersDelivery).toBe(delivery ?? "argv");
+  });
+
   it("defaults tools to claude_code preset when not provided", async () => {
     await agent.newSession({
       cwd: process.cwd(),

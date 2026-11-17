@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import type { Options } from "@anthropic-ai/claude-agent-sdk";
 
 const CLI_FILE_NAME = process.platform === "win32" ? "claude.exe" : "claude";
 
@@ -29,6 +30,20 @@ export async function claudeCliPath(): Promise<string> {
   }
   return installedClaudeCliPath();
 }
+
+/**
+ * How a session's MCP servers reach the Claude CLI unless the client's options
+ * name a `mcpServersDelivery`: in the `--mcp-config` flag, as before SDK
+ * 0.3.326. A server's `env` and `headers` are then on the CLI's command line.
+ * `'initialize'` sends them over stdin instead, but with a CLI that cannot
+ * read them there (e.g. 2.1.323 through `CLAUDE_CODE_EXECUTABLE`) the session
+ * fails at startup.
+ *
+ * The adapter always sets the option. It names the CLI to start
+ * (`pathToClaudeCodeExecutable`), and for such an app the SDK prints a
+ * `DeprecationWarning` when a session has MCP servers and the option is unset.
+ */
+export const MCP_SERVERS_DELIVERY: NonNullable<Options["mcpServersDelivery"]> = "argv";
 
 function bundledClaudeCliPath(directory: string): string {
   const path = join(directory, CLI_FILE_NAME);

@@ -878,6 +878,26 @@ describe("ACP v2 core", () => {
     expect(claude.options.env?.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS).toBe("1");
   });
 
+  it.each([
+    { name: "sends MCP servers on the command line", delivery: undefined },
+    { name: "lets the client choose the MCP delivery", delivery: "initialize" },
+  ])("$name", async ({ delivery }) => {
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      await agent.request(v2.methods.agent.initialize, {
+        protocolVersion: v2.PROTOCOL_VERSION,
+        info: { name: "v2-test-client", version: "1.0.0" },
+        capabilities: {},
+      });
+      await agent.request(v2.methods.agent.session.new, {
+        cwd,
+        ...(delivery && { _meta: { claudeCode: { options: { mcpServersDelivery: delivery } } } }),
+      });
+    });
+
+    expect(sdk.processes[0].options.mcpServersDelivery).toBe(delivery ?? "argv");
+  });
+
   it("answers a prompt when Claude Code starts it, and reports the work until the turn's result", async () => {
     const client = v2Client();
     await client.connect(async (agent) => {
