@@ -879,7 +879,7 @@ describe("ACP v2 core", () => {
   });
 
   it.each([
-    { name: "sends MCP servers on the command line", delivery: undefined },
+    { name: "sends MCP servers as the CLI takes them", delivery: undefined },
     { name: "lets the client choose the MCP delivery", delivery: "initialize" },
   ])("$name", async ({ delivery }) => {
     const client = v2Client();
@@ -895,6 +895,7 @@ describe("ACP v2 core", () => {
       });
     });
 
+    // Unit runs name a CLI with CLAUDE_CODE_EXECUTABLE (see `vitest.config.ts`).
     expect(sdk.processes[0].options.mcpServersDelivery).toBe(delivery ?? "argv");
   });
 

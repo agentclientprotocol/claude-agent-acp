@@ -46,6 +46,10 @@ Claude CLI (`claude`) it runs. Keep them in the same directory; a symlink to
 instead, set `CLAUDE_CODE_EXECUTABLE`. On Alpine, install `libgcc` and
 `libstdc++` first.
 
+A CLI named with `CLAUDE_CODE_EXECUTABLE` gets a session's MCP servers on its
+command line, where other users of the machine can read their `env` and
+`headers`. The CLI that comes with the adapter gets them over stdin.
+
 To build one for your machine (needs [Bun](https://bun.sh)) and check it:
 
 ```sh
