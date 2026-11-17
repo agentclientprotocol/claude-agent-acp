@@ -38,6 +38,10 @@
  *   `agentCapabilities.sessionCapabilities.options`, which origin/main did
  *   not: the agent now serves `session/options` and takes `configOptions` on
  *   session setup requests.
+ * - The `initialize` response also advertises
+ *   `agentCapabilities.mcpCapabilities.acp`, which origin/main did not: the
+ *   agent now takes MCP servers that the client serves over the ACP
+ *   connection (`"type": "acp"`).
  * - A SandboxNetworkAccess tool call is settled by a `tool_call_update` with
  *   only its final `status` once its permission request is answered. The
  *   callback runs nothing, so origin/main never settled the call (see
@@ -253,16 +257,16 @@ function withoutSessionCapabilities(record: Recorded, keys: readonly string[]): 
   } as Recorded;
 }
 
-/** `record` without `agentCapabilities.auth.status`, when it is an `initialize` response. */
-function withoutAuthStatusCapability(record: Recorded): Recorded {
+/** `record` without `agentCapabilities.<group>.<key>`, when it is an `initialize` response. */
+function withoutAgentCapability(record: Recorded, group: string, key: string): Recorded {
   if (record.kind !== "initialize") return record;
   const payload = record.payload as Json;
   const agent = payload.agentCapabilities as Json | undefined;
-  const auth = agent?.auth as Json | undefined;
-  if (!auth || !("status" in auth)) return record;
+  const capabilities = agent?.[group] as Json | undefined;
+  if (!capabilities || !(key in capabilities)) return record;
   return {
     ...record,
-    payload: { ...payload, agentCapabilities: { ...agent, auth: without(auth, "status") } },
+    payload: { ...payload, agentCapabilities: { ...agent, [group]: without(capabilities, key) } },
   } as Recorded;
 }
 
@@ -281,8 +285,14 @@ export function compareWithBaseline(baseline: Recorded[], traffic: Recorded[]): 
     });
   const current = withoutSandboxNetworkSettlements(
     traffic.map((record) =>
-      withoutAuthStatusCapability(
-        withoutSessionCapabilities(record, ["systemPrompt", "status", "title", "options"]),
+      withoutAgentCapability(
+        withoutAgentCapability(
+          withoutSessionCapabilities(record, ["systemPrompt", "status", "title", "options"]),
+          "auth",
+          "status",
+        ),
+        "mcpCapabilities",
+        "acp",
       ),
     ),
   );

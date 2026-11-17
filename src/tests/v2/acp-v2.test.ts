@@ -15,6 +15,7 @@ import {
   forkSession,
   getSessionInfo,
   getSessionMessages,
+  type McpHttpServerConfig,
   type Options,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -36,7 +37,7 @@ import {
   v2ConfigOptions,
 } from "../../v2/session-requests.js";
 import { encodeProjectPath } from "../../session-index/project-dirs.js";
-import { setModelRefusal, startupFailure } from "../helpers.js";
+import { claudeCodeMcpRequest, setModelRefusal, startupFailure } from "../helpers.js";
 import packageJson from "../../../package.json" with { type: "json" };
 
 const execFileSpy = vi.hoisted(() => vi.fn());
@@ -402,7 +403,7 @@ describe("ACP protocol routing", () => {
     // and the providers methods.
     expect(response.capabilities?.session).toEqual({
       prompt: { image: {}, embeddedContext: {} },
-      mcp: { stdio: {}, http: {} },
+      mcp: { stdio: {}, http: {}, acp: {} },
       delete: {},
       fork: {},
       additionalDirectories: {},
@@ -609,21 +610,6 @@ describe("ACP v2 sessions", () => {
           mcpServers: [{ type: "_custom", name: "custom" }],
         }),
       ).rejects.toMatchObject({ code: -32602 });
-      await authUpdate(1);
-    });
-    expect(sdk.queryOptions).toHaveLength(0);
-  });
-
-  it("rejects an MCP-over-ACP server, which the agent does not advertise", async () => {
-    const { app, authUpdate } = v2Client();
-    await app.connectWith(connectRouter(), async (agent) => {
-      await initializeV2(agent);
-      await expect(
-        agent.request(v2.methods.agent.session.new, {
-          cwd,
-          mcpServers: [{ type: "acp", name: "tools", serverId: "server-1" }],
-        }),
-      ).rejects.toMatchObject({ code: -32602, data: { type: "acp" } });
       await authUpdate(1);
     });
     expect(sdk.queryOptions).toHaveLength(0);
@@ -2079,6 +2065,89 @@ function turnTrace(updates: v2.UpdateSessionNotification[]): string[] {
 }
 
 const text = (value: string) => [{ type: "text" as const, text: value }];
+
+describe("MCP servers that the client serves over the ACP connection", () => {
+  const TOOL_CALL = { name: "echo", arguments: { message: "hi" } };
+
+  /** The `tools` server of a client. Its tool reports progress, then answers with its arguments. */
+  const toolsServer: v2.McpRequestHandler = async (request) => {
+    await request.notify("notifications/progress", { progressToken: 1, progress: 1 });
+    return {
+      result: {
+        resultType: "complete",
+        content: [{ type: "text", text: JSON.stringify(request.params?.arguments) }],
+      },
+    };
+  };
+
+  /** Calls the tool as Claude Code does, with the `tools` config that its query started with. */
+  const callTool = () =>
+    claudeCodeMcpRequest(
+      sdk.queryOptions[0].mcpServers?.tools as McpHttpServerConfig,
+      "tools/call",
+      TOOL_CALL,
+    );
+
+  /** What Claude Code gets: the progress that the client reported, then the result. */
+  const TOOL_CALL_MESSAGES = [
+    {
+      jsonrpc: "2.0",
+      method: "notifications/progress",
+      params: { progressToken: 1, progress: 1 },
+    },
+    {
+      jsonrpc: "2.0",
+      id: 1,
+      result: { resultType: "complete", content: [{ type: "text", text: '{"message":"hi"}' }] },
+    },
+  ];
+
+  it("sends Claude Code's tool call of a v1 session to the client", async () => {
+    const provider = new v1.McpOverAcpProvider();
+    const authUpdate = Promise.withResolvers<void>();
+    const response = await v1
+      .client({ name: "v1-test-client" })
+      .onNotification(
+        "_auth/status_update",
+        (params) => params,
+        () => authUpdate.resolve(),
+      )
+      .onRequest(v1.methods.client.mcp.message, provider.handleRequest)
+      .connectWith(connectRouter() as unknown as v1.Stream, async (agent) => {
+        await agent.request(v1.methods.agent.initialize, { protocolVersion: v1.PROTOCOL_VERSION });
+        const tools = provider.registerServer(agent, { name: "tools", handler: toolsServer });
+        await agent.request(v1.methods.agent.session.new, {
+          cwd,
+          mcpServers: [tools.declaration],
+        });
+        await authUpdate.promise;
+        return callTool();
+      });
+
+    expect(response.messages).toEqual(TOOL_CALL_MESSAGES);
+  });
+
+  it("sends Claude Code's tool call of a v2 session to the client, also after a resume", async () => {
+    sdk.setMcpServers = vi.fn(sdkDefaults.setMcpServers);
+    const provider = new v2.McpOverAcpProvider();
+    const client = v2Client();
+    const response = await client.app
+      .onRequest(v2.methods.client.mcp.message, provider.handleRequest)
+      .connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const tools = provider.registerServer(agent, { name: "tools", handler: toolsServer });
+        const setup = { cwd, mcpServers: [tools.declaration] };
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, setup);
+        await agent.request(v2.methods.agent.session.resume, { sessionId, ...setup });
+        await client.authUpdate(1);
+        return callTool();
+      });
+
+    // The resume of the active session names the same server: it stays connected.
+    expect(sdk.setMcpServers).not.toHaveBeenCalled();
+    expect(response.messages).toEqual(TOOL_CALL_MESSAGES);
+  });
+});
 
 describe("ACP v2 prompts", () => {
   it("answers a prompt once Claude Code takes it in, then reports the turn as state", async () => {

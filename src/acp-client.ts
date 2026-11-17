@@ -3,12 +3,14 @@ import type {
   CompleteElicitationNotification,
   CreateElicitationRequest,
   CreateElicitationResponse,
+  McpServerAcp,
   ReadTextFileRequest,
   ReadTextFileResponse,
   RequestPermissionResponse,
   WriteTextFileRequest,
   WriteTextFileResponse,
 } from "@agentclientprotocol/sdk/unstable";
+import type { McpHttpServerConfig } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpSessionNotification } from "./acp-subagents.js";
 import type { AcpPermissionRequest } from "./permissions/presentation.js";
 
@@ -43,4 +45,10 @@ export interface AcpClient {
   authStatusUpdate(params: AuthStatusUpdateNotification): Promise<void>;
   /** Send a custom (extension) notification, e.g. `_claude/sdkMessage`. */
   extNotification(method: string, params: Record<string, unknown>): Promise<void>;
+  /**
+   * The SDK config of an MCP server that the client serves over this
+   * connection (`"type": "acp"`): an endpoint that sends each MCP request to
+   * the client as `mcp/message` (see `McpOverAcp` in `mcp-servers.ts`).
+   */
+  mcpServerOverAcp(server: McpServerAcp): Promise<McpHttpServerConfig>;
 }

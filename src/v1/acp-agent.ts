@@ -186,7 +186,7 @@ import {
 } from "../auth-status.js";
 import { AuthStatusReporter, cliLogout } from "../auth-status-reporter.js";
 import { terminalAuthMethods as authMethodsForTerminal } from "../auth-methods.js";
-import { sdkMcpServers } from "../mcp-servers.js";
+import { McpOverAcp, sdkMcpServers } from "../mcp-servers.js";
 import { claudeCliPath } from "../claude-cli.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { randomUUID } from "node:crypto";
@@ -1851,6 +1851,8 @@ export class ClaudeAcpAgent {
         mcpCapabilities: {
           http: true,
           sse: true,
+          // Servers that the client serves over this connection (`mcp/message`).
+          acp: true,
         },
         auth: {
           logout: {},
@@ -9945,6 +9947,11 @@ export class ClaudeAcpAgent {
       timing.phase("resume-transcript");
     }
 
+    // Before the settings watchers open: a failure here leaves nothing to dispose.
+    const mcpServers = await sdkMcpServers(params.mcpServers, (server) =>
+      this.client.mcpServerOverAcp(server),
+    );
+
     const input = new Pushable<SDKUserMessage>();
 
     const settingsManager = new SettingsManager(params.cwd, {
@@ -9952,8 +9959,6 @@ export class ClaudeAcpAgent {
     });
     await settingsManager.initialize();
     timing.phase("settings");
-
-    const mcpServers = sdkMcpServers(params.mcpServers);
 
     const customInstructions = airCustomInstructions(params._meta);
     const systemPrompt = sessionSystemPrompt(
@@ -11194,11 +11199,13 @@ export function v1AgentApp(
   onAgent: (agent: ClaudeAcpAgent) => void,
 ): AgentApp {
   let agent!: ClaudeAcpAgent;
+  const mcp = new McpOverAcp();
   const app = acpAgent({ name: "claude-code-acp" })
     .onConnect((connection) => {
-      agent = new ClaudeAcpAgent(new ClientConnection(connection.client), logger);
+      agent = new ClaudeAcpAgent(new ClientConnection(connection.client, mcp), logger);
       onAgent(agent);
     })
+    .onNotification(methods.agent.mcp.message, mcp.handleNotification)
     .onRequest(methods.agent.initialize, (ctx) => agent.initialize(ctx.params))
     .onRequest(methods.agent.session.new, (ctx) => agent.newSession(ctx.params))
     .onRequest(methods.agent.session.load, (ctx) => agent.loadSession(ctx.params))
