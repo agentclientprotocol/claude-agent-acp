@@ -1645,7 +1645,7 @@ Claude Code sends the result of the turn when the main agent stops, also while s
 
 ### Hold without the capability
 
-A client that does not declare `backgroundSubagents` gets the hold of issues #864 and #866, unless it gets the RFD form of [subagent sessions](../README.md#subagent-sessions).
+A client that does not declare `backgroundSubagents` gets the hold of issues #864 and #866, unless it gets the RFD form of [subagent sessions](subagent-sessions.md).
 The adapter keeps the `session/prompt` request open while a subagent that the turn started or resumed runs.
 The subagent output, its permission requests and the followup summary of the model then go out inside the turn.
 The turn ends at the followup result, at an `idle` with no live subagent, at `session/cancel`, or when the next prompt starts.
