@@ -1134,16 +1134,15 @@ describe("ACP v2 sessions", () => {
           await agent.request(v2.methods.agent.session.setConfigOption, { sessionId, ...request });
         }
         sdk.flagSettings = [];
-        vi.mocked(fetch).mockResolvedValueOnce(Response.json({ data: [] }));
         await agent.request(v2.methods.agent.providers.set, {
           providerId: "main",
           apiType: "anthropic",
           baseUrl: "https://gateway.example.com",
         });
         await vi.waitFor(() =>
-          // The gateway lists no models, so the model option is gone.
           expect(values(client.updates("config_option_update").at(-1)?.configOptions)).toEqual({
             mode: ["select", "auto"],
+            model: ["select", "claude-opus-4-8"],
             effort: ["select", "low"],
             fast: ["boolean", true],
             ultracode: ["boolean", true],
