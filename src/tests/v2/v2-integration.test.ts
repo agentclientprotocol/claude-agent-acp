@@ -159,6 +159,17 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("v2 core with Claude Code", 
     // Claude Code asks for the server's MCP revision first, not with `initialize`.
     await until(() => served.includes("tools/list"), 30_000);
     expect(served[0]).toBe("server/discover");
+    // The server's bearer token went to Claude Code over stdin: it is on no
+    // command line of the adapter's processes (`ps`, so not on Windows). A
+    // CLAUDE_CODE_EXECUTABLE CLI gets it on its command line.
+    if (process.platform !== "win32" && !process.env.CLAUDE_CODE_EXECUTABLE) {
+      const commandLines = spawnSync("ps", ["-axww", "-o", "ppid=,command="], { encoding: "utf8" })
+        .stdout.split("\n")
+        .filter((line) => line.trim().startsWith(`${child.pid} `));
+      // Claude Code's session process is one of them.
+      expect(commandLines.some((line) => line.includes("stream-json"))).toBe(true);
+      expect(commandLines.filter((line) => line.includes("Bearer "))).toEqual([]);
+    }
   }, 60_000);
 
   it("reports requires_action while a permission request waits", async () => {

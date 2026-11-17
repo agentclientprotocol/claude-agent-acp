@@ -32,18 +32,26 @@ export async function claudeCliPath(): Promise<string> {
 }
 
 /**
- * How a session's MCP servers reach the Claude CLI unless the client's options
- * name a `mcpServersDelivery`: in the `--mcp-config` flag, as before SDK
- * 0.3.326. A server's `env` and `headers` are then on the CLI's command line.
- * `'initialize'` sends them over stdin instead, but with a CLI that cannot
- * read them there (e.g. 2.1.323 through `CLAUDE_CODE_EXECUTABLE`) the session
- * fails at startup.
+ * How a session's MCP servers reach the CLI of {@link claudeCliPath}, unless
+ * the client's options name a `mcpServersDelivery`.
+ *
+ * - `'initialize'` for the CLI that the adapter ships: over stdin, in the
+ *   SDK's initialize request. A server's `env` and `headers`, such as the
+ *   bearer token of an MCP-over-ACP endpoint (see `McpOverAcp`), stay off the
+ *   CLI's command line, which other users of the machine can read. Only a
+ *   launch that the client's options give `--sdk-url` still gets them there.
+ * - `'argv'` for a CLI that `CLAUDE_CODE_EXECUTABLE` names: in the
+ *   `--mcp-config` flag, so on its command line, as before SDK 0.3.326. Its
+ *   version is not known, and the SDK ends the session at startup when the CLI
+ *   cannot read the servers from the initialize request (e.g. 2.1.323).
  *
  * The adapter always sets the option. It names the CLI to start
  * (`pathToClaudeCodeExecutable`), and for such an app the SDK prints a
  * `DeprecationWarning` when a session has MCP servers and the option is unset.
  */
-export const MCP_SERVERS_DELIVERY: NonNullable<Options["mcpServersDelivery"]> = "argv";
+export function mcpServersDelivery(): NonNullable<Options["mcpServersDelivery"]> {
+  return process.env.CLAUDE_CODE_EXECUTABLE ? "argv" : "initialize";
+}
 
 function bundledClaudeCliPath(directory: string): string {
   const path = join(directory, CLI_FILE_NAME);
