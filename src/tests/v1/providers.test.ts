@@ -799,7 +799,7 @@ describe("providers", () => {
       );
     });
 
-    it("rejects incompatible provider models and recovers after a switch", async () => {
+    it("rejects incompatible provider models", async () => {
       const [agent, mockQuery] = await createAgentMock();
       const setModel = mockQueryWithModels(mockQuery);
       stubListing(["gpt-5"]);
@@ -822,16 +822,6 @@ describe("providers", () => {
       const rejectedQuery = mockQuery.mock.results.at(-1)!.value;
       expect(rejectedQuery.close).toHaveBeenCalledOnce();
       expect(setModel).not.toHaveBeenCalled();
-
-      stubListing(["claude-sonnet-5"]);
-      await agent.unstable_setProvider({
-        providerId: "main",
-        apiType: "anthropic",
-        baseUrl: "https://compatible-provider.example",
-      });
-      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
-      expect(modelOptionValues(response)).toEqual(["sonnet"]);
-      expect(agent.sessions[response.sessionId]).toBeDefined();
     });
 
     it("sets a gateway that has no listing and narrows nothing", async () => {

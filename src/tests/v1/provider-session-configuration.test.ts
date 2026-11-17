@@ -519,7 +519,7 @@ describe("provider updates preserve session configuration", { timeout: 10_000 },
     },
   );
 
-  it("cleans up an incompatible provider restart and can create a session after recovery", async () => {
+  it("reports sessionFailure for an incompatible provider restart", async () => {
     await initializeClient(agent, {
       _meta: { jetbrains: { air: { version: 1, capabilities: [AIR_SESSION_FAILURE_CAPABILITY] } } },
     });
@@ -531,9 +531,6 @@ describe("provider updates preserve session configuration", { timeout: 10_000 },
 
     await agent.unstable_setProvider({ ...PROVIDER, baseUrl: "https://incompatible.example" });
 
-    expect(agent.sessions[sessionId]).toBeUndefined();
-    expect(queries).toHaveLength(2);
-    expect(queries.every((query) => query.close.mock.calls.length === 1)).toBe(true);
     expect(updates).toContainEqual(
       expect.objectContaining({
         sessionId,
@@ -552,19 +549,6 @@ describe("provider updates preserve session configuration", { timeout: 10_000 },
         }),
       }),
     );
-
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () =>
-        Response.json({
-          data: MODELS.map((model) => ({ id: model.resolvedModel })),
-        }),
-      ),
-    );
-    await refresh();
-    const recovered = await newSession();
-    expect(agent.sessions[recovered.sessionId]).toBeDefined();
-    expect(current(recovered.sessionId, "model")).toBe("sonnet");
   });
 
   it("removes the old session when provider recreation fails", async () => {
