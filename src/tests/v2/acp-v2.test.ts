@@ -4197,6 +4197,83 @@ describe("ACP v2 prompts", () => {
     expect(reports.at(-1)).toMatchObject({ status: "failed" });
   });
 
+  /**
+   * Scenario:
+   * 1. Claude's reply calls the advisor, and its stream goes silent.
+   * 2. Claude Code gives up on the reply, for example after its stream idle
+   *    timeout, and asks again. The call never gets its result.
+   * Expected:
+   * - The advisor call ends `cancelled` once the next reply starts, before
+   *   its text, rather than at the idle.
+   */
+  it.each<[string, boolean]>([
+    ["streams", true],
+    ["does not stream", false],
+  ])(
+    "ends an advisor call whose reply Claude Code gave up on once the next reply starts, which %s",
+    async (_name, streams) => {
+      const advisorCall = {
+        type: "server_tool_use",
+        id: "srvtoolu_cut_off",
+        name: "advisor",
+        input: {},
+      };
+      scriptTurns(async function* (options) {
+        yield stream(options, {
+          type: "message_start",
+          message: { id: "msg_cut_off", role: "assistant", content: [], usage: {} },
+        });
+        yield stream(options, {
+          type: "content_block_start",
+          index: 0,
+          content_block: advisorCall,
+        });
+        const cutOff = assistantText(options, "", "msg_cut_off");
+        yield { ...cutOff, message: { ...cutOff.message, content: [advisorCall] } };
+        if (streams) {
+          yield stream(options, {
+            type: "message_start",
+            message: { id: "msg_asked_again", role: "assistant", content: [], usage: {} },
+          });
+          yield stream(options, {
+            type: "content_block_start",
+            index: 0,
+            content_block: { type: "text", text: "" },
+          });
+          yield stream(options, {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: "Next." },
+          });
+        }
+        yield assistantText(options, "Next.", "msg_asked_again");
+        yield result(options);
+      });
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+        await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+        await client.authUpdate(1);
+      });
+
+      const updates = client.sessionUpdates.map(({ update }) => update);
+      const closed = updates.findIndex(
+        (update) =>
+          update.sessionUpdate === "tool_call_update" &&
+          update.toolCallId === advisorCall.id &&
+          update.status === "cancelled",
+      );
+      expect(JSON.stringify(updates[closed])).toContain(
+        "Claude Code replaced the response that made this tool call, and stopped the call. If it had started, some of its effects may have happened.",
+      );
+      expect(closed).toBeLessThan(
+        updates.findIndex((update) => update.sessionUpdate === "agent_message_chunk"),
+      );
+    },
+  );
+
   it("reports a turn that fails after it was taken in as idle with the error stop reason", async () => {
     scriptTurns(async function* (options) {
       yield result(options, { is_error: true, result: "API Error: 529 Overloaded" });
