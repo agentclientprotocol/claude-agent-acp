@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.108.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.107.3...v0.108.0) (2026-11-17)
+
+
+### Features
+
+* stream the output of foreground Bash commands ([#1587](https://github.com/agentclientprotocol/claude-agent-acp/issues/1587)) ([378e85d](https://github.com/agentclientprotocol/claude-agent-acp/commit/378e85d06027f5fa1802e94535548747a0feccc9))
+* support MCP servers that the client serves over the ACP connection (MCP-over-ACP) ([#1645](https://github.com/agentclientprotocol/claude-agent-acp/issues/1645)) ([20aeb46](https://github.com/agentclientprotocol/claude-agent-acp/commit/20aeb46ecedc60fef26ca8b1439b37e3bbd9b27a))
+
+
+### Bug Fixes
+
+* an autonomous result naming the original prompt must not end a steered turn early ([#1451](https://github.com/agentclientprotocol/claude-agent-acp/issues/1451)) ([edab713](https://github.com/agentclientprotocol/claude-agent-acp/commit/edab7135028d83efaeaa38d0f8efe62ea7ddf203))
+* do not count a confirmWithUser question as an unfinished tool call ([#1644](https://github.com/agentclientprotocol/claude-agent-acp/issues/1644)) ([bcd3cda](https://github.com/agentclientprotocol/claude-agent-acp/commit/bcd3cdad35e4356247303870ac3137675e401227))
+* handle invalid file paths in tool reports ([#1419](https://github.com/agentclientprotocol/claude-agent-acp/issues/1419)) ([0073280](https://github.com/agentclientprotocol/claude-agent-acp/commit/0073280b977a69934fb56670943d1ef42e7b687e))
+* keep a workflow agent's tool call out of the turn's unfinished tools ([#1638](https://github.com/agentclientprotocol/claude-agent-acp/issues/1638)) ([451bc04](https://github.com/agentclientprotocol/claude-agent-acp/commit/451bc04ae022ef02473bdd92740cf19d8ceb5f3c))
+* offer clearing the context on plan approval only when Claude Code's setting is on ([#1627](https://github.com/agentclientprotocol/claude-agent-acp/issues/1627)) ([9d71d12](https://github.com/agentclientprotocol/claude-agent-acp/commit/9d71d12336c392c28967c600f8409841deaab7e0))
+* send MCP servers to Claude Code over stdin, not on its command line ([#1647](https://github.com/agentclientprotocol/claude-agent-acp/issues/1647)) ([c4dd80d](https://github.com/agentclientprotocol/claude-agent-acp/commit/c4dd80d7392b035f331b50bfdd802cfb3e144d37))
+* update to @anthropic-ai/claude-agent-sdk 0.3.326 ([#1646](https://github.com/agentclientprotocol/claude-agent-acp/issues/1646)) ([4a07639](https://github.com/agentclientprotocol/claude-agent-acp/commit/4a076397c6e785a8dd9166e8ea1df14fe17c52ed))
+
 ## [0.107.3](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.107.2...v0.107.3) (2026-11-16)
 
 
