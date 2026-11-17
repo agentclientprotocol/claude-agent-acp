@@ -701,7 +701,7 @@ When `matchedAskRule` is present, the adapter offers no persistent choice. A con
 | WebFetch                  | One-time allow; a generated `domain:<hostname>` local rule; reject.                                                          |
 | Skill                     | One-time allow; exact skill and optional `prefix:*` local rules; reject.                                                     |
 | EnterPlanMode             | Enter plan mode once, or reject and continue.                                                                                |
-| ExitPlanMode              | One keep-context and one clear-context elevated mode (`auto` before bypass before accept edits), manual approval, or reject. |
+| ExitPlanMode              | One keep-context elevated mode, one clear-context mode (with `showClearContextOnPlanAccept` on), manual approval, or reject. |
 | SandboxNetworkAccess      | One-time allow; the exact SDK host rule when representable; reject.                                                          |
 | Computer Use MCP          | One-time allow; an exact representable SDK allow suggestion; reject.                                                         |
 | MCP                       | One-time allow; an exact representable SDK allow suggestion for that tool; reject.                                           |
@@ -726,7 +726,9 @@ A host removes `Bypass permissions` with `_meta.claudeCode.options.allowDangerou
 A `bypassPermissions` settings default then falls back to `default`.
 
 `ExitPlanMode` offers one elevated keep-context choice by priority: `auto`, then `bypassPermissions`, then `acceptEdits`.
-A non-empty plan also gets one clear-context choice with the same priority.
+When Claude Code's `showClearContextOnPlanAccept` setting is on, a non-empty plan also gets one clear-context choice with the same priority.
+The setting is off by default, as in Claude Code.
+The adapter reads it as Claude Code does: managed settings first, then the `settings` option of the session, then the user, project, and local settings files.
 After that choice, the adapter stops the old private Claude query and hides that internal rejection.
 It starts a new private query under the same ACP session.
 It continues the turn with `Implement the following plan:` and the complete plan.
@@ -1672,7 +1674,7 @@ The request has no clear-context option, because the fresh query must continue a
 "No, keep planning" stops only the followup cycle. There is no turn to end.
 
 A prompt turn owns the request when the turn is active, or when Claude Code asks before the echo of its prompt.
-Then the request has the clear-context option.
+Then the request has the clear-context option, when `showClearContextOnPlanAccept` is on.
 A turn that took over a followup cycle also owns the request of that cycle, and the accepted plan continues in that turn.
 
 ## Context compaction

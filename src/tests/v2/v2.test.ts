@@ -2973,6 +2973,28 @@ describe("ACP v2 core", () => {
     });
   });
 
+  it("offers no clearing of the context while Claude Code's showClearContextOnPlanAccept is off, its default", async () => {
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      const { response, claude } = await openSession(agent);
+      // In a turn: a request out of a turn has no clear-context option either way.
+      const prompted = agent.request(v2.methods.agent.session.prompt, {
+        sessionId: response.sessionId,
+        prompt: PROMPT,
+      });
+      claude.send(echo(await claude.prompt(0)));
+      await prompted;
+      await askPermission(claude, "ExitPlanMode", { plan: "Fix it" });
+    });
+
+    expect(client.permissionRequests[0].options.map((option) => option.optionId)).toEqual([
+      "exit-plan-default",
+      "exit-plan-auto",
+      "exit-plan-bypass",
+      "reject",
+    ]);
+  });
+
   it("offers clearing the context at 0% used after Claude Code mounted a fresh conversation", async () => {
     const client = v2Client();
     await client.connect(async (agent) => {

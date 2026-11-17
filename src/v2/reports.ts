@@ -355,13 +355,13 @@ export class SessionReports {
     ]);
   }
 
-  /** The share of the context window in use, in percent, once a request reported it. */
   /** Claude Code's `showClearContextOnPlanAccept` for this session's query;
    *  false before {@link configure}. */
   showClearContextOnPlanAccept(): boolean {
     return this.settings?.getShowClearContextOnPlanAccept(this.configuredSettings) ?? false;
   }
 
+  /** The share of the context window in use, in percent, once a request reported it. */
   contextUsedPercent(): number | undefined {
     if (this.contextUsed === undefined || this.contextWindow <= 0) return undefined;
     return Math.max(0, Math.min(100, Math.round((this.contextUsed / this.contextWindow) * 100)));
