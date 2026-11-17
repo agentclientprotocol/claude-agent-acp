@@ -200,6 +200,7 @@ import {
   answerUserDialog,
   ElicitationSupport,
   elicitUnlessWithdrawn,
+  isConfirmQuestion,
   REFUSAL_FALLBACK_DIALOG_KIND,
 } from "../elicitation.js";
 import {
@@ -8731,12 +8732,13 @@ export class ClaudeAcpAgent {
     return sessionSignal ? AbortSignal.any([signal, sessionSignal]) : signal;
   }
 
-  /** Settle the tool call `ensureToolCallEmitted` emitted for a
-   *  SandboxNetworkAccess request once the request is answered. The callback
-   *  asks for permission and runs nothing, so the SDK never sends a
-   *  `tool_result` for its synthetic id, and the call would otherwise stay
-   *  pending in the client. */
-  private async settleSandboxNetworkCall(
+  /** Settle the tool call `ensureToolCallEmitted` emitted for a request that
+   *  no tool use of the stream stands for, once the request is answered: a
+   *  SandboxNetworkAccess request, or a question that Claude Code asks on its
+   *  own (see `isConfirmQuestion`). The callback asks and runs nothing, so the
+   *  SDK never sends a `tool_result` for its synthetic id, and the call would
+   *  otherwise stay pending in the client. */
+  private async settlePermissionOnlyCall(
     sessionId: string,
     toolCallSessionId: string,
     toolCallId: string,
@@ -8744,6 +8746,11 @@ export class ClaudeAcpAgent {
   ): Promise<void> {
     const session = this.sessions[sessionId];
     if (!session) return;
+    // Forgotten first, as `closeToolCall` does: a cancel later in the turn
+    // ends every tool call that is still recorded as emitted, and would end
+    // this one a second time.
+    session.emittedToolCalls.delete(toolCallId);
+    session.toolCallFields?.delete(toolCallId);
     const update: SessionNotification["update"] = {
       sessionUpdate: "tool_call_update",
       toolCallId,
@@ -8756,7 +8763,7 @@ export class ClaudeAcpAgent {
         await this.client.sessionUpdate({ sessionId: toolCallSessionId, update });
       }
     } catch (error) {
-      this.logger.error("Failed to settle the SandboxNetworkAccess tool call:", error);
+      this.logger.error(`Failed to settle the tool call ${toolCallId}:`, error);
     }
   }
 
@@ -8806,7 +8813,9 @@ export class ClaudeAcpAgent {
     if (
       !parentToolUseId &&
       notificationSessionId === sessionId &&
-      toolName !== "SandboxNetworkAccess"
+      toolName !== "SandboxNetworkAccess" &&
+      // Neither does it send one for a question that Claude Code asks on its own.
+      !isConfirmQuestion(toolCallId)
     ) {
       recordForegroundToolCall(session, toolCallId);
     }
@@ -8980,7 +8989,7 @@ export class ClaudeAcpAgent {
           signal,
           permissionSessionId,
         );
-        return this.handleAskUserQuestion(
+        const answer = this.handleAskUserQuestion(
           sessionId,
           permissionSessionId,
           toolInput,
@@ -8988,6 +8997,28 @@ export class ClaudeAcpAgent {
           signal,
           agentID,
         );
+        if (!isConfirmQuestion(toolUseID)) return answer;
+        // No tool_result ends the tool call of such a question, so its answer
+        // does: also a declined form, which answers with nothing selected.
+        let answered = false;
+        try {
+          const result = await answer;
+          answered = result.behavior === "allow";
+          return result;
+        } finally {
+          // A request that Claude Code withdrew has no answer. A cancel ends
+          // the open tool calls of the work it stops (`closeOpenToolCalls`).
+          // Nothing ends the call when the SDK aborts `signal` while the
+          // turn goes on.
+          if (!signal.aborted) {
+            await this.settlePermissionOnlyCall(
+              sessionId,
+              permissionSessionId,
+              toolUseID,
+              answered,
+            );
+          }
+        }
       }
 
       // Do not auto-allow here based on the session's advertised mode. Claude
@@ -9108,7 +9139,7 @@ export class ClaudeAcpAgent {
       const autoFallback = this.sessionModes.applyPermissionFallback(session, permissionResult);
       permissionResult = autoFallback.permissionResult;
       if (toolName === "SandboxNetworkAccess") {
-        await this.settleSandboxNetworkCall(
+        await this.settlePermissionOnlyCall(
           sessionId,
           permissionSessionId,
           toolUseID,

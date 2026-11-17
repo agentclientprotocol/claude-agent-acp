@@ -24,6 +24,8 @@ vi.mock("node:child_process", async () => ({
 
 const sessionId = "test-session";
 const toolCallId = "unfinished-bash";
+/** The id of a question that Claude Code's confirmWithUser asks. */
+const confirmId = "confirm_0b7c5f3e-5a7e-4d55-9a54-2f7f0a1c9e11";
 
 afterEach(() => clearHookCallbacks(sessionId));
 
@@ -67,6 +69,90 @@ describe("incomplete foreground tools", () => {
     await expect(prompt()).rejects.toMatchObject({ data: { errorKind: "incomplete_tool_call" } });
     expect(updates).toContainEqual(expect.objectContaining({ toolCallId, status: "failed" }));
   });
+
+  it.each([
+    {
+      client: "answers",
+      answer: async () => ({ action: "accept", content: { question_0: "Download" } }),
+      toolCall: "completed",
+    },
+    // A declined form answers the question with nothing selected.
+    { client: "declines", answer: async () => ({ action: "decline" }), toolCall: "completed" },
+    { client: "cancels", answer: async () => ({ action: "cancel" }), toolCall: "failed" },
+    {
+      client: "cannot show",
+      answer: async () => {
+        throw new Error("Invalid params");
+      },
+      toolCall: "failed",
+    },
+  ])(
+    "ends the turn after a confirmWithUser question that the client $client, with its tool call $toolCall",
+    async ({ answer, toolCall }) => {
+      const { agent, prompt, updates } = createTestSession(confirmQuestionMessages, {
+        createElicitation: answer as AcpClient["createElicitation"],
+      });
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { elicitation: { form: {} } },
+      });
+
+      await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+      // No tool_result comes for the question, so its answer ends the tool call.
+      expect(
+        updates.filter((update) => update.toolCallId === confirmId).map((update) => update.status),
+      ).toEqual(["pending", toolCall]);
+    },
+  );
+
+  it("ends the turn after a confirmWithUser question that Claude Code withdrew", async () => {
+    const { createElicitation, messages } = withdrawnConfirmQuestion(false);
+    const { agent, prompt } = createTestSession(messages, { createElicitation });
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { elicitation: { form: {} } },
+    });
+
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+  });
+
+  it.each([
+    {
+      cancel: "while the client shows it",
+      session: () => withdrawnConfirmQuestion(true),
+      // The cancel ends it, as it ends the turn's other open tool calls.
+      ends: [["failed", "The turn was cancelled before this tool call returned a result."]],
+    },
+    {
+      cancel: "after the client answered it",
+      session: () => ({
+        messages: answeredConfirmQuestionThenCancelMessages,
+        createElicitation: async () => ({
+          action: "accept" as const,
+          content: { question_0: "Download" },
+        }),
+      }),
+      // The answer ended it: the cancel does not end it again.
+      ends: [["completed", undefined]],
+    },
+  ])(
+    "ends the tool call of a confirmWithUser question once at a cancel $cancel",
+    async ({ session, ends }) => {
+      const { createElicitation, messages } = session();
+      const { agent, prompt, updates } = createTestSession(messages, { createElicitation });
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { elicitation: { form: {} } },
+      });
+
+      await expect(prompt()).resolves.toMatchObject({ stopReason: "cancelled" });
+      expect(
+        updates
+          .filter((update) => update.toolCallId === confirmId && update.status !== "pending")
+          .map((update) => [update.status, update.content?.[0].content.text]),
+      ).toEqual(ends);
+    },
+  );
 
   it("allows a completed tool with a late PostToolUse hook", async () => {
     const { prompt, logError } = createTestSession(completedToolMessages);
@@ -1294,6 +1380,7 @@ function toolResult(id = toolCallId, parent: string | null = null) {
 
 function createTestSession(
   createSdkMessages: (input: Pushable<any>, agent: ClaudeAcpAgent) => AsyncGenerator<any>,
+  client: Partial<AcpClient> = {},
 ) {
   const updates: any[] = [];
   const logError = vi.fn();
@@ -1306,6 +1393,7 @@ function createTestSession(
       requestPermission: async () => ({ outcome: { outcome: "selected", optionId: "allow-once" } }),
       extNotification: async () => {},
       authStatusUpdate: async () => {},
+      ...client,
     } as unknown as AcpClient,
     { log: () => {}, error: logError },
   );
@@ -1919,4 +2007,78 @@ async function* steeredAbandonedToolMessages(input: Pushable<any>, agent: Claude
   yield userEcho((await messages.next()).value);
   yield assistantText("Done as you asked.");
   yield successfulResultMessage();
+}
+
+/** How Claude Code's confirmWithUser asks the user: through AskUserQuestion,
+ *  under a synthetic `confirm_` id, with no tool_use or tool_result. */
+function askConfirmQuestion(agent: ClaudeAcpAgent, signal = new AbortController().signal) {
+  const questions = [
+    {
+      question: "Download report.pdf from Drive?",
+      header: "Download",
+      options: [
+        { label: "Download", description: "" },
+        { label: "Don't download", description: "" },
+      ],
+      multiSelect: false,
+    },
+  ];
+  return agent.canUseTool(sessionId)(
+    "AskUserQuestion",
+    { questions, metadata: { source: "mcp_connector_download" } },
+    { toolUseID: confirmId, signal, suggestions: [] } as any,
+  );
+}
+
+async function* confirmQuestionMessages(input: Pushable<any>, agent: ClaudeAcpAgent) {
+  yield* echoNextPrompt(input);
+  // A question that the client cancelled rejects.
+  await askConfirmQuestion(agent).catch(() => {});
+  yield successfulResultMessage();
+}
+
+/**
+ * A confirmWithUser question whose request Claude Code withdraws while the
+ * client still shows it: at a `session/cancel` (`cancel`), or with the turn
+ * going on, as when another client of the session answered it.
+ */
+function withdrawnConfirmQuestion(cancel: boolean) {
+  let asked!: () => void;
+  const shown = new Promise<void>((resolve) => (asked = resolve));
+  return {
+    // The ACP connection rejects a request whose signal aborts.
+    createElicitation: ((_request: unknown, signal: AbortSignal) => {
+      asked();
+      return new Promise((_resolve, reject) =>
+        signal.addEventListener("abort", () => reject(new Error("Request cancelled"))),
+      );
+    }) as unknown as AcpClient["createElicitation"],
+    async *messages(input: Pushable<any>, agent: ClaudeAcpAgent) {
+      yield* echoNextPrompt(input);
+      const withdrawal = new AbortController();
+      const answer = askConfirmQuestion(agent, withdrawal.signal).catch(() => {});
+      await shown;
+      if (cancel) void agent.cancel({ sessionId });
+      withdrawal.abort();
+      await answer;
+      if (cancel) {
+        yield interruptNote;
+        yield abortedResult();
+      } else {
+        yield successfulResultMessage();
+      }
+    },
+  };
+}
+
+/** A `session/cancel` later in the turn of a confirmWithUser question that the client answered. */
+async function* answeredConfirmQuestionThenCancelMessages(
+  input: Pushable<any>,
+  agent: ClaudeAcpAgent,
+) {
+  yield* echoNextPrompt(input);
+  await askConfirmQuestion(agent);
+  await agent.cancel({ sessionId });
+  yield interruptNote;
+  yield abortedResult();
 }
