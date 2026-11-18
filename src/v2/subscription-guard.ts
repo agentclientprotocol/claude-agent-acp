@@ -109,12 +109,14 @@ export class SubscriptionGuard {
     if (shouldHideClaudeAuth()) this.accountMayHaveChanged(sessionId);
   }
 
-  /** An auth status probe read `kind`: a session started on another kind restarts. */
-  probed(kind: AuthStatusKind): void {
+  /** A session in the probe's credential scope restarts if its cached kind differs. */
+  probed(kind: AuthStatusKind, appliesTo: (sessionId: string) => boolean): void {
     if (!this.active()) return;
     for (const [sessionId, session] of this.sessions) {
       // No kind: the account said nothing that this read could contradict.
-      if (session.kind && session.kind !== kind) this.accountMayHaveChanged(sessionId);
+      if (session.kind && session.kind !== kind && appliesTo(sessionId)) {
+        this.accountMayHaveChanged(sessionId);
+      }
     }
   }
 

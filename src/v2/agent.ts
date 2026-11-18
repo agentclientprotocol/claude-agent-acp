@@ -195,7 +195,7 @@ class V2Agent implements AgentHandle, SessionConnection {
   ) {
     this.auth = new V2Auth(ctx, logger, {
       routeChanged: () => this.restarts.reroute(),
-      probed: (kind) => this.guard.probed(kind),
+      probed: (kind, appliesTo) => this.guard.probed(kind, appliesTo),
     });
     this.guard = new SubscriptionGuard(this.auth, logger, (sessionId) =>
       this.restarts.accountMayHaveChanged(sessionId),

@@ -10749,12 +10749,12 @@ describe("ACP v2 auth", () => {
       });
       const expectSessionProbe = () => {
         const [, args, execOptions] = execFileSpy.mock.lastCall!;
-        expect(args).toEqual([
-          ...(options.settings ? ["--settings", JSON.stringify(options.settings)] : []),
-          "auth",
-          "status",
-          "--json",
-        ]);
+        const expectedArgs = ["auth", "status", "--json"];
+        if (options.settings) {
+          expect(path.isAbsolute(args[1])).toBe(true);
+          expectedArgs.unshift("--settings", args[1]);
+        }
+        expect(args).toEqual(expectedArgs);
         expect(execOptions.cwd).toBe(cwd);
         expect(execOptions.env.ANTHROPIC_AUTH_TOKEN).toBe(options.env?.ANTHROPIC_AUTH_TOKEN);
       };
@@ -11008,6 +11008,56 @@ describe("ACP v2 subscription guard (--hide-claude-auth)", () => {
       account: accounts[Math.min(started++, accounts.length - 1)],
     });
   }
+
+  it("keeps both stable queries when a bearer session and a setup-token session alternate", async () => {
+    const bearer = { tokenSource: "ANTHROPIC_AUTH_TOKEN", apiProvider: "firstParty" };
+    const setup = { tokenSource: "CLAUDE_CODE_OAUTH_TOKEN", apiProvider: "firstParty" };
+    const oauth = JSON.stringify({
+      loggedIn: true,
+      authMethod: "oauth_token",
+      apiProvider: "firstParty",
+    });
+    execFileSpy.mockImplementation((_cli, _args, _options, callback) => {
+      callback(null, { stdout: oauth });
+    });
+    sdk.initializationResult = async () => ({
+      ...(await sdkDefaults.initializationResult()),
+      account: sdk.queryOptions.at(-1)?.env?.ANTHROPIC_AUTH_TOKEN ? bearer : setup,
+    });
+    scriptTurns(async function* (options) {
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      await client.authUpdate(1);
+      const start = (env: Record<string, string>) =>
+        agent.request(v2.methods.agent.session.new, {
+          cwd,
+          _meta: { claudeCode: { options: { env } } },
+        });
+      const a = await start({ ANTHROPIC_AUTH_TOKEN: "synthetic-bearer" });
+      const b = await start({ CLAUDE_CODE_OAUTH_TOKEN: "synthetic-setup" });
+      sdk.accountInfo = async () => setup;
+      await agent.request(v2.methods.agent.session.prompt, {
+        sessionId: b.sessionId,
+        prompt: text("setup"),
+      });
+      await client.authUpdate(3);
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      sdk.accountInfo = async () => bearer;
+      await agent.request(v2.methods.agent.session.prompt, {
+        sessionId: a.sessionId,
+        prompt: text("bearer"),
+      });
+      await vi.waitFor(() =>
+        expect(
+          turnTrace(client.sessionUpdates).filter((event) => event === "idle end_turn"),
+        ).toHaveLength(2),
+      );
+      expect(sdk.queryOptions).toHaveLength(2);
+    });
+  });
 
   it.each([
     ["a subscription would pay", SUBSCRIPTION, NOT_SUPPORTED],

@@ -184,7 +184,7 @@ import {
   gatewayAuthStatus,
   notLoggedInAuthStatus,
 } from "../auth-status.js";
-import { AuthStatusReporter, cliLogout } from "../auth-status-reporter.js";
+import { AuthStatusReporter, cliLogout, type AuthProbeScope } from "../auth-status-reporter.js";
 import { terminalAuthMethods as authMethodsForTerminal } from "../auth-methods.js";
 import { McpOverAcp, sdkMcpServers, type UnservedMcpServer } from "../mcp-servers.js";
 import { claudeCliPath, mcpServersDelivery } from "../claude-cli.js";
@@ -1653,7 +1653,7 @@ export class ClaudeAcpAgent {
     },
     gatewayLogin: () => this.gatewayAuthRequest !== undefined,
     providerOverride: () => this.providerConfig !== undefined,
-    onProbe: (kind) => this.markSessionsWhoseAccountKindChanged(kind),
+    onProbe: (kind, appliesTo) => this.markSessionsWhoseAccountKindChanged(kind, appliesTo),
   });
   /** Last auth identity reported to the client. Undefined means "not determined yet". */
   get currentAuthStatus(): AuthStatus | undefined {
@@ -2247,7 +2247,10 @@ export class ClaudeAcpAgent {
    * creation guard judges it. So a probe can never refuse or abort a turn, and
    * a wrong read costs one query recreation, not a false refusal.
    */
-  private markSessionsWhoseAccountKindChanged(kind: AuthStatusKind): void {
+  private markSessionsWhoseAccountKindChanged(
+    kind: AuthStatusKind,
+    appliesTo: AuthProbeScope,
+  ): void {
     if (!this.claudeSubscriptionGuardActive()) {
       return;
     }
@@ -2257,7 +2260,14 @@ export class ClaudeAcpAgent {
       if (!session.accountKind || session.queryClosed || session.needsSignOutRespawn) {
         continue;
       }
-      if (kind !== session.accountKind) {
+      if (
+        kind !== session.accountKind &&
+        appliesTo(
+          session.settingsManager,
+          session.effortSettingsOverride,
+          (session.creationParams?._meta as NewSessionMeta | undefined)?.claudeCode?.options?.env,
+        )
+      ) {
         // `endQuery: false` is the whole turn-boundary contract: the flag is
         // set now, the query dies at the recreation the next prompt runs.
         this.markSessionForSignOutRespawn(sessionId, session, { endQuery: false });

@@ -70,7 +70,7 @@ export interface AuthEvents {
    */
   routeChanged(): Promise<void>;
   /** An auth status probe read the identity `kind`. */
-  probed(kind: AuthStatusKind): void;
+  probed(kind: AuthStatusKind, appliesTo: (sessionId: string) => boolean): void;
 }
 
 type SessionAuthSettings = {
@@ -107,7 +107,13 @@ export class V2Auth {
       logger,
       gatewayLogin: () => this.gatewayLogin !== undefined,
       providerOverride: () => this.provider !== undefined,
-      onProbe: (kind) => events.probed(kind),
+      onProbe: (kind, appliesTo) =>
+        events.probed(kind, (sessionId) => {
+          const settings = this.sessionSettings.get(sessionId);
+          return (
+            settings !== undefined && appliesTo(settings.manager, settings.override, settings.env)
+          );
+        }),
     });
   }
 

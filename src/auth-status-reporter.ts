@@ -6,6 +6,9 @@
  * identity).
  */
 import { execFile } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import {
@@ -39,6 +42,13 @@ export type AuthStatusSettings = Pick<
   "getCwd" | "getApiKeyHelper" | "getEnvironment"
 >;
 
+/** Does a session share the credential sources this probe read? */
+export type AuthProbeScope = (
+  manager: AuthStatusSettings,
+  override?: Settings,
+  env?: Options["env"],
+) => boolean;
+
 export interface AuthStatusReporterOptions {
   /** Sends `_auth/status_update`. */
   push: (status: AuthStatus) => Promise<void>;
@@ -49,8 +59,8 @@ export interface AuthStatusReporterOptions {
   gatewayLogin: () => boolean;
   /** A `providers/set` override is active: a session account describes its route. */
   providerOverride: () => boolean;
-  /** A completed probe read `kind`. */
-  onProbe?: (kind: AuthStatusKind) => void;
+  /** A completed probe read `kind` for the sessions in its scope. */
+  onProbe?: (kind: AuthStatusKind, appliesTo: AuthProbeScope) => void;
 }
 
 export class AuthStatusReporter {
@@ -269,8 +279,11 @@ export class AuthStatusReporter {
     const epoch = this.epoch;
     const run = ++this.probeRuns;
     const context = this.settings;
-    const apiKeyHelper = context?.manager.getApiKeyHelper(context.override);
-    const launchEnv = context?.env ? { ...process.env, ...context.env } : process.env;
+    const cwd = context?.manager.getCwd() ?? process.cwd();
+    const processEnv = { ...process.env };
+    const launchEnv = { ...processEnv, ...context?.env };
+    let apiKeyHelper = context?.manager.getApiKeyHelper(context.override);
+    let settingsEnv = context?.manager.getEnvironment(context.override) ?? {};
     // ACP gateway auth bypasses the CLI credential store entirely, so the
     // probe would report an identity that is not the one being used. A mere
     // client provider override (`providers/set`) does NOT skip the probe: it
@@ -280,15 +293,24 @@ export class AuthStatusReporter {
       return this.current;
     }
     let stdout: string;
+    let settingsDir: string | undefined;
     try {
       const cliPath = await claudeCliPath();
       const args = ["auth", "status", "--json"];
-      // `--settings` is a global CLI option: after the `auth status` subcommand the CLI rejects
-      // it with "unknown option '--settings'", so it has to come first.
-      if (context?.override) args.unshift("--settings", JSON.stringify(context.override));
+      if (context?.override) {
+        // Use a private per-probe file because the settings can contain credentials.
+        settingsDir = await mkdtemp(join(tmpdir(), "claude-acp-auth-"));
+        const settingsPath = join(settingsDir, "settings.json");
+        await writeFile(settingsPath, JSON.stringify(context.override), {
+          mode: 0o600,
+          flag: "wx",
+        });
+        // `--settings` is a global CLI option and precedes the auth subcommand.
+        args.unshift("--settings", settingsPath);
+      }
       ({ stdout } = await execFileAsync(cliPath, args, {
         timeout: AUTH_STATUS_PROBE_TIMEOUT_MS,
-        cwd: context?.manager.getCwd() ?? process.cwd(),
+        cwd,
         env: launchEnv,
       }));
     } catch (error) {
@@ -308,40 +330,35 @@ export class AuthStatusReporter {
       // The logged-out case exits 1 while still printing valid JSON, so the
       // stdout of a failed exec is parsed just like a successful one.
       if (typeof failed?.stdout !== "string" || failed.stdout.trim().length === 0) {
-        logger.error(
-          "claude auth status failed:",
-          error instanceof Error ? error.message : String(error),
-        );
+        // Exec errors can include the command and the CLI's stderr.
+        logger.error("claude auth status failed");
         return undefined;
       }
       stdout = failed.stdout;
+    } finally {
+      if (settingsDir) {
+        try {
+          await rm(settingsDir, { recursive: true, force: true, maxRetries: 2 });
+        } catch {
+          logger.error("Could not remove temporary auth probe settings");
+        }
+      }
     }
     let status = fromCliStatus(stdout, apiKeyHelper);
     const oauthToken = status?.kind === "account" && status.detail === "OAuth token";
-    if (
-      !context &&
-      ((status?.kind === "api_key" && status.detail === "API key helper") || oauthToken)
-    ) {
+    if (!context && status) {
       try {
-        const resolved = await resolveSettings({ cwd: process.cwd() });
+        const resolved = await resolveSettings({ cwd });
         const settings = filterEscalatingDefaultMode(resolved);
-        status = fromCliStatus(
-          stdout,
-          settings.apiKeyHelper,
-          Boolean({ ...launchEnv, ...settings.env }.ANTHROPIC_AUTH_TOKEN),
-        );
+        apiKeyHelper = settings.apiKeyHelper;
+        settingsEnv = settings.env ?? {};
       } catch {
         logger.error("Could not resolve auth source settings");
       }
-    } else if (context && oauthToken) {
-      status = fromCliStatus(
-        stdout,
-        apiKeyHelper,
-        Boolean(
-          { ...launchEnv, ...context.manager.getEnvironment(context.override) }
-            .ANTHROPIC_AUTH_TOKEN,
-        ),
-      );
+    }
+    const effectiveEnv = { ...launchEnv, ...settingsEnv };
+    if (oauthToken || (status?.kind === "api_key" && status.detail === "API key helper")) {
+      status = fromCliStatus(stdout, apiKeyHelper, Boolean(effectiveEnv.ANTHROPIC_AUTH_TOKEN));
     }
     if (!status) {
       logger.error("claude auth status returned unparseable output");
@@ -365,7 +382,18 @@ export class AuthStatusReporter {
     // regressing the payload; a different identity replaces it wholesale.
     const merged = mergeAuthStatus(this.current, status, "cli");
     this.set(merged);
-    this.options.onProbe?.(status.kind);
+    this.options.onProbe?.(status.kind, (manager, override, env) => {
+      // A relative key helper command can resolve differently in another cwd.
+      if (apiKeyHelper !== manager.getApiKeyHelper(override)) return false;
+      if (apiKeyHelper && cwd !== manager.getCwd()) return false;
+      const sessionEnv = { ...processEnv, ...env, ...manager.getEnvironment(override) };
+      return (
+        Object.keys(effectiveEnv).length === Object.keys(sessionEnv).length &&
+        Object.entries(effectiveEnv).every(
+          ([name, value]) => Object.hasOwn(sessionEnv, name) && sessionEnv[name] === value,
+        )
+      );
+    });
     return merged;
   }
 }
