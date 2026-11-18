@@ -1877,9 +1877,15 @@ async function writeSubagentHistory(
   agentId: string,
   meta: Record<string, unknown>,
   records: Array<Record<string, unknown>>,
+  workflowRun?: string,
 ) {
   const project = path.join(tempDir, "claude", "projects", "-project");
-  const subagents = path.join(project, sessionId, "subagents");
+  const subagents = path.join(
+    project,
+    sessionId,
+    "subagents",
+    ...(workflowRun ? ["workflows", workflowRun] : []),
+  );
   await mkdir(subagents, { recursive: true });
   const lines = (entries: Array<Record<string, unknown>>) =>
     entries.map((entry) => JSON.stringify(entry) + "\n").join("");
@@ -1889,6 +1895,7 @@ async function writeSubagentHistory(
     lines(records.map((record) => ({ ...record, isSidechain: true, agentId }))),
   );
   await writeFile(path.join(subagents, `agent-${agentId}.meta.json`), JSON.stringify(meta));
+  return path.join(subagents, `agent-${agentId}.jsonl`);
 }
 
 function stream(options: Options, event: Record<string, unknown>) {
@@ -9458,6 +9465,188 @@ describe("ACP v2 terminal of a command in the background", () => {
             update.stopReason === "end_turn",
         )?.update;
       }
+
+      it("reads the running Workflow worker's own SDK transcript and drains the last result before idle", async () => {
+        const finish = Promise.withResolvers<void>();
+        const worker = {
+          type: "workflow_agent",
+          label: "Review",
+          index: 1,
+          agentId: "adeadbeef00000001",
+        };
+        const recordIds = Array.from({ length: 7 }, () => randomUUID());
+        const modelMessage = "msg_shared";
+        scriptTurns(async function* (options) {
+          const root = options.sessionId!;
+          const pieces = [
+            {
+              role: "user",
+              content: "Read logs<system-reminder>private-reminder</system-reminder>",
+            },
+            {
+              role: "assistant",
+              id: modelMessage,
+              content: [
+                { type: "thinking", thinking: "private-thought", signature: "private-signature" },
+                { type: "text", text: "Looking now." },
+              ],
+            },
+            {
+              role: "assistant",
+              id: modelMessage,
+              content: [
+                {
+                  type: "tool_use",
+                  id: "toolu_child",
+                  name: "Bash",
+                  input: { command: "echo checked" },
+                },
+              ],
+            },
+            {
+              role: "user",
+              content: [{ type: "tool_result", tool_use_id: "toolu_child", content: "checked" }],
+            },
+            {
+              role: "assistant",
+              id: "msg_submit",
+              content: [
+                {
+                  type: "tool_use",
+                  id: "toolu_submit",
+                  name: "StructuredOutput",
+                  input: { checked: true },
+                },
+              ],
+            },
+            {
+              role: "user",
+              content: [{ type: "tool_result", tool_use_id: "toolu_submit", content: "Accepted." }],
+            },
+            {
+              role: "assistant",
+              id: "msg_done",
+              content: [{ type: "text", text: "Finished checking." }],
+            },
+          ].map((message, i) =>
+            transcriptRecord(root, recordIds[i], recordIds[i - 1] ?? null, message, {
+              agentId: worker.agentId,
+              isSidechain: true,
+            }),
+          );
+          const file = await writeSubagentHistory(
+            root,
+            [transcriptRecord(root, randomUUID(), null, { role: "user", content: "hi" })],
+            worker.agentId,
+            {},
+            pieces.slice(0, 3),
+            "wf_test",
+          );
+          yield* workflowStarts(options, "review");
+          const progress = (state: string) =>
+            taskEvent(options, "task_progress", {
+              task_id: "wf1",
+              tool_use_id: "toolu_wf",
+              description: "Review",
+              workflow_progress: [{ ...worker, state }],
+            });
+          yield progress("start");
+          yield result(options);
+          yield idleState(options);
+          await finish.promise;
+          await appendFile(
+            file,
+            pieces
+              .slice(3)
+              .map((piece) => JSON.stringify(piece) + "\n")
+              .join(""),
+          );
+          yield progress("done");
+          yield progress("done");
+          yield level(options, []);
+        });
+        const client = await promptUntil("running []", async (_agent, root, client) => {
+          try {
+            await vi.waitFor(() => {
+              const updates = client.sessionUpdates
+                .filter((item) => item.sessionId === worker.agentId)
+                .map((item) => item.update);
+              expect(updates).toContainEqual(
+                expect.objectContaining({
+                  sessionUpdate: "terminal_update",
+                  terminalId: "toolu_child",
+                  command: "echo checked",
+                }),
+              );
+              expect(rootTurnEnd(client, root)).toBeDefined();
+            });
+          } finally {
+            finish.resolve();
+          }
+          await vi.waitFor(() =>
+            expect(client.sessionUpdates).toContainEqual(
+              expect.objectContaining({
+                sessionId: worker.agentId,
+                update: expect.objectContaining({ sessionUpdate: "state_update", state: "idle" }),
+              }),
+            ),
+          );
+        });
+        const updates = client.sessionUpdates
+          .filter(({ sessionId }) => sessionId === worker.agentId)
+          .map(({ update }) => update);
+        const trace = updates.flatMap((u) => {
+          const content = ("content" in u ? u.content : undefined) as
+            { type?: string; text?: string } | undefined;
+          if (
+            (u.sessionUpdate === "user_message_chunk" ||
+              u.sessionUpdate === "agent_message_chunk") &&
+            content?.type === "text"
+          )
+            return [u.messageId + " " + content.text];
+          if (
+            u.sessionUpdate === "tool_call_update" &&
+            u.toolCallId === "toolu_child" &&
+            u.status === "completed"
+          )
+            return ["tool completed"];
+          if (u.sessionUpdate === "state_update" && u.state === "idle") return ["idle"];
+          return [];
+        });
+        expect(trace).toEqual([
+          recordIds[0] + " Read logs",
+          recordIds[1] + " Looking now.",
+          "tool completed",
+          recordIds[6] + " Finished checking.",
+          "idle",
+        ]);
+        expect(updates).toContainEqual(
+          expect.objectContaining({
+            sessionUpdate: "terminal_update",
+            terminalId: "toolu_child",
+            output: expect.objectContaining({ data: Buffer.from("checked").toString("base64") }),
+          }),
+        );
+        expect(updates).toContainEqual(
+          expect.objectContaining({
+            sessionUpdate: "tool_call_update",
+            toolCallId: "toolu_submit",
+            status: "completed",
+            content: expect.arrayContaining([
+              expect.objectContaining({
+                type: "content",
+                content: { type: "text", text: expect.stringContaining('"checked": true') },
+              }),
+            ]),
+          }),
+        );
+        expect(JSON.stringify(updates)).not.toContain("private-");
+        expect(
+          client.sessionUpdates
+            .filter(({ sessionId }) => sessionId !== worker.agentId)
+            .some(({ update }) => JSON.stringify(update).includes("toolu_child")),
+        ).toBe(false);
+      });
 
       it("reports each identified Workflow worker while the root is idle, through its own outcome", async () => {
         const finish = Promise.withResolvers<void>();

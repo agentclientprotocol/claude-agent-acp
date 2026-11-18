@@ -290,7 +290,7 @@ async function readLaunchIdsFromTranscript(
 export async function readSubagentMessages(
   sessionId: string,
   agentId: string,
-  history: SubagentHistory,
+  history: Partial<SubagentHistory>,
   logger: { error(...args: unknown[]): void },
 ): Promise<SessionMessage[]> {
   try {

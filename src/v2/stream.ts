@@ -128,6 +128,7 @@ export class SessionOutput {
   private replayHooks: ReplayHooks | undefined;
   /** During {@link replay}, the replayed tool calls without a final status. */
   private replayUnfinished: Set<string> | undefined;
+  private workflowCleared?: Set<string>;
   /** Set by the session's tasks: rewrites the live updates (see {@link OutputRoute}). */
   route: OutputRoute | undefined;
   /** Set by the session around one message: rewrites its updates before {@link route}. */
@@ -472,6 +473,21 @@ export class SessionOutput {
     }
   }
 
+  /** An already recorded worker message: no tool hooks can run for it.
+   * Replace its content by UUID, including when a concurrent resume replayed it. */
+  workflowRecord(message: SessionMessage): void {
+    const inner = message.message as { content: AssistantContent | UserContent };
+    this.workflowCleared = new Set();
+    try {
+      this.content(inner.content, message.type === "assistant" ? "assistant" : "user", null, {
+        messageId: message.uuid,
+        registerHooks: false,
+      });
+    } finally {
+      this.workflowCleared = undefined;
+    }
+  }
+
   /** Agent text that is not a model message, such as a local command's result. */
   agentMessage(text: string, messageId: string): void {
     this.content(text, "assistant", null, { messageId });
@@ -505,6 +521,7 @@ export class SessionOutput {
       toolUseResult?: unknown;
       toolResultMeta?: unknown;
       cancelled?: boolean;
+      registerHooks?: boolean;
       replay?: boolean;
     },
     transform: (notification: AcpSessionNotification) => AcpSessionNotification = (n) => n,
@@ -663,7 +680,8 @@ export class SessionOutput {
       if (!replaying) this.onAgentText?.(update.content);
     }
     for (const v2Update of this.translator.updates(this.sessionId, update, replaying)) {
-      const clear = this.replayCleared && replayClear(this.replayCleared, v2Update);
+      const cleared = this.replayCleared ?? this.workflowCleared;
+      const clear = cleared && replayClear(cleared, v2Update);
       if (clear) this.send(clear);
       if (v2Update.sessionUpdate === "tool_call_update") {
         const { toolCallId, status } = v2Update as { toolCallId: string; status?: string | null };

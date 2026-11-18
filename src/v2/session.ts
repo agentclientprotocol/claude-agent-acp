@@ -894,6 +894,11 @@ export class V2Session implements RequestTarget {
       for await (const message of query) {
         if (this.closed) break;
         try {
+          const draining = this.tasks.beforeTask(message);
+          if (draining) {
+            await draining;
+            if (this.closed) break;
+          }
           await this.handle(message);
         } catch (error) {
           this.connection.logger.error(

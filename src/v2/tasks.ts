@@ -84,7 +84,7 @@ import {
   type SubagentIdentity,
   type SubagentModels,
 } from "../native-subagents.js";
-import { subagentLineage } from "../subagent-history.js";
+import { readSubagentMessages, subagentLineage } from "../subagent-history.js";
 import {
   streamedTerminals,
   withRunningTerminal,
@@ -104,6 +104,7 @@ import {
 } from "../workflow-progress.js";
 import { ChildConfigurations } from "./child-config.js";
 import { SessionOutput } from "./stream.js";
+import { WorkflowTranscripts } from "./workflow-transcript.js";
 import { SubagentReplay } from "./subagent-replay.js";
 
 /** What the tasks need of their root session. */
@@ -285,6 +286,7 @@ export class SessionTasks {
   private readonly children = new Map<string, Child>();
   /** The session that owns each Workflow call, through its final notification,
    * and the last worker observed in each slot (a retry gets a new agent id). */
+  private readonly workflowTranscripts: WorkflowTranscripts;
   private readonly workflows = new Map<string, ObservedWorkflow>();
   /** The child of each Agent call that launched or resumed one. */
   private readonly childByToolUse = new Map<string, Child>();
@@ -380,6 +382,11 @@ export class SessionTasks {
     /** The root session's output, which owns its tool calls. */
     private readonly rootOutput: SessionOutput,
   ) {
+    this.workflowTranscripts = new WorkflowTranscripts(
+      (id) => readSubagentMessages(host.sessionId, id, { dir: host.cwd }, host.logger),
+      (id, error) =>
+        host.logger.error(`Failed to report the transcript of Workflow worker ${id}:`, error),
+    );
     rootOutput.route = (notification) => this.route(rootOutput, notification, undefined);
     this.configs = new ChildConfigurations({
       modes: () => host.modes(),
@@ -393,6 +400,53 @@ export class SessionTasks {
   }
 
   // --- Claude Code's messages ---------------------------------------------
+
+  /** Drain the SDK transcript before a task event can end a worker or remove its background entry. */
+  beforeTask(message: SDKMessage): Promise<void> | undefined {
+    if (message.type !== "system" || this.closed) return;
+    const ids = new Set<string>();
+    const finishing = (workflow: ObservedWorkflow | undefined) => {
+      for (const worker of workflow?.workers.values() ?? []) {
+        if (worker.working) ids.add(worker.sessionId);
+      }
+    };
+    if (message.subtype === "background_tasks_changed") {
+      const remaining = new Set(message.tasks.map((task) => task.task_id));
+      for (const [id, workflow] of this.workflows) {
+        if (!remaining.has(id)) finishing(workflow);
+      }
+    } else if (
+      message.subtype === "task_progress" ||
+      message.subtype === "task_updated" ||
+      message.subtype === "task_notification"
+    ) {
+      const workflow = this.workflows.get(message.task_id);
+      const task = this.level.get(message.task_id);
+      if (task?.workersForgotten || (!workflow && task?.taskType !== "local_workflow")) return;
+      const patch = message.subtype === "task_updated" ? message.patch : undefined;
+      const final =
+        message.subtype === "task_notification" ||
+        (patch?.status && ["completed", "failed", "killed"].includes(patch.status));
+      if (final) finishing(workflow);
+      const source = patch ? (patch as { terminal?: unknown }).terminal : message;
+      const snapshot = workflowSnapshot(
+        (source as { workflow_progress?: unknown } | undefined)?.workflow_progress,
+      );
+      for (const agent of snapshot?.agents ?? []) {
+        if (!agent.agentId || agent.agentId === this.host.sessionId) continue;
+        const known = this.children.get(agent.agentId);
+        if (known && known.workflowTaskId !== message.task_id) continue;
+        const state = workflowWorkerState(agent);
+        if (state && state !== "running" && (!known || known.working || known.unobservable))
+          ids.add(agent.agentId);
+        if (!known && agent.index !== undefined) {
+          const replaced = workflow?.slots.get(agent.index);
+          if (replaced?.working) ids.add(replaced.sessionId);
+        }
+      }
+    }
+    if (ids.size) return this.workflowTranscripts.final(ids);
+  }
 
   /**
    * Takes a message of the query that concerns the tasks. Returns whether it
@@ -713,6 +767,7 @@ export class SessionTasks {
    */
   withdrawAll(): void {
     this.closed = true;
+    this.workflowTranscripts.clear();
     this.stopForeground();
     for (const agentId of this.agentRequests.keys()) this.withdraw(agentId);
   }
@@ -921,6 +976,7 @@ export class SessionTasks {
    * `error`, as the root's work does.
    */
   queryEnded(error: { code: number; message: string } | undefined): void {
+    this.workflowTranscripts.clear();
     this.stopForeground();
     for (const [taskId, terminal] of this.terminals) {
       terminal.tail?.stop();
@@ -949,6 +1005,7 @@ export class SessionTasks {
    * its state.
    */
   conversationReset(): void {
+    this.workflowTranscripts.clear();
     for (const child of [...this.parentsFirst()].reverse()) {
       if (!child.working) continue;
       child.working = false;
@@ -1139,6 +1196,9 @@ export class SessionTasks {
       (message as { workflow_progress?: unknown }).workflow_progress,
     );
     this.taskEnded(message.task_id, message.status);
+    for (const child of this.workflows.get(message.task_id)?.workers.values() ?? []) {
+      this.workflowTranscripts.forget(child.sessionId);
+    }
     this.workflows.delete(message.task_id);
   }
 
@@ -1192,10 +1252,11 @@ export class SessionTasks {
     // Only a final snapshot may enrich a call after it ended.
     const call = final ? workflow?.call : this.toolCalls.get(taskId);
     if (!call) return false;
+    const afterCard: Array<() => void> = [];
     const changed = !!(
       workflow &&
       snapshot &&
-      this.workflowWorkers(taskId, workflow, snapshot, final)
+      this.workflowWorkers(taskId, workflow, snapshot, final, afterCard)
     );
     if (workflow) workflow.progress = progress;
     const card = workflowCard(progress, workflow?.workers.keys());
@@ -1206,6 +1267,7 @@ export class SessionTasks {
         call.sentWorkflowCard = serialized;
       }
     }
+    for (const send of afterCard) send();
     return changed;
   }
 
@@ -1218,6 +1280,7 @@ export class SessionTasks {
     workflow: ObservedWorkflow,
     snapshot: WorkflowSnapshot,
     final: boolean,
+    afterCard: Array<() => void>,
   ): boolean {
     let changed = false;
     for (const agent of snapshot.agents) {
@@ -1240,6 +1303,27 @@ export class SessionTasks {
         continue;
       }
       const previous = child.reportedState;
+      const output = child.output!;
+      const follow = (running: boolean) =>
+        this.workflowTranscripts.follow(id, (message) => output.workflowRecord(message), running);
+      if (
+        previous === undefined &&
+        state !== "running" &&
+        this.workflowTranscripts.hasMessages(id)
+      ) {
+        // The first report can already be terminal. Link its session and
+        // deliver its recorded work before its idle, without inventing a run.
+        this.host.send({ sessionId: child.parentSessionId, update: this.announcement(child) });
+        const observed = child;
+        afterCard.push(() => {
+          follow(false);
+          this.endRun(observed, state);
+          this.publishConfiguration(observed, undefined);
+        });
+        changed = true;
+        continue;
+      }
+      if (previous === undefined) afterCard.push(() => follow(state === "running"));
       if (state === "running") {
         // A retry starts a new agent id; an earlier snapshot must not revive one.
         if (child.working) this.reportChild(child);
@@ -1260,6 +1344,7 @@ export class SessionTasks {
   /** Losing sight of an attempt or its Workflow does not say how the worker ended. */
   private loseWorker(child: Child): void {
     if (!child.working) return;
+    this.workflowTranscripts.stop(child.sessionId);
     child.working = false;
     child.unobservable = true;
     this.reportChild(child);
@@ -1561,7 +1646,8 @@ export class SessionTasks {
       this.host.logger,
       true,
     );
-    output.route = (notification) => this.route(output, notification, child);
+    if (child.workflowTaskId === undefined)
+      output.route = (notification) => this.route(output, notification, child);
     child.output = output;
     child.announced = true;
     // Before the messages that waited for the announcement go out.

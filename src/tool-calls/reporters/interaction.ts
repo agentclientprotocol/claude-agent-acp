@@ -17,7 +17,7 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { exitPlanModeRawOutput } from "../../exit-plan.js";
-import { textContent, toAcpContentUpdate } from "../content.js";
+import { textContent, toAcpContentUpdate, resultText } from "../content.js";
 import type {
   ToolReporter,
   ToolResultContext,
@@ -188,6 +188,29 @@ export class ReportFindingsReporter implements ToolReporter {
           }
         : {}),
     };
+  }
+}
+
+/** A successful StructuredOutput submission is the worker's result. The
+ * tool result confirms it, while the submitted JSON is in the tool input. */
+export class StructuredOutputReporter implements ToolReporter {
+  toolUse(input: unknown, { capabilities }: ToolUseContext): ToolUseFacts {
+    return {
+      title: "StructuredOutput",
+      kind: "other",
+      ...(capabilities.v2 ? { display: this.submission(input) } : {}),
+    };
+  }
+
+  toolResult({ toolUse, result, capabilities }: ToolResultContext): ToolResultFacts {
+    const shown = resultText(result);
+    return capabilities.v2 && !result.is_error
+      ? { content: [...this.submission(toolUse.input), ...(shown.content ?? [])] }
+      : shown;
+  }
+
+  private submission(input: unknown) {
+    return [textContent(`\`\`\`json\n${JSON.stringify(input, null, 2)}\n\`\`\``)];
   }
 }
 
