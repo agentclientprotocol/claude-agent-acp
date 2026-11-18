@@ -8,7 +8,7 @@
 import { vi } from "vitest";
 import { randomUUID } from "crypto";
 import { SessionBackgroundWork } from "../../v1/background-work.js";
-import { PromptSuggestions } from "../../prompt-suggestions.js";
+import { clientTakesPromptSuggestions, PromptSuggestions } from "../../prompt-suggestions.js";
 import { SessionTitles } from "../../session-titles.js";
 import { DEFAULT_CONTEXT_WINDOW } from "../../session-usage.js";
 
@@ -101,10 +101,12 @@ export function mockSessionState(
     owedTrailingIdles: 0,
     messageIdToUuid: new Map(),
     sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
-    // As `createSession` gives it to the session of an AIR client.
-    ...(agent?.toolCallCapabilities?.air?.client
-      ? { promptSuggestions: new PromptSuggestions() }
-      : {}),
+    // As `createSession` gives it to the session: for an AIR client, and for
+    // one that advertised `session.promptSuggestions`.
+    promptSuggestions: PromptSuggestions.forClient({
+      meta: agent?.toolCallCapabilities?.air?.client === true,
+      update: clientTakesPromptSuggestions(agent?.clientCapabilities?.session),
+    }),
     ...overrides,
   } as any;
 }

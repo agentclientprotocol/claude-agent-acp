@@ -2,7 +2,7 @@
  * The reports of a v2 session that are not Claude's output: the
  * context window and cost (`usage_update`), Claude Code's warnings and MCP startup failures (`notice`), compactions
  * (`compaction_update`), the title (`session_info_update`), the predicted
- * follow-up prompt of an AIR client (`session_info_update._meta.promptSuggestions`),
+ * predicted follow-up prompt (`prompt_suggestions_update`, and AIR's `_meta.promptSuggestions`),
  * and the adapter's own idle compaction.
  *
  * They are built as the v1 core builds them, from the shared modules
@@ -37,7 +37,7 @@ import {
 } from "../context-window.js";
 import { IdleCompaction } from "../idle-compaction.js";
 import type { UnservedMcpServer } from "../mcp-servers.js";
-import { PromptSuggestions } from "../prompt-suggestions.js";
+import { PromptSuggestions, type PromptSuggestionForms } from "../prompt-suggestions.js";
 import {
   informationalNotice,
   mcpServerStartupNotice,
@@ -65,11 +65,14 @@ type UsageUpdate = Extract<AcpSessionNotification["update"], { sessionUpdate: "u
 export interface ReportsHost {
   readonly sessionId: string;
   readonly logger: Logger;
-  /** The client is JetBrains AIR, the only one that gets the predicted follow-up prompt. */
-  readonly airClient: boolean;
+  /** The forms of the predicted follow-up prompt that the client takes (see `prompt-suggestions.ts`). */
+  readonly promptSuggestions: PromptSuggestionForms;
   /** Sends v1-shaped updates of the session, in the order of the calls. */
   emit(notifications: AcpSessionNotification[]): void;
-  /** For the idle compaction: whether the session is busy, and its `/compact`. */
+  /**
+   * Whether the session is busy: for the idle compaction, and for a predicted
+   * prompt that arrives meanwhile. `compact` is the idle compaction's `/compact`.
+   */
   isBusy(): boolean;
   compact(): Promise<void>;
   /** The session as titles read it, the same object each time; undefined until it starts and once it ends. */
@@ -142,11 +145,11 @@ export class SessionReports {
   private disposed = false;
   /** The context used after the last main-thread request. */
   private contextUsed: number | undefined;
-  /** The follow-up prompt the client holds, for an AIR client only. */
+  /** The follow-up prompt the client holds. Undefined for a client that takes none. */
   private suggestions: PromptSuggestions | undefined;
 
   constructor(private readonly host: ReportsHost) {
-    this.suggestions = host.airClient ? new PromptSuggestions() : undefined;
+    this.suggestions = PromptSuggestions.forClient(host.promptSuggestions);
     this.titles = new SessionTitles(
       {
         client: { sessionUpdate: async (notification) => host.emit([notification]) },
@@ -219,6 +222,10 @@ export class SessionReports {
     this.lastTotal = null;
     this.lastModel = null;
     this.noticeTexts = [];
+    // ACP: a list of suggestions is withdrawn when foreground work starts
+    // without a prompt, such as a cycle that Claude Code started on its own.
+    // A prompt's own turn finds the list withdrawn already (`promptSent`).
+    this.sendSuggestions(this.suggestions?.workStarted());
   }
 
   /**
@@ -285,7 +292,7 @@ export class SessionReports {
     // The prediction is spent: the user sent it or something else. A turn
     // that predicts nothing (plan mode, an API error, the usage limit) then
     // leaves no stale prediction in the composer.
-    this.sendSuggestion(this.suggestions?.clear());
+    this.sendSuggestions(this.suggestions?.clear());
   }
 
   /** The client prompt went to Claude Code, which may title the session from it. */
@@ -351,7 +358,7 @@ export class SessionReports {
     this.titles.reset();
     this.idleCompaction?.reset();
     // The prediction came from the transcript that the reset dropped.
-    this.sendSuggestion(this.suggestions?.clear());
+    this.sendSuggestions(this.suggestions?.clear());
   }
 
   /** Sends the usage of an empty context, as a fresh context for an approved plan starts. */
@@ -477,7 +484,10 @@ export class SessionReports {
     switch (message.type) {
       case "prompt_suggestion":
         // AIR shows it as gray text in an empty composer, which Tab fills.
-        this.sendSuggestion(this.suggestions?.suggested(message.suggestion));
+        // While the session is busy, such as with a prompt that waits or a
+        // cycle that Claude Code started on its own, the
+        // `prompt_suggestions_update` form drops the prediction.
+        this.sendSuggestions(this.suggestions?.suggested(message.suggestion, this.host.isBusy()));
         return true;
       case "rate_limit_event":
         this.idleCompaction?.noteRateLimit(message.rate_limit_info);
@@ -607,15 +617,10 @@ export class SessionReports {
     }
   }
 
-  /** Sends the `_meta` of {@link PromptSuggestions}, when it has one. */
-  private sendSuggestion(meta: Record<string, unknown> | undefined): void {
-    if (!meta) return;
-    this.host.emit([
-      {
-        sessionId: this.host.sessionId,
-        update: { sessionUpdate: "session_info_update", _meta: meta },
-      },
-    ]);
+  /** Sends the updates of {@link PromptSuggestions}, when it has any. */
+  private sendSuggestions(updates: AcpSessionNotification["update"][] | undefined): void {
+    if (!updates?.length) return;
+    this.host.emit(updates.map((update) => ({ sessionId: this.host.sessionId, update })));
   }
 
   /**

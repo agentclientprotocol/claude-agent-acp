@@ -98,7 +98,7 @@ import {
   toGoalSnapshot,
 } from "./goal-extension.js";
 import { checklistPlanUpdate, resetPlanUpdates, type SubagentChecklists } from "../plans.js";
-import { PromptSuggestions } from "../prompt-suggestions.js";
+import { clientTakesPromptSuggestions, PromptSuggestions } from "../prompt-suggestions.js";
 import { savedSessionStatus, SESSION_STATUS_CAPABILITY } from "../session-status.js";
 import {
   applyInitialConfigOptions,
@@ -891,7 +891,8 @@ export type Session = {
   /** Last goal snapshot sent to the ACP client, used to roll back an
    *  optimistic `/goal` update when the command itself fails. */
   lastPublishedGoal?: GoalSnapshot | null;
-  /** The follow-up prompt the client holds, for an AIR client only. */
+  /** The follow-up prompt the client holds, for an AIR client and for one that
+   *  advertised `session.promptSuggestions`. Undefined for any other client. */
   promptSuggestions?: PromptSuggestions;
   /** Count of result messages the consumer should treat as orphans and skip
    *  (not promote/attribute to the current head). When cancel() settles+removes
@@ -2562,7 +2563,7 @@ export class ClaudeAcpAgent {
       // session that holds no prediction needs no clear, and the prompt path
       // then keeps the ordering it has without this feature.
       const cleared = session.promptSuggestions?.clear();
-      if (cleared) await this.publishPromptSuggestion(params.sessionId, cleared);
+      if (cleared?.length) await this.publishPromptSuggestions(params.sessionId, cleared);
     }
 
     // A `/remote-control` command still in flight answers into the session's
@@ -2909,19 +2910,16 @@ export class ClaudeAcpAgent {
   }
 
   /**
-   * Sends the `_meta` of a session's {@link PromptSuggestions}: the follow-up
+   * Sends the updates of a session's {@link PromptSuggestions}: the follow-up
    * prompt the CLI predicted for the next turn, or the clear of the one the
-   * client holds. Only AIR renders it, so only an AIR session has the state;
-   * see `docs/air-extensions.md`.
+   * client holds, in each form the client takes. Only a session of AIR or of a
+   * client that advertised `session.promptSuggestions` has the state.
    */
-  private async publishPromptSuggestion(
+  private async publishPromptSuggestions(
     sessionId: string,
-    meta: Record<string, unknown>,
+    updates: SessionNotification["update"][],
   ): Promise<void> {
-    await this.client.sessionUpdate({
-      sessionId,
-      update: { sessionUpdate: "session_info_update", _meta: meta },
-    });
+    for (const update of updates) await this.client.sessionUpdate({ sessionId, update });
   }
 
   private async publishTaskPlan(sessionId: string, taskState: TaskState): Promise<void> {
@@ -7140,7 +7138,7 @@ export class ClaudeAcpAgent {
             // The follow-up prompt was predicted from the transcript the reset
             // dropped, so it no longer follows from anything.
             const cleared = session.promptSuggestions?.clear();
-            if (cleared) await this.publishPromptSuggestion(params.sessionId, cleared);
+            if (cleared?.length) await this.publishPromptSuggestions(params.sessionId, cleared);
             // The recorded request and TTL describe the dropped conversation.
             session.idleCompaction?.reset();
             break;
@@ -7150,9 +7148,16 @@ export class ClaudeAcpAgent {
           case "prompt_suggestion": {
             // The CLI predicts the next prompt after the turn's `result`. AIR
             // shows it as gray text in an empty composer; Tab fills the
-            // composer, and nothing is sent until the user sends it.
-            const suggested = session.promptSuggestions?.suggested(message.suggestion);
-            if (suggested) await this.publishPromptSuggestion(params.sessionId, suggested);
+            // composer, and nothing is sent until the user sends it. While
+            // Claude works, such as on a prompt queued before that result,
+            // the `prompt_suggestions_update` form drops the prediction.
+            const suggested = session.promptSuggestions?.suggested(
+              message.suggestion,
+              this.claudeIsWorking(params.sessionId, session),
+            );
+            if (suggested?.length) {
+              await this.publishPromptSuggestions(params.sessionId, suggested);
+            }
             break;
           }
           case "auth_status":
@@ -10201,7 +10206,9 @@ export class ClaudeAcpAgent {
       // `perTaskStopAffordance` wins.
       ...(subagentForm(this.clientCapabilities) === "rfd" ? { perTaskStopAffordance: true } : {}),
       // One predicted follow-up prompt per turn, published as
-      // `session_info_update._meta.promptSuggestions`. It rides the turn's own
+      // `prompt_suggestions_update` or, for AIR, as
+      // `session_info_update._meta.promptSuggestions` (see
+      // `prompt-suggestions.ts`). It rides the turn's own
       // prompt cache, and the user can turn it off in settings.json
       // (`promptSuggestionEnabled`) or with CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false.
       // Before `userProvidedOptions`, so a client that passes
@@ -10704,9 +10711,10 @@ export class ClaudeAcpAgent {
           settingsManager.getApiKeyHelper(configuredSettingsObject),
         )?.kind,
         fileChangeReporter,
-        ...(this.toolCallCapabilities.air.client
-          ? { promptSuggestions: new PromptSuggestions() }
-          : {}),
+        promptSuggestions: PromptSuggestions.forClient({
+          meta: this.toolCallCapabilities.air.client,
+          update: clientTakesPromptSuggestions(this.clientCapabilities?.session),
+        }),
       };
       const registered = this.sessions[sessionId];
       registered.idleCompaction = new IdleCompaction(

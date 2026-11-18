@@ -61,6 +61,10 @@ export function v2SessionUpdate(
     case "session_message_chunk":
       // The subagents RFD gives these the same shape in v1 and v2.
       return update;
+    case "prompt_suggestions_update":
+      // The prompt suggestions RFD gives it the same shape in v1 and v2, and
+      // v2 content blocks are a superset of the v1 blocks.
+      return update;
     case "current_mode_update":
       // v2 has no modes: the mode is the `mode` config option. Every mode
       // change also reaches the client as a `config_option_update` or in the

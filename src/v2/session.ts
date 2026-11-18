@@ -102,6 +102,8 @@ export interface SessionConnection {
   ): Promise<v2.RequestPermissionResponse>;
   /** The elicitation modes that the client advertised. */
   readonly elicitation: ElicitationSupport;
+  /** Whether the client advertised `session.promptSuggestions`, read at `initialize`. */
+  readonly promptSuggestions: boolean;
   createElicitation(
     request: CreateElicitationRequest,
     signal: AbortSignal,
@@ -250,7 +252,7 @@ export class V2Session implements RequestTarget {
     this.reports = new SessionReports({
       sessionId,
       logger: connection.logger,
-      airClient: connection.air.client,
+      promptSuggestions: { meta: connection.air.client, update: connection.promptSuggestions },
       emit: (notifications) => this.output.emitV1(notifications),
       isBusy: () => this.foreground || this.pending.size > 0 || this.requests.size > 0,
       compact: () => this.compact(),
