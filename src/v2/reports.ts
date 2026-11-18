@@ -1,3 +1,4 @@
+import type { NativeConfiguration } from "../session-observation.js";
 /**
  * The reports of a v2 session that are not Claude's output: the
  * context window and cost (`usage_update`), Claude Code's warnings and MCP startup failures (`notice`), compactions
@@ -102,7 +103,7 @@ export interface ReportsSetup {
    * identity strings are a trustworthy window signal (see
    * `withCurrentModelInfo`).
    */
-  model: { id: string; info: ModelInfo | undefined };
+  model: { id: string; info: ModelInfo | undefined; native?: NativeConfiguration };
 }
 
 export class SessionReports {
@@ -174,7 +175,8 @@ export class SessionReports {
     this.query = setup.query;
     // From the same env the query got.
     this.providerCacheKey = providerCacheKeyFor(setup.env);
-    this.seedContextWindow(setup.model.id, setup.model.info);
+    if (setup.model.native) this.nativeConfiguration(setup.model.native);
+    else this.seedContextWindow(setup.model.id, setup.model.info);
     this.idleCompaction = new IdleCompaction(
       {
         isBusy: () => this.host.isBusy(),
@@ -321,7 +323,18 @@ export class SessionReports {
    * the old one, and the context window is seeded for the new one, as on v1
    * (`applyConfigOptionValue`). Nothing changes for the same model.
    */
-  modelChanged(id: string, info: ModelInfo | undefined): void {
+  nativeConfiguration(actual: NativeConfiguration): void {
+    this.modelId = actual.model;
+    this.contextWindow = actual.size;
+    this.contextUsed = actual.used;
+    this.contextWindowAuthoritative = true;
+  }
+
+  modelChanged(id: string, info: ModelInfo | undefined, native?: NativeConfiguration): void {
+    if (native) {
+      this.nativeConfiguration(native);
+      return;
+    }
     if (id === this.modelId) return;
     this.idleCompaction?.disarm("model change");
     this.seedContextWindow(id, info);

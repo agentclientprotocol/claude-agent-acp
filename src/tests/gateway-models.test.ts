@@ -357,7 +357,14 @@ describe("getAvailableModels under a gateway listing", () => {
     narrowedByGateway = true,
   ) {
     return getAvailableModels(
-      { setModel } as unknown as Query,
+      {
+        setModel,
+        getContextUsage: async () => ({
+          model: resumedModelHint,
+          rawMaxTokens: 200000,
+          totalTokens: 0,
+        }),
+      } as unknown as Query,
       LISTED,
       SDK_MODELS,
       { getSettings: () => ({}) },

@@ -95,7 +95,12 @@ const sdk = vi.hoisted(() => ({
   /** The flag settings that the agent applied (`applyFlagSettings`), in order. */
   flagSettings: [] as Array<Record<string, unknown>>,
   /** What `getContextUsage({ detail: "summary" })` answers. */
-  contextUsage: async (): Promise<{ totalTokens: number; rawMaxTokens: number }> => ({
+  contextUsage: async (): Promise<{
+    totalTokens: number;
+    rawMaxTokens: number;
+    model?: string;
+  }> => ({
+    model: "claude-sonnet-4-6",
     totalTokens: 0,
     rawMaxTokens: 200000,
   }),
@@ -116,6 +121,7 @@ const sdk = vi.hoisted(() => ({
   }),
   /** The account that the query cached at its start, which `accountInfo()` reads. */
   accountInfo: async (): Promise<Record<string, unknown>> => ({}),
+  settings: async (): Promise<{ effective?: { effortLevel?: string } }> => ({}),
   /** The query switches its model (`setModel`). */
   setModel: async (_model?: string): Promise<void> => {},
   /** Claude Code stores a session title (`rename_session`). */
@@ -158,7 +164,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         renameSession: (title: string, sessionId?: string) => sdk.renameSession(title, sessionId),
         ...(sdk.enableRemoteControl ? { enableRemoteControl: sdk.enableRemoteControl } : {}),
       });
-      return Object.assign(messages, controls);
+      return Object.assign(messages, controls, { getSettings: () => sdk.settings() });
     },
     listSessions: vi.fn(async () => [
       {
@@ -979,7 +985,12 @@ describe("ACP v2 sessions", () => {
     });
   });
 
-  it("offers a resumed Fable 5.2 session's model as `fable`, as a new session lists it", async () => {
+  it("offers the resumed Fable alias and reports its concrete native model", async () => {
+    sdk.contextUsage = async () => ({
+      model: "claude-fable-5-2",
+      rawMaxTokens: 200000,
+      totalTokens: 0,
+    });
     // On resume, the CLI lists the transcript's Fable row under its id, with no `fable` row.
     const row = (value: string, resolvedModel: string, displayName: string) => ({
       value,
@@ -1020,8 +1031,12 @@ describe("ACP v2 sessions", () => {
     });
 
     expect(model).toMatchObject({
-      currentValue: "fable",
-      options: [{ value: "default" }, { value: "fable", name: "Fable 5.2" }],
+      currentValue: "claude-fable-5-2",
+      options: [
+        { value: "default" },
+        { value: "fable", name: "Fable 5.2" },
+        { value: "claude-fable-5-2" },
+      ],
     });
     expect(setModel).not.toHaveBeenCalled();
   });
@@ -1394,6 +1409,7 @@ describe("ACP v2 sessions", () => {
     // The query of a restart may run on a provider that cannot serve the model
     // of the query it replaces, though Claude Code would take the id.
     it("does not pass the model of a replaced query to Claude Code when the new query does not list it", async () => {
+      sdk.contextUsage = async () => ({ model: OPUS.value, rawMaxTokens: 200000, totalTokens: 0 });
       vi.stubGlobal(
         "fetch",
         vi.fn(
@@ -1495,6 +1511,15 @@ describe("ACP v2 sessions", () => {
     });
 
     it("keeps the client's effort, Fast mode, ultracode and agent across a restart of the query", async () => {
+      sdk.contextUsage = async () => ({ model: OPUS.value, rawMaxTokens: 200000, totalTokens: 0 });
+      sdk.settings = async () => ({
+        effective: {
+          effortLevel: String(
+            sdk.flagSettings.findLast((flags) => flags.effortLevel !== undefined)?.effortLevel ??
+              "high",
+          ),
+        },
+      });
       const client = v2Client();
       await client.app.connectWith(connectRouter(), async (agent) => {
         await initializeV2(agent);
@@ -11286,3 +11311,246 @@ async function previewToolUse(
     }
   }
 }
+
+describe("fresh native configuration on cold resume", () => {
+  it.each(["v1", "v2"] as const)(
+    "%s observes the live model and verifies standard selections",
+    async (protocol) => {
+      const fable = "claude-fable-5-2";
+      let nativeModel = fable;
+      const writes: string[] = [];
+      let applySonnet = false;
+      const echoed = scriptTurns(async function* (options) {
+        yield result(options);
+        yield idleState(options);
+      });
+      sdk.contextUsage = async () => ({
+        model: nativeModel,
+        totalTokens: 42,
+        rawMaxTokens: 777777,
+      });
+      sdk.settings = async () => ({ effective: { effortLevel: "high" } });
+      sdk.initializationResult = async () => ({
+        models: [
+          { value: "fable", resolvedModel: fable, displayName: "Fable", description: "" },
+          {
+            value: "sonnet",
+            resolvedModel: "claude-sonnet-5-5",
+            displayName: "Sonnet",
+            description: "",
+          },
+        ],
+      });
+      sdk.setModel = async (value) => {
+        writes.push(value!);
+        // The requested Sonnet is acknowledged, but native state stays on Fable.
+        if (value !== "sonnet") nativeModel = value!;
+        else if (applySonnet) nativeModel = "claude-sonnet-5-5";
+      };
+      const notifications: Array<{ update: { sessionUpdate: string; [key: string]: unknown } }> =
+        [];
+      const assertResume = (options: unknown) => {
+        expect(options).toEqual(
+          expect.arrayContaining([expect.objectContaining({ currentValue: fable })]),
+        );
+        expect(writes).toEqual([]);
+        const updates = notifications
+          .map((row) => row.update)
+          .filter(
+            (update) =>
+              update.sessionUpdate === "config_option_update" ||
+              update.sessionUpdate === "usage_update",
+          );
+        expect(updates.slice(-2)).toMatchObject([
+          { sessionUpdate: "config_option_update" },
+          { sessionUpdate: "usage_update", size: 777777, used: 42 },
+        ]);
+      };
+      if (protocol === "v2") {
+        const client = v2Client();
+        await client.app.connectWith(connectRouter(), async (agent) => {
+          await initializeV2(agent);
+          const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+          await agent.request(v2.methods.agent.session.close, { sessionId });
+          vi.stubEnv("ANTHROPIC_MODEL", "sonnet");
+          const resumed = await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+          notifications.push(...client.sessionUpdates);
+          assertResume(resumed.configOptions);
+          expect(sdk.queryOptions.at(-1)?.resume).toBe(sessionId);
+          expect(sdk.queryOptions.at(-1)?.model).toBeUndefined();
+          expect(sdk.flagSettings).toEqual([]);
+          await agent.request(v2.methods.agent.session.setConfigOption, {
+            sessionId,
+            configId: "model",
+            type: "id",
+            value: "fable",
+          });
+          expect(writes).toEqual([]);
+          await expect(
+            agent.request(v2.methods.agent.session.setConfigOption, {
+              sessionId,
+              configId: "model",
+              type: "id",
+              value: "sonnet",
+            }),
+          ).rejects.toMatchObject({ code: -32600 });
+          applySonnet = true;
+          const selected = await agent.request(v2.methods.agent.session.setConfigOption, {
+            sessionId,
+            configId: "model",
+            type: "id",
+            value: "sonnet",
+          });
+          expect(
+            selected.configOptions?.find((option) => option.configId === "model"),
+          ).toMatchObject({ currentValue: "claude-sonnet-5-5" });
+          nativeModel = fable;
+          await expect(
+            agent.request(v2.methods.agent.session.prompt, {
+              sessionId,
+              prompt: text("refuse before input"),
+            }),
+          ).rejects.toMatchObject({ code: -32600 });
+          expect(echoed).toEqual([]);
+          await agent.request(v2.methods.agent.session.close, { sessionId });
+          await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+          const reading = Promise.withResolvers<void>();
+          const releaseRead = Promise.withResolvers<void>();
+          const contextUsage = sdk.contextUsage;
+          sdk.contextUsage = async () => {
+            reading.resolve();
+            await releaseRead.promise;
+            return contextUsage();
+          };
+          const prompting = agent.request(v2.methods.agent.session.prompt, {
+            sessionId,
+            prompt: text("plain current use"),
+          });
+          await reading.promise;
+          let controlSettled = false;
+          const control = agent
+            .request(v2.methods.agent.session.setConfigOption, {
+              sessionId,
+              configId: "model",
+              type: "id",
+              value: "fable",
+            })
+            .then(
+              () => {
+                controlSettled = true;
+                return undefined;
+              },
+              (error: unknown) => {
+                controlSettled = true;
+                return error;
+              },
+            );
+          try {
+            await vi.waitFor(() => expect(controlSettled).toBe(true), { timeout: 100 });
+            expect(await control).toMatchObject({ code: -32600 });
+          } finally {
+            releaseRead.resolve();
+            await Promise.allSettled([prompting, control]);
+          }
+          await vi.waitFor(() =>
+            expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"),
+          );
+          const accepted = client.sessionUpdates.findIndex(
+            ({ update }) => update.sessionUpdate === "user_message",
+          );
+          expect(
+            client.sessionUpdates.slice(accepted - 2, accepted).map(({ update }) => update),
+          ).toMatchObject([
+            {
+              sessionUpdate: "config_option_update",
+              configOptions: expect.arrayContaining([
+                expect.objectContaining({ configId: "model", currentValue: fable }),
+              ]),
+            },
+            { sessionUpdate: "usage_update", size: 777777, used: 42 },
+          ]);
+          await client.authUpdate(1);
+        });
+      } else {
+        await v1
+          .client({ name: "native-observation-test" })
+          .onNotification(
+            "_auth/status_update",
+            (params) => params,
+            () => {},
+          )
+          .onNotification(v1.methods.client.session.update, ({ params }) => {
+            notifications.push(params);
+          })
+          .connectWith(connectRouter() as unknown as v1.Stream, async (agent) => {
+            await agent.request(v1.methods.agent.initialize, {
+              protocolVersion: v1.PROTOCOL_VERSION,
+            });
+            const { sessionId } = await agent.request(v1.methods.agent.session.new, {
+              cwd,
+              mcpServers: [],
+            });
+            await agent.request(v1.methods.agent.session.close, { sessionId });
+            vi.stubEnv("ANTHROPIC_MODEL", "sonnet");
+            const resumed = await agent.request(v1.methods.agent.session.resume, {
+              sessionId,
+              cwd,
+              mcpServers: [],
+            });
+            assertResume(resumed.configOptions);
+            expect(sdk.queryOptions.at(-1)?.resume).toBe(sessionId);
+            expect(sdk.queryOptions.at(-1)?.model).toBeUndefined();
+            expect(sdk.flagSettings).toEqual([]);
+            await agent.request(v1.methods.agent.session.setConfigOption, {
+              sessionId,
+              configId: "model",
+              value: "fable",
+            });
+            expect(writes).toEqual([]);
+            await expect(
+              agent.request(v1.methods.agent.session.setConfigOption, {
+                sessionId,
+                configId: "model",
+                value: "sonnet",
+              }),
+            ).rejects.toMatchObject({ code: -32600 });
+            applySonnet = true;
+            const selected = await agent.request(v1.methods.agent.session.setConfigOption, {
+              sessionId,
+              configId: "model",
+              value: "sonnet",
+            });
+            expect(selected.configOptions?.find((option) => option.id === "model")).toMatchObject({
+              currentValue: "claude-sonnet-5-5",
+            });
+            nativeModel = fable;
+            await expect(
+              agent.request(v1.methods.agent.session.prompt, {
+                sessionId,
+                prompt: text("refuse before input"),
+              }),
+            ).rejects.toMatchObject({ code: -32600 });
+            expect(echoed).toEqual([]);
+            await agent.request(v1.methods.agent.session.close, { sessionId });
+            await agent.request(v1.methods.agent.session.resume, {
+              sessionId,
+              cwd,
+              mcpServers: [],
+            });
+            await agent.request(v1.methods.agent.session.prompt, {
+              sessionId,
+              prompt: text("plain current use"),
+            });
+            expect(notifications.map(({ update }) => update)).toEqual(
+              expect.arrayContaining([
+                expect.objectContaining({ sessionUpdate: "usage_update", size: 777777, used: 42 }),
+              ]),
+            );
+          });
+      }
+      expect(writes).toEqual(["sonnet", fable, "sonnet"]);
+      expect(echoed).toHaveLength(1);
+      expect(nativeModel).toBe(fable);
+    },
+  );
+});

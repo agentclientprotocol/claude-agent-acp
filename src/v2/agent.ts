@@ -538,6 +538,7 @@ class V2Agent implements AgentHandle, SessionConnection {
       // A notice is not history, so it follows `replay_complete`.
       subagents?.reportMissingHistory();
     }
+    await session.refreshNativeConfiguration();
     // The current title, after the replay and before the state.
     await session.reports.publishTitle();
     for (const notification of session.resumeSnapshot()) this.send(notification);
@@ -953,7 +954,11 @@ class V2Agent implements AgentHandle, SessionConnection {
       mcpServers: opened.request.mcpServers.map((server) => server.name),
       mcpOAuth: this.elicitation.url && supportsMcpOAuth(q),
       query: q,
-      model: { id: models.models.currentModelId, info: models.allowlistedModelInfo },
+      model: {
+        id: models.models.currentModelId,
+        info: models.allowlistedModelInfo,
+        native: models.models.native,
+      },
     });
     session.start(q, config, opened.mcpServers, resume !== undefined);
     this.sessions.set(sessionId, session);

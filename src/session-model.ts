@@ -1,3 +1,4 @@
+import { stripContextHints, canonicalizeModelId, contextHintOf } from "./context-window.js";
 import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import { PROVIDER_ID } from "./providers.js";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk/unstable";
@@ -10,12 +11,15 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY, withAirMeta } from "./air-extension.js";
 import { bedrockRegionPrefix } from "./gateway-models.js";
+import { readNativeConfiguration, type NativeConfiguration } from "./session-observation.js";
 
 export const MODEL_CONFIG_ID = "model";
 
 export type SessionModelState = {
   availableModels: Array<{ modelId: string; name: string; description?: string }>;
   currentModelId: string;
+  native?: NativeConfiguration;
+  verifiedModel?: string;
 };
 
 type ModelLogger = {
@@ -24,24 +28,10 @@ type ModelLogger = {
 };
 type ModelSettingsSource = { getSettings(): Settings };
 
-const MODEL_CONTEXT_HINT_PATTERN = /\[(\d+m)\]$/i;
-const CONTEXT_HINT_SUFFIX_PATTERN = /-(\d+m)$/i;
 const MODEL_FAMILY_VERSION_PATTERN = /\b(\d+)(?:[-.](\d+))?\b/;
 const VERSIONABLE_MODEL_DISPLAY_PATTERN =
   /^(?:Claude\s+)?([a-z][a-z0-9-]*)(?:\s+\d+(?:\.\d+)?)?(?:\s+\(\d+[mk]\s+context\))?$/i;
 const DISPLAY_CONTEXT_SUFFIX_PATTERN = /\s+\((\d+[mk])\s+context\)$/i;
-
-function stripContextHints(value: string): string {
-  return value.replace(/\[\d+m\]/gi, "").replace(CONTEXT_HINT_SUFFIX_PATTERN, "");
-}
-
-function canonicalizeModelId(value: string): string {
-  return value.trim().toLowerCase().replace(CONTEXT_HINT_SUFFIX_PATTERN, "[$1]");
-}
-
-function contextHintOf(value: string): string | null {
-  return canonicalizeModelId(value).match(MODEL_CONTEXT_HINT_PATTERN)?.[1] ?? null;
-}
 
 function extractModelFamilyVersion(value: string): string | null {
   const match = stripContextHints(value).match(MODEL_FAMILY_VERSION_PATTERN);
@@ -706,6 +696,15 @@ export async function getAvailableModels(
   resumedModelHint?: string,
   narrowedByGateway = false,
 ): Promise<SessionModelState> {
+  // A native resume observes the existing Query; saved settings are not a new selection.
+  if (isResumedSession && !narrowedByGateway) {
+    const native = await readNativeConfiguration(query);
+    return {
+      availableModels: availableModelRows(models),
+      currentModelId: native.model,
+      native,
+    };
+  }
   // A gateway that lists none of the SDK's models leaves none to offer
   // (`narrowToGatewayModels`). The session stays on the model the SDK runs,
   // and the gateway refuses its requests.
@@ -838,29 +837,7 @@ export async function getAvailableModels(
     }
   }
 
-  const displayNames = models.map(versionedModelDisplayName);
-  const displayNameCounts = new Map<string, number>();
-  for (const name of displayNames) {
-    displayNameCounts.set(name, (displayNameCounts.get(name) ?? 0) + 1);
-  }
-  const names = models.map((model, index) =>
-    displayNameCounts.get(displayNames[index]) === 1 ? displayNames[index] : model.displayName,
-  );
-  const nameCounts = new Map<string, number>();
-  for (const name of names) {
-    nameCounts.set(name, (nameCounts.get(name) ?? 0) + 1);
-  }
-
-  return {
-    availableModels: models.map((model, index) => ({
-      modelId: model.value,
-      // Allowlisted aliases can inherit the same SDK label. Keep every ID
-      // selectable, but distinguish the rows for clients that show only names.
-      name: nameCounts.get(names[index]) === 1 ? names[index] : `${names[index]} (${model.value})`,
-      description: model.description,
-    })),
-    currentModelId: currentModel.value,
-  };
+  return { availableModels: availableModelRows(models), currentModelId: currentModel.value };
 }
 
 /** The display name of the model id `model` in `modelInfos`, if it is there. */
@@ -946,4 +923,27 @@ function findModelEntry(
     entries.find((entry) => entry.value === model || resolved(entry.value) === observed) ??
     entries.find((entry) => sameModel(entry.value))
   );
+}
+
+function availableModelRows(models: ModelInfo[]): SessionModelState["availableModels"] {
+  const displayNames = models.map(versionedModelDisplayName);
+  const displayNameCounts = new Map<string, number>();
+  for (const name of displayNames) {
+    displayNameCounts.set(name, (displayNameCounts.get(name) ?? 0) + 1);
+  }
+  const names = models.map((model, index) =>
+    displayNameCounts.get(displayNames[index]) === 1 ? displayNames[index] : model.displayName,
+  );
+  const nameCounts = new Map<string, number>();
+  for (const name of names) {
+    nameCounts.set(name, (nameCounts.get(name) ?? 0) + 1);
+  }
+
+  return models.map((model, index) => ({
+    modelId: model.value,
+    // Allowlisted aliases can inherit the same SDK label. Keep every ID
+    // selectable, but distinguish the rows for clients that show only names.
+    name: nameCounts.get(names[index]) === 1 ? names[index] : `${names[index]} (${model.value})`,
+    description: model.description,
+  }));
 }

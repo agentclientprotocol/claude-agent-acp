@@ -1,4 +1,10 @@
 import {
+  prepareNativePrompt,
+  readNativeConfiguration,
+  selectNativeEffort,
+  type NativeConfiguration,
+} from "../session-observation.js";
+import {
   agent as acpAgent,
   AgentApp,
   AuthenticateRequest,
@@ -410,6 +416,7 @@ import {
   clientSupportsRecommendedConfigValue,
   configOptionValue,
   setSelectedModel,
+  observedConfigOptions,
   discoverCustomAgents,
 } from "../session-config-options.js";
 import {
@@ -613,6 +620,7 @@ type TurnOrigin = "client" | "idleCompaction";
  *  queued user messages back in submission order, so `turnQueue[0]` is the turn
  *  currently running. */
 type Turn = {
+  nativeConfiguration?: NativeConfiguration;
   /** The `ClaudeAcpAgent.promptsReceived` count when `startTurn()` received
    *  this prompt. `cancelTurns` cancels only turns received before the cancel. */
   received: number;
@@ -2100,6 +2108,7 @@ export class ClaudeAcpAgent {
       initial,
     );
 
+    await this.publishCurrentNativeConfiguration(params.sessionId);
     this.afterSetupResponse(params.sessionId, params.mcpServers ?? []);
     return result;
   }
@@ -2120,6 +2129,7 @@ export class ClaudeAcpAgent {
     timing.phase("replay");
     result = await this.withInitialConfigOptions(result, initial);
 
+    await this.publishCurrentNativeConfiguration(params.sessionId);
     // After the replay, so the commands do not interleave with the history.
     this.afterSetupResponse(params.sessionId, params.mcpServers ?? []);
 
@@ -2577,6 +2587,7 @@ export class ClaudeAcpAgent {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
 
+    if (session.models.native) await this.configurationChanges.get(params.sessionId);
     // Each prompt is a Turn that the persistent consumer settles once the
     // turn's outcome is known. `startTurn()` owns no loop: it enqueues the
     // turn, pushes the user message onto the streaming input, and makes sure
@@ -2609,7 +2620,24 @@ export class ClaudeAcpAgent {
     session.turnQueue ??= [];
     session.turnQueue.push(turn);
     (session.sentUserUuids ??= new Set()).add(promptUuid);
-    session.input.push(userMessage);
+    if (session.models.native) {
+      try {
+        await this.serializeConfigurationChange(params.sessionId, async () => {
+          turn.nativeConfiguration = await prepareNativePrompt(
+            session.query,
+            session.models,
+            session.modelInfos,
+          );
+          if (turn.settled || session.queryClosed || session.tornDown)
+            throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+          session.input.push(userMessage);
+        });
+      } catch (error) {
+        session.turnQueue = session.turnQueue.filter((queued) => queued !== turn);
+        session.sentUserUuids?.delete(promptUuid);
+        throw error;
+      }
+    } else session.input.push(userMessage);
     this.ensureConsumer(session, params.sessionId);
     if (origin === "client") session.titles.onPromptQueued(session, params.prompt);
     // The prompt is queued, so its turn goes ahead even if the client misses
@@ -3530,7 +3558,7 @@ export class ClaudeAcpAgent {
      *  activates, so a non-zero remainder means the SDK dropped a queued turn on
      *  interrupt (no orphan emitted) — drop the stale count so a later echo-less
      *  result isn't wrongly skipped. */
-    const activateTurn = (turn: Turn) => {
+    const activateTurn = async (turn: Turn) => {
       session.activeTurn = turn;
       session.cancelled = false;
       session.cancelledPrompts = undefined;
@@ -3565,15 +3593,19 @@ export class ClaudeAcpAgent {
       // Without a command_lifecycle "started" frame before it (see that
       // handler), activation is the first sign that Claude Code took the
       // prompt in: its echo, or for an echo-less command, its result.
-      reportInserted(turn);
+      await reportInserted(turn);
     };
 
     /** Report that Claude Code took the turn's prompt in, once. A turn can be
      *  settled by now: an echo hand-off awaits settling the previous turn, and
      *  a cancel in that window settles the queued one. */
-    const reportInserted = (turn: Turn) => {
+    const reportInserted = async (turn: Turn) => {
       if (turn.insertedReported || turn.settled) return;
       turn.insertedReported = true;
+      if (turn.nativeConfiguration) {
+        const actual = await readNativeConfiguration(session.query);
+        await this.publishNativeConfiguration(params.sessionId, session, actual);
+      }
       turn.events.inserted(turn.promptUuid);
       this.startForeground(params.sessionId, turn);
     };
@@ -3712,7 +3744,7 @@ export class ClaudeAcpAgent {
         return;
       }
       if (asyncTasks.autonomousTurnOpen) await asyncTasks.autonomousTurnEnded("completed");
-      activateTurn(head);
+      await activateTurn(head);
     };
 
     /** Result-time bookkeeping that must run whether or not the result can be
@@ -4626,7 +4658,7 @@ export class ClaudeAcpAgent {
                 // cancelled and awaiting its trailing idle), insertion waits
                 // for this turn's echo, whose hand-off ends that turn first.
                 const active = session.activeTurn;
-                if (!active || active.settled || active === queued) reportInserted(queued);
+                if (!active || active.settled || active === queued) await reportInserted(queued);
               }
               // ...and promote an already-orphaned command: once dispatched,
               // a bare `cancelled` no longer means "dropped without running".
@@ -6624,7 +6656,7 @@ export class ClaudeAcpAgent {
                   if (asyncTasks.autonomousTurnOpen) {
                     await asyncTasks.autonomousTurnEnded("completed");
                   }
-                  activateTurn(queued);
+                  await activateTurn(queued);
                 }
                 break;
               }
@@ -7904,6 +7936,12 @@ export class ClaudeAcpAgent {
     if (session.queryClosed) {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
+    if (session.models.native && this.claudeIsWorking(params.sessionId, session)) {
+      throw RequestError.invalidRequest(
+        undefined,
+        "Claude is working. Try again when the turn ends.",
+      );
+    }
 
     const option = session.configOptions.find((o) => o.id === params.configId);
     if (!option) {
@@ -7934,7 +7972,50 @@ export class ClaudeAcpAgent {
       );
       if (!duringSetup) await this.sessionModes.publishCurrent(params.sessionId, effectiveValue);
     } else if (params.configId === MODEL_CONFIG_ID) {
-      await setSelectedModel(this.sessions[params.sessionId].query, selected);
+      if (session.models.native) {
+        await setSelectedModel(session.query, selected, {
+          query: session.query,
+          models: session.modelInfos,
+          ultracode: session.ultracodeEnabled,
+          publish: (actual) => this.publishNativeConfiguration(params.sessionId, session, actual),
+          invalidate: async () => {
+            await this.client.sessionUpdate({
+              sessionId: params.sessionId,
+              update: {
+                sessionUpdate: "config_option_update",
+                configOptions: session.configOptions,
+              },
+            });
+          },
+        });
+        const info = withCurrentModelInfo(
+          session.modelInfos,
+          session.modelInfos,
+          session.models.currentModelId,
+        ).currentModelInfo;
+        if (await this.sessionModes.reconcileForModel(session, info))
+          await this.sessionModes.publishFallbackWarning(params.sessionId, session);
+        session.models.verifiedModel = selected.value;
+        return { configOptions: session.configOptions };
+      }
+      await setSelectedModel(session.query, selected);
+    }
+    if (params.configId === EFFORT_CONFIG_ID && session.models.native) {
+      await selectNativeEffort(
+        session.query,
+        resolvedValue,
+        (actual) => this.publishNativeConfiguration(params.sessionId, session, actual),
+        async () => {
+          await this.client.sessionUpdate({
+            sessionId: params.sessionId,
+            update: { sessionUpdate: "config_option_update", configOptions: session.configOptions },
+          });
+        },
+        session.ultracodeEnabled,
+      );
+      session.effortPinnedLevel = resolvedValue === "default" ? undefined : resolvedValue;
+      session.appliedEffortLevel = session.effortPinnedLevel;
+      return { configOptions: session.configOptions };
     }
     // Effort SDK sync is handled inside applyConfigOptionValue so that direct
     // effort changes and effort changes induced by a model switch go through
@@ -9523,6 +9604,44 @@ export class ClaudeAcpAgent {
       );
   }
 
+  private async publishNativeConfiguration(
+    sessionId: string,
+    session: Session,
+    actual: NativeConfiguration,
+  ): Promise<void> {
+    session.configOptions = observedConfigOptions(
+      session.configOptions,
+      session.models,
+      session.modelInfos,
+      actual,
+      clientSupportsRecommendedConfigValue(this.clientCapabilities),
+    );
+    session.contextWindowSize = actual.size;
+    session.contextWindowAuthoritative = true;
+    session.contextUsedTokens = actual.used;
+    await this.client.sessionUpdate({
+      sessionId,
+      update: { sessionUpdate: "config_option_update", configOptions: session.configOptions },
+    });
+    await this.client.sessionUpdate({
+      sessionId,
+      update: { sessionUpdate: "usage_update", size: actual.size, used: actual.used },
+    });
+  }
+
+  private async publishCurrentNativeConfiguration(sessionId: string): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session?.models.native) return;
+    await this.serializeConfigurationChange(sessionId, async () => {
+      if (this.claudeIsWorking(sessionId, session))
+        throw RequestError.invalidRequest(
+          undefined,
+          "Claude is working. Try again when the turn ends.",
+        );
+      await this.publishNativeConfiguration(sessionId, session, session.models.native!);
+    });
+  }
+
   private async applyConfigOptionValue(
     sessionId: string,
     session: Session,
@@ -10547,11 +10666,14 @@ export class ClaudeAcpAgent {
         useBooleanOption: clientSupportsBooleanConfigOptions(this.clientCapabilities),
       };
 
-      const configOptions = buildConfigOptions(
+      let configOptions = buildConfigOptions(
         modes,
         models,
         modelInfos,
-        userProvidedOptions?.effort ?? settingsEffortForModel(effortSettings, currentModelInfo),
+        userProvidedOptions?.effort ??
+          (models.native
+            ? models.native.effort
+            : settingsEffortForModel(effortSettings, currentModelInfo)),
         agents,
         currentAgent,
         fastMode,
@@ -10560,12 +10682,24 @@ export class ClaudeAcpAgent {
         },
         ultracode,
       );
+      if (models.native)
+        configOptions = observedConfigOptions(
+          configOptions,
+          models,
+          modelInfos,
+          models.native,
+          useRecommendedValue,
+        );
       if (creationOpts.optionsOnly) {
         this.discardUnregisteredQuery(q, input, settingsManager);
         return { sessionId, modes, configOptions };
       }
       const initialEffort = configOptions.find((option) => option.id === EFFORT_CONFIG_ID);
-      if (useRecommendedValue && typeof initialEffort?.currentValue === "string") {
+      if (
+        !models.native &&
+        useRecommendedValue &&
+        typeof initialEffort?.currentValue === "string"
+      ) {
         await q.applyFlagSettings(effortFlagSettings(initialEffort.currentValue, ultracodeEnabled));
       }
       // Seed the context window without awaited IPC. The cached authoritative
@@ -10580,11 +10714,9 @@ export class ClaudeAcpAgent {
       // fallback-resolved sibling's resolvedModel can name a different context
       // lane than the verbatim live id (e.g. an "opus[1m]" row matched for a
       // bare 200k id), so on the fallback path the lookup uses the id itself.
-      const seededWindow = immediateContextWindow(
-        providerCacheKey,
-        models.currentModelId,
-        allowlistedModelInfo,
-      );
+      const seededWindow = models.native
+        ? { size: models.native.size, authoritative: true }
+        : immediateContextWindow(providerCacheKey, models.currentModelId, allowlistedModelInfo);
 
       if (creationOpts.replacingSession?.tornDown) {
         throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);

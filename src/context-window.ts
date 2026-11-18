@@ -154,6 +154,45 @@ export function clearContextWindowCache(): void {
 export async function readContextWindow(
   query: Pick<Query, "getContextUsage">,
 ): Promise<number | undefined> {
-  const usage = await query.getContextUsage({ detail: "summary" });
+  const usage = await readContextUsage(query);
   return usage.rawMaxTokens > 0 ? usage.rawMaxTokens : undefined;
+}
+
+/** A fresh read of this Query, independent of transcript and cross-session caches. */
+export type NativeContext = { model: string; size: number; used: number };
+
+export async function readNativeContext(
+  query: Pick<Query, "getContextUsage">,
+): Promise<NativeContext> {
+  const usage = await readContextUsage(query);
+  if (
+    typeof usage.model !== "string" ||
+    usage.model.trim() === "" ||
+    !Number.isFinite(usage.rawMaxTokens) ||
+    usage.rawMaxTokens <= 0 ||
+    !Number.isFinite(usage.totalTokens) ||
+    usage.totalTokens < 0
+  ) {
+    throw new Error("Claude Code did not report its current model and context usage");
+  }
+  return { model: usage.model, size: usage.rawMaxTokens, used: usage.totalTokens };
+}
+
+function readContextUsage(query: Pick<Query, "getContextUsage">) {
+  return query.getContextUsage({ detail: "summary" });
+}
+
+const MODEL_CONTEXT_HINT_PATTERN = /\[(\d+m)\]$/i;
+const CONTEXT_HINT_SUFFIX_PATTERN = /-(\d+m)$/i;
+
+export function stripContextHints(value: string): string {
+  return value.replace(/\[\d+m\]/gi, "").replace(CONTEXT_HINT_SUFFIX_PATTERN, "");
+}
+
+export function canonicalizeModelId(value: string): string {
+  return value.trim().toLowerCase().replace(CONTEXT_HINT_SUFFIX_PATTERN, "[$1]");
+}
+
+export function contextHintOf(value: string): string | null {
+  return canonicalizeModelId(value).match(MODEL_CONTEXT_HINT_PATTERN)?.[1] ?? null;
 }

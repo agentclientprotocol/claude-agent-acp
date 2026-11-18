@@ -15,6 +15,11 @@ import {
   AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
   clientSupportsAirCapability,
 } from "./air-extension.js";
+import {
+  selectNativeModel,
+  type NativeConfiguration,
+  type NativeQuery,
+} from "./session-observation.js";
 import { AGENT_CONFIG_ID, DEFAULT_AGENT_ID } from "./session-config-ids.js";
 import { buildEffortConfigOption } from "./session-effort.js";
 import {
@@ -298,8 +303,24 @@ function refusesModelId(error: unknown): error is Error {
 export async function setSelectedModel(
   query: Pick<Query, "setModel">,
   selected: { value: string; unlisted?: true },
-): Promise<void> {
+  native?: {
+    query: NativeQuery;
+    models: readonly ModelInfo[];
+    publish(actual: NativeConfiguration): Promise<void>;
+    invalidate(): Promise<void>;
+    ultracode?: boolean;
+  },
+): Promise<NativeConfiguration | undefined> {
   try {
+    if (native)
+      return await selectNativeModel(
+        native.query,
+        selected.value,
+        native.models,
+        native.publish,
+        native.invalidate,
+        native.ultracode,
+      );
     await query.setModel(selected.value);
   } catch (error) {
     if (!selected.unlisted || !refusesModelId(error)) throw error;
@@ -308,4 +329,56 @@ export async function setSelectedModel(
       `Invalid value for config option ${MODEL_CONFIG_ID}: ${selected.value}. ${error.message}`,
     );
   }
+}
+
+/** Standard selectors describing a fresh native read, rather than a requested alias. */
+export function observedConfigOptions(
+  options: SessionConfigOption[],
+  models: SessionModelState,
+  modelInfos: ModelInfo[],
+  actual: NativeConfiguration,
+  useRecommendedValue: boolean,
+): SessionConfigOption[] {
+  models.currentModelId = actual.model;
+  models.native = actual;
+  const result = options.filter(
+    (option) => option.id !== MODEL_CONFIG_ID && option.id !== "effort",
+  );
+  const model = buildModelConfigOption(models, modelInfos, useRecommendedValue);
+  result.splice(
+    Math.max(
+      0,
+      options.findIndex((option) => option.id === MODEL_CONFIG_ID),
+    ),
+    0,
+    model,
+  );
+  if (actual.effort !== undefined) {
+    const info = modelInfos.find(
+      (row) => row.value === actual.model || row.resolvedModel === actual.model,
+    );
+    const effort = info
+      ? buildEffortConfigOption(
+          [{ ...info, value: actual.model }],
+          actual.model,
+          actual.effort,
+          useRecommendedValue,
+        )
+      : undefined;
+    const choices =
+      effort?.type === "select"
+        ? effort.options.flatMap((row) => ("value" in row ? [row] : row.options))
+        : [];
+    result.push({
+      id: "effort",
+      category: "thought_level",
+      type: "select",
+      name: "Effort",
+      currentValue: actual.effort,
+      options: choices.some((row) => "value" in row && row.value === actual.effort)
+        ? choices
+        : [...choices, { value: actual.effort, name: actual.effort }],
+    });
+  }
+  return result;
 }

@@ -17,7 +17,11 @@ import path from "node:path";
  *  Claude Code reports for `claude-sonnet-4-5`. It differs from the agent's
  *  DEFAULT_CONTEXT_WINDOW, so a test can tell a window that was read from the
  *  default. */
-export const DEFAULT_CONTEXT_USAGE = { totalTokens: 0, rawMaxTokens: 200000 };
+export const DEFAULT_CONTEXT_USAGE = {
+  model: "claude-sonnet-4-5",
+  totalTokens: 0,
+  rawMaxTokens: 200000,
+};
 
 /**
  * Base stub for the SDK `query()` return object, covering the surface

@@ -1,3 +1,4 @@
+import type { NativeConfiguration } from "../session-observation.js";
 /**
  * One ACP v2 session, served straight from its Claude Code query.
  *
@@ -113,6 +114,7 @@ export interface SessionConnection {
 }
 
 type PendingPrompt = {
+  nativeConfiguration?: NativeConfiguration;
   prompt: v2.ContentBlock[];
   /** Whether the prompt went to Claude Code (see {@link V2Session.prompt}). */
   pushed: boolean;
@@ -251,7 +253,7 @@ export class V2Session implements RequestTarget {
       logger: connection.logger,
       airClient: connection.air.client,
       emit: (notifications) => this.output.emitV1(notifications),
-      isBusy: () => this.foreground || this.pending.size > 0 || this.requests.size > 0,
+      isBusy: () => this.isBusy(),
       compact: () => this.compact(),
       titledSession: () => (this.query && !this.closed ? titled : undefined),
     });
@@ -472,12 +474,23 @@ export class V2Session implements RequestTarget {
             if (answered()) return;
             this.fileChanges?.requested(uuid, params._meta);
           }
+          try {
+            pending.nativeConfiguration = await this.config.preparePrompt();
+          } catch (error) {
+            this.failPrompt(uuid, error);
+            return;
+          }
+          if (answered()) return;
           pending.pushed = true;
           this.remoteControl.pushed(uuid);
           this.input.push(message);
           this.reports.promptQueued(request.prompt);
         });
     });
+  }
+
+  private isBusy(): boolean {
+    return this.foreground || this.pending.size > 0 || this.requests.size > 0;
   }
 
   /**
@@ -652,9 +665,19 @@ export class V2Session implements RequestTarget {
     this.modelChangedReports();
   }
 
+  async refreshNativeConfiguration(): Promise<void> {
+    if (this.config.observesNative() && this.isBusy()) return;
+    await this.config.refreshNative();
+  }
+
   async setConfigOption(
     params: v2.SetSessionConfigOptionRequest,
   ): Promise<v2.SessionConfigOption[]> {
+    if (this.config.observesNative() && this.isBusy())
+      throw RequestError.invalidRequest(
+        undefined,
+        "Claude is working. Try again when the turn ends.",
+      );
     await this.config.set(params);
     if (params.configId === MODEL_CONFIG_ID) this.modelChangedReports();
     const options = this.config.options();
@@ -845,8 +868,8 @@ export class V2Session implements RequestTarget {
 
   /** The reports follow the model: its context window, and the idle compaction. */
   private modelChangedReports(): void {
-    const { id, info } = this.config.currentModel();
-    this.reports.modelChanged(id, info);
+    const { id, info, native } = this.config.currentModel();
+    this.reports.modelChanged(id, info, native);
   }
 
   /** Claude Code reported a Fast mode state, on a `system`/init or on a result (`from`). */
@@ -936,14 +959,13 @@ export class V2Session implements RequestTarget {
   }
 
   /**
-   * Handles one message. Only a `/mcp` turn's result, a result whose turn
+   * Handles one message. Native acceptance, a `/mcp` turn's result, a result whose turn
    * reads file-change reports, and a subagent's restore from the history are
    * awaited (see {@link result}, {@link endTurn} and `SessionTasks.restored`).
    */
   private handle(message: SDKMessage): void | Promise<void> {
     if ((message as { type: string }).type === "command_lifecycle") {
-      this.lifecycle(message as unknown as CommandLifecycleFrame);
-      return;
+      return this.lifecycle(message as unknown as CommandLifecycleFrame);
     }
     // Before the tasks take a subagent's messages: its file edits are the turn's.
     this.fileChanges?.message(message);
@@ -990,7 +1012,7 @@ export class V2Session implements RequestTarget {
             // A message typed in another client of the session.
             const remote = this.remoteControl.remoteMessage(message);
             if (remote !== undefined) this.output.userMessage(remote, message.uuid);
-            this.promptStarted(message.uuid);
+            return this.promptStarted(message.uuid);
           }
           return;
         }
@@ -1086,12 +1108,12 @@ export class V2Session implements RequestTarget {
     this.reports.handle(message);
   }
 
-  private lifecycle(frame: CommandLifecycleFrame): void {
+  private async lifecycle(frame: CommandLifecycleFrame): Promise<void> {
     this.lifecycleFrames = true;
     const uuid = frame.command_uuid;
     switch (frame.state) {
       case "started":
-        this.promptStarted(uuid);
+        await this.promptStarted(uuid);
         return;
       case "cancelled":
         if (this.failPrompt(uuid, RequestError.requestCancelled())) return;
@@ -1130,12 +1152,15 @@ export class V2Session implements RequestTarget {
    * either order. A prompt that a cancel abandoned starts
    * nothing (see {@link StoppedWork}).
    */
-  private promptStarted(uuid: string): void {
+  private async promptStarted(uuid: string): Promise<void> {
     if (this.stopped.promptStarted(uuid, this.foreground)) return;
     // Claude Code takes its prompts in order: the work that a cancel stopped
     // has ended, also when the cancel came while it ran nothing.
     this.tasks.foregroundCancelEnded();
     if (this.clearContext.promptStarted(uuid)) this.fileChanges?.contextCleared(uuid);
+    const pending = this.pending.get(uuid);
+    if (pending?.nativeConfiguration)
+      pending.nativeConfiguration = await this.config.preparePrompt();
     this.inserted(uuid);
     this.openTurn(uuid);
   }
@@ -1144,6 +1169,7 @@ export class V2Session implements RequestTarget {
     const prompt = this.pending.get(uuid);
     if (!prompt) return;
     this.pending.delete(uuid);
+    if (prompt.nativeConfiguration) this.config.publishNative(prompt.nativeConfiguration);
     this.fileChanges?.promptStarted(uuid);
     this.send({ sessionUpdate: "user_message", messageId: uuid, content: prompt.prompt });
     prompt.resolve({ messageId: uuid });

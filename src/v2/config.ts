@@ -1,3 +1,8 @@
+import {
+  prepareNativePrompt,
+  selectNativeEffort,
+  type NativeConfiguration,
+} from "../session-observation.js";
 /**
  * The config options of a v2 session: its permission mode, model,
  * effort, Fast mode, ultracode and main-thread agent. Claude Code owns them
@@ -52,6 +57,7 @@ import {
   buildConfigOptions,
   configOptionValue,
   setSelectedModel,
+  observedConfigOptions,
   discoverCustomAgents,
 } from "../session-config-options.js";
 import {
@@ -96,7 +102,12 @@ import { v1SetSessionConfigOptionRequest, v2ConfigOptions } from "./session-requ
 
 type ConfigQuery = Pick<
   Query,
-  "setPermissionMode" | "setModel" | "applyFlagSettings" | "supportedAgents"
+  | "setPermissionMode"
+  | "setModel"
+  | "applyFlagSettings"
+  | "supportedAgents"
+  | "getContextUsage"
+  | "close"
 >;
 
 /** Every v2 client takes boolean config options. */
@@ -250,11 +261,12 @@ export class SessionConfig {
     const ultracodeEnabled = ultracodeReport?.requested ?? settings.ultracode === true;
     const workflowsEnabled = ultracodeWorkflowsEnabled(ultracodeReport, currentModelInfo);
     const clientEffort = setup.client?.effort;
-    const configOptions = buildConfigOptions(
+    let configOptions = buildConfigOptions(
       modes,
       models,
       modelInfos,
-      clientEffort ?? settingsEffortForModel(settings, currentModelInfo),
+      clientEffort ??
+        (models.native ? models.native.effort : settingsEffortForModel(settings, currentModelInfo)),
       agents,
       currentAgent,
       {
@@ -271,6 +283,14 @@ export class SessionConfig {
         useBooleanOption: BOOLEAN_OPTIONS,
       },
     );
+    if (models.native)
+      configOptions = observedConfigOptions(
+        configOptions,
+        models,
+        modelInfos,
+        models.native,
+        setup.recommendedValue,
+      );
     const shownEffort = configOptions.find(
       (option) => option.id === EFFORT_CONFIG_ID,
     )?.currentValue;
@@ -282,7 +302,7 @@ export class SessionConfig {
     // v1. A failure fails the session's start, as on v1.
     const applied =
       setup.recommendedValue && typeof shownEffort === "string" ? shownEffort : pinned;
-    if (setup.recommendedValue && typeof shownEffort === "string") {
+    if (!models.native && setup.recommendedValue && typeof shownEffort === "string") {
       await query.applyFlagSettings(effortFlagSettings(shownEffort, ultracodeEnabled));
     }
     return new SessionConfig(
@@ -310,6 +330,40 @@ export class SessionConfig {
     );
   }
 
+  publishNative(actual: NativeConfiguration): void {
+    this.session.configOptions = observedConfigOptions(
+      this.session.configOptions,
+      this.session.models,
+      this.modelInfos,
+      actual,
+      this.recommendedValue,
+    );
+    this.notify({
+      sessionId: this.sessionId,
+      update: { sessionUpdate: "config_option_update", configOptions: this.session.configOptions },
+    });
+    this.notify({
+      sessionId: this.sessionId,
+      update: { sessionUpdate: "usage_update", size: actual.size, used: actual.used },
+    });
+  }
+
+  refreshNative(): Promise<void> {
+    return this.serialized(async () => {
+      if (this.session.models.native) this.publishNative(this.session.models.native);
+    });
+  }
+
+  preparePrompt(): Promise<NativeConfiguration | undefined> {
+    return this.serialized(() =>
+      prepareNativePrompt(this.session.query, this.session.models, this.modelInfos),
+    );
+  }
+
+  observesNative(): boolean {
+    return this.session.models.native !== undefined;
+  }
+
   /** The options, in v2 form. */
   options(): v2.SessionConfigOption[] {
     return v2ConfigOptions(this.session.configOptions);
@@ -324,9 +378,13 @@ export class SessionConfig {
   }
 
   /** The current model, and what Claude Code reports of it. */
-  currentModel(): { id: string; info: ModelInfo | undefined } {
+  currentModel(): { id: string; info: ModelInfo | undefined; native?: NativeConfiguration } {
     const id = this.session.models.currentModelId;
-    return { id, info: this.modelInfos.find((model) => model.value === id) };
+    return {
+      id,
+      info: this.modelInfos.find((model) => model.value === id),
+      native: this.session.models.native,
+    };
   }
 
   availableModeIds(): string[] {
@@ -474,10 +532,52 @@ export class SessionConfig {
         await this.applyMode(value as PermissionMode, duringSetup);
         return;
       case MODEL_CONFIG_ID:
+        if (this.session.models.native) {
+          await setSelectedModel(this.session.query, selected, {
+            query: this.session.query,
+            models: this.modelInfos,
+            ultracode: this.ultracodeEnabled,
+            publish: async (actual) => this.publishNative(actual),
+            invalidate: async () =>
+              this.notify({
+                sessionId: this.sessionId,
+                update: {
+                  sessionUpdate: "config_option_update",
+                  configOptions: this.session.configOptions,
+                },
+              }),
+          });
+          const info = this.modelInfos.find((row) => row.value === selected.value);
+          if (await this.rules.reconcileForModel(this.session, info))
+            await this.warnOfFallback(duringSetup);
+          this.session.models.verifiedModel = selected.value;
+          return;
+        }
         await setSelectedModel(this.session.query, selected);
         await this.recordModel(value, duringSetup);
         return;
       case EFFORT_CONFIG_ID:
+        if (this.session.models.native) {
+          await selectNativeEffort(
+            this.session.query,
+            value,
+            async (actual) => this.publishNative(actual),
+            async () =>
+              this.notify({
+                sessionId: this.sessionId,
+                update: {
+                  sessionUpdate: "config_option_update",
+                  configOptions: this.session.configOptions,
+                },
+              }),
+            this.ultracodeEnabled,
+          );
+          this.effort =
+            value === "default"
+              ? { pinned: undefined, applied: undefined }
+              : { pinned: value, applied: value };
+          return;
+        }
         // Applied first, so a rejected control request leaves the option as it was.
         await this.session.query.applyFlagSettings(
           effortFlagSettings(value, this.ultracodeEnabled),

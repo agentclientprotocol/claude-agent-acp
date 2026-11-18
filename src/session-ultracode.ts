@@ -3,7 +3,7 @@ import type {
   SessionConfigOption,
   SetSessionConfigOptionRequest,
 } from "@agentclientprotocol/sdk/unstable";
-import type { ModelInfo, Query } from "@anthropic-ai/claude-agent-sdk";
+import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import { ULTRACODE_CONFIG_ID } from "./session-config-ids.js";
 
 export { ULTRACODE_CONFIG_ID } from "./session-config-ids.js";
@@ -19,6 +19,8 @@ const ULTRACODE_DESCRIPTION = "Dynamic workflows on every task, at any effort le
 export type UltracodeSettingsReport = {
   /** Workflows are enabled and the current model supports ultracode. */
   available?: boolean;
+  /** Native effective effort; absent when the CLI cannot attest it. */
+  effort?: string;
   /** Ultracode is turned on for the session, whether or not it can take
    *  effect on the current model. */
   requested?: boolean;
@@ -26,9 +28,10 @@ export type UltracodeSettingsReport = {
 
 // `Query.getSettings()` exists at runtime (sdk.mjs) but is missing from the
 // SDK's type declarations as of 0.3.319.
-type GetSettingsQuery = Query & {
+type GetSettingsQuery = {
   getSettings?: () => Promise<{
     applied?: { ultracodeAvailable?: unknown; ultracodeRequested?: unknown };
+    effective?: { effortLevel?: unknown };
   }>;
 };
 
@@ -36,13 +39,22 @@ type GetSettingsQuery = Query & {
  *  Returns undefined when the SDK has no `getSettings` or the request fails;
  *  callers then fall back to {@link modelSupportsUltracode}. */
 export async function readUltracodeSettings(
-  query: Query,
+  query: object,
 ): Promise<UltracodeSettingsReport | undefined> {
   const getSettings = (query as GetSettingsQuery).getSettings;
   if (typeof getSettings !== "function") return undefined;
   try {
-    const applied = (await getSettings.call(query))?.applied;
+    const settings = await getSettings.call(query);
+    const applied = settings?.applied;
+    const effort = settings?.effective?.effortLevel;
     return {
+      effort: settings?.effective
+        ? typeof effort === "string"
+          ? effort
+          : effort == null
+            ? "default"
+            : undefined
+        : undefined,
       available:
         typeof applied?.ultracodeAvailable === "boolean" ? applied.ultracodeAvailable : undefined,
       requested:
