@@ -182,7 +182,12 @@ export class SubagentReplay {
       }
       for (const child of children) {
         if (transcripts.has(child.id) || child.id === host.sessionId) continue;
-        const records = await readSubagentMessages(host.sessionId, child.id, history, host.logger);
+        const records = await readSubagentMessages(
+          host.sessionId,
+          child.id,
+          child.file && !history.dir ? { ...history, dir: host.cwd } : history,
+          host.logger,
+        );
         const transcript = child.file
           ? records.flatMap((record) => workflowWorkerMessage(record) ?? [])
           : records.map((message) => ({ ...message, parent_tool_use_id: null }));

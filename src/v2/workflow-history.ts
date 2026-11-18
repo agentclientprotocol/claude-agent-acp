@@ -114,9 +114,15 @@ export async function readWorkflowLaunches(
       )
         return;
       const callId = typeof r.uuid === "string" ? results.get(r.uuid) : undefined;
+      const blocks = (r.message as { content?: unknown } | null)?.content;
+      if (
+        !callId ||
+        !Array.isArray(blocks) ||
+        !blocks.some((b) => b?.type === "tool_result" && b.tool_use_id === callId)
+      )
+        return;
       const t = r.toolUseResult as Record<string, unknown> | null;
       if (
-        callId &&
         t?.taskType === "local_workflow" &&
         safeId(t.runId) &&
         t.runId.startsWith("wf_") &&
