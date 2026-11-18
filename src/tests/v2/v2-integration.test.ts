@@ -131,6 +131,29 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("v2 core with Claude Code", 
     expect(states(sessionId).at(-1)).toMatchObject({ stopReason: "end_turn" });
   }, 180_000);
 
+  it("inserts one message for an idempotencyKey, and knows the key after a close and a resume", async () => {
+    const sessionId = await newSession("default");
+    const keyed = {
+      sessionId,
+      idempotencyKey: "0b6f3c1e-8d2a-4c57-9a41-5e2f7d90c3ab",
+      prompt: [{ type: "text" as const, text: "Reply with exactly the single word: pong" }],
+    };
+    const userMessages = () =>
+      updates.filter(
+        ({ sessionId: id, update }) => id === sessionId && update.sessionUpdate === "user_message",
+      );
+    const { messageId } = await agent.request(v2.methods.agent.session.prompt, keyed);
+    await until(() => states(sessionId).some((update) => update.state === "idle"));
+    expect(await agent.request(v2.methods.agent.session.prompt, keyed)).toEqual({ messageId });
+
+    // Claude Code stored the message under the uuid that carries the key.
+    await agent.request(v2.methods.agent.session.close, { sessionId });
+    await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+    expect(await agent.request(v2.methods.agent.session.prompt, keyed)).toEqual({ messageId });
+    expect(userMessages()).toHaveLength(1);
+    expect(states(sessionId).filter((update) => update.state === "running")).toHaveLength(1);
+  }, 180_000);
+
   // No prompt: it costs no API usage.
   it("lists the tools of an MCP server that the client serves over ACP", async () => {
     const served: string[] = [];

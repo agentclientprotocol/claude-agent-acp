@@ -673,6 +673,25 @@ describe("ACP v2 core", () => {
       });
     });
 
+    it("keeps the idempotencyKeys of a session across the restart of its query", async () => {
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const keyed = { sessionId: response.sessionId, idempotencyKey: "key-1", prompt: PROMPT };
+        const first = agent.request(v2.methods.agent.session.prompt, keyed);
+        claude.send(lifecycle(await claude.prompt(0), "started"));
+        const { messageId } = await first;
+        claude.send(result());
+        await vi.waitFor(() => expect(client.states().at(-1)).toBe("idle"));
+
+        await setProvider(agent);
+        expect(sdk.processes).toHaveLength(2);
+        // The stored history that the test's SDK returns is empty: the record answers.
+        expect(await agent.request(v2.methods.agent.session.prompt, keyed)).toEqual({ messageId });
+        expect(sdk.processes[1].prompts).toHaveLength(0);
+      });
+    });
+
     it("sends a prompt of an idle session right after the response to the new query", async () => {
       const client = v2Client();
       await client.connect(async (agent) => {
@@ -1101,6 +1120,139 @@ describe("ACP v2 core", () => {
       sessionUpdate: "user_message",
       messageId: expect.any(String),
       content: PROMPT,
+    });
+  });
+
+  describe("a prompt with an idempotencyKey", () => {
+    const userMessages = (client: ReturnType<typeof v2Client>) =>
+      client.sessionUpdates.filter((update) => update.sessionUpdate === "user_message");
+
+    it("answers a retry of an inserted prompt with its messageId, and inserts nothing more", async () => {
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const keyed = { sessionId: response.sessionId, idempotencyKey: "key-1" };
+        const first = agent.request(v2.methods.agent.session.prompt, { ...keyed, prompt: PROMPT });
+        const prompt = await claude.prompt(0);
+        claude.send(lifecycle(prompt, "started"));
+        const { messageId } = await first;
+        expect(messageId).toBe(prompt.uuid);
+        // The id is a hash of the key: no update shows the key.
+        expect(messageId).not.toContain("key-1");
+
+        // The prompts of a key are not compared: another one is a retry too.
+        for (const text of ["Hi", "Hello again"]) {
+          expect(
+            await agent.request(v2.methods.agent.session.prompt, {
+              ...keyed,
+              prompt: [{ type: "text", text }],
+            }),
+          ).toEqual({ messageId });
+        }
+        expect(claude.prompts).toHaveLength(1);
+
+        // The same key in another session names another prompt.
+        const other = await agent.request(v2.methods.agent.session.new, { cwd });
+        const second = agent.request(v2.methods.agent.session.prompt, {
+          sessionId: other.sessionId,
+          idempotencyKey: "key-1",
+          prompt: PROMPT,
+        });
+        const otherPrompt = await sdk.processes[1].prompt(0);
+        sdk.processes[1].send(lifecycle(otherPrompt, "started"));
+        expect((await second).messageId).not.toBe(messageId);
+      });
+
+      expect(userMessages(client)).toHaveLength(2);
+    });
+
+    it("answers a retry of a prompt that is not inserted yet with that prompt's outcome", async () => {
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const keyed = { sessionId: response.sessionId, idempotencyKey: "key-1", prompt: PROMPT };
+        const first = agent.request(v2.methods.agent.session.prompt, keyed);
+        const prompt = await claude.prompt(0);
+        const retry = agent.request(v2.methods.agent.session.prompt, keyed);
+        // The retry reaches the agent while the first prompt waits.
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(claude.prompts).toHaveLength(1);
+
+        claude.send(lifecycle(prompt, "started"));
+        expect(await first).toEqual({ messageId: prompt.uuid });
+        expect(await retry).toEqual({ messageId: prompt.uuid });
+      });
+
+      expect(userMessages(client)).toHaveLength(1);
+    });
+
+    it("leaves the key unused when its prompt fails, and sends the next attempt under another uuid", async () => {
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const sessionId = response.sessionId;
+        const keyed = { sessionId, idempotencyKey: "key-1", prompt: PROMPT };
+        const failed = (request: Promise<unknown>) => request.catch((error: unknown) => error);
+        const first = failed(agent.request(v2.methods.agent.session.prompt, keyed));
+        const cancelled = await claude.prompt(0);
+        const retry = failed(agent.request(v2.methods.agent.session.prompt, keyed));
+
+        await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+        expect(await first).toMatchObject({ code: -32800 });
+        expect(await retry).toMatchObject({ code: -32800 });
+        await vi.waitFor(() => expect(claude.interrupt).toHaveBeenCalled());
+        claude.send(lifecycle(cancelled, "cancelled"));
+
+        const again = agent.request(v2.methods.agent.session.prompt, keyed);
+        const prompt = await claude.prompt(1);
+        // Claude Code ignores a uuid it has seen, and the cancelled prompt may have reached it.
+        expect(prompt.uuid).not.toBe(cancelled.uuid);
+        claude.send(lifecycle(prompt, "started"));
+        expect(await again).toEqual({ messageId: prompt.uuid });
+      });
+
+      expect(userMessages(client)).toHaveLength(1);
+    });
+
+    it.each([
+      ["answers a retry with the messageId of a message that the stored history holds", true],
+      ["inserts a prompt whose key the stored history does not hold", false],
+    ])("after a close and a resume, %s", async (_, stored) => {
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const { sessionId } = response;
+        const keyed = { sessionId, idempotencyKey: "key-1", prompt: PROMPT };
+        const first = agent.request(v2.methods.agent.session.prompt, keyed);
+        claude.send(lifecycle(await claude.prompt(0), "started"));
+        const { messageId } = await first;
+        claude.send(result());
+        await vi.waitFor(() => expect(client.states().at(-1)).toBe("idle"));
+
+        // The close drops the session's record: only a stored message keeps its key.
+        await agent.request(v2.methods.agent.session.close, { sessionId });
+        await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+        const resumed = sdk.processes[1];
+        if (stored) {
+          vi.mocked(getSessionMessages).mockResolvedValueOnce([
+            {
+              type: "user",
+              uuid: messageId,
+              session_id: sessionId,
+              parent_tool_use_id: null,
+              parent_agent_id: null,
+              message: { role: "user", content: "Hi" },
+            },
+          ]);
+        }
+
+        const retry = agent.request(v2.methods.agent.session.prompt, keyed);
+        if (!stored) resumed.send(lifecycle(await resumed.prompt(0), "started"));
+        expect(await retry).toEqual({ messageId });
+        expect(resumed.prompts).toHaveLength(stored ? 0 : 1);
+      });
+
+      expect(userMessages(client)).toHaveLength(stored ? 1 : 2);
     });
   });
 
