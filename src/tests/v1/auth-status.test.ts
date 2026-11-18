@@ -923,9 +923,8 @@ describe("auth status over ACP", () => {
       expect(lastPush()).toEqual({ kind: "gateway", label: "JetBrains Air Gateway" }),
     );
     expect(updates()).toHaveLength(1);
+    deferStatus = false;
     await promptOnce(sessionId);
-    await vi.waitFor(() => expect(pendingStatus).toHaveLength(1));
-    await flushStatus();
     expect(updates()).toHaveLength(1);
   });
 

@@ -1170,7 +1170,11 @@ class V2Agent implements AgentHandle, SessionConnection {
     }
     authStarted(sessionId, initialization.account);
     try {
-      this.guard.sessionStarted(sessionId, initialization.account, settings.getApiKeyHelper());
+      this.guard.sessionStarted(
+        sessionId,
+        initialization.account,
+        settings.getApiKeyHelper(configured),
+      );
     } catch (error) {
       q.close();
       settings.dispose();

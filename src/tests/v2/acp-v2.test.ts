@@ -5,7 +5,7 @@
  * schema, so a malformed v2 message fails the test.
  */
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -11008,6 +11008,43 @@ describe("ACP v2 subscription guard (--hide-claude-auth)", () => {
       account: accounts[Math.min(started++, accounts.length - 1)],
     });
   }
+
+  it("keeps an inline API key helper on the same query after an auth probe", async () => {
+    const account = { apiProvider: "firstParty", apiKeySource: "apiKeyHelper" };
+    accountsAtStart(account);
+    sdk.accountInfo = async () => account;
+    const stdout = JSON.stringify({ ...account, loggedIn: true, authMethod: "none" });
+    let startupProbe: { settingsPath: string; finish: () => void } | undefined;
+    execFileSpy.mockImplementation((_cli, args, _options, callback) => {
+      const finish = () => callback(null, { stdout });
+      if (args[0] === "--settings" && !startupProbe) {
+        startupProbe = { settingsPath: args[1], finish };
+      } else {
+        finish();
+      }
+    });
+    scriptTurns(async function* (options) {
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      expect((await client.authUpdate(1)).authStatus.kind).toBe("api_key");
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, {
+        cwd,
+        _meta: { claudeCode: { options: { settings: { apiKeyHelper: "central proxy start" } } } },
+      });
+      expect((await client.authUpdate(2)).authStatus.kind).toBe("gateway");
+      await vi.waitFor(() => expect(startupProbe).toBeDefined());
+      startupProbe!.finish();
+      await vi.waitFor(async () => {
+        await expect(access(startupProbe!.settingsPath)).rejects.toMatchObject({ code: "ENOENT" });
+      });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      expect(sdk.queryOptions).toHaveLength(1);
+    });
+  });
 
   it("keeps both stable queries when a bearer session and a setup-token session alternate", async () => {
     const bearer = { tokenSource: "ANTHROPIC_AUTH_TOKEN", apiProvider: "firstParty" };
