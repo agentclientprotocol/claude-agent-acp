@@ -8814,7 +8814,6 @@ describe("ACP v2 terminal of a command in the background", () => {
       // the tool call that started it returned. The call is the task's entity
       // either way, so it must not fall back to a `task_<taskId>` card.
       type TaskAfterResult = {
-        tool: "Monitor" | "Workflow";
         toolCallId: string;
         taskId: string;
         starts: TurnScript;
@@ -8836,7 +8835,6 @@ describe("ACP v2 terminal of a command in the background", () => {
         [
           "Monitor",
           {
-            tool: "Monitor",
             toolCallId: "toolu_mon",
             taskId: localBashMonitor.task_id,
             starts: (options) => monitorStarts(options, localBashMonitor, true),
@@ -8845,7 +8843,6 @@ describe("ACP v2 terminal of a command in the background", () => {
         [
           "Workflow",
           {
-            tool: "Workflow",
             toolCallId: "toolu_wf",
             taskId: workflow.task_id,
             starts: workflowStartsAfterResult,
@@ -8881,7 +8878,6 @@ describe("ACP v2 terminal of a command in the background", () => {
           expect(toolCallTrace(client, spec.toolCallId)).toEqual([
             "running []",
             "pending",
-            "in_progress",
             "in_progress",
             "cancel",
             `running [${spec.toolCallId}]`,
@@ -8950,11 +8946,43 @@ describe("ACP v2 terminal of a command in the background", () => {
         expect(toolCallTrace(client, "toolu_ps")).toEqual([
           "running []",
           "pending",
-          "in_progress",
           "completed",
           "idle end_turn []",
         ]);
         expect(backgroundTrace(client).join(" ")).not.toContain("task_ps1");
+      });
+
+      it("keeps a paused call paused when the task paused before the level named it", async () => {
+        scriptTurns(async function* (options) {
+          yield toolUseMessage(options, "toolu_wf", "Workflow", { script: "review" });
+          yield {
+            ...toolResultMessage(options, "toolu_wf", { content: "Workflow launched." }),
+            tool_use_result: {
+              status: "async_launched",
+              taskId: workflow.task_id,
+              taskType: workflow.task_type,
+            },
+          };
+          yield taskEvent(options, "task_started", { ...workflow, tool_use_id: "toolu_wf" });
+          yield taskEvent(options, "task_updated", {
+            task_id: workflow.task_id,
+            patch: { status: "paused" },
+          });
+          yield level(options, [workflow]);
+          yield result(options);
+          yield idleState(options);
+        });
+        const client = await promptUntil("idle end_turn [toolu_wf]");
+
+        expect(toolCallTrace(client, "toolu_wf")).toEqual([
+          "running []",
+          "pending",
+          "in_progress",
+          "paused",
+          "cancel",
+          "running [toolu_wf]",
+          "idle end_turn [toolu_wf]",
+        ]);
       });
 
       it("stops the task on tool_call/cancel, and reports the call cancelled", async () => {

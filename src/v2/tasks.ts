@@ -234,9 +234,9 @@ const TASK_TOOLS = new Set(["Monitor", "Workflow"]);
  * as `local_bash`, like a shell command's: a command is its terminal, while the
  * call of a tool that starts a task is that task.
  */
-function keepsTaskCall(toolUseName: string, task: LevelTask): boolean {
-  if (task.taskType === "local_agent") return false;
-  if (task.taskType === "local_bash" && !TASK_TOOLS.has(toolUseName)) return false;
+function keepsTaskCall(toolUseName: string, taskType: string | undefined): boolean {
+  if (taskType === "local_agent") return false;
+  if (taskType === "local_bash" && !TASK_TOOLS.has(toolUseName)) return false;
   return true;
 }
 
@@ -499,6 +499,11 @@ export class SessionTasks {
         [...this.started].find(([, task]) => task.toolUseId === toolCallId)?.[0];
       if (taskId === undefined) continue;
       const task = this.level.get(taskId);
+      // A call outside TASK_TOOLS finds its task only through `this.started`,
+      // so its type is known here: a call that is not its task's entity ends
+      // with the result, also when the level names the task only later.
+      if (!keepsTaskCall(toolUse.name, task?.taskType ?? this.started.get(taskId)?.taskType))
+        continue;
       if (!task) {
         // A task that already ended ends its call with the result: no later
         // level can name it. Any other task can join the level after this
@@ -514,7 +519,6 @@ export class SessionTasks {
         runningToolCalls.add(toolCallId);
         continue;
       }
-      if (!keepsTaskCall(toolUse.name, task)) continue;
       this.toolCalls.set(taskId, {
         toolCallId,
         output,
@@ -1171,18 +1175,17 @@ export class SessionTasks {
       if (this.level.get(taskId)?.ambient === false) terminal.leveled = true;
     }
     // A call whose task joined the level after its result is part of that task
-    // again: it stays in progress, and the next list names it. When the task is
-    // not the call's, the call ends completed, as its result reported it.
+    // again: it stays in progress (or paused, as a task update already set it)
+    // and the next list names it. When the task is not the call's, the call ends
+    // completed, as its result reported it.
     for (const [taskId, call] of this.toolCalls) {
       if (!call.unleveled) continue;
       const task = this.level.get(taskId);
       if (!task) continue;
       call.unleveled = false;
-      if (call.toolUse === undefined || !keepsTaskCall(call.toolUse.name, task)) {
+      if (call.toolUse === undefined || !keepsTaskCall(call.toolUse.name, task.taskType)) {
         this.endToolCall(taskId, "completed");
-        continue;
       }
-      call.output.toolCallStatus(call.toolCallId, "in_progress");
     }
     for (const taskId of [...this.terminals.keys(), ...this.toolCalls.keys()]) {
       // A kept call waits for a later level that names its task.
