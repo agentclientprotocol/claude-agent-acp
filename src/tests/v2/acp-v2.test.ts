@@ -2564,6 +2564,133 @@ describe("ACP v2 prompts", () => {
     });
   });
 
+  it("restores Workflow workers and their tool history on the launching call across a cold replay", async () => {
+    scriptTurns();
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const root = path.join(tempDir, "claude", "projects", "-project");
+      const runId = "wf_abc123";
+      const callId = "workflow-call";
+      const workerId = "abc123";
+      const run = path.join(root, sessionId, "subagents", "workflows", runId);
+      await mkdir(run, { recursive: true });
+      const launch = {
+        role: "assistant",
+        content: [{ type: "tool_use", name: "Workflow", id: callId, input: {} }],
+      };
+      const reply = {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: callId, content: "Launched" }],
+      };
+      const wrote = (records: unknown[]) => records.map((r) => JSON.stringify(r)).join("\n") + "\n";
+      await writeFile(
+        path.join(root, sessionId + ".jsonl"),
+        wrote([
+          transcriptRecord(sessionId, "r1", null, launch),
+          transcriptRecord(sessionId, "r2", "r1", reply, {
+            toolUseResult: { taskType: "local_workflow", taskId: "task1", runId },
+          }),
+        ]),
+      );
+      await writeFile(
+        path.join(run, "journal.jsonl"),
+        wrote([
+          { type: "started", agentId: workerId, key: "1", label: "Reader" },
+          { type: "result", agentId: workerId, key: "1", result: "finished" },
+        ]),
+      );
+      await writeFile(
+        path.join(run, "agent-" + workerId + ".jsonl"),
+        wrote(
+          [
+            transcriptRecord(sessionId, "c1", null, { role: "user", content: "Read the fixture." }),
+            transcriptRecord(sessionId, "c2", "c1", {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool_use",
+                  name: "Read",
+                  id: "child-read",
+                  input: { file_path: "/fixture.txt" },
+                },
+              ],
+            }),
+            transcriptRecord(sessionId, "c3", "c2", {
+              role: "user",
+              content: [
+                { type: "tool_result", tool_use_id: "child-read", content: "File result." },
+              ],
+            }),
+            transcriptRecord(sessionId, "c4", "c3", {
+              role: "assistant",
+              content: [{ type: "text", text: "Worker report." }],
+            }),
+          ].map((r) => ({ ...r, isSidechain: true, agentId: workerId })),
+        ),
+      );
+      vi.mocked(getSessionMessages).mockResolvedValueOnce([
+        transcriptEntry("assistant", "r1", launch),
+        transcriptEntry("user", "r2", reply),
+        transcriptEntry("user", "r3", { role: "user", content: "Later question." }),
+      ] as Awaited<ReturnType<typeof getSessionMessages>>);
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+      const updates = client.sessionUpdates;
+      const child = updates.filter((n) => n.sessionId === workerId).map((n) => n.update);
+      expect(child).toContainEqual(
+        expect.objectContaining({
+          sessionUpdate: "tool_call_update",
+          name: "Read",
+          toolCallId: "child-read",
+        }),
+      );
+      expect(child).toContainEqual(
+        expect.objectContaining({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "child-read",
+          status: "completed",
+        }),
+      );
+      expect(JSON.stringify(child)).toContain("File result.");
+      expect(JSON.stringify(child)).toContain("Worker report.");
+      expect(child).toContainEqual(
+        expect.objectContaining({
+          sessionUpdate: "state_update",
+          state: "idle",
+          stopReason: "end_turn",
+        }),
+      );
+      const parent = updates.filter((n) => n.sessionId === sessionId).map((n) => n.update);
+      const announce = parent.findIndex(
+        (u) => u.sessionUpdate === "subagent_update" && u.sessionId === workerId,
+      );
+      const card = parent.findIndex(
+        (u) =>
+          u.sessionUpdate === "tool_call_update" &&
+          u.toolCallId === callId &&
+          Array.isArray(u.content) &&
+          u.content.some((c) => c.type === "session" && c.sessionId === workerId),
+      );
+      expect(announce).toBeGreaterThanOrEqual(0);
+      expect(card).toBeGreaterThan(announce);
+      expect(JSON.stringify(parent)).not.toContain("Worker report.");
+      expect(
+        updates.findIndex(
+          (n) => n.sessionId === workerId && n.update.sessionUpdate === "tool_call_update",
+        ),
+      ).toBeLessThan(
+        updates.findIndex(
+          (n) => n.sessionId === sessionId && JSON.stringify(n.update).includes("Later question."),
+        ),
+      );
+    });
+  });
+
   it("replays a subagent's history to its own session, and clears each replayed message there first", async () => {
     // Claude Code keeps its stream open while the session lives.
     scriptTurns();

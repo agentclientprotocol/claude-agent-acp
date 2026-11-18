@@ -92,7 +92,10 @@ Workflow, the adapter also announces that worker as a child session and links to
 Workflow card. The child reports its own state, including the error when Claude Code provides
 one. Workers without an agent ID appear only on the card. The card can stop the whole Workflow.
 Individual workers have no SDK task handle for cancellation. An active session can resend its
-current workers on resume. A cold history replay cannot recover the live Workflow snapshots.
+current workers on resume. Each worker's messages, tool calls and tool results come from its
+own Claude Code transcript. A cold replay uses the recorded Workflow launch and run journal
+or final snapshot to restore those workers on the original tool call. A worker with no
+recorded outcome and no live state is shown with unknown status.
 
 JetBrains AIR keeps the earlier draft of the RFD (`subagent_spawned`, `subagent_state_update`),
 which it enables with `nativeSubagentSessions` in `_meta.jetbrains.air.capabilities`. See

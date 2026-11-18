@@ -2462,7 +2462,7 @@ function stateObject(state: ChildState, outcome: IdleOutcome | undefined): v2.St
 }
 
 /** A worker's own reported outcome, independent of the outer Workflow task. */
-function workflowWorkerState(agent: WorkflowAgent): "running" | IdleOutcome | undefined {
+export function workflowWorkerState(agent: WorkflowAgent): "running" | IdleOutcome | undefined {
   switch (agent.state) {
     case "start":
     case "progress":
