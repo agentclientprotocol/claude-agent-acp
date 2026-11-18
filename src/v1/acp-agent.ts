@@ -9411,7 +9411,7 @@ export class ClaudeAcpAgent {
    *
    * Call it in the same synchronous step as the handler's `return`: an
    * `await` between them would let the timer run before the response. The ACP
-   * SDK (2.7.0) gives a request handler no responder and no after-response
+   * SDK (2.8.0) gives a request handler no responder and no after-response
    * hook, so the order rests on two things that its source shows and its API
    * does not promise. `registerAppRequest` queues the response in the
    * microtask that follows the handler's return, with no macrotask in

@@ -26,6 +26,7 @@ import { McpOverAcp } from "../../mcp-servers.js";
 import { acpProtocolRouter } from "../../serve.js";
 import { SettingsManager } from "../../settings.js";
 import type { AgentHandle } from "../../v2/agent.js";
+import { v2ElicitationRequest } from "../../v2/elicitation.js";
 import { StoppedWork } from "../../v2/stopped-work.js";
 import {
   transcriptAssistant,
@@ -4893,6 +4894,48 @@ describe("ACP v2 core", () => {
     } finally {
       await Promise.all([...v1Agents, ...v2Agents].map((agent) => agent.dispose()));
     }
+  });
+});
+
+describe("v2ElicitationRequest", () => {
+  it("drops `pattern` from a form's string properties, and nothing else", () => {
+    const request = {
+      mode: "form" as const,
+      sessionId: "s1",
+      message: "Which release?",
+      requestedSchema: {
+        type: "object" as const,
+        required: ["tag"],
+        properties: {
+          tag: { type: "string" as const, title: "Tag", minLength: 2, pattern: "^v\\d+$" },
+          // A property that is named `pattern` is no keyword.
+          pattern: { type: "string" as const, enum: ["a", "b"] },
+          count: { type: "integer" as const, minimum: 1 },
+        },
+      },
+    };
+
+    expect(v2ElicitationRequest(request)).toEqual({
+      ...request,
+      requestedSchema: {
+        ...request.requestedSchema,
+        properties: {
+          ...request.requestedSchema.properties,
+          tag: { type: "string", title: "Tag", minLength: 2 },
+        },
+      },
+    });
+  });
+
+  it("passes a URL request as it is", () => {
+    const request = {
+      mode: "url" as const,
+      sessionId: "s1",
+      message: "Sign in",
+      url: "https://example.com/login",
+      elicitationId: "e1",
+    };
+    expect(v2ElicitationRequest(request)).toBe(request);
   });
 });
 

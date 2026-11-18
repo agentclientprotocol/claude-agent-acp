@@ -564,7 +564,7 @@ export class SessionTasks {
   /** Reads the subagents that the history `messages` launched, for its replay. */
   loadReplay(messages: SessionMessage[]): Promise<SubagentReplay | undefined> {
     return SubagentReplay.load(this.host, messages, {
-      tracks: (sessionId) => this.children.has(sessionId),
+      working: (sessionId) => this.children.get(sessionId)?.working === true,
       configuration: (sessionId) =>
         this.hasChild(sessionId) ? this.configs.published(sessionId) : undefined,
     });

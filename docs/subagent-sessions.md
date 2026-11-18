@@ -20,8 +20,8 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
   first model request. It sends `cwd: null` when the child is back in its parent's directory. A
   child in its parent's directory gets no `cwd`, and no child gets `additionalDirectories`: Claude
   Code gives a subagent the session's additional directories, so it inherits them. A replay
-  announces a child with the `cwd` that its transcript recorded, and clears it after the response
-  when that directory no longer exists.
+  announces a child with the `cwd` that its transcript recorded, and clears it with the child's
+  current state (see below) when that directory no longer exists.
 - Session messages replace the Agent or Task call that launches the child, which its parent is
   not shown:
   - The launch's prompt is a `session_message` in both transcripts: the parent's outgoing view and
@@ -70,7 +70,8 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
   guessing its parent.
 - A replay restores each child under its live session id, from its own transcript, with the same
   session messages and `session` references as live, and its end is an `idle` before the response.
-  Each replayed child's current state follows the response.
+  Each replayed child's current state follows the response: on v1, the response is what separates
+  a replayed child state from a current one.
   A launch without Claude Code's metadata file for the child stays an ordinary tool call of the
   parent, and a notice, for a client that takes notices, says that subagent history is missing.
 - After a load or resume, with or without replay, a SendMessage that resumes an agent from before
@@ -88,8 +89,10 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
 An [ACP v2](../README.md#experimental-acp-v2) client gets the same without declaring anything, since subagents
 are part of v2's baseline. Each child also reports its work state as its own `state_update`, right
 after the parent's copy. A replay ends each child's history with a `replay_complete` on the child's
-session, before the child's `idle`. The notice that subagent history is missing follows the
-parent's `replay_complete`.
+session. On v2, the parent's `replay_complete` is what separates a replayed child state from a
+current one, so each replayed child's current state follows the root session's `replay_complete`
+and comes before the response: on its parent, with the cleared `cwd`, and then as the child's own
+`idle`. The notice that subagent history is missing follows the root's `replay_complete` too.
 
 JetBrains AIR keeps the earlier draft of the RFD (`subagent_spawned`, `subagent_state_update`),
 which it enables with `nativeSubagentSessions` in `_meta.jetbrains.air.capabilities`. See

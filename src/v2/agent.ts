@@ -71,6 +71,7 @@ import { airInitializeMeta, airSupport, NO_AIR, type AirSupport } from "./air.js
 import { V2Auth } from "./auth.js";
 import { subagentHooks } from "./child-config.js";
 import { modelSwitchHook, SessionConfig } from "./config.js";
+import { v2ElicitationRequest } from "./elicitation.js";
 import { fileChangePreviewHook } from "./file-preview.js";
 import { canUseTool, denyingStoppedWork } from "./permissions.js";
 import { ReplayHolds } from "./replay-hold.js";
@@ -288,15 +289,11 @@ class V2Agent implements AgentHandle, SessionConnection {
   ): Promise<CreateElicitationResponse> {
     // An elicitation of a request, not of a session, names no session.
     const sessionId = (request as { sessionId?: unknown }).sessionId;
-    // The v1 types accept a property schema with any tag; the v2 types accept
-    // one only in a received value. An MCP server's schema is relayed
-    // unchanged, as on v1, so this cast does not check it.
     return this.afterReplay(typeof sessionId === "string" ? sessionId : undefined, signal, () =>
-      this.ctx.request(
-        v2.methods.client.elicitation.create,
-        request as v2.CreateElicitationRequest,
-        { cancellationSignal: signal, stopWaitingOnCancel: true },
-      ),
+      this.ctx.request(v2.methods.client.elicitation.create, v2ElicitationRequest(request), {
+        cancellationSignal: signal,
+        stopWaitingOnCancel: true,
+      }),
     );
   }
 
@@ -538,25 +535,16 @@ class V2Agent implements AgentHandle, SessionConnection {
       release?.();
       // A notice is not history, so it follows `replay_complete`.
       subagents?.reportMissingHistory();
+      // A `subagent_update` after its parent's `replay_complete` is current,
+      // and so is a `state_update` of the child: the replayed children's
+      // current states go out here, before the snapshot and the response.
+      subagents?.currentStates();
     }
     // The current title, after the replay and before the state.
     await session.reports.publishTitle();
     for (const notification of session.resumeSnapshot()) this.send(notification);
     const response = await this.setupFields(session);
     this.afterSetup(session, params);
-    // A replayed child's state that comes before the response is history to
-    // the client, also after the child's `replay_complete`: the children's
-    // current states follow the response. The ACP SDK (2.7.0)
-    // gives a request handler no responder and no after-response hook, so the
-    // order rests on two things that its source shows and its API does not
-    // promise. `registerAppRequest` queues the response in the microtask that
-    // follows this handler's return, with no macrotask in between, so the
-    // timer runs after it. And `Connection.sendMessage` writes in call order,
-    // so what the timer sends is written after the response. The timer is
-    // set in the same synchronous step as the `return`: an `await` between
-    // them would let it run first. The v1 core's `afterSetupResponse` relies
-    // on the same.
-    if (subagents) setTimeout(() => subagents.afterResponse(), 0);
     return response;
   }
 

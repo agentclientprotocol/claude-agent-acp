@@ -20,17 +20,21 @@
  * history follows its launch, so a call to a child from its parent is always
  * delivered first. Any other SendMessage call stays a tool call.
  *
- * Every child's end goes out on its parent at the end of the replay. Each
- * announced child then gets its own `replay_complete`, as v2 requires, and
- * its end once on its own stream: v2 forbids replaying a child's past
- * `running` as current activity. These states are history to the client, so
- * each child's current state goes out again after the response
- * ({@link afterResponse}).
- * A child that the live session still tracks, on a resume of the active
- * session, gets its current state from the resume snapshot instead
- * (`SessionTasks.currentState`). After the response, a child whose
- * configuration is not the `model` that the replay sent, such as a live child
- * whose hooks reported its mode, gets it again.
+ * Every child's end goes out on its parent at the end of the replay, and
+ * each announced child then gets its own `replay_complete`, as v2 requires.
+ * These ends are history to the client: a `subagent_update` is an update of
+ * the child's parent, so the parent's `replay_complete` is what separates a
+ * replayed one from a current one. A child's own stream gets no state in the
+ * replay: v2 forbids replaying a past `running` as current activity.
+ *
+ * Each child's current state goes out after the root's `replay_complete`,
+ * which follows every other one, and before the resume's state snapshot
+ * ({@link currentStates}): on its parent and on its own stream. A child that
+ * works in the live session, on a resume of the active session, gets its
+ * current state from the resume snapshot instead
+ * (`SessionTasks.currentState`). A child whose configuration is not the
+ * `model` that the replay sent, such as a live child whose hooks reported its
+ * mode, gets it again then too.
  *
  * A launch without metadata has no known id, so it is not announced: the RFD
  * forbids inventing one. Its Agent call stays an ordinary tool call of the
@@ -87,13 +91,13 @@ export interface ReplayHost {
 
 /** What the live session knows of the replayed children. */
 export interface LiveChildren {
-  /** Whether the live session tracks the child session `sessionId`. */
-  tracks(sessionId: string): boolean;
+  /** Whether the child session `sessionId` works in the live session now. */
+  working(sessionId: string): boolean;
   /** The configuration that the client last got for the live child `sessionId`, if any. */
   configuration(sessionId: string): SessionConfigOption[] | undefined;
 }
 
-const NO_LIVE_CHILDREN: LiveChildren = { tracks: () => false, configuration: () => undefined };
+const NO_LIVE_CHILDREN: LiveChildren = { working: () => false, configuration: () => undefined };
 
 /** A replayed child, with the output of its session once announced. */
 type ReplayChild = SharedReplayChild & { output?: SessionOutput };
@@ -149,9 +153,8 @@ export class SubagentReplay {
   /**
    * Ends the replay of the children. Every child's end goes out on its
    * parent, whose history it is. Then each announced child gets its
-   * `replay_complete`, also one without history, and its end once on its own
-   * stream. A `state_update` is not history, so it follows the child's
-   * `replay_complete`.
+   * `replay_complete`, also one without history. The caller sends the root's
+   * `replay_complete` next, then the current states ({@link currentStates}).
    */
   finish(): void {
     const announced = [...this.transcript.children.values()].filter((child) => child.announced);
@@ -167,10 +170,6 @@ export class SubagentReplay {
     }
     for (const child of announced) {
       this.host.send({ sessionId: child.sessionId, update: REPLAY_COMPLETE });
-      this.host.send({
-        sessionId: child.sessionId,
-        update: { sessionUpdate: "state_update", ...replayEndState(child) } as v2.SessionUpdate,
-      });
     }
   }
 
@@ -188,18 +187,25 @@ export class SubagentReplay {
   }
 
   /**
-   * After the response, as the v1 core sends them (`currentStates`): the
-   * current state of each replayed child that the live session does not
-   * track, since its process is gone, so its replayed end. A `cwd` that is
-   * gone, such as a worktree that Claude Code removed, is cleared. Then each
-   * replayed child's configuration, when it is not the `model` that the
-   * replay sent: the live child's, else the model of its latest response, by
-   * the session's model list.
+   * What is current of the replayed children. The caller sends it after the
+   * root's `replay_complete`, so every child's parent has sent its own, and
+   * before the resume's state snapshot.
+   *
+   * The current state of each replayed child that does not work in the live
+   * session: its work ended, or its process is gone, so its replayed end, on
+   * its parent and on its own stream. A `cwd` that is gone, such as a
+   * worktree that Claude Code removed, is cleared. Then each replayed child's
+   * configuration, when it is not the `model` that the replay sent: the live
+   * child's, else the model of its latest response, by the session's model
+   * list.
+   *
+   * The v1 core sends the same after the response (`currentStates`): on v1
+   * the response is what separates a replayed child state from a current one.
    */
-  afterResponse(): void {
+  currentStates(): void {
     for (const child of this.transcript.children.values()) {
       if (!child.announced) continue;
-      if (!this.live.tracks(child.sessionId)) this.sendEndState(child);
+      if (!this.live.working(child.sessionId)) this.sendEndState(child);
       this.sendConfiguration(child);
     }
   }
