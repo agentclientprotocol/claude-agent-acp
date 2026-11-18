@@ -46,6 +46,7 @@ import {
   stripLocalCommandMetadata,
 } from "../../message-filters.js";
 import type { AcpClient } from "../../acp-client.js";
+import type { UnservedMcpServer } from "../../mcp-servers.js";
 import type { SDKMessageFilter } from "../../new-session-meta.js";
 import { SessionTitles } from "../../session-titles.js";
 import { SessionBackgroundWork } from "../../v1/background-work.js";
@@ -14130,7 +14131,10 @@ describe("model refusal fallback handling", () => {
 });
 
 describe("MCP server startup failures", () => {
-  function setup(mcpServersStatus: { name: string; status: string; source?: string }[]) {
+  function setup(
+    mcpServersStatus: { name: string; status: string; source?: string }[],
+    unservedMcpServers?: UnservedMcpServer[],
+  ) {
     const sessionUpdate = vi.fn(async () => {});
     const agent = new ClaudeAcpAgent({ sessionUpdate } as unknown as AcpClient, {
       log: () => {},
@@ -14188,6 +14192,7 @@ describe("MCP server startup failures", () => {
           { name: "client-api", type: "http", url: "https://example.com/mcp", headers: [] },
         ],
       },
+      unservedMcpServers,
     });
     const updates = () =>
       sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
@@ -14213,6 +14218,29 @@ describe("MCP server startup failures", () => {
         severity: "warning",
         title: 'MCP server "client-fs" failed to start',
         description: "Its tools are unavailable in this session. Run /mcp for the error.",
+      },
+    ]);
+  });
+
+  it("sends one notice, with the error, for a server the query started without", async () => {
+    // Claude Code was not given the server, so its init does not list it.
+    const { agent, updates } = setup(
+      [{ name: "client-api", status: "connected", source: "dynamic" }],
+      [{ name: "client-acp", status: "failed", error: "listen EPERM" }],
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { session: { notices: {} } },
+    });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    expect(updates().filter((u) => u.sessionUpdate === "notice")).toEqual([
+      {
+        sessionUpdate: "notice",
+        severity: "warning",
+        title: 'MCP server "client-acp" failed to start',
+        description: "Its tools are unavailable in this session. listen EPERM",
       },
     ]);
   });

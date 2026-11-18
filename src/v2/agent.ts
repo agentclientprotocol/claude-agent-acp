@@ -508,10 +508,11 @@ class V2Agent implements AgentHandle, SessionConnection {
       // session's.
       const request = await validatedSetup(params);
       assertCwdOf(session, request.cwd, "resume it");
-      await session.setMcpServers({
-        ...clientOptions(params._meta)?.mcpServers,
-        ...(await this.sdkMcpServers(request.mcpServers)),
-      });
+      const served = await this.sdkMcpServers(sessionId, request.mcpServers);
+      await session.setMcpServers(
+        { ...clientOptions(params._meta)?.mcpServers, ...served.configs },
+        served.unserved,
+      );
       if (!sameDirectories(request.additionalDirectories ?? [], session.additionalDirectories)) {
         // The SDK cannot change them on a running query: it restarts with
         // them at its next turn boundary (see `restarts.ts`).
@@ -951,6 +952,7 @@ class V2Agent implements AgentHandle, SessionConnection {
       configuredSettings: opened.configured,
       env: opened.env,
       mcpServers: opened.request.mcpServers.map((server) => server.name),
+      unservedMcpServers: opened.unservedMcpServers,
       mcpOAuth: this.elicitation.url && supportsMcpOAuth(q),
       query: q,
       model: { id: models.models.currentModelId, info: models.allowlistedModelInfo },
@@ -967,10 +969,18 @@ class V2Agent implements AgentHandle, SessionConnection {
 
   /**
    * The SDK configs of a setup request's MCP servers. An `acp` server is
-   * served to Claude Code over this connection (see `mcp-servers.ts`).
+   * served to Claude Code over this connection (see `mcp-servers.ts`). One
+   * that gets no endpoint is in `unserved`, and the session goes on without
+   * it.
    */
-  private sdkMcpServers(servers: readonly McpServer[]) {
-    return sdkMcpServers(servers, (server) => this.mcp.sdkConfig(this.ctx, server));
+  private async sdkMcpServers(sessionId: string, servers: readonly McpServer[]) {
+    const served = await sdkMcpServers(servers, (server) => this.mcp.sdkConfig(this.ctx, server));
+    for (const server of served.unserved) {
+      this.logger.error(
+        `Session ${sessionId} runs without MCP server ${server.name}: ${server.error}`,
+      );
+    }
+    return served;
   }
 
   /**
@@ -993,8 +1003,8 @@ class V2Agent implements AgentHandle, SessionConnection {
   ) {
     const request = await validatedSetup(params);
     const client = clientOptions(params._meta);
-    // Before the settings watchers open: a failure here leaves nothing to dispose.
-    const mcpServers = { ...client?.mcpServers, ...(await this.sdkMcpServers(request.mcpServers)) };
+    const served = await this.sdkMcpServers(sessionId, request.mcpServers);
+    const mcpServers = { ...client?.mcpServers, ...served.configs };
     // After a provider change that is still listing its models.
     await this.auth.routeSettled();
     // The resumed transcript's last model and mode.
@@ -1228,6 +1238,7 @@ class V2Agent implements AgentHandle, SessionConnection {
       env: options.env ?? {},
       request,
       mcpServers,
+      unservedMcpServers: served.unserved,
       routeGeneration,
     };
   }
