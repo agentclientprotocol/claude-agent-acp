@@ -186,7 +186,7 @@ import {
 } from "../auth-status.js";
 import { AuthStatusReporter, cliLogout } from "../auth-status-reporter.js";
 import { terminalAuthMethods as authMethodsForTerminal } from "../auth-methods.js";
-import { McpOverAcp, sdkMcpServers } from "../mcp-servers.js";
+import { McpOverAcp, sdkMcpServers, type UnservedMcpServer } from "../mcp-servers.js";
 import { claudeCliPath, mcpServersDelivery } from "../claude-cli.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { randomUUID } from "node:crypto";
@@ -991,6 +991,10 @@ export type Session = {
    *  needing authentication. `system`/init re-emits on every turn with the
    *  same statuses, and each server is reported once per session. */
   reportedMcpServers?: Set<string>;
+  /** The client's `acp` MCP servers that the session's query started without
+   *  (see `sdkMcpServers`). They are reported like a server that `system`/init
+   *  lists as `failed`. */
+  unservedMcpServers?: UnservedMcpServer[];
   /** The long-lived consumer task. Lazily started on the first `prompt()` and
    *  kept alive for the session so between-turn/background messages are still
    *  drained and forwarded. */
@@ -2739,12 +2743,13 @@ export class ClaudeAcpAgent {
   }
 
   /** Tells the user about client-provided MCP servers that `system`/init
-   *  reports as `failed` or `needs-auth`, once per server per session. Servers
-   *  from the user's Claude Code settings are left to `/mcp`: they are the same
-   *  in every session, so a broken one would be reported in every session. A
-   *  `needs-auth` server is reported only when the OAuth flow can't run (no
-   *  URL elicitation on the client, or no `mcpAuthenticate` on the query);
-   *  otherwise `startMcpAuthentication` asks the user to sign in. */
+   *  reports as `failed` or `needs-auth`, and about the ones the query started
+   *  without (`session.unservedMcpServers`), once per server per session.
+   *  Servers from the user's Claude Code settings are left to `/mcp`: they are
+   *  the same in every session, so a broken one would be reported in every
+   *  session. A `needs-auth` server is reported only when the OAuth flow can't
+   *  run (no URL elicitation on the client, or no `mcpAuthenticate` on the
+   *  query); otherwise `startMcpAuthentication` asks the user to sign in. */
   private async reportMcpServerStartupFailures(
     session: Session,
     servers: SDKSystemMessage["mcp_servers"] | undefined,
@@ -2752,16 +2757,18 @@ export class ClaudeAcpAgent {
     sendUpdate: (notification: AcpSessionNotification) => Promise<void>,
     sessionId: string,
   ): Promise<void> {
-    if (!servers?.length) return;
     const clientServers = new Set(
       (session.creationParams?.mcpServers ?? []).map((server) => server.name),
     );
+    const notStarted = [
+      ...(session.unservedMcpServers ?? []),
+      ...(servers ?? []).filter((server) => clientServers.has(server.name)),
+    ];
+    if (!notStarted.length) return;
     const oauthAvailable =
       !!this.clientCapabilities?.elicitation?.url && supportsMcpOAuth(session.query);
-    for (const server of servers) {
-      if (!clientServers.has(server.name) || session.reportedMcpServers?.has(server.name)) {
-        continue;
-      }
+    for (const server of notStarted) {
+      if (session.reportedMcpServers?.has(server.name)) continue;
       const notice = mcpServerStartupNotice(server, oauthAvailable);
       if (!notice) continue;
       (session.reportedMcpServers ??= new Set()).add(server.name);
@@ -9991,10 +9998,15 @@ export class ClaudeAcpAgent {
       timing.phase("resume-transcript");
     }
 
-    // Before the settings watchers open: a failure here leaves nothing to dispose.
-    const mcpServers = await sdkMcpServers(params.mcpServers, (server) =>
-      this.client.mcpServerOverAcp(server),
+    const { configs: mcpServers, unserved: unservedMcpServers } = await sdkMcpServers(
+      params.mcpServers,
+      (server) => this.client.mcpServerOverAcp(server),
     );
+    for (const server of unservedMcpServers) {
+      this.logger.error(
+        `Session ${sessionId} starts without MCP server ${server.name}: ${server.error}`,
+      );
+    }
 
     const input = new Pushable<SDKUserMessage>();
 
@@ -10597,6 +10609,7 @@ export class ClaudeAcpAgent {
         cwd: params.cwd,
         sessionFingerprint: computeSessionFingerprint(params),
         creationParams: params,
+        unservedMcpServers,
         settingsManager,
         effortSettingsOverride: configuredSettingsObject,
         titles: new SessionTitles(this, sessionId),

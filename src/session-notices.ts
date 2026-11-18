@@ -132,18 +132,23 @@ export function informationalNotice(message: { level: string; content: string })
   };
 }
 
-/** The notice of a client MCP server that the `system/init` lists as not
- *  started: `failed`, or `needs-auth` when the client cannot run the OAuth
- *  flow (`oauthAvailable`). Undefined for any other status. */
+/** The notice of a client MCP server that did not start: `failed`, or
+ *  `needs-auth` when the client cannot run the OAuth flow (`oauthAvailable`).
+ *  Undefined for any other status. A server of the `system/init` list has no
+ *  `error`: `/mcp` shows it. An `UnservedMcpServer` is on no list of Claude
+ *  Code, so the notice has its `error`. */
 export function mcpServerStartupNotice(
-  server: { name: string; status: string },
+  server: { name: string; status: string; error?: string },
   oauthAvailable: boolean,
 ): SessionNotice | undefined {
   if (server.status === "failed") {
     return {
       severity: "warning",
       title: `MCP server "${server.name}" failed to start`,
-      description: "Its tools are unavailable in this session. Run /mcp for the error.",
+      description:
+        server.error === undefined
+          ? "Its tools are unavailable in this session. Run /mcp for the error."
+          : `Its tools are unavailable in this session. ${server.error}`,
     };
   }
   if (server.status === "needs-auth" && !oauthAvailable) {

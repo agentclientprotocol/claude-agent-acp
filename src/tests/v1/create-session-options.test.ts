@@ -1271,6 +1271,32 @@ describe("createSession options merging", () => {
     expect(capturedOptions!.mcpServers).toHaveProperty("acp-server");
   });
 
+  it("starts the session without an acp server that gets no endpoint", async () => {
+    agent = new ClaudeAcpAgent(
+      {
+        ...createMockClient(),
+        mcpServerOverAcp: async () => {
+          throw new Error("listen EPERM");
+        },
+      },
+      { log: () => {}, error: () => {} },
+    );
+
+    const { sessionId } = await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [
+        { type: "acp", name: "tools", serverId: "tools:1" },
+        { name: "files", command: "node", args: ["files.js"], env: [] },
+      ],
+    });
+
+    expect(Object.keys(capturedOptions!.mcpServers ?? {})).toEqual(["files"]);
+    // What the first turn reports (see "MCP server startup failures").
+    expect(agent.sessions[sessionId].unservedMcpServers).toEqual([
+      { name: "tools", status: "failed", error: "listen EPERM" },
+    ]);
+  });
+
   describe("thinking config from MAX_THINKING_TOKENS", () => {
     let originalMaxThinking: string | undefined;
 

@@ -26,16 +26,35 @@ describe("sdkMcpServers", () => {
     });
 
     expect(configs).toEqual({
-      files: { type: "stdio", command: "/bin/files", args: ["--stdio"], env: { A: "1" } },
-      linear: {
-        type: "http",
-        url: "https://mcp.linear.app/mcp",
-        headers: { Authorization: "Bearer token" },
+      configs: {
+        files: { type: "stdio", command: "/bin/files", args: ["--stdio"], env: { A: "1" } },
+        linear: {
+          type: "http",
+          url: "https://mcp.linear.app/mcp",
+          headers: { Authorization: "Bearer token" },
+        },
+        events: { type: "sse", url: "https://example.com/sse", headers: {} },
+        tools: overAcp,
       },
-      events: { type: "sse", url: "https://example.com/sse", headers: {} },
-      tools: overAcp,
+      unserved: [],
     });
     expect(acpServers).toEqual([{ type: "acp", name: "tools", serverId: "tools:1" }]);
+  });
+
+  it("leaves out an acp server that gets no config, and keeps the others", async () => {
+    const servers = [
+      { type: "acp", name: "tools", serverId: "tools:1" },
+      { name: "files", command: "/bin/files", args: [], env: [] },
+    ] as acp.McpServer[];
+
+    const served = await sdkMcpServers(servers, async () => {
+      throw new Error("listen EPERM");
+    });
+
+    expect(served).toEqual({
+      configs: { files: { type: "stdio", command: "/bin/files", args: [], env: {} } },
+      unserved: [{ name: "tools", status: "failed", error: "listen EPERM" }],
+    });
   });
 });
 
@@ -117,10 +136,10 @@ describe("McpOverAcp", () => {
     agent.close();
     await agent.closed;
     await expect(claudeCodeMcpRequest(config, "tools/list")).rejects.toThrow();
-    await expect(mcp.sdkConfig(agent.client, tools)).rejects.toMatchObject({
-      code: -32603,
-      message: expect.stringContaining("MCP server tools"),
-    });
+    await expect(mcp.sdkConfig(agent.client, tools)).rejects.toThrow(
+      "The adapter could not open the local endpoint that serves it to Claude Code " +
+        "(ACP connection is closed). A new session tries again.",
+    );
   });
 
   it.each([

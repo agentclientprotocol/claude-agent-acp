@@ -12,7 +12,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import {
   forkSession,
@@ -22,6 +22,7 @@ import {
   type Settings,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import { McpOverAcp } from "../../mcp-servers.js";
 import { acpProtocolRouter } from "../../serve.js";
 import { SettingsManager } from "../../settings.js";
 import type { AgentHandle } from "../../v2/agent.js";
@@ -1338,6 +1339,57 @@ describe("ACP v2 core", () => {
       },
     ]);
   });
+
+  it.each([{ request: "session/new" }, { request: "a resume of the active session" }] as const)(
+    "goes on without an acp MCP server that gets no endpoint at $request, and reports it",
+    async ({ request }) => {
+      const endpoint = vi
+        .spyOn(McpOverAcp.prototype, "sdkConfig")
+        .mockRejectedValue(new Error("listen EPERM"));
+      onTestFinished(() => endpoint.mockRestore());
+      const mcpServers: v2.McpServer[] = [
+        { type: "acp", name: "tools", serverId: "tools:1" },
+        { type: "stdio", name: "files", command: "/usr/local/bin/mcp-files" },
+      ];
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        await agent.request(v2.methods.agent.initialize, {
+          protocolVersion: v2.PROTOCOL_VERSION,
+          info: { name: "v2-test-client", version: "1.0.0" },
+          capabilities: {},
+        });
+        if (request === "session/new") {
+          await agent.request(v2.methods.agent.session.new, { cwd, mcpServers });
+        } else {
+          const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+          await agent.request(v2.methods.agent.session.resume, { sessionId, cwd, mcpServers });
+        }
+        const claude = sdk.processes.at(-1)!;
+        if (request === "session/new") {
+          expect(Object.keys(claude.options.mcpServers ?? {})).toEqual(["files"]);
+        }
+        // Claude Code lists the servers it was given.
+        claude.send({
+          type: "system",
+          subtype: "init",
+          uuid: randomUUID(),
+          mcp_servers: [{ name: "files", status: "connected" }],
+        });
+        claude.send(result());
+        // The resume sent the session's idle state first.
+        await vi.waitFor(() => expect(client.states().slice(-2)).toEqual(["running", "idle"]));
+      });
+
+      expect(client.sessionUpdates.filter((update) => update.sessionUpdate === "notice")).toEqual([
+        {
+          sessionUpdate: "notice",
+          severity: "warning",
+          title: 'MCP server "tools" failed to start',
+          description: "Its tools are unavailable in this session. listen EPERM",
+        },
+      ]);
+    },
+  );
 
   it("replaces Claude Code's text of /mcp with the server list, before the turn's idle", async () => {
     const client = v2Client();
