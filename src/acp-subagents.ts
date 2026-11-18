@@ -1,7 +1,8 @@
-import type {
-  ClientCapabilities,
-  SessionCapabilities,
-  SessionNotification,
+import {
+  RequestError,
+  type ClientCapabilities,
+  type SessionCapabilities,
+  type SessionNotification,
 } from "@agentclientprotocol/sdk/unstable";
 import {
   AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
@@ -23,6 +24,18 @@ export { AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY } from "./air-extension.js";
  *   whichever capability it declares (`docs/air-extensions.md`).
  */
 export type SubagentForm = "rfd" | "air";
+
+/**
+ * The error of a client's request that names a child session, other than
+ * `session/cancel`: invalid params (-32602), as the RFD asks, not the -32002
+ * of an unknown session. `method` completes "the client cannot … it".
+ */
+export function restrictedChild(sessionId: string, method: string): RequestError {
+  return RequestError.invalidParams(
+    { sessionId },
+    `${sessionId} is a subagent session: the client cannot ${method} it. Its parent session runs it.`,
+  );
+}
 
 /** The form of native subagent sessions that the client gets, or none. */
 export function subagentForm(capabilities?: ClientCapabilities | null): SubagentForm | undefined {

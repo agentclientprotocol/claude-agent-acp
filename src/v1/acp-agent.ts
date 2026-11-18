@@ -111,6 +111,7 @@ import {
   AcpSessionNotification,
   asSdkSessionNotification,
   clientSupportsSubagents,
+  restrictedChild,
   SubagentAwareSessionCapabilities,
   subagentForm,
   type SubagentState,
@@ -7318,6 +7319,20 @@ export class ClaudeAcpAgent {
   }
 
   /**
+   * Throws invalid params (-32602) when `sessionId` is a child session that a
+   * session of this connection announced on the subagents RFD form (see
+   * `NativeSubagentRuntime.hasChild`): the client can cancel a child, and
+   * nothing else. `method` completes "the client cannot … it".
+   */
+  assertNoChildSession(sessionId: string, method: string): void {
+    for (const session of Object.values(this.sessions)) {
+      if (session.nativeSubagentRuntime?.hasChild(sessionId)) {
+        throw restrictedChild(sessionId, method);
+      }
+    }
+  }
+
+  /**
    * Cancels the current work of the subagent child session `sessionId`, which
    * its `cancel` capability permits on the subagents RFD form, without
    * cancelling its parent (see `NativeSubagentRuntime.cancelChild`). Returns
@@ -7865,8 +7880,9 @@ export class ClaudeAcpAgent {
    * session whose query ended (`queryClosed`) is `open` too: a `session/load`
    * with the same params returns it as it is, and its prompts fail with what
    * happened. Every other session is `saved` or unknown by its stored
-   * transcript (see `session-status.ts`). A subagent's session is unknown,
-   * as for the other session requests.
+   * transcript (see `session-status.ts`). A subagent's session is refused
+   * before this runs, as for the other session requests (see
+   * {@link assertNoChildSession}).
    */
   async sessionStatus({ sessionId }: SessionStatusRequest): Promise<SessionStatusResponse> {
     if (Object.hasOwn(this.sessions, sessionId)) return { status: "open" };
@@ -11269,6 +11285,28 @@ export function v1AgentApp(
 ): AgentApp {
   let agent!: ClaudeAcpAgent;
   const mcp = new McpOverAcp();
+  /**
+   * `handle`, for a request that names a session the client set up: one that
+   * names a subagent's child session fails with invalid params (-32602), as
+   * the subagents RFD asks (see `assertNoChildSession`). `session/cancel` is
+   * the one message that can name a child.
+   *
+   * Not `async`: the handler's promise is returned as it is, so the response
+   * keeps its place before the timer of `afterSetupResponse`.
+   */
+  const ofRootSession =
+    <C extends { params: { sessionId?: string | null } }, R>(
+      method: string,
+      handle: (ctx: C) => Promise<R>,
+    ) =>
+    (ctx: C): Promise<R> => {
+      try {
+        if (ctx.params.sessionId != null) agent.assertNoChildSession(ctx.params.sessionId, method);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      return handle(ctx);
+    };
   const app = acpAgent({ name: "claude-code-acp" })
     .onConnect((connection) => {
       agent = new ClaudeAcpAgent(new ClientConnection(connection.client, mcp), logger);
@@ -11277,20 +11315,48 @@ export function v1AgentApp(
     .onNotification(methods.agent.mcp.message, mcp.handleNotification)
     .onRequest(methods.agent.initialize, (ctx) => agent.initialize(ctx.params))
     .onRequest(methods.agent.session.new, (ctx) => agent.newSession(ctx.params))
-    .onRequest(methods.agent.session.load, (ctx) => agent.loadSession(ctx.params))
-    .onRequest(methods.agent.session.fork, (ctx) =>
-      agent.forking(ctx.params.sessionId, () => agent.unstable_forkSession(ctx.params)),
+    .onRequest(
+      methods.agent.session.load,
+      ofRootSession("load", (ctx) => agent.loadSession(ctx.params)),
+    )
+    .onRequest(
+      methods.agent.session.fork,
+      ofRootSession("fork", (ctx) =>
+        agent.forking(ctx.params.sessionId, () => agent.unstable_forkSession(ctx.params)),
+      ),
     )
     .onRequest(methods.agent.session.list, (ctx) => agent.listSessions(ctx.params))
-    .onRequest(methods.agent.session.delete, (ctx) => agent.deleteSession(ctx.params))
-    .onRequest(methods.agent.session.setTitle, (ctx) => agent.setSessionTitle(ctx.params))
-    .onRequest(methods.agent.session.resume, (ctx) => agent.resumeSession(ctx.params))
-    .onRequest(methods.agent.session.close, (ctx) => agent.closeSession(ctx.params))
-    .onRequest(methods.agent.session.status, (ctx) => agent.sessionStatus(ctx.params))
-    .onRequest(methods.agent.session.options, (ctx) => agent.sessionOptions(ctx.params))
-    .onRequest(methods.agent.session.setMode, (ctx) => agent.setSessionMode(ctx.params))
-    .onRequest(methods.agent.session.setConfigOption, (ctx) =>
-      agent.setSessionConfigOption(ctx.params),
+    .onRequest(
+      methods.agent.session.delete,
+      ofRootSession("delete", (ctx) => agent.deleteSession(ctx.params)),
+    )
+    .onRequest(
+      methods.agent.session.setTitle,
+      ofRootSession("retitle", (ctx) => agent.setSessionTitle(ctx.params)),
+    )
+    .onRequest(
+      methods.agent.session.resume,
+      ofRootSession("resume", (ctx) => agent.resumeSession(ctx.params)),
+    )
+    .onRequest(
+      methods.agent.session.close,
+      ofRootSession("close", (ctx) => agent.closeSession(ctx.params)),
+    )
+    .onRequest(
+      methods.agent.session.status,
+      ofRootSession("ask the status of", (ctx) => agent.sessionStatus(ctx.params)),
+    )
+    .onRequest(
+      methods.agent.session.options,
+      ofRootSession("read the options of", (ctx) => agent.sessionOptions(ctx.params)),
+    )
+    .onRequest(
+      methods.agent.session.setMode,
+      ofRootSession("set the mode of", (ctx) => agent.setSessionMode(ctx.params)),
+    )
+    .onRequest(
+      methods.agent.session.setConfigOption,
+      ofRootSession("configure", (ctx) => agent.setSessionConfigOption(ctx.params)),
     )
     .onRequest(methods.agent.authenticate, (ctx) => agent.authenticate(ctx.params))
     .onRequest(methods.agent.providers.list, (ctx) => agent.unstable_listProviders(ctx.params))
@@ -11298,8 +11364,9 @@ export function v1AgentApp(
     .onRequest(methods.agent.providers.disable, (ctx) => agent.unstable_disableProvider(ctx.params))
     .onRequest(methods.agent.logout, (ctx) => agent.logout(ctx.params))
     .onRequest(methods.agent.auth.status, () => agent.authStatusResponse())
-    .onRequest(methods.agent.session.prompt, (ctx) =>
-      runPromptWithCancellation(agent, ctx.params, ctx.signal),
+    .onRequest(
+      methods.agent.session.prompt,
+      ofRootSession("prompt", (ctx) => runPromptWithCancellation(agent, ctx.params, ctx.signal)),
     )
     .onNotification(methods.agent.session.cancel, (ctx) => agent.cancel(ctx.params))
     .onRequest<SteerRequest, SteerResponse>(STEER_METHOD, { parse: parseSteerRequest }, (ctx) =>

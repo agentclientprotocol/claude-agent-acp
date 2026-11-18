@@ -84,7 +84,9 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
   parent's: Claude Code also stops the foreground children it waits on, and the parent's turn goes
   on. Each stopped child reports `idle` with `cancelled` from Claude Code's own events, and its
   requests that the stop withdraws report no `running` first. A replayed child, which no longer
-  runs, gets no capabilities. A client cannot prompt or otherwise change a child.
+  runs, gets no capabilities. A client cannot prompt or otherwise change a child: any other request
+  that names an announced child of a running session fails with `-32602` (Invalid params),
+  `session/close` and `session/delete` too.
 
 An [ACP v2](../README.md#experimental-acp-v2) client gets the same without declaring anything, since subagents
 are part of v2's baseline. Each child also reports its work state as its own `state_update`, right

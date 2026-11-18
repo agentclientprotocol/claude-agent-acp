@@ -33,6 +33,7 @@ import packageJson from "../../package.json" with { type: "json" };
 import { messageIdForGrouping } from "../sdk-to-acp.js";
 import type { Logger } from "../logger.js";
 import { customAgents } from "../session-config-options.js";
+import { restrictedChild } from "../acp-subagents.js";
 import { claudeCliPath, mcpServersDelivery } from "../claude-cli.js";
 import { clientSystemPrompt, sessionSystemPrompt } from "../client-system-prompt.js";
 import type { ElicitationSupport } from "../elicitation.js";
@@ -89,7 +90,6 @@ import {
 } from "./setup.js";
 import type { SubagentReplay } from "./subagent-replay.js";
 import { SubscriptionGuard } from "./subscription-guard.js";
-import { restrictedChild } from "./tasks.js";
 
 /** The sessions per `session/list` page. */
 const SESSION_LIST_PAGE_SIZE = 1000;

@@ -945,14 +945,30 @@ export class NativeSubagentRuntime {
    * of this runtime. AIR's draft grants no `cancel`.
    */
   async cancelChild(sessionId: string, stop: (taskId: string) => Promise<void>): Promise<boolean> {
-    if (this.form !== "rfd") return false;
-    for (const [taskId, child] of this.children) {
-      if (child.sessionId !== sessionId || !child.announced) continue;
-      child.cancels = (child.cancels ?? 0) + 1;
-      await stop(taskId);
-      return true;
+    const announced = this.announcedChild(sessionId);
+    if (!announced) return false;
+    const [taskId, child] = announced;
+    child.cancels = (child.cancels ?? 0) + 1;
+    await stop(taskId);
+    return true;
+  }
+
+  /**
+   * The RFD form: whether `sessionId` is a child session that this runtime
+   * announced. The client can cancel such a session and nothing else (see
+   * `restrictedChild`). False in AIR's draft, which keeps its own rules.
+   */
+  hasChild(sessionId: string): boolean {
+    return this.announcedChild(sessionId) !== undefined;
+  }
+
+  /** The RFD form: the announced child session `sessionId`, with its task id. */
+  private announcedChild(sessionId: string): [string, NativeSubagent] | undefined {
+    if (this.form !== "rfd") return undefined;
+    for (const entry of this.children) {
+      if (entry[1].sessionId === sessionId && entry[1].announced) return entry;
     }
-    return false;
+    return undefined;
   }
 
   /**

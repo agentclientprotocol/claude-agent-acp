@@ -2223,11 +2223,3 @@ function terminalOutput(
     },
   };
 }
-
-/** The error of a request on a child session: the client can only watch a child. */
-export function restrictedChild(sessionId: string, method: string): RequestError {
-  return RequestError.invalidParams(
-    { sessionId },
-    `${sessionId} is a subagent session: the client cannot ${method} it. Its parent session runs it.`,
-  );
-}

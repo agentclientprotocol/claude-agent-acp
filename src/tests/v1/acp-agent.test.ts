@@ -8305,6 +8305,71 @@ describe("subagent permission attribution (issue #851)", () => {
       });
     });
 
+    describe("any other request that names a child session", () => {
+      const sessionId = "agent-42";
+      const setup = { sessionId, cwd: "/test", mcpServers: [] };
+
+      it.each<[string, Record<string, unknown>]>([
+        [methods.agent.session.load, setup],
+        [methods.agent.session.resume, setup],
+        [methods.agent.session.fork, setup],
+        [methods.agent.session.close, { sessionId }],
+        [methods.agent.session.delete, { sessionId }],
+        [methods.agent.session.setTitle, { sessionId, title: "Scout" }],
+        [methods.agent.session.status, { sessionId }],
+        [methods.agent.session.options, { sessionId, cwd: "/test" }],
+        [methods.agent.session.setMode, { sessionId, modeId: "default" }],
+        [methods.agent.session.setConfigOption, { sessionId, configId: "mode", value: "default" }],
+        [methods.agent.session.prompt, { sessionId, prompt: [{ type: "text", text: "hi" }] }],
+      ])("rejects %s with invalid params", async (method, params) => {
+        const toAgent = new TransformStream<AnyMessage, AnyMessage>();
+        const toClient = new TransformStream<AnyMessage, AnyMessage>();
+        const logger = { log: () => {}, error: () => {} };
+        let agent!: ClaudeAcpAgent;
+        acpProtocolRouter(logger, (created) => (agent = created), "v1").connect({
+          readable: toAgent.readable,
+          writable: toClient.writable,
+        });
+
+        await acpClient({ name: "test-client" }).connectWith(
+          { readable: toClient.readable, writable: toAgent.writable },
+          async (client) => {
+            await client.request(methods.agent.initialize, {
+              protocolVersion: 1,
+              clientCapabilities: { subagents: {} },
+            });
+            injectGeneratorSession(agent, async function* () {} as never);
+            const session = agent.sessions["test-session"]!;
+            session.nativeSubagentsByTaskId = new Map([
+              [
+                sessionId,
+                {
+                  sessionId,
+                  parentSessionId: "test-session",
+                  name: "Explore",
+                  task: "Go",
+                  announced: true,
+                },
+              ],
+            ]);
+            session.nativeSubagentRuntime = new NativeSubagentRuntime(
+              "rfd",
+              "test-session",
+              session,
+              async () => {},
+              logger,
+            );
+
+            await expect(client.request(method as never, params as never)).rejects.toMatchObject({
+              code: -32602,
+              data: { sessionId },
+              message: expect.stringContaining("agent-42 is a subagent session"),
+            });
+          },
+        );
+      });
+    });
+
     describe("session/cancel on the parent session", () => {
       /**
        * Runs a turn that starts a background workflow, a background command
