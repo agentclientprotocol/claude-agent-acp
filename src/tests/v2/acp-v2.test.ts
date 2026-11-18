@@ -1575,6 +1575,7 @@ describe("ACP v2 sessions", () => {
       ]);
       const [update] = client.updates("config_option_update");
       expect(update.configOptions.find((option) => option.configId === "fast")).toMatchObject({
+        category: "speed",
         currentValue: false,
         description:
           "Faster responses on supported models — requires extra usage to be enabled for this account",
