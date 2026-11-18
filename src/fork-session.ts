@@ -176,10 +176,23 @@ function isUnknownSessionError(error: unknown, sessionId: string): boolean {
   );
 }
 
+/**
+ * Copies the transcript of `params.sessionId` into a new session.
+ *
+ * Fails with invalid params (-32602) for a `cursorId`: the agent sends no
+ * `cursor_update`, so it issued no cursor, and ACP forbids forking the whole
+ * session in its place.
+ */
 export async function forkSession(
   params: ForkSessionRequest,
   dependencies: ForkSessionDependencies,
 ): Promise<ForkSessionResponse> {
+  if (params.cursorId != null) {
+    throw RequestError.invalidParams(
+      { cursorId: params.cursorId },
+      `Session ${params.sessionId} has no cursor ${params.cursorId}: this agent announces no session cursors. Send the request without \`cursorId\` to fork the whole session.`,
+    );
+  }
   try {
     return await forkTranscript(params, dependencies);
   } catch (error) {

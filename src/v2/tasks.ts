@@ -640,7 +640,7 @@ export class SessionTasks {
   /** Reads the subagents that the history `messages` launched, for its replay. */
   loadReplay(messages: SessionMessage[]): Promise<SubagentReplay | undefined> {
     return SubagentReplay.load(this.host, messages, {
-      tracks: (sessionId) => this.children.has(sessionId),
+      working: (sessionId) => this.children.get(sessionId)?.working === true,
       configuration: (sessionId) =>
         this.hasChild(sessionId) ? this.configs.published(sessionId) : undefined,
     });
@@ -2501,12 +2501,4 @@ function terminalOutput(
       _meta: output.replaces ? { terminal_output: data } : { terminal_output_delta: data },
     },
   };
-}
-
-/** The error of a request on a child session: the client can only watch a child. */
-export function restrictedChild(sessionId: string, method: string): RequestError {
-  return RequestError.invalidParams(
-    { sessionId },
-    `${sessionId} is a subagent session: the client cannot ${method} it. Its parent session runs it.`,
-  );
 }

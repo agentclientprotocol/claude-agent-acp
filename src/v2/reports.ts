@@ -36,6 +36,7 @@ import {
   readContextWindow,
 } from "../context-window.js";
 import { IdleCompaction } from "../idle-compaction.js";
+import type { UnservedMcpServer } from "../mcp-servers.js";
 import { PromptSuggestions } from "../prompt-suggestions.js";
 import {
   informationalNotice,
@@ -88,6 +89,8 @@ export interface ReportsSetup {
   env: Record<string, string | undefined>;
   /** The names of the client's MCP servers. */
   mcpServers: readonly string[];
+  /** The ones of them that the query started without (see `sdkMcpServers`). */
+  unservedMcpServers: readonly UnservedMcpServer[];
   /**
    * Whether the session asks the user to sign in to an MCP server that needs
    * it (see `SessionElicitations.authenticateMcpServers`): the client renders
@@ -112,6 +115,7 @@ export class SessionReports {
   private settings: ReportsSetup["settings"] | undefined;
   private configuredSettings: Settings | undefined;
   private clientMcpServers = new Set<string>();
+  private unservedMcpServers: readonly UnservedMcpServer[] = [];
   private mcpOAuth = false;
   private readonly reportedMcpServers = new Set<string>();
   /** The tool uses whose `informational` progress went out as a notice. */
@@ -168,6 +172,7 @@ export class SessionReports {
   /** Called once, before the query's first message. */
   configure(setup: ReportsSetup): void {
     this.clientMcpServers = new Set(setup.mcpServers);
+    this.unservedMcpServers = setup.unservedMcpServers;
     this.mcpOAuth = setup.mcpOAuth;
     this.settings = setup.settings;
     this.configuredSettings = setup.configuredSettings;
@@ -198,9 +203,13 @@ export class SessionReports {
     this.suggestions = previous.suggestions;
   }
 
-  /** The session's MCP servers changed, as a resume of the active session asks. */
-  mcpServersChanged(names: readonly string[]): void {
+  /**
+   * The session's MCP servers are now the ones of `names`, and `unserved`
+   * the ones it goes on without, as a resume of the active session asks.
+   */
+  mcpServersChanged(names: readonly string[], unserved: readonly UnservedMcpServer[]): void {
     this.clientMcpServers = new Set(names);
+    this.unservedMcpServers = unserved;
   }
 
   // --- Turns ---------------------------------------------------------------
@@ -579,12 +588,18 @@ export class SessionReports {
       );
   }
 
-  /** A notice for each client MCP server that did not start, once per server. */
+  /**
+   * A notice for each client MCP server that did not start, once per server:
+   * the ones that `servers`, the list of `system/init`, has as not started,
+   * and the ones the query started without.
+   */
   private mcpStartupFailures(servers: Array<{ name: string; status: string }> | undefined): void {
-    for (const server of servers ?? []) {
-      if (!this.clientMcpServers.has(server.name) || this.reportedMcpServers.has(server.name)) {
-        continue;
-      }
+    const notStarted = [
+      ...this.unservedMcpServers,
+      ...(servers ?? []).filter((server) => this.clientMcpServers.has(server.name)),
+    ];
+    for (const server of notStarted) {
+      if (this.reportedMcpServers.has(server.name)) continue;
       const notice = mcpServerStartupNotice(server, this.mcpOAuth);
       if (!notice) continue;
       this.reportedMcpServers.add(server.name);

@@ -46,6 +46,7 @@ import {
   stripLocalCommandMetadata,
 } from "../../message-filters.js";
 import type { AcpClient } from "../../acp-client.js";
+import type { UnservedMcpServer } from "../../mcp-servers.js";
 import type { SDKMessageFilter } from "../../new-session-meta.js";
 import { SessionTitles } from "../../session-titles.js";
 import { SessionBackgroundWork } from "../../v1/background-work.js";
@@ -8304,6 +8305,71 @@ describe("subagent permission attribution (issue #851)", () => {
       });
     });
 
+    describe("any other request that names a child session", () => {
+      const sessionId = "agent-42";
+      const setup = { sessionId, cwd: "/test", mcpServers: [] };
+
+      it.each<[string, Record<string, unknown>]>([
+        [methods.agent.session.load, setup],
+        [methods.agent.session.resume, setup],
+        [methods.agent.session.fork, setup],
+        [methods.agent.session.close, { sessionId }],
+        [methods.agent.session.delete, { sessionId }],
+        [methods.agent.session.setTitle, { sessionId, title: "Scout" }],
+        [methods.agent.session.status, { sessionId }],
+        [methods.agent.session.options, { sessionId, cwd: "/test" }],
+        [methods.agent.session.setMode, { sessionId, modeId: "default" }],
+        [methods.agent.session.setConfigOption, { sessionId, configId: "mode", value: "default" }],
+        [methods.agent.session.prompt, { sessionId, prompt: [{ type: "text", text: "hi" }] }],
+      ])("rejects %s with invalid params", async (method, params) => {
+        const toAgent = new TransformStream<AnyMessage, AnyMessage>();
+        const toClient = new TransformStream<AnyMessage, AnyMessage>();
+        const logger = { log: () => {}, error: () => {} };
+        let agent!: ClaudeAcpAgent;
+        acpProtocolRouter(logger, (created) => (agent = created), "v1").connect({
+          readable: toAgent.readable,
+          writable: toClient.writable,
+        });
+
+        await acpClient({ name: "test-client" }).connectWith(
+          { readable: toClient.readable, writable: toAgent.writable },
+          async (client) => {
+            await client.request(methods.agent.initialize, {
+              protocolVersion: 1,
+              clientCapabilities: { subagents: {} },
+            });
+            injectGeneratorSession(agent, async function* () {} as never);
+            const session = agent.sessions["test-session"]!;
+            session.nativeSubagentsByTaskId = new Map([
+              [
+                sessionId,
+                {
+                  sessionId,
+                  parentSessionId: "test-session",
+                  name: "Explore",
+                  task: "Go",
+                  announced: true,
+                },
+              ],
+            ]);
+            session.nativeSubagentRuntime = new NativeSubagentRuntime(
+              "rfd",
+              "test-session",
+              session,
+              async () => {},
+              logger,
+            );
+
+            await expect(client.request(method as never, params as never)).rejects.toMatchObject({
+              code: -32602,
+              data: { sessionId },
+              message: expect.stringContaining("agent-42 is a subagent session"),
+            });
+          },
+        );
+      });
+    });
+
     describe("session/cancel on the parent session", () => {
       /**
        * Runs a turn that starts a background workflow, a background command
@@ -8989,7 +9055,7 @@ describe("subagent permission attribution (issue #851)", () => {
       }
     });
 
-    it("closes a background child's tool call in its session when the SDK reports the stop after the cancelled response", async () => {
+    it("closes a background child's tool call in its session when the SDK reports the stop after the prompt response", async () => {
       const log: string[] = [];
       const updates: AcpSessionNotification[] = [];
       const logError = vi.fn();
@@ -9050,9 +9116,9 @@ describe("subagent permission attribution (issue #851)", () => {
             ...rootToolUse("toolu_child", "Bash", { command: "make" }),
             parent_tool_use_id: "toolu_agent",
           };
-          // The turn's result comes while the subagent runs, so v1 holds the turn
-          // for it. The cancel settles the held turn, which leaves the subagent's
-          // command open, since the subagent runs.
+          // The turn's result comes while the subagent runs. The client declares
+          // `subagents`, so the turn ends at it, and the cancel comes while no
+          // prompt runs. The subagent's command stays open, since the subagent runs.
           yield successResult();
           await agent.cancel({ sessionId: "test-session" });
           await responded.promise;
@@ -9089,14 +9155,14 @@ describe("subagent permission attribution (issue #851)", () => {
             responded.resolve();
             return response;
           }),
-      ).resolves.toMatchObject({ stopReason: "cancelled" });
+      ).resolves.toMatchObject({ stopReason: "end_turn" });
       await agent.sessions["test-session"]?.consumer;
 
       // The command ends in the child's session, after the child reported idle.
       // The background launch's own result is not shown in the parent.
       expect(log).toEqual([
         'agent-42 {"state":"running"}',
-        "prompt cancelled",
+        "prompt end_turn",
         'agent-42 {"state":"idle","stopReason":"cancelled"}',
         "tool @agent-42 toolu_child failed",
       ]);
@@ -14130,7 +14196,10 @@ describe("model refusal fallback handling", () => {
 });
 
 describe("MCP server startup failures", () => {
-  function setup(mcpServersStatus: { name: string; status: string; source?: string }[]) {
+  function setup(
+    mcpServersStatus: { name: string; status: string; source?: string }[],
+    unservedMcpServers?: UnservedMcpServer[],
+  ) {
     const sessionUpdate = vi.fn(async () => {});
     const agent = new ClaudeAcpAgent({ sessionUpdate } as unknown as AcpClient, {
       log: () => {},
@@ -14188,6 +14257,7 @@ describe("MCP server startup failures", () => {
           { name: "client-api", type: "http", url: "https://example.com/mcp", headers: [] },
         ],
       },
+      unservedMcpServers,
     });
     const updates = () =>
       sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
@@ -14213,6 +14283,29 @@ describe("MCP server startup failures", () => {
         severity: "warning",
         title: 'MCP server "client-fs" failed to start',
         description: "Its tools are unavailable in this session. Run /mcp for the error.",
+      },
+    ]);
+  });
+
+  it("sends one notice, with the error, for a server the query started without", async () => {
+    // Claude Code was not given the server, so its init does not list it.
+    const { agent, updates } = setup(
+      [{ name: "client-api", status: "connected", source: "dynamic" }],
+      [{ name: "client-acp", status: "failed", error: "listen EPERM" }],
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { session: { notices: {} } },
+    });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    expect(updates().filter((u) => u.sessionUpdate === "notice")).toEqual([
+      {
+        sessionUpdate: "notice",
+        severity: "warning",
+        title: 'MCP server "client-acp" failed to start',
+        description: "Its tools are unavailable in this session. listen EPERM",
       },
     ]);
   });
@@ -23482,18 +23575,23 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
   // subagents are done — at the followup's terminal result, or at an idle
   // with none of them left.
   //
-  // The tests without `declareBackgroundSubagents` are the cases of a client
-  // that does not declare the AIR `backgroundSubagents` capability. Such a
-  // client keeps the hold.
+  // The tests without `declareNoHold` are the cases of a client that keeps
+  // the hold: it neither declares the AIR `backgroundSubagents` capability nor
+  // gets the RFD form of subagent sessions.
 
-  /** Declares the AIR `backgroundSubagents` capability: no turn is held. */
-  const declareBackgroundSubagents = (agent: ClaudeAcpAgent) =>
-    agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: {
-        _meta: { jetbrains: { air: { version: 1, capabilities: ["backgroundSubagents"] } } },
-      },
-    });
+  /** AIR's `backgroundSubagents` capability. */
+  const AIR_BACKGROUND_SUBAGENTS: ClientCapabilities = {
+    _meta: { jetbrains: { air: { version: 1, capabilities: ["backgroundSubagents"] } } },
+  };
+  /** The clients that get no hold, by what each declares in `initialize`. */
+  const NO_HOLD_CLIENTS: [string, ClientCapabilities][] = [
+    ["backgroundSubagents", AIR_BACKGROUND_SUBAGENTS],
+    ["the RFD form of subagent sessions", { subagents: {} } as ClientCapabilities],
+  ];
+
+  /** Declares a client that gets no hold: no turn of it is held. */
+  const declareNoHold = (agent: ClaudeAcpAgent, clientCapabilities: ClientCapabilities) =>
+    agent.initialize({ protocolVersion: 1, clientCapabilities });
 
   function createMockAgent() {
     const mockClient = {
@@ -23900,7 +23998,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       expect(agent.sessions["test-session"].pendingExitPlanModeInterruption).toBeUndefined();
     });
 
-    describe("with backgroundSubagents", () => {
+    describe.each(NO_HOLD_CLIENTS)("with %s", (_client, noHold) => {
       it("asks out of the turn without a clear-context option and drops the interrupt", async () => {
         let request: RequestPermissionRequest | undefined;
         const agent = new ClaudeAcpAgent(
@@ -23940,7 +24038,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
           }
           return messageGenerator();
         });
-        await declareBackgroundSubagents(agent);
+        await declareNoHold(agent, noHold);
         const session = agent.sessions["test-session"]!;
 
         const first = await agent.prompt({
@@ -24011,7 +24109,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
           }
           return messageGenerator();
         });
-        await declareBackgroundSubagents(agent);
+        await declareNoHold(agent, noHold);
         agent.sessions["test-session"]!.settingsManager.getShowClearContextOnPlanAccept = () =>
           true;
 
@@ -24059,7 +24157,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
             },
           },
         );
-        await declareBackgroundSubagents(agent);
+        await declareNoHold(agent, noHold);
         const session = agent.sessions["test-session"]!;
 
         const response = await agent.prompt({
@@ -24127,7 +24225,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
           }
           return messageGenerator();
         });
-        await declareBackgroundSubagents(agent);
+        await declareNoHold(agent, noHold);
         agent.sessions["test-session"]!.settingsManager.getShowClearContextOnPlanAccept = () =>
           true;
         const session = agent.sessions["test-session"]!;
@@ -24181,7 +24279,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
           }
           return messageGenerator();
         });
-        await declareBackgroundSubagents(agent);
+        await declareNoHold(agent, noHold);
         const session = agent.sessions["test-session"]!;
 
         const first = await agent.prompt({
@@ -24300,7 +24398,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
             },
           },
         );
-        await declareBackgroundSubagents(agent);
+        await declareNoHold(agent, noHold);
 
         const response = await agent.prompt({
           sessionId: "test-session",
@@ -24607,7 +24705,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
      *  agent-1 completes and the model sends its followup. */
     function run(
       resume: unknown[],
-      options: { subagents?: boolean; backgroundSubagents?: boolean } = {},
+      options: { subagents?: boolean; noHold?: ClientCapabilities } = {},
     ) {
       const updates: AcpSessionNotification[] = [];
       const requests: RequestPermissionRequest[] = [];
@@ -24658,7 +24756,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
             clientCapabilities: AIR_NATIVE_SUBAGENTS,
           });
         }
-        if (options.backgroundSubagents) await declareBackgroundSubagents(agent);
+        if (options.noHold) await declareNoHold(agent, options.noHold);
         const first = await agent.prompt({
           sessionId: "test-session",
           prompt: [{ type: "text", text: "explore" }],
@@ -24668,8 +24766,8 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
           sessionId: "test-session",
           prompt: [{ type: "text", text: "continue" }],
         });
-        // With `backgroundSubagents` the turn is never held.
-        if (!options.backgroundSubagents) {
+        // A turn of a client that gets no hold is never held.
+        if (!options.noHold) {
           await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
         }
         // Wrapped: an async function would unwrap and wait for the held prompt.
@@ -24820,7 +24918,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       await agent.sessions["test-session"]?.consumer;
     });
 
-    describe("with backgroundSubagents", () => {
+    describe.each(NO_HOLD_CLIENTS)("with %s", (_client, noHold) => {
       const summaryChunks = (updates: AcpSessionNotification[]) =>
         updates.filter(
           (n) =>
@@ -24830,7 +24928,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
 
       it("settles the SendMessage turn at its result while the resumed subagent runs", async () => {
         const { agent, updates, release, notified, start } = run([sendMessageResult()], {
-          backgroundSubagents: true,
+          noHold,
         });
         const { second } = await start();
         const session = agent.sessions["test-session"]!;
@@ -24850,7 +24948,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
 
       it("sends a permission request of the resumed subagent after the prompt response", async () => {
         const { agent, updates, requests, release, start } = run([sendMessageResult()], {
-          backgroundSubagents: true,
+          noHold,
         });
         const { second } = await start();
         await expect(second).resolves.toMatchObject({ stopReason: "end_turn" });
@@ -24876,7 +24974,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     });
   });
 
-  describe("with backgroundSubagents", () => {
+  describe.each(NO_HOLD_CLIENTS)("with %s", (_client, noHold) => {
     /** Agent whose client records the chunk texts as `chunk:<text>`, keeps
      *  every update, and allows every permission request. */
     const recordingAgent = () => {
@@ -24921,7 +25019,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
         }
         return messageGenerator();
       });
-      await declareBackgroundSubagents(agent);
+      await declareNoHold(agent, noHold);
       const session = agent.sessions["test-session"]!;
 
       const response = await agent.prompt({
@@ -24963,7 +25061,12 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       expect(session.owedTrailingIdles).toBe(0);
     });
 
-    it("keeps the streamed tool input of a running subagent when the turn ends at its result", async () => {
+    it("keeps the streamed tool input of a running subagent when the turn ends at its result", async ({
+      skip,
+    }) => {
+      // AIR only: this fixture has no Agent call that the RFD form could
+      // expose the child from, so an RFD client gets none of its updates.
+      skip(noHold !== AIR_BACKGROUND_SUBAGENTS);
       const { agent, updates } = recordingAgent();
       let release!: () => void;
       const gate = new Promise<void>((resolve) => (release = resolve));
@@ -25003,7 +25106,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
         }
         return messageGenerator();
       });
-      await declareBackgroundSubagents(agent);
+      await declareNoHold(agent, noHold);
       const session = agent.sessions["test-session"]!;
 
       const response = await agent.prompt({
@@ -25065,7 +25168,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
         }
         return messageGenerator();
       });
-      await declareBackgroundSubagents(agent);
+      await declareNoHold(agent, noHold);
       const session = agent.sessions["test-session"]!;
 
       const first = await agent.prompt({

@@ -74,6 +74,10 @@ with replay, which `replay_complete` ends, `session/close`, `session/prompt`, `s
 compaction, display terminals for commands, permission requests, elicitation, providers, auth, and
 [subagents](docs/subagent-sessions.md). Steering is v1 only for now.
 
+Two parts of the draft are not served yet. `session/prompt` takes an `idempotencyKey` and does not
+use it, so a prompt that a client sends again with the same key is inserted again. The adapter
+announces no session cursors, so `session/fork` with a `cursorId` fails with `-32602`.
+
 v2 is served by the v2 agent in `src/v2/`, which runs straight on Claude
 Code instead of translating to v1. A v2 client that declares JetBrains AIR
 (`_meta.jetbrains.air`) also gets the AIR extensions that ACP v2 does not cover.

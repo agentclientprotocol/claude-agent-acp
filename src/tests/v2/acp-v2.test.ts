@@ -2564,140 +2564,210 @@ describe("ACP v2 prompts", () => {
     });
   });
 
-  it("restores Workflow workers and their tool history on the launching call across a cold replay", async () => {
-    scriptTurns();
-    const client = v2Client();
-    await client.app.connectWith(connectRouter(), async (agent) => {
-      await initializeV2(agent);
-      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
-      const root = path.join(tempDir, "claude", "projects", "-project");
-      const runId = "wf_abc123";
-      const callId = "workflow-call";
-      const workerId = "abc123";
-      const run = path.join(root, sessionId, "subagents", "workflows", runId);
-      await mkdir(run, { recursive: true });
-      const launch = {
-        role: "assistant",
-        content: [{ type: "tool_use", name: "Workflow", id: callId, input: {} }],
-      };
-      const reply = {
-        role: "user",
-        content: [{ type: "tool_result", tool_use_id: callId, content: "Launched" }],
-      };
-      const wrote = (records: unknown[]) => records.map((r) => JSON.stringify(r)).join("\n") + "\n";
-      await writeFile(
-        path.join(root, sessionId + ".jsonl"),
-        wrote([
-          transcriptRecord(sessionId, "r1", null, launch),
-          transcriptRecord(sessionId, "r2", "r1", reply, {
-            toolUseResult: { taskType: "local_workflow", taskId: "task1", runId },
+  it.each(["cold", "active"] as const)(
+    "restores Workflow workers on their launching call across a %s session replay",
+    async (sessionKind) => {
+      scriptTurns();
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        const root = path.join(tempDir, "claude", "projects", "-project");
+        const runId = "wf_abc123";
+        const callId = "workflow-call";
+        const workerId = "abc123";
+        const run = path.join(root, sessionId, "subagents", "workflows", runId);
+        await mkdir(run, { recursive: true });
+        const launch = {
+          role: "assistant",
+          content: [{ type: "tool_use", name: "Workflow", id: callId, input: {} }],
+        };
+        const reply = {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: callId, content: "Launched" }],
+        };
+        const wrote = (records: unknown[]) =>
+          records.map((r) => JSON.stringify(r)).join("\n") + "\n";
+        await writeFile(
+          path.join(root, sessionId + ".jsonl"),
+          wrote([
+            transcriptRecord(sessionId, "r1", null, launch),
+            transcriptRecord(sessionId, "r2", "r1", reply, {
+              toolUseResult: { taskType: "local_workflow", taskId: "task1", runId },
+            }),
+          ]),
+        );
+        await writeFile(
+          path.join(run, "journal.jsonl"),
+          wrote([
+            { type: "started", agentId: workerId, key: "1", label: "Reader" },
+            { type: "result", agentId: workerId, key: "1", result: "finished" },
+          ]),
+        );
+        await writeFile(
+          path.join(run, "agent-" + workerId + ".jsonl"),
+          wrote(
+            [
+              transcriptRecord(sessionId, "c1", null, {
+                role: "user",
+                content: "Read the fixture.",
+              }),
+              transcriptRecord(sessionId, "c2", "c1", {
+                role: "assistant",
+                content: [
+                  {
+                    type: "tool_use",
+                    name: "Read",
+                    id: "child-read",
+                    input: { file_path: "/fixture.txt" },
+                  },
+                ],
+              }),
+              transcriptRecord(sessionId, "c3", "c2", {
+                role: "user",
+                content: [
+                  { type: "tool_result", tool_use_id: "child-read", content: "File result." },
+                ],
+              }),
+              transcriptRecord(sessionId, "c4", "c3", {
+                role: "assistant",
+                content: [{ type: "text", text: "Worker report." }],
+              }),
+            ].map((r) => ({ ...r, isSidechain: true, agentId: workerId })),
+          ),
+        );
+        if (sessionKind === "cold") {
+          await agent.request(v2.methods.agent.session.close, { sessionId });
+        } else {
+          // The worker is still observable but has gone unknown after its
+          // Workflow dropped off the list. Its current snapshot takes precedence
+          // over the earlier result in the journal.
+          const session = v2Session(sessionId);
+          const previous = session.resumeSnapshot();
+          vi.spyOn(session, "resumeSnapshot").mockReturnValueOnce([
+            {
+              sessionId,
+              update: {
+                sessionUpdate: "subagent_update",
+                sessionId: workerId,
+                state: { state: "unknown" },
+              },
+            },
+            { sessionId: workerId, update: { sessionUpdate: "state_update", state: "unknown" } },
+            ...previous,
+          ]);
+        }
+        const start = client.sessionUpdates.length;
+        vi.mocked(getSessionMessages).mockResolvedValueOnce([
+          transcriptEntry("assistant", "r1", launch),
+          transcriptEntry("user", "r2", reply),
+          transcriptEntry("user", "r3", { role: "user", content: "Later question." }),
+        ] as Awaited<ReturnType<typeof getSessionMessages>>);
+        await agent.request(v2.methods.agent.session.resume, {
+          sessionId,
+          cwd,
+          replayFrom: { type: "start" },
+        });
+        const responded = client.sessionUpdates.length;
+        await client.authUpdate(1);
+        const updates = client.sessionUpdates.slice(start);
+        const trace = client.sessionUpdates
+          .slice(start, responded)
+          .flatMap(({ sessionId: owner, update }) => {
+            if (update.sessionUpdate === "replay_complete")
+              return [owner === workerId ? "child complete" : "root complete"];
+            if (owner === workerId && update.sessionUpdate === "state_update")
+              return [`own ${update.state}`];
+            if (
+              owner === sessionId &&
+              update.sessionUpdate === "subagent_update" &&
+              update.sessionId === workerId &&
+              update.state
+            )
+              return [`mirror ${(update.state as v2.StateUpdate).state}`];
+            return [];
+          });
+        const current = sessionKind === "cold" ? "idle" : "unknown";
+        expect(trace).toEqual([
+          "mirror idle",
+          "child complete",
+          "root complete",
+          `mirror ${current}`,
+          `own ${current}`,
+        ]);
+        expect(
+          client.sessionUpdates
+            .slice(responded)
+            .filter(
+              ({ sessionId: owner, update }) =>
+                (owner === workerId && update.sessionUpdate === "state_update") ||
+                (update.sessionUpdate === "subagent_update" && update.sessionId === workerId),
+            ),
+        ).toEqual([]);
+
+        const child = updates.filter((n) => n.sessionId === workerId).map((n) => n.update);
+        expect(child).toContainEqual(
+          expect.objectContaining({
+            sessionUpdate: "tool_call_update",
+            name: "Read",
+            toolCallId: "child-read",
           }),
-        ]),
-      );
-      await writeFile(
-        path.join(run, "journal.jsonl"),
-        wrote([
-          { type: "started", agentId: workerId, key: "1", label: "Reader" },
-          { type: "result", agentId: workerId, key: "1", result: "finished" },
-        ]),
-      );
-      await writeFile(
-        path.join(run, "agent-" + workerId + ".jsonl"),
-        wrote(
-          [
-            transcriptRecord(sessionId, "c1", null, { role: "user", content: "Read the fixture." }),
-            transcriptRecord(sessionId, "c2", "c1", {
-              role: "assistant",
-              content: [
-                {
-                  type: "tool_use",
-                  name: "Read",
-                  id: "child-read",
-                  input: { file_path: "/fixture.txt" },
-                },
-              ],
+        );
+        expect(child).toContainEqual(
+          expect.objectContaining({
+            sessionUpdate: "tool_call_update",
+            toolCallId: "child-read",
+            status: "completed",
+          }),
+        );
+        expect(JSON.stringify(child)).toContain("File result.");
+        expect(JSON.stringify(child)).toContain("Worker report.");
+        if (sessionKind === "cold") {
+          expect(child).toContainEqual(
+            expect.objectContaining({
+              sessionUpdate: "state_update",
+              state: "idle",
+              stopReason: "end_turn",
             }),
-            transcriptRecord(sessionId, "c3", "c2", {
-              role: "user",
-              content: [
-                { type: "tool_result", tool_use_id: "child-read", content: "File result." },
-              ],
-            }),
-            transcriptRecord(sessionId, "c4", "c3", {
-              role: "assistant",
-              content: [{ type: "text", text: "Worker report." }],
-            }),
-          ].map((r) => ({ ...r, isSidechain: true, agentId: workerId })),
-        ),
-      );
-      vi.mocked(getSessionMessages).mockResolvedValueOnce([
-        transcriptEntry("assistant", "r1", launch),
-        transcriptEntry("user", "r2", reply),
-        transcriptEntry("user", "r3", { role: "user", content: "Later question." }),
-      ] as Awaited<ReturnType<typeof getSessionMessages>>);
-      await agent.request(v2.methods.agent.session.resume, {
-        sessionId,
-        cwd,
-        replayFrom: { type: "start" },
+          );
+        }
+        const parent = updates.filter((n) => n.sessionId === sessionId).map((n) => n.update);
+        const announce = parent.findIndex(
+          (u) => u.sessionUpdate === "subagent_update" && u.sessionId === workerId,
+        );
+        const card = parent.findIndex(
+          (u) =>
+            u.sessionUpdate === "tool_call_update" &&
+            u.toolCallId === callId &&
+            Array.isArray(u.content) &&
+            u.content.some((c) => c.type === "session" && c.sessionId === workerId),
+        );
+        expect(announce).toBeGreaterThanOrEqual(0);
+        expect(card).toBeGreaterThan(announce);
+        expect(JSON.stringify(parent)).not.toContain("Worker report.");
+        expect(
+          updates.findIndex(
+            (n) => n.sessionId === workerId && n.update.sessionUpdate === "tool_call_update",
+          ),
+        ).toBeLessThan(
+          updates.findIndex(
+            (n) =>
+              n.sessionId === sessionId && JSON.stringify(n.update).includes("Later question."),
+          ),
+        );
       });
-      const updates = client.sessionUpdates;
-      const child = updates.filter((n) => n.sessionId === workerId).map((n) => n.update);
-      expect(child).toContainEqual(
-        expect.objectContaining({
-          sessionUpdate: "tool_call_update",
-          name: "Read",
-          toolCallId: "child-read",
-        }),
-      );
-      expect(child).toContainEqual(
-        expect.objectContaining({
-          sessionUpdate: "tool_call_update",
-          toolCallId: "child-read",
-          status: "completed",
-        }),
-      );
-      expect(JSON.stringify(child)).toContain("File result.");
-      expect(JSON.stringify(child)).toContain("Worker report.");
-      expect(child).toContainEqual(
-        expect.objectContaining({
-          sessionUpdate: "state_update",
-          state: "idle",
-          stopReason: "end_turn",
-        }),
-      );
-      const parent = updates.filter((n) => n.sessionId === sessionId).map((n) => n.update);
-      const announce = parent.findIndex(
-        (u) => u.sessionUpdate === "subagent_update" && u.sessionId === workerId,
-      );
-      const card = parent.findIndex(
-        (u) =>
-          u.sessionUpdate === "tool_call_update" &&
-          u.toolCallId === callId &&
-          Array.isArray(u.content) &&
-          u.content.some((c) => c.type === "session" && c.sessionId === workerId),
-      );
-      expect(announce).toBeGreaterThanOrEqual(0);
-      expect(card).toBeGreaterThan(announce);
-      expect(JSON.stringify(parent)).not.toContain("Worker report.");
-      expect(
-        updates.findIndex(
-          (n) => n.sessionId === workerId && n.update.sessionUpdate === "tool_call_update",
-        ),
-      ).toBeLessThan(
-        updates.findIndex(
-          (n) => n.sessionId === sessionId && JSON.stringify(n.update).includes("Later question."),
-        ),
-      );
-    });
-  });
+    },
+  );
 
   it("replays a subagent's history to its own session, and clears each replayed message there first", async () => {
     // Claude Code keeps its stream open while the session lives.
     scriptTurns();
     const client = v2Client();
+    let root = "";
     await client.app.connectWith(connectRouter(), async (agent) => {
       await initializeV2(agent);
       const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      root = sessionId;
       await writeSubagentHistory(
         sessionId,
         [transcriptRecord(sessionId, "r1", null, { role: "user", content: "Explore it" })],
@@ -2740,26 +2810,17 @@ describe("ACP v2 prompts", () => {
         sessionId: "response",
         update: { sessionUpdate: "response" },
       } as never);
-      await vi.waitFor(() =>
-        expect(
-          client.sessionUpdates.filter(
-            ({ sessionId, update }) =>
-              sessionId === "abc123" && update.sessionUpdate === "state_update",
-          ),
-        ).toHaveLength(2),
-      );
       await client.authUpdate(1);
     });
 
     const child = client.sessionUpdates.flatMap(({ sessionId, update }) =>
       sessionId === "abc123" || sessionId === "response" ? [update] : [],
     );
-    // The child's past `running` does not replay; its last state goes once,
-    // after the child's own `replay_complete`. That state is history to the
-    // client, so the child's current state follows the response: its process
-    // is gone, so it is idle.
+    // The child's past `running` does not replay. Its current state goes
+    // once, after its own `replay_complete` and before the response: its
+    // process is gone, so it is idle.
     // The child's model, from its transcript, goes right after its
-    // announcement. It does not go again after the response: it is unchanged.
+    // announcement. It does not go again after the replay: it is unchanged.
     const model = expect.objectContaining({
       sessionUpdate: "config_option_update",
       configOptions: [
@@ -2779,7 +2840,23 @@ describe("ACP v2 prompts", () => {
       { sessionUpdate: "replay_complete" },
       { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn", background: [] },
       { sessionUpdate: "response" },
-      { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn", background: [] },
+    ]);
+    // On the parent, the child's states before the parent's `replay_complete`
+    // are history: its announcement and its end. Its current state follows
+    // the `replay_complete`, before the response.
+    const parent = client.sessionUpdates.flatMap(({ sessionId, update }) => {
+      if (sessionId === "response") return ["response"];
+      if (sessionId !== root) return [];
+      if (update.sessionUpdate === "replay_complete") return ["replay_complete"];
+      if (update.sessionUpdate !== "subagent_update") return [];
+      return [`subagent ${(update as { state?: { state: string } }).state?.state}`];
+    });
+    expect(parent).toEqual([
+      "subagent running",
+      "subagent idle",
+      "replay_complete",
+      "subagent idle",
+      "response",
     ]);
     // The current state on the parent grants nothing: the child cannot run again here.
     expect(
@@ -6729,7 +6806,7 @@ describe("ACP v2 requests that subagents make", () => {
       });
     });
 
-    it("sends a live child's configuration again after a replay's response, when the replay sent another", async () => {
+    it("sends a live child's configuration again after a replay, when the replay sent another", async () => {
       scriptTurns(async function* (options) {
         yield toolUseMessage(options, "toolu_agent-1", "Agent", {
           description: "Explore the project",
@@ -6800,9 +6877,6 @@ describe("ACP v2 requests that subagents make", () => {
           sessionId: "agent-1",
           update: { sessionUpdate: "response" },
         } as never);
-        await vi.waitFor(() =>
-          expect(client.sessionUpdates.at(-1)?.update.sessionUpdate).toBe("config_option_update"),
-        );
         await client.authUpdate(1);
       });
 
@@ -6819,12 +6893,22 @@ describe("ACP v2 requests that subagents make", () => {
         ];
       });
       // The replay sends the model of the child's response. The live child's
-      // configuration has its mode too, so it goes again after the response.
+      // configuration has its mode too, so it goes again after the replay,
+      // before the response.
       expect(configurations).toEqual([
         "model=claude-sonnet-4-6",
-        "response",
         "mode=acceptEdits model=claude-sonnet-4-6 agent=Explore",
+        "response",
       ]);
+      // The live child's work has ended, so the replay reports its current
+      // state too: once on its own stream, before the response.
+      const states = client.sessionUpdates.flatMap(({ sessionId, update }) => {
+        if (sessionId !== "agent-1") return [];
+        if (update.sessionUpdate === "response") return ["response"];
+        if (update.sessionUpdate !== "state_update") return [];
+        return [(update as { state: string }).state];
+      });
+      expect(states).toEqual(["idle", "response"]);
     });
 
     it("names a replayed child's model by the session's model list, on a resume of a closed session", async () => {
@@ -6876,15 +6960,6 @@ describe("ACP v2 requests that subagents make", () => {
           sessionId: "agent-1",
           update: { sessionUpdate: "response" },
         } as never);
-        // The child's current state follows the response.
-        await vi.waitFor(() =>
-          expect(
-            client.sessionUpdates.filter(
-              ({ sessionId, update }) =>
-                sessionId === "agent-1" && update.sessionUpdate === "state_update",
-            ),
-          ).toHaveLength(2),
-        );
         await client.authUpdate(1);
       });
 

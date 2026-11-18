@@ -63,6 +63,7 @@ import { V2Background, stateUpdate as currentStateUpdate } from "./background.js
 import type { V2UpdateTranslator } from "./update-translator.js";
 import { isLocalCommandOutput } from "../message-filters.js";
 import { MODEL_CONFIG_ID } from "../session-model.js";
+import type { UnservedMcpServer } from "../mcp-servers.js";
 import { modelRefusalFallback, noticeUpdate } from "../session-notices.js";
 import { planModeUpdate } from "../exit-plan.js";
 import { resetPlanUpdates } from "../plans.js";
@@ -389,14 +390,16 @@ export class V2Session implements RequestTarget {
 
   /**
    * Replaces the session's MCP servers, as a resume of the active session
-   * asks. The same servers stay as they are, connected.
+   * asks. The same servers stay as they are, connected. `unserved` are the
+   * request's servers that are not in `servers` (see `sdkMcpServers`).
    */
-  async setMcpServers(servers: McpServers): Promise<void> {
+  async setMcpServers(servers: McpServers, unserved: readonly UnservedMcpServer[]): Promise<void> {
     const key = JSON.stringify(servers);
-    if (key === this.mcpServers) return;
-    await this.query?.setMcpServers(servers);
-    this.reports.mcpServersChanged(Object.keys(servers));
-    this.mcpServers = key;
+    if (key !== this.mcpServers) {
+      await this.query?.setMcpServers(servers);
+      this.mcpServers = key;
+    }
+    this.reports.mcpServersChanged(Object.keys(servers), unserved);
   }
 
   // --- Requests ---------------------------------------------------------

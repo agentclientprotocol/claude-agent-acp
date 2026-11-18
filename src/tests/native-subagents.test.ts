@@ -2214,6 +2214,7 @@ describe("NativeSubagentRuntime in the RFD form", () => {
       const { runtime, published } = await runningWorker();
       const stop = vi.fn(async (_taskId: string) => {});
 
+      expect(runtime.hasChild("worker-1")).toBe(true);
       await expect(runtime.cancelChild("worker-1", stop)).resolves.toBe(true);
 
       expect(stop).toHaveBeenCalledExactlyOnceWith("worker-1");
@@ -2240,6 +2241,9 @@ describe("NativeSubagentRuntime in the RFD form", () => {
       await expect(runtime.cancelChild("other-1", stop)).resolves.toBe(false);
       await expect(air.cancelChild("child-1", stop)).resolves.toBe(false);
       expect(stop).not.toHaveBeenCalled();
+      // AIR's draft keeps its own rules for a request that names a child.
+      expect(["root", "other-1"].map((id) => runtime.hasChild(id))).toEqual([false, false]);
+      expect(air.hasChild("child-1")).toBe(false);
     });
   });
 
