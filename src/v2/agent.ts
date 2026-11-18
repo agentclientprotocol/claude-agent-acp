@@ -1036,9 +1036,8 @@ class V2Agent implements AgentHandle, SessionConnection {
       this.logger,
       { allowBypass, allowAuto },
     );
-    // The settings stay live for the idle compaction (see `reports.ts`) until the session
-    // ends. They keep the values they read: their cwd and key helper.
-    const authStarted = this.auth.sessionStarting(settings);
+    // Auth probes use the client's launch env and inline settings, before provider routing.
+    const authStarted = this.auth.sessionStarting(settings, configured, client?.env);
     const routeGeneration = this.auth.routeGeneration;
     const routing = this.auth.routing();
     const thinking = resolveThinkingConfig(

@@ -10714,6 +10714,73 @@ describe("ACP v2 providers", () => {
 });
 
 describe("ACP v2 auth", () => {
+  const bearerEnv = { ANTHROPIC_AUTH_TOKEN: "synthetic-bearer-token" };
+
+  it.each([
+    { source: "launch environment", options: { env: bearerEnv }, detail: "ANTHROPIC_AUTH_TOKEN" },
+    {
+      source: "inline settings",
+      options: { settings: { env: bearerEnv } },
+      detail: "ANTHROPIC_AUTH_TOKEN",
+    },
+    {
+      source: "inline settings clearing a launch token",
+      options: {
+        env: { ...bearerEnv, CLAUDE_CODE_OAUTH_TOKEN: "synthetic-setup-token" },
+        settings: { env: { ANTHROPIC_AUTH_TOKEN: "" } },
+      },
+      detail: "OAuth token",
+    },
+  ])(
+    "probes the v2 $source at session startup and again at prompts",
+    async ({ options, detail }) => {
+      vi.stubEnv("ANTHROPIC_AUTH_TOKEN", undefined);
+      scriptTurns(async function* (options) {
+        yield result(options);
+      });
+      const oauth = JSON.stringify({
+        loggedIn: true,
+        authMethod: "oauth_token",
+        apiProvider: "firstParty",
+      });
+      execFileSpy.mockImplementation((_cli, _args, execOptions, callback) => {
+        const stdout = execOptions.cwd === cwd ? oauth : CLI_SUBSCRIPTION;
+        callback(null, { stdout, stderr: "" });
+      });
+      const expectSessionProbe = () => {
+        const [, args, execOptions] = execFileSpy.mock.lastCall!;
+        expect(args).toEqual([
+          ...(options.settings ? ["--settings", JSON.stringify(options.settings)] : []),
+          "auth",
+          "status",
+          "--json",
+        ]);
+        expect(execOptions.cwd).toBe(cwd);
+        expect(execOptions.env.ANTHROPIC_AUTH_TOKEN).toBe(options.env?.ANTHROPIC_AUTH_TOKEN);
+      };
+      const { app, authUpdate, sessionUpdates } = v2Client();
+      await app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        expect((await authUpdate(1)).authStatus.account?.email).toBe("user@example.com");
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, {
+          cwd,
+          _meta: { claudeCode: { options } },
+        });
+        expect((await authUpdate(2)).authStatus.detail).toBe(detail);
+        expectSessionProbe();
+
+        const otherCwd = await mkdtemp(path.join(tempDir, "other-"));
+        await agent.request(v2.methods.agent.session.new, { cwd: otherCwd });
+        expect((await authUpdate(3)).authStatus.account?.email).toBe("user@example.com");
+
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+        expect((await authUpdate(4)).authStatus.detail).toBe(detail);
+        expectSessionProbe();
+        await vi.waitFor(() => expect(turnTrace(sessionUpdates)).toContain("idle end_turn"));
+      });
+    },
+  );
+
   it("reports the settings bearer token before and after a session, then reports removal", async () => {
     const env = {
       ANTHROPIC_AUTH_TOKEN: "synthetic-bearer-token",

@@ -17,7 +17,7 @@
  */
 import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
-import type { AccountInfo, ModelInfo, Settings } from "@anthropic-ai/claude-agent-sdk";
+import type { AccountInfo, ModelInfo, Options, Settings } from "@anthropic-ai/claude-agent-sdk";
 import type { AuthStatusKind } from "../auth-status.js";
 import type { Logger } from "../logger.js";
 import { terminalAuthMethods } from "../auth-methods.js";
@@ -73,6 +73,12 @@ export interface AuthEvents {
   probed(kind: AuthStatusKind): void;
 }
 
+type SessionAuthSettings = {
+  manager: AuthStatusSettings;
+  override?: Settings;
+  env?: Options["env"];
+};
+
 export class V2Auth {
   private gatewayLogin?: GatewayAuthRequest;
   private provider?: ProviderConfig;
@@ -81,7 +87,7 @@ export class V2Auth {
   /** How many of {@link providerUpdate} have not settled. */
   private providerUpdates = 0;
   /** The settings of each live session, for the probe at the start of its prompts. */
-  private readonly sessionSettings = new Map<string, AuthStatusSettings>();
+  private readonly sessionSettings = new Map<string, SessionAuthSettings>();
   private readonly status: AuthStatusReporter;
   /**
    * Counts the route changes that restarted the live sessions. A session
@@ -258,14 +264,16 @@ export class V2Auth {
    * reports nothing when a login or a logout came in between.
    */
   sessionStarting(
-    settings: AuthStatusSettings,
+    manager: AuthStatusSettings,
+    override?: Settings,
+    env?: Options["env"],
   ): (sessionId: string, account: AccountInfo | undefined) => void {
-    this.status.useSettings(settings);
+    this.status.useSettings(manager, override, env);
     const epoch = this.status.epoch;
     return (sessionId, account) => {
-      this.sessionSettings.set(sessionId, settings);
+      this.sessionSettings.set(sessionId, { manager, override, env });
       if (epoch === this.status.epoch) {
-        this.status.publishSessionAccount(account, settings.getApiKeyHelper());
+        this.status.publishSessionAccount(account, manager.getApiKeyHelper(override));
       }
     };
   }
@@ -276,15 +284,16 @@ export class V2Auth {
    */
   promptStarted(sessionId: string): void {
     const settings = this.sessionSettings.get(sessionId);
-    if (settings) this.status.useSettings(settings);
+    if (settings) this.status.useSettings(settings.manager, settings.override, settings.env);
     void this.status.probe();
   }
 
   /** Reports the account that the query of `sessionId` cached, as the identity. */
   publishAccount(sessionId: string, account: AccountInfo): void {
+    const settings = this.sessionSettings.get(sessionId);
     this.status.publishSessionAccount(
       account,
-      this.sessionSettings.get(sessionId)?.getApiKeyHelper(),
+      settings?.manager.getApiKeyHelper(settings.override),
     );
   }
 
