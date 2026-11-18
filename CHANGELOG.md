@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.108.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.108.0...v0.108.1) (2026-11-18)
+
+
+### Bug Fixes
+
+* answer -32602 on v1 for a request that names a subagent's session ([#1656](https://github.com/agentclientprotocol/claude-agent-acp/issues/1656)) ([253cd84](https://github.com/agentclientprotocol/claude-agent-acp/commit/253cd84ed84efd38fd9d90faaf954690d1610677))
+* close a server tool call whose reply Claude Code gave up on, once its next reply starts ([#1604](https://github.com/agentclientprotocol/claude-agent-acp/issues/1604)) ([3205f0b](https://github.com/agentclientprotocol/claude-agent-acp/commit/3205f0bf0211f9346dad8583944f007bd0ef73c2))
+* end a v1 turn at its result for a client in the subagents RFD form ([#1603](https://github.com/agentclientprotocol/claude-agent-acp/issues/1603)) ([c4b64f6](https://github.com/agentclientprotocol/claude-agent-acp/commit/c4b64f628d1fad37ed1d56016b91eefc59df5052))
+* reject session setup for an incompatible model provider ([#1506](https://github.com/agentclientprotocol/claude-agent-acp/issues/1506)) ([90070d6](https://github.com/agentclientprotocol/claude-agent-acp/commit/90070d6cbf29f5425e4e08828552f91493dd3e59))
+* start a session without an MCP-over-ACP server whose local endpoint cannot open ([#1653](https://github.com/agentclientprotocol/claude-agent-acp/issues/1653)) ([96dd2bb](https://github.com/agentclientprotocol/claude-agent-acp/commit/96dd2bb10d838aeb39d75bb0cfde1c7b4eae958a)), closes [#1651](https://github.com/agentclientprotocol/claude-agent-acp/issues/1651)
+* update to @agentclientprotocol/sdk 2.8.0 ([#1655](https://github.com/agentclientprotocol/claude-agent-acp/issues/1655)) ([b6167a8](https://github.com/agentclientprotocol/claude-agent-acp/commit/b6167a82dba9864a13dad31a7cad151704badf5e))
+
 ## [0.108.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.107.3...v0.108.0) (2026-11-17)
 
 
