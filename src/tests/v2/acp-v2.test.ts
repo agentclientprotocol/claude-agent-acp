@@ -2790,6 +2790,8 @@ describe("ACP v2 prompts", () => {
       expect.objectContaining({ currentValue: "claude-haiku-4-5" }),
       expect.objectContaining({ currentValue: "claude-sonnet-4-6" }),
     ]);
+    // The client cannot fork a child, so the messages a child received get no cursor.
+    expect(client.updates("cursor_update")).toEqual([]);
   });
 
   it("ends a resume with replay with one end event after replay_complete for a client with loadReplayEnd", async () => {

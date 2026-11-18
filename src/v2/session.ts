@@ -68,6 +68,7 @@ import type { UnservedMcpServer } from "../mcp-servers.js";
 import { modelRefusalFallback, noticeUpdate } from "../session-notices.js";
 import { planModeUpdate } from "../exit-plan.js";
 import { resetPlanUpdates } from "../plans.js";
+import { forkCursorUpdate, promptGetsCursor } from "../session-cursors.js";
 import type { ClearContextReset } from "../clear-context-coordinator.js";
 import { agentFileChangeReportMeta } from "../file-change-audit.js";
 import type { AirSupport } from "./air.js";
@@ -179,6 +180,12 @@ export class V2Session implements RequestTarget {
   private lifecycleFrames = false;
   /** What the open turn's assistant messages reported about its end (see {@link TurnReport}). */
   private readonly turnReport = new TurnReport();
+  /**
+   * Whether the conversation holds an entry: the query resumed a stored one,
+   * or a prompt of this session was inserted. A prompt that follows one gets
+   * a session cursor (see {@link inserted}).
+   */
+  private hasHistory = false;
   /** Set by `session/close`, or when the query ends: nothing more goes out. */
   private closed = false;
   private closing: Promise<void> | undefined;
@@ -364,6 +371,7 @@ export class V2Session implements RequestTarget {
     this.config = config;
     this.keys = keys;
     this.usage = new ResultUsage(resumed);
+    this.hasHistory = resumed;
     this.mcpServers = JSON.stringify(mcpServers);
     this.commands = new SessionCommands(query);
     void this.consume(query);
@@ -1198,12 +1206,22 @@ export class V2Session implements RequestTarget {
     this.openTurn(uuid);
   }
 
+  /**
+   * The prompt `uuid` is inserted: its `user_message` goes out, and its
+   * response. A prompt that follows an entry of the conversation also gets
+   * its session cursor, which `session/fork` takes to copy the history
+   * before the prompt (see `session-cursors.ts`). The cursor is announced at
+   * once, and a fork finds it once Claude Code stored the message. A slash
+   * command gets none.
+   */
   private inserted(uuid: string): void {
     const prompt = this.pending.get(uuid);
     if (!prompt) return;
     this.pending.delete(uuid);
     this.fileChanges?.promptStarted(uuid);
     this.send({ sessionUpdate: "user_message", messageId: uuid, content: prompt.prompt });
+    if (this.hasHistory && promptGetsCursor(prompt.prompt)) this.send(forkCursorUpdate(uuid));
+    this.hasHistory = true;
     prompt.resolve({ messageId: uuid });
   }
 
