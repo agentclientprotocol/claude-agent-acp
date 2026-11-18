@@ -322,6 +322,8 @@ export class SessionRestarts {
       // The new query read the account in force.
       this.accountChanged.delete(sessionId);
       session.reports.restartedFrom(previous.reports);
+      // Before its connect below: Remote Control that the user turned off stays off.
+      session.remoteControlRestartedFrom(previous);
       // Work that started on the old query while the new one started, such
       // as a turn that Claude Code started on its own, ends first. New
       // prompts wait for this restart meanwhile (`beforePrompt`).

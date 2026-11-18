@@ -14,8 +14,9 @@ import type { SessionNotice } from "../session-notices.js";
 export type PromptHoldingSession = {
   /**
    * The Remote Control change that is running, from its request to its
-   * answer. Prompts wait for it, and a `/remote-control` command is refused
-   * meanwhile.
+   * answer: a `/remote-control` command, or Remote Control starting with the
+   * query. Prompts wait for it, and a `/remote-control` is refused meanwhile:
+   * v1 refuses a command rather than hold it, as it does while Claude works.
    */
   remoteControlCommand?: Promise<void>;
 };
@@ -56,7 +57,10 @@ export type StartupConnection = RemoteControlAtStartupSession & {
  * Starts Remote Control with the session's query when Claude Code asked for it
  * (see `RemoteControlAtStartup`), and holds the session's prompts back until
  * its notice is sent. A `/remote-control` command that runs meanwhile makes
- * the session busy too: Remote Control is that command's to decide.
+ * the session busy too: Remote Control is that command's to decide. One that
+ * comes while this runs is refused, as during another command. A query
+ * that closed before the answer, as by a restart or a close, gets no notice:
+ * it would report on Remote Control that ended with that query.
  */
 export async function connectAtStartup(
   session: PromptHoldingSession & { remoteControlAtStartup?: RemoteControlAtStartup },
@@ -71,7 +75,10 @@ export async function connectAtStartup(
     await holdingPrompts(
       session,
       () => connection.readStream(),
-      async () => connection.notice(await notice),
+      async () => {
+        const answer = await notice;
+        if (connection.query()) await connection.notice(answer);
+      },
     );
   } catch (error) {
     connection.logger.error(

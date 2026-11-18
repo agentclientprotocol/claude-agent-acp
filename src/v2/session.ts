@@ -412,6 +412,15 @@ export class V2Session implements RequestTarget {
   }
 
   /**
+   * A restart replaced the query of `previous` with this session's: Remote
+   * Control that the user turned off there stays off (see
+   * `SessionRemoteControl.restartedFrom`).
+   */
+  remoteControlRestartedFrom(previous: V2Session): void {
+    this.remoteControl.restartedFrom(previous.remoteControl);
+  }
+
+  /**
    * Starts Remote Control for a query that Claude Code asked to start with it
    * (see `SessionRemoteControl.connectAtStartup`), in line with the session's
    * prompts: the prompts after it wait for its notice, as they wait for the

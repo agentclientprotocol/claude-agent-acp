@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { ClaudeAcpAgent } from "../../v1/acp-agent.js";
 import type { AcpClient } from "../../acp-client.js";
-import { RemoteControlAtStartup, startsWithRemoteControl } from "../../remote-control.js";
+import { RemoteControlAtStartup } from "../../remote-control.js";
 import { mockSessionState } from "./session-doubles.js";
 
 /** A stream that stays open, like the real one: a consumer that reaches its end
@@ -266,6 +266,79 @@ describe("/remote-control", () => {
         push.mock.invocationCallOrder[0],
       );
     });
+
+    it("holds a prompt that waits for a sign-out respawn until its query's notice is sent", async () => {
+      const { enableRemoteControl, finish } = pendingRequest();
+      const push = vi.fn();
+      // A sign-out closed the query: the next prompt starts it again.
+      const { agent, sessionUpdate } = createAgent(
+        {},
+        {
+          needsSignOutRespawn: true,
+          queryClosed: true,
+          creationParams: { cwd: "/test", mcpServers: [] },
+        },
+      );
+      vi.spyOn(agent as any, "createSession").mockImplementation(async () => {
+        agent.sessions["session-1"] = mockSessionState({
+          query: Object.assign(openStream(), {
+            supportedCommands: async () => [],
+            enableRemoteControl,
+          }),
+          input: { push },
+          remoteControlAtStartup: new RemoteControlAtStartup(true),
+        });
+      });
+
+      const following = agent.startTurn(prompt("hello"), events);
+      await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalled());
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(push).not.toHaveBeenCalled();
+
+      finish({ session_url: "https://claude.ai/code/s" });
+      await following;
+
+      const notice = (sessionUpdate.mock.calls as any[][]).findIndex(([{ update }]) =>
+        JSON.stringify(update).includes("Remote Control connected"),
+      );
+      expect(push).toHaveBeenCalledOnce();
+      expect(sessionUpdate.mock.invocationCallOrder[notice]).toBeLessThan(
+        push.mock.invocationCallOrder[0],
+      );
+    });
+
+    it("refuses a /remote-control that comes while Remote Control starts with the query", async () => {
+      const { agent, enableRemoteControl, finish } = createPendingAgent({
+        remoteControlAtStartup: new RemoteControlAtStartup(true),
+      });
+
+      const start = agent.connectRemoteControlAtStartup("session-1");
+      await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalled());
+
+      await expect(agent.startTurn(prompt("/remote-control off"), events)).rejects.toThrow(
+        /already being changed/,
+      );
+      expect(enableRemoteControl).toHaveBeenCalledOnce();
+
+      finish({ session_url: "https://claude.ai/code/s" });
+      await start;
+    });
+
+    it("sends no notice when the query closed while Remote Control was starting", async () => {
+      const { agent, sessionUpdate, enableRemoteControl, finish } = createPendingAgent({
+        remoteControlAtStartup: new RemoteControlAtStartup(true),
+      });
+
+      const start = agent.connectRemoteControlAtStartup("session-1");
+      await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalled());
+      // A restart or a close ended the query, and its Remote Control with it.
+      agent.sessions["session-1"].queryClosed = true;
+      finish({ session_url: "https://claude.ai/code/s" });
+      await start;
+
+      expect(sessionUpdate).not.toHaveBeenCalled();
+    });
   });
 
   it("starts reading the query stream so other clients' messages reach this one", async () => {
@@ -293,108 +366,56 @@ describe("/remote-control", () => {
   });
 });
 
-describe("startsWithRemoteControl", () => {
-  /** The Remote Control fields of the `initialize` result of Claude Code
-   *  2.1.303 with `remoteControlAtStartup: true` in the user settings. */
-  const reported = {
-    remote_control_auto_enable: true,
-    remote_control_auto_connect_default: false,
-    remote_control_available: true,
-    remote_control_auto_on_by_default: false,
-  };
-
-  it.each([
-    [true, "asks for it", reported],
-    [
-      false,
-      "does not ask for it",
-      { ...reported, remote_control_auto_enable: false, remote_control_auto_on_by_default: true },
-    ],
-    [false, "predates the field", {}],
-  ])("is %s when Claude Code %s", (expected, _case, fields) => {
-    expect(startsWithRemoteControl({ models: [], ...fields } as any)).toBe(expected);
-  });
-});
-
 describe("Remote Control at session start", () => {
   /** The fields of a session whose query Claude Code asked to start Remote
    *  Control with. New for each test, as the first connect spends the request. */
   const startsWith = () => ({ remoteControlAtStartup: new RemoteControlAtStartup(true) });
 
-  it.each([
-    [
-      { session_url: "https://claude.ai/code/session_123" },
-      "\n\n> **Remote Control connected:** Continue this session from claude.ai/code or the Claude mobile app: https://claude.ai/code/session_123\n> Run /remote-control off to disconnect.\n\n",
-    ],
-    [
-      {},
-      "\n\n> **Remote Control connected:** Claude Code did not return a session URL.\n> Run /remote-control off to disconnect.\n\n",
-    ],
-  ])("connects and reports %j in a notice", async (result, expected) => {
-    const enableRemoteControl = vi.fn(async () => result);
+  it("connects and reports it in a notice, as a transcript line to a client without notices", async () => {
+    const enableRemoteControl = vi.fn(async () => ({
+      session_url: "https://claude.ai/code/session_123",
+    }));
     const { agent, sessionUpdate } = createAgent({ enableRemoteControl }, startsWith());
 
     await agent.connectRemoteControlAtStartup("session-1");
 
     expect(enableRemoteControl).toHaveBeenCalledExactlyOnceWith(true);
-    expect(messageText(sessionUpdate)).toBe(expected);
-  });
-
-  it("reports a refusal in a warning", async () => {
-    const enableRemoteControl = vi.fn(async () => {
-      throw new Error("Remote Control is disabled by policy");
-    });
-    const { agent, sessionUpdate } = createAgent({ enableRemoteControl }, startsWith());
-
-    await agent.connectRemoteControlAtStartup("session-1");
-
     expect(messageText(sessionUpdate)).toBe(
-      "\n\n> **Could not start Remote Control:** Remote Control is disabled by policy\n\n",
+      "\n\n> **Remote Control connected:** Continue this session from claude.ai/code or the Claude mobile app: https://claude.ai/code/session_123\n> Run /remote-control off to disconnect.\n\n",
     );
   });
 
-  it.each<[string, () => Record<string, unknown>, boolean, ((agent: ClaudeAcpAgent) => void)?]>([
-    [
-      "Claude Code did not ask for it",
-      () => ({ remoteControlAtStartup: new RemoteControlAtStartup(false) }),
-      true,
-    ],
-    ["the query has no Remote Control", startsWith, false],
-    ["the query is closed", () => ({ ...startsWith(), queryClosed: true }), true],
-    ["a turn is running", () => ({ ...startsWith(), turnQueue: [{ settled: false }] }), true],
+  // What v1 counts as busy, and its closed query. The steps both cores share
+  // are tested in `src/tests/remote-control.test.ts`.
+  it.each<[string, () => Record<string, unknown>, ((agent: ClaudeAcpAgent) => void)?]>([
+    ["the query is closed", () => ({ ...startsWith(), queryClosed: true })],
+    ["a turn is running", () => ({ ...startsWith(), turnQueue: [{ settled: false }] })],
     [
       "Claude Code runs a cycle of its own",
       startsWith,
-      true,
       (agent) => (agent as any).startForeground("session-1", "autonomous-cycle"),
     ],
     [
       "a /remote-control command runs",
       () => ({ ...startsWith(), remoteControlCommand: new Promise(() => {}) }),
-      true,
     ],
-  ])("starts nothing when %s", async (_case, overrides, supported, setup) => {
+    // A close before the setup response's timer ran.
+    [
+      "the session is gone",
+      startsWith,
+      (agent) => {
+        delete agent.sessions["session-1"];
+      },
+    ],
+  ])("starts nothing when %s", async (_case, overrides, setup) => {
     const enableRemoteControl = vi.fn(async () => ({ session_url: "https://claude.ai/code/s" }));
-    const { agent, sessionUpdate } = createAgent(
-      supported ? { enableRemoteControl } : {},
-      overrides(),
-    );
+    const { agent, sessionUpdate } = createAgent({ enableRemoteControl }, overrides());
     setup?.(agent);
 
     await agent.connectRemoteControlAtStartup("session-1");
 
     expect(enableRemoteControl).not.toHaveBeenCalled();
     expect(sessionUpdate).not.toHaveBeenCalled();
-  });
-
-  it("starts Remote Control once per query", async () => {
-    const enableRemoteControl = vi.fn(async () => ({ session_url: "https://claude.ai/code/s" }));
-    const { agent } = createAgent({ enableRemoteControl }, startsWith());
-
-    await agent.connectRemoteControlAtStartup("session-1");
-    await agent.connectRemoteControlAtStartup("session-1");
-
-    expect(enableRemoteControl).toHaveBeenCalledOnce();
   });
 
   it("spends the request of a fresh context for an approved plan, which starts while Claude works", async () => {
@@ -439,6 +460,51 @@ describe("Remote Control at session start", () => {
     expect(agent.sessions["session-1"]).toBe(fresh);
     expect(fresh.turnQueue).toEqual([turn]);
     expect(enableRemoteControl).not.toHaveBeenCalled();
+  });
+
+  it("keeps a /remote-control off through the fresh context of an approved plan", async () => {
+    const enableRemoteControl = vi.fn(async () => ({ session_url: "https://claude.ai/code/s" }));
+    const { agent } = createAgent(
+      { enableRemoteControl, close: vi.fn() },
+      {
+        ...startsWith(),
+        creationParams: { cwd: "/test", mcpServers: [] },
+        input: { push: vi.fn(), end: vi.fn() },
+      },
+    );
+    await agent.prompt(prompt("/remote-control off"));
+    const old = agent.sessions["session-1"];
+    const turn = { promptUuid: "prompt-1", settled: false, resolve: vi.fn(), reject: vi.fn() };
+    Object.assign(old, { activeTurn: turn, turnQueue: [turn] });
+    const fresh = mockSessionState({
+      query: Object.assign(openStream(), {
+        supportedCommands: async () => [],
+        enableRemoteControl,
+      }),
+      input: { push: vi.fn() },
+      ...startsWith(),
+    });
+    vi.spyOn(agent as any, "createSession").mockImplementation(async () => {
+      agent.sessions["session-1"] = fresh;
+    });
+
+    await (agent as any).exitPlan.restart("session-1", old, {
+      toolUseId: "tool-plan",
+      plan: "Ship it",
+      mode: "auto",
+    });
+    // A later restart of the fresh query, such as a provider switch.
+    const later = new RemoteControlAtStartup(true);
+    later.restartedFrom(fresh.remoteControlAtStartup);
+    await later.connect({
+      sessionId: "session-1",
+      logger: { log: vi.fn(), error: vi.fn() },
+      query: () => fresh.query,
+      working: () => false,
+    });
+
+    expect(agent.sessions["session-1"]).toBe(fresh);
+    expect(enableRemoteControl.mock.calls).toEqual([[false]]);
   });
 
   it("starts reading the query stream so other clients' messages reach this one", async () => {

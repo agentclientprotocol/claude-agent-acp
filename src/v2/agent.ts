@@ -1360,7 +1360,8 @@ class V2Agent implements AgentHandle, SessionConnection {
     }
     // For the description of a child's agent type in its configuration.
     session.tasks.configs.configureAgents(customAgents(initialization.agents ?? []));
-    // Read again for every query, so a restart's new query starts it too.
+    // Read again for every query, so a restart's new query starts it too,
+    // unless the user turned it off (`restarts.ts` carries that over).
     session.setRemoteControlAtStartup(startsWithRemoteControl(initialization));
     let models;
     try {

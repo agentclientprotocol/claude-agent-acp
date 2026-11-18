@@ -129,8 +129,10 @@ type RemoteControlInitializeResponse = SDKControlInitializeResponse & {
   remote_control_auto_enable?: boolean;
 };
 
-/** Whether Claude Code asks for Remote Control to start with the session.
- *  `false` when the field is missing, as from a CLI that predates it. */
+/** Whether Claude Code asks for Remote Control to start with the session:
+ *  `remoteControlAtStartup` in the settings, else the policy default, else a
+ *  rollout (see `RemoteControlInitializeResponse`). `false` when the field is
+ *  missing, as from a CLI that predates it. */
 export function startsWithRemoteControl(
   initializationResult: SDKControlInitializeResponse,
 ): boolean {
@@ -173,7 +175,7 @@ export async function startRemoteControl(
 export type RemoteControlAtStartupSession = {
   readonly sessionId: string;
   readonly logger: Logger;
-  /** The session's query, or `undefined` once it is closed. */
+  /** The session's query, or `undefined` when it has none to start Remote Control on. */
   query(): Query | undefined;
   /** Whether the session is busy in its core's sense, such as Claude working. */
   working(): boolean;
@@ -183,21 +185,47 @@ export type RemoteControlAtStartupSession = {
  * Remote Control at the start of a query that Claude Code asked to start with
  * it (see {@link startsWithRemoteControl}). Each core keeps one per query and
  * connects it after the query's setup response and after a restart, whose new
- * query asks again: closing the old query ended its Remote Control. Holding
- * prompts back and sending the notice are each core's own, as they follow the
- * core's turn model.
+ * query asks again: closing the old query ended its Remote Control. Unless the
+ * user turned it off: a restart carries the user's last `/remote-control` into
+ * the new query (see {@link restartedFrom}). A session that a failed restart
+ * lost carries nothing: the client sets it up again, and that setup asks
+ * afresh. Holding prompts back and sending the notice are each core's own, as
+ * they follow the core's turn model.
  */
 export class RemoteControlAtStartup {
+  /** Whether the user's last `/remote-control` on this query turned it off. */
+  private turnedOff = false;
+
   constructor(private asked: boolean) {}
+
+  /**
+   * The user ran `command` on this query. Recorded before its request goes
+   * out, so a restart that overlaps the request already knows.
+   */
+  commandRan(command: RemoteControlCommand): void {
+    this.turnedOff = command.action === "disconnect";
+  }
+
+  /**
+   * A restart replaced the query of `previous` with this one. Remote Control
+   * that the user turned off there stays off: this query asks again only
+   * because the setting does, and the setting can come from a rollout the user
+   * never chose.
+   */
+  restartedFrom(previous: RemoteControlAtStartup | undefined): void {
+    if (!previous?.turnedOff) return;
+    this.turnedOff = true;
+    this.asked = false;
+  }
 
   /**
    * Starts Remote Control on the first call, and resolves the notice that
    * tells the user how it went. When nothing starts, it returns `undefined`
    * rather than a promise, so a core can hold its prompts back in the same
-   * synchronous step: Claude Code did not ask, an earlier call ran, the query
-   * is closed or has no Remote Control, or the session is busy, as the notice
-   * would land inside that work. `/remote-control` still connects the session
-   * then.
+   * synchronous step: Claude Code did not ask, the user turned it off before
+   * a restart, an earlier call ran, the query is closed or has no Remote
+   * Control, or the session is busy, as the notice would land inside that
+   * work. `/remote-control` still connects the session then.
    */
   connect(session: RemoteControlAtStartupSession): Promise<SessionNotice> | undefined {
     if (!this.asked) return undefined;

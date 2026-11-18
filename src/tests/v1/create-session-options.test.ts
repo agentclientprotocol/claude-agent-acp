@@ -2219,6 +2219,82 @@ describe("createSession options merging", () => {
       expect(enableRemoteControl).toHaveBeenLastCalledWith(true);
       expect(notices()).toHaveLength(2);
     });
+
+    it.each<[string, (agent: ClaudeAcpAgentType, sessionId: string) => Promise<unknown>]>([
+      [
+        "a provider switch",
+        (agent) =>
+          agent.unstable_setProvider({
+            providerId: "main",
+            apiType: "anthropic",
+            baseUrl: "https://gw.example",
+            headers: {},
+          }),
+      ],
+      [
+        "a resume that changes its options",
+        (agent, sessionId) =>
+          agent.resumeSession({
+            sessionId,
+            cwd: process.cwd(),
+            mcpServers: [],
+            _meta: { claudeCode: { options: { maxTurns: 10 } } },
+          }),
+      ],
+    ])(
+      "keeps Remote Control off on the new query of %s after /remote-control off",
+      async (_case, restart) => {
+        remoteControlAutoEnable = true;
+        const enableRemoteControl = vi.fn(async () => ({
+          session_url: "https://claude.ai/code/session_123",
+        }));
+        enableRemoteControlImpl = enableRemoteControl;
+        const { sessionId } = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+        await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalledOnce());
+        await agent.prompt({ sessionId, prompt: [{ type: "text", text: "/remote-control off" }] });
+        const optionsBefore = capturedOptions;
+
+        await restart(agent, sessionId);
+        // Past the timer of a setup response, which connects a new query.
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        expect(capturedOptions).not.toBe(optionsBefore);
+        expect(enableRemoteControl.mock.calls).toEqual([[true], [false]]);
+      },
+    );
+
+    it("keeps Remote Control off on the new query of a provider switch while /remote-control off is still out", async () => {
+      remoteControlAutoEnable = true;
+      let turnOff!: () => void;
+      const enableRemoteControl = vi.fn(async (enabled: boolean) => {
+        // The off request is still out when the provider switch restarts the query.
+        if (!enabled) await new Promise<void>((resolve) => (turnOff = resolve));
+        return { session_url: "https://claude.ai/code/session_123" };
+      });
+      enableRemoteControlImpl = enableRemoteControl;
+      const { sessionId } = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalledOnce());
+      const off = agent.prompt({
+        sessionId,
+        prompt: [{ type: "text", text: "/remote-control off" }],
+      });
+      await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalledTimes(2));
+      const optionsBefore = capturedOptions;
+
+      await agent.unstable_setProvider({
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gw.example",
+        headers: {},
+      });
+      turnOff();
+      await off;
+      // Past the timers of the restart's setup work.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(capturedOptions).not.toBe(optionsBefore);
+      expect(enableRemoteControl.mock.calls).toEqual([[true], [false]]);
+    });
   });
 
   describe("context window seeding", () => {
