@@ -86,6 +86,14 @@ after the parent's copy. A replay ends each child's history with a `replay_compl
 session, before the child's `idle`. The notice that subagent history is missing follows the
 parent's `replay_complete`.
 
+On ACP v2, a Dynamic Workflow keeps its tool card for the overall run and its phases.
+When Claude Code reports a worker's agent ID and the adapter knows which session owns the
+Workflow, the adapter also announces that worker as a child session and links to it from the
+Workflow card. The child reports its own state, including the error when Claude Code provides
+one. Workers without an agent ID appear only on the card. The card can stop the whole Workflow.
+Individual workers have no SDK task handle for cancellation. An active session can resend its
+current workers on resume. A cold history replay cannot recover the live Workflow snapshots.
+
 JetBrains AIR keeps the earlier draft of the RFD (`subagent_spawned`, `subagent_state_update`),
 which it enables with `nativeSubagentSessions` in `_meta.jetbrains.air.capabilities`. See
 [AIR extensions](air-extensions.md#native-subagent-sessions).

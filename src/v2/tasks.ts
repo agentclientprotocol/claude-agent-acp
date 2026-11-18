@@ -95,7 +95,13 @@ import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { AcpToolCallRenderer } from "../tool-calls/renderer.js";
 import type { BackgroundItem, V2Background, WorkStateName } from "./background.js";
 import type { V2UpdateTranslator } from "./update-translator.js";
-import { type WorkflowCardProgress, workflowCard, workflowSnapshot } from "../workflow-progress.js";
+import {
+  type WorkflowAgent,
+  type WorkflowCardProgress,
+  type WorkflowSnapshot,
+  workflowCard,
+  workflowSnapshot,
+} from "../workflow-progress.js";
 import { ChildConfigurations } from "./child-config.js";
 import { SessionOutput } from "./stream.js";
 import { SubagentReplay } from "./subagent-replay.js";
@@ -177,6 +183,8 @@ type Launch = {
 type AgentTask = { parentTaskId: string | undefined; background: boolean };
 
 type Child = {
+  /** Workflow workers have an agent id but no task id that stopTask can target. */
+  workflowTaskId?: string;
   /** The child's session id: its agent id. */
   sessionId: string;
   /** The session that made its launch call, once it is announced. */
@@ -221,6 +229,23 @@ type Child = {
   stopped: Set<string>;
 };
 
+type TaskToolCall = {
+  toolCallId: string;
+  output: SessionOutput;
+  toolUse?: { name: string; input: unknown };
+  title?: string;
+  paused: boolean;
+  /** The last progress card sent, including its references to announced sessions. */
+  sentWorkflowCard?: string;
+};
+
+type ObservedWorkflow = {
+  call: TaskToolCall;
+  workers: Map<string, Child>;
+  slots: Map<number, Child>;
+  progress?: WorkflowCardProgress;
+};
+
 type ToolResultBlock = { type: "tool_result"; tool_use_id: string; is_error?: boolean };
 
 type ToolCallUpdate = Extract<
@@ -235,6 +260,8 @@ type LevelTask = {
   description: string;
   parentTaskId?: string;
   progress?: WorkflowCardProgress;
+  /** A conversation reset detached this still-running workflow from its original parent. */
+  workersForgotten?: boolean;
 };
 
 /** What `task_started` said of a task that is not a subagent. */
@@ -256,6 +283,9 @@ const V2_RENDERER = new AcpToolCallRenderer(ClientCapabilities.from(undefined, {
 export class SessionTasks {
   /** The subagents, by agent id. */
   private readonly children = new Map<string, Child>();
+  /** The session that owns each Workflow call, through its final notification,
+   * and the last worker observed in each slot (a retry gets a new agent id). */
+  private readonly workflows = new Map<string, ObservedWorkflow>();
   /** The child of each Agent call that launched or resumed one. */
   private readonly childByToolUse = new Map<string, Child>();
   /** The Agent and Task calls, by tool use id. */
@@ -306,16 +336,7 @@ export class SessionTasks {
    * that the adapter started for its task (see {@link adoptTasks}) has the
    * task's description as its `title` instead of a tool use.
    */
-  private readonly toolCalls = new Map<
-    string,
-    {
-      toolCallId: string;
-      output: SessionOutput;
-      toolUse?: { name: string; input: unknown };
-      title?: string;
-      paused: boolean;
-    }
-  >();
+  private readonly toolCalls = new Map<string, TaskToolCall>();
   /** The tool calls that returned: their tasks no longer hold their work. */
   private readonly returned = new Set<string>();
   /** What a subagent's hooks reported before the child was announced, by agent id. */
@@ -546,8 +567,9 @@ export class SessionTasks {
     // goes on the call after the result's own updates.
     for (const [taskId, toolCall] of this.toolCalls) {
       if (!runningToolCalls.has(toolCall.toolCallId)) continue;
-      const card = workflowCard(this.level.get(taskId)?.progress);
-      if (card) toolCall.output.taskToolCallProgress(toolCall.toolCallId, card);
+      const progress = this.level.get(taskId)?.progress;
+      if (toolCall.toolUse?.name === "Workflow") this.observeWorkflow(taskId, toolCall);
+      if (progress) this.reportWorkflowCard(taskId, progress, progress.workflow);
     }
     // After the result's own updates: the output replaces their placeholder.
     if (command && runningTerminal) {
@@ -702,7 +724,7 @@ export class SessionTasks {
    */
   async cancelChild(sessionId: string): Promise<void> {
     const child = this.children.get(sessionId);
-    if (!child?.announced || !child.working) return;
+    if (!child?.announced || !child.working || child.workflowTaskId !== undefined) return;
     // The agents that this cancel stops, and not an earlier one still.
     const withdrawn: string[] = [];
     for (const agentId of this.agents.keys()) {
@@ -801,16 +823,35 @@ export class SessionTasks {
   currentState(): v2.UpdateSessionNotification[] {
     const updates: v2.UpdateSessionNotification[] = [];
     const lists = this.lists();
+    // A completed Workflow can still receive its final snapshot after a resume.
+    // Reintroduce the sessions that card may reference, and their ancestors.
+    const owners = new Set(
+      Array.from(this.workflows.values(), (workflow) => workflow.call.output.sessionId),
+    );
+    const childrenByParent = new Map<string, Child[]>();
+    for (const child of this.parentsFirst().reverse()) {
+      const { sessionId, parentSessionId, workflowTaskId } = child;
+      if (
+        !child.working &&
+        !owners.has(sessionId) &&
+        !childrenByParent.has(sessionId) &&
+        !(workflowTaskId !== undefined && this.workflows.has(workflowTaskId)) &&
+        !lists
+          .get(parentSessionId)
+          ?.some((item) => item.type === "subagent" && item.sessionId === sessionId)
+      )
+        continue;
+      const siblings = childrenByParent.get(parentSessionId) ?? [];
+      siblings.push(child);
+      childrenByParent.set(parentSessionId, siblings);
+    }
     const visit = (sessionId: string) => {
       const listed = lists.get(sessionId) ?? [];
-      const children = this.parentsFirst().filter(
-        (child) =>
-          child.parentSessionId === sessionId &&
-          (child.working ||
-            listed.some((item) => item.type === "subagent" && item.sessionId === child.sessionId)),
-      );
-      for (const child of children) {
-        const state = stateObject(this.childState(child), undefined);
+      for (const child of childrenByParent.get(sessionId)?.reverse() ?? []) {
+        const state = stateObject(
+          this.childState(child),
+          child.workflowTaskId ? child.outcome : undefined,
+        );
         if ((lists.get(child.sessionId) ?? []).length === 0) {
           updates.push(
             this.host.background.stamp({
@@ -818,6 +859,7 @@ export class SessionTasks {
               update: { ...this.announcement(child), state },
             }),
           );
+          if (childrenByParent.has(child.sessionId)) visit(child.sessionId);
         } else {
           updates.push({ sessionId: child.parentSessionId, update: this.announcement(child) });
           visit(child.sessionId);
@@ -849,7 +891,10 @@ export class SessionTasks {
         const status = toolCall.paused ? "paused" : "in_progress";
         for (const v2Update of this.host.translator.updates(sessionId, {
           ...update,
-          ...workflowCard(this.level.get(taskId)?.progress),
+          ...workflowCard(
+            this.level.get(taskId)?.progress,
+            this.workflows.get(taskId)?.workers.keys(),
+          ),
           status,
         } as AcpSessionNotification["update"])) {
           updates.push({ sessionId, update: v2Update });
@@ -912,6 +957,10 @@ export class SessionTasks {
     }
     this.publish();
     for (const child of this.children.values()) this.configs.forget(child.sessionId);
+    for (const task of this.level.values()) {
+      if (task.taskType === "local_workflow") task.workersForgotten = true;
+    }
+    this.workflows.clear();
     this.children.clear();
     this.childByToolUse.clear();
     this.launches.clear();
@@ -1035,6 +1084,12 @@ export class SessionTasks {
       this.host.foregroundRequestsChanged();
       this.publish();
     }
+    if (patch.status === "completed" || patch.status === "failed" || patch.status === "killed") {
+      this.finalWorkflowSnapshot(
+        taskId,
+        (patch as { terminal?: { workflow_progress?: unknown } }).terminal?.workflow_progress,
+      );
+    }
     switch (patch.status) {
       case "completed":
       case "failed":
@@ -1077,7 +1132,14 @@ export class SessionTasks {
     ) {
       return;
     }
+    // Recent CLIs can attach final worker states to the notification, after
+    // the last task_progress or even after the task left the background list.
+    this.finalWorkflowSnapshot(
+      message.task_id,
+      (message as { workflow_progress?: unknown }).workflow_progress,
+    );
     this.taskEnded(message.task_id, message.status);
+    this.workflows.delete(message.task_id);
   }
 
   /**
@@ -1095,16 +1157,112 @@ export class SessionTasks {
     const workflow = workflowSnapshot(
       (message as { workflow_progress?: unknown }).workflow_progress,
     );
-    const previous = workflowCard(task.progress);
     task.progress = {
       ...task.progress,
       ...taskProgressFields(message),
       ...(workflow ? { workflow } : {}),
     };
-    const card = workflowCard(task.progress);
-    if (!card || JSON.stringify(previous) === JSON.stringify(card)) return;
-    const toolCall = this.toolCalls.get(message.task_id);
-    toolCall?.output.taskToolCallProgress(toolCall.toolCallId, card);
+    if (this.reportWorkflowCard(message.task_id, task.progress, workflow)) this.publish();
+  }
+
+  /** Remember the call's owner even if the task leaves the list before its final snapshot. */
+  private observeWorkflow(taskId: string, call: TaskToolCall): void {
+    const task = this.level.get(taskId);
+    if (task?.taskType !== "local_workflow" || task.workersForgotten || this.workflows.has(taskId))
+      return;
+    this.workflows.set(taskId, { call, workers: new Map(), slots: new Map() });
+  }
+
+  private finalWorkflowSnapshot(taskId: string, rows: unknown): void {
+    const workflow = this.workflows.get(taskId);
+    const snapshot = workflowSnapshot(rows);
+    if (workflow && snapshot) {
+      this.reportWorkflowCard(taskId, { ...workflow.progress, workflow: snapshot }, snapshot, true);
+    }
+  }
+
+  /** Announce children before a replacement tool-card body references them. */
+  private reportWorkflowCard(
+    taskId: string,
+    progress: WorkflowCardProgress,
+    snapshot?: WorkflowSnapshot,
+    final = false,
+  ): boolean {
+    const workflow = this.workflows.get(taskId);
+    // Only a final snapshot may enrich a call after it ended.
+    const call = final ? workflow?.call : this.toolCalls.get(taskId);
+    if (!call) return false;
+    const changed = !!(
+      workflow &&
+      snapshot &&
+      this.workflowWorkers(taskId, workflow, snapshot, final)
+    );
+    if (workflow) workflow.progress = progress;
+    const card = workflowCard(progress, workflow?.workers.keys());
+    if (card) {
+      const serialized = JSON.stringify(card);
+      if (serialized !== call.sentWorkflowCard) {
+        call.output.taskToolCallProgress(call.toolCallId, card);
+        call.sentWorkflowCard = serialized;
+      }
+    }
+    return changed;
+  }
+
+  /**
+   * Workers have no launch tool_use or independent stopTask target. Their
+   * real agent ids and states come from the Workflow's progress entries.
+   */
+  private workflowWorkers(
+    taskId: string,
+    workflow: ObservedWorkflow,
+    snapshot: WorkflowSnapshot,
+    final: boolean,
+  ): boolean {
+    let changed = false;
+    for (const agent of snapshot.agents) {
+      const id = agent.agentId;
+      const state = workflowWorkerState(agent);
+      if (!id || id === this.host.sessionId || !state) continue;
+      if (state === "running" && (final || !this.toolCalls.has(taskId))) continue;
+      let child = this.children.get(id);
+      if (!child) {
+        if (agent.index !== undefined) {
+          const replaced = workflow.slots.get(agent.index);
+          if (replaced) this.loseWorker(replaced);
+        }
+        child = this.newChild(id, undefined, { name: agent.label });
+        child.workflowTaskId = taskId;
+        if (agent.index !== undefined) workflow.slots.set(agent.index, child);
+        workflow.workers.set(id, child);
+        this.open(child, workflow.call.output.sessionId);
+      } else if (child.workflowTaskId !== taskId) {
+        continue;
+      }
+      const previous = child.reportedState;
+      if (state === "running") {
+        // A retry starts a new agent id; an earlier snapshot must not revive one.
+        if (child.working) this.reportChild(child);
+      } else {
+        if (child.unobservable) {
+          // A final snapshot can give an outcome after the group left the list.
+          child.unobservable = false;
+          child.working = true;
+        }
+        this.endRun(child, state);
+      }
+      if (previous === undefined) this.publishConfiguration(child, undefined);
+      if (previous !== child.reportedState) changed = true;
+    }
+    return changed;
+  }
+
+  /** Losing sight of an attempt or its Workflow does not say how the worker ended. */
+  private loseWorker(child: Child): void {
+    if (!child.working) return;
+    child.working = false;
+    child.unobservable = true;
+    this.reportChild(child);
   }
 
   /**
@@ -1152,6 +1310,8 @@ export class SessionTasks {
         this.publish();
       });
     }
+    for (const worker of this.workflows.get(taskId)?.workers.values() ?? [])
+      this.loseWorker(worker);
     if (this.toolCalls.has(taskId)) this.endToolCall(taskId, status);
     this.publish();
   }
@@ -1178,6 +1338,7 @@ export class SessionTasks {
           description: task.description,
           ...(task.parent_task_id !== undefined ? { parentTaskId: task.parent_task_id } : {}),
           progress: this.level.get(task.task_id)?.progress,
+          workersForgotten: this.level.get(task.task_id)?.workersForgotten,
         },
       ]),
     );
@@ -1796,6 +1957,7 @@ export class SessionTasks {
     state: ChildState,
     capabilities?: { capabilities: null },
   ): void {
+    const first = child.reportedState === undefined;
     child.reportedState = state;
     const snapshot = stateObject(state, state === "idle" ? child.outcome : undefined);
     this.host.send({
@@ -1803,6 +1965,7 @@ export class SessionTasks {
       update: {
         sessionUpdate: "subagent_update",
         sessionId: child.sessionId,
+        ...(first && child.workflowTaskId !== undefined ? this.announcement(child) : {}),
         ...capabilities,
         state: snapshot,
       },
@@ -1963,7 +2126,9 @@ export class SessionTasks {
       ...(child.description !== undefined ? { description: child.description } : {}),
       ...(child.cwd !== undefined ? { cwd: child.cwd } : {}),
       // `session/cancel` of the child stops its run (`stopTask`).
-      ...(cancellable ? { capabilities: { cancel: {} } } : {}),
+      ...(cancellable && child.workflowTaskId === undefined
+        ? { capabilities: { cancel: {} } }
+        : {}),
     };
   }
 
@@ -2026,7 +2191,7 @@ export class SessionTasks {
     }
     // Deeper children first: a child's own list is whole before its parent's reads it.
     for (const child of [...children].reverse()) {
-      const task = this.level.get(child.sessionId);
+      const task = this.level.get(child.workflowTaskId ?? child.sessionId);
       const inBackground = child.working && task !== undefined && !task.ambient;
       if (inBackground || (lists.get(child.sessionId)?.length ?? 0) > 0) {
         lists.get(child.parentSessionId)?.push({ type: "subagent", sessionId: child.sessionId });
@@ -2061,8 +2226,15 @@ export class SessionTasks {
       const parent = task.parentTaskId ? this.children.get(task.parentTaskId) : undefined;
       const output = (parent?.announced ? parent.output : undefined) ?? this.rootOutput;
       const toolCallId = `task_${taskId}`;
-      this.toolCalls.set(taskId, { toolCallId, output, title: task.description, paused: false });
+      const call = { toolCallId, output, title: task.description, paused: false };
+      this.toolCalls.set(taskId, call);
       output.taskToolCall(taskToolCall(toolCallId, task.description));
+      // A parent task id can name a child we have not announced. Its fallback
+      // card on the root does not make the root the workers' parent.
+      if (task.taskType === "local_workflow" && (!task.parentTaskId || parent?.announced)) {
+        this.observeWorkflow(taskId, call);
+        if (task.progress) this.reportWorkflowCard(taskId, task.progress, task.progress.workflow);
+      }
     }
   }
 
@@ -2200,6 +2372,27 @@ function stateObject(state: ChildState, outcome: IdleOutcome | undefined): v2.St
       return { state: "unknown" };
     default:
       return { state: "idle", ...(outcome ?? {}) } as v2.StateUpdate;
+  }
+}
+
+/** A worker's own reported outcome, independent of the outer Workflow task. */
+function workflowWorkerState(agent: WorkflowAgent): "running" | IdleOutcome | undefined {
+  switch (agent.state) {
+    case "start":
+    case "progress":
+      return "running";
+    case "done":
+      return { stopReason: "end_turn" };
+    case "error":
+      if (agent.skipped || agent.endedWithRun === "stopped") return { stopReason: "cancelled" };
+      return {
+        stopReason: "error",
+        ...(agent.error
+          ? { error: { code: RequestError.internalError().code, message: agent.error } }
+          : {}),
+      };
+    default:
+      return undefined;
   }
 }
 

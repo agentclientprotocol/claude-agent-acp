@@ -16,8 +16,13 @@ import { textContent } from "./tool-calls/content.js";
 export type WorkflowPhase = { index: number; title: string };
 
 export type WorkflowAgent = {
+  index?: number;
+  agentId?: string;
+  skipped?: boolean;
+  endedWithRun?: string;
+  error?: string;
   label: string;
-  /** `start` while it runs and `done` when it finished, as the CLI names them. */
+  /** The CLI reports start/progress while working, then done/error. */
   state: string;
   phaseIndex?: number;
   attempt?: number;
@@ -48,6 +53,7 @@ export type WorkflowCardProgress = TaskProgressFields & { workflow?: WorkflowSna
  */
 export function workflowCard(
   progress: WorkflowCardProgress | undefined,
+  announced: Iterable<string> = [],
 ): { title: string; content: ToolCallContent[] } | undefined {
   if (!progress || Object.keys(progress).length === 0) return undefined;
   const activity = progress.description ?? progress.summary;
@@ -64,7 +70,10 @@ export function workflowCard(
     .join("\n\n");
   return {
     title: activity ? `Workflow: ${activity}` : "Workflow",
-    content: [textContent(text)],
+    content: [
+      textContent(text),
+      ...Array.from(announced, (sessionId) => ({ type: "session" as const, sessionId })),
+    ],
   };
 }
 
@@ -85,8 +94,9 @@ export function workflowSnapshot(value: unknown): WorkflowSnapshot | undefined {
       agents.push({
         label,
         state,
-        ...numbers(entry, ["phaseIndex", "attempt", "tokens", "toolCalls", "durationMs"]),
-        ...strings(entry, ["lastToolName", "lastToolSummary"]),
+        ...numbers(entry, ["index", "phaseIndex", "attempt", "tokens", "toolCalls", "durationMs"]),
+        ...(entry.skipped === true ? { skipped: true } : {}),
+        ...strings(entry, ["agentId", "endedWithRun", "error", "lastToolName", "lastToolSummary"]),
       });
     }
   }

@@ -9019,6 +9019,24 @@ describe("ACP v2 terminal of a command in the background", () => {
         ambient: true,
       };
       const workflow = { task_id: "wf1", task_type: "local_workflow", description: "Review" };
+      async function* workflowStarts(
+        options: Options,
+        script: string,
+        earlyProgress?: ReturnType<typeof taskEvent>,
+      ) {
+        yield toolUseMessage(options, "toolu_wf", "Workflow", { script });
+        yield level(options, [workflow]);
+        yield taskEvent(options, "task_started", { ...workflow, tool_use_id: "toolu_wf" });
+        if (earlyProgress) yield earlyProgress;
+        yield {
+          ...toolResultMessage(options, "toolu_wf", { content: "Workflow launched." }),
+          tool_use_result: {
+            status: "async_launched",
+            taskId: workflow.task_id,
+            taskType: workflow.task_type,
+          },
+        };
+      }
       /** A Monitor call whose task `mon1` runs on after the call returns. The
        *  tool starts the task, which joins the level before its
        *  `task_started`, and returns. */
@@ -9190,17 +9208,7 @@ describe("ACP v2 terminal of a command in the background", () => {
         const stopTask = vi.fn(async () => {});
         sdk.stopTask = stopTask;
         scriptTurns(async function* (options) {
-          yield toolUseMessage(options, "toolu_wf", "Workflow", { script: "review" });
-          yield level(options, [workflow]);
-          yield taskEvent(options, "task_started", { ...workflow, tool_use_id: "toolu_wf" });
-          yield {
-            ...toolResultMessage(options, "toolu_wf", { content: "Workflow launched." }),
-            tool_use_result: {
-              status: "async_launched",
-              taskId: "wf1",
-              taskType: "local_workflow",
-            },
-          };
+          yield* workflowStarts(options, "review");
           await interrupted.promise;
           yield result(options, ABORTED_TOOLS);
           yield idleState(options);
@@ -9335,6 +9343,16 @@ describe("ACP v2 terminal of a command in the background", () => {
         ).toEqual([]);
       });
 
+      function linkedWorkflowCard(updates: v2.UpdateSessionNotification[]) {
+        return updates.findIndex(
+          ({ update }) =>
+            update.sessionUpdate === "tool_call_update" &&
+            update.toolCallId === "toolu_wf" &&
+            Array.isArray(update.content) &&
+            update.content.some((item) => item.type === "session"),
+        );
+      }
+
       it("lists a workflow's phases and agents on its card, and keeps them when a report has none", async () => {
         // As CLI 2.1.319 sends it, trimmed of the fields the card ignores.
         const snapshot = [
@@ -9376,21 +9394,14 @@ describe("ACP v2 terminal of a command in the background", () => {
             ...fields,
           });
         scriptTurns(async function* (options) {
-          yield toolUseMessage(options, "toolu_wf", "Workflow", { script: "probe" });
-          yield level(options, [workflow]);
-          yield taskEvent(options, "task_started", { ...workflow, tool_use_id: "toolu_wf" });
-          yield {
-            ...toolResultMessage(options, "toolu_wf", { content: "Workflow launched." }),
-            tool_use_result: {
-              status: "async_launched",
-              taskId: "wf1",
-              taskType: "local_workflow",
-            },
-          };
-          yield progress(options, {
-            usage: { total_tokens: 14629, tool_uses: 0, duration_ms: 1343 },
-            workflow_progress: snapshot,
-          });
+          yield* workflowStarts(
+            options,
+            "probe",
+            progress(options, {
+              usage: { total_tokens: 14629, tool_uses: 0, duration_ms: 1343 },
+              workflow_progress: snapshot,
+            }),
+          );
           // The CLI leaves the snapshot out of some reports.
           yield progress(options, {
             usage: { total_tokens: 29282, tool_uses: 1, duration_ms: 2806 },
@@ -9408,6 +9419,18 @@ describe("ACP v2 terminal of a command in the background", () => {
         ].join("\n");
         const client = await promptUntil("idle end_turn [toolu_wf]");
 
+        // This worker's first available snapshot already records its outcome.
+        const announced = client.sessionUpdates.findIndex(
+          ({ update }) => update.sessionUpdate === "subagent_update",
+        );
+        expect(announced).toBeLessThan(linkedWorkflowCard(client.sessionUpdates));
+        expect(client.updates("subagent_update")).toEqual([
+          expect.objectContaining({
+            sessionId: "af3724ea06eadb5dd",
+            title: "two",
+            state: expect.objectContaining({ state: "idle", stopReason: "end_turn" }),
+          }),
+        ]);
         expect(
           client
             .updates("tool_call_update")
@@ -9420,9 +9443,272 @@ describe("ACP v2 terminal of a command in the background", () => {
                 type: "content",
                 content: { type: "text", text: `Count: three\n\n${usage}\n\n${list}` },
               },
+              { type: "session", sessionId: "af3724ea06eadb5dd" },
             ],
           ),
         );
+      });
+
+      function rootTurnEnd(client: ReturnType<typeof v2Client>, root: string) {
+        return client.sessionUpdates.find(
+          ({ sessionId, update }) =>
+            sessionId === root &&
+            update.sessionUpdate === "state_update" &&
+            "stopReason" in update &&
+            update.stopReason === "end_turn",
+        )?.update;
+      }
+
+      it("reports each identified Workflow worker while the root is idle, through its own outcome", async () => {
+        const finish = Promise.withResolvers<void>();
+        const stopTask = vi.fn(async () => {});
+        sdk.stopTask = stopTask;
+        const read = { type: "workflow_agent", index: 1, label: "Read", phaseIndex: 1, attempt: 1 };
+        const first = { ...read, agentId: "a1", state: "start" };
+        const second = { ...read, index: 2, agentId: "a2", state: "start" };
+        const progress = (options: Options, fields: Record<string, unknown>) =>
+          taskEvent(options, "task_progress", {
+            task_id: workflow.task_id,
+            tool_use_id: "toolu_wf",
+            description: "Read",
+            ...fields,
+          });
+        scriptTurns(async function* (options) {
+          yield* workflowStarts(options, "review");
+          yield progress(options, {
+            workflow_progress: [first, second, { ...read, index: 3, state: "start" }],
+          });
+          yield progress(options, {
+            usage: { total_tokens: 14000, tool_uses: 2, duration_ms: 600 },
+          });
+          yield result(options);
+          yield idleState(options);
+          await finish.promise;
+          yield progress(options, {
+            workflow_progress: [
+              { ...first, state: "error", error: "Model unavailable" },
+              { ...second, state: "done" },
+            ],
+          });
+          yield taskEvent(options, "task_updated", {
+            task_id: "wf1",
+            patch: { status: "completed" },
+          });
+          yield level(options, []);
+        });
+
+        await promptUntil("running []", async (agent, root, client) => {
+          const rootUpdates = () =>
+            client.sessionUpdates.filter(({ sessionId }) => sessionId === root);
+          try {
+            await vi.waitFor(() =>
+              expect(rootTurnEnd(client, root)).toMatchObject({
+                background: expect.arrayContaining([
+                  { type: "tool_call", toolCallId: "toolu_wf" },
+                  { type: "subagent", sessionId: "a1" },
+                  { type: "subagent", sessionId: "a2" },
+                ]),
+              }),
+            );
+            const start = client.sessionUpdates.length;
+            await agent.request(v2.methods.agent.session.resume, { sessionId: root, cwd });
+            const resumed = client.sessionUpdates.slice(start);
+            const listed = resumed.findIndex(
+              ({ sessionId, update }) =>
+                sessionId === root && update.sessionUpdate === "state_update",
+            );
+            const linked = linkedWorkflowCard(resumed);
+            expect(linked).toBeGreaterThanOrEqual(0);
+            expect(resumed[linked].update).toMatchObject({
+              content: [
+                expect.objectContaining({ type: "content" }),
+                { type: "session", sessionId: first.agentId },
+                { type: "session", sessionId: second.agentId },
+              ],
+            });
+            for (const child of [first, second]) {
+              const announce = resumed.findIndex(
+                ({ sessionId, update }) =>
+                  sessionId === root &&
+                  update.sessionUpdate === "subagent_update" &&
+                  update.sessionId === child.agentId,
+              );
+              expect(announce).toBeGreaterThanOrEqual(0);
+              expect(announce).toBeLessThan(listed);
+              expect(announce).toBeLessThan(linked);
+              expect(resumed[announce].update).toMatchObject({
+                title: child.label,
+                state: { state: "running" },
+              });
+            }
+            await agent.notify(v2.methods.agent.session.cancel, { sessionId: first.agentId });
+          } finally {
+            finish.resolve();
+          }
+          await vi.waitFor(() =>
+            expect(
+              rootUpdates().findLast(({ update }) => update.sessionUpdate === "state_update")
+                ?.update,
+            ).toMatchObject({
+              sessionUpdate: "state_update",
+              state: "idle",
+              background: [],
+            }),
+          );
+          expect(stopTask).not.toHaveBeenCalled();
+          const announcements = client.updates("subagent_update");
+          expect(new Set(announcements.map((u) => u.sessionId))).toEqual(new Set(["a1", "a2"]));
+          expect(announcements.every((u) => !u.capabilities?.cancel)).toBe(true);
+          for (const [id, outcome] of [
+            ["a1", { state: "idle", stopReason: "error", error: { message: "Model unavailable" } }],
+            ["a2", { state: "idle", stopReason: "end_turn" }],
+          ] as const) {
+            expect(announcements.filter((u) => u.sessionId === id).at(-1)).toMatchObject({
+              state: outcome,
+            });
+            expect(
+              client.sessionUpdates
+                .filter(
+                  ({ sessionId, update }) =>
+                    sessionId === id && update.sessionUpdate === "state_update",
+                )
+                .at(-1)?.update,
+            ).toMatchObject(outcome);
+          }
+        });
+      });
+
+      it("tracks a retry by its new worker id and accepts final outcomes after the Workflow leaves the list", async () => {
+        const slot = { type: "workflow_agent", index: 1, label: "Read", phaseIndex: 1 };
+        const first = { ...slot, attempt: 1, agentId: "reader-one", state: "progress" };
+        const retry = { ...slot, attempt: 2, agentId: "reader-two", state: "progress" };
+        const verifier = { ...slot, index: 2, agentId: "verifier", label: "Verify", state: "done" };
+        scriptTurns(async function* (options) {
+          yield* workflowStarts(options, "review");
+          for (const worker of [first, retry]) {
+            yield taskEvent(options, "task_progress", {
+              task_id: "wf1",
+              tool_use_id: "toolu_wf",
+              description: "Read",
+              workflow_progress: [worker],
+            });
+          }
+          yield result(options);
+          yield idleState(options);
+          yield level(options, []);
+          yield taskEvent(options, "task_notification", {
+            task_id: "wf1",
+            tool_use_id: "toolu_wf",
+            status: "completed",
+            output_file: "/tmp/tasks/wf1.output",
+            summary: "Done",
+            workflow_progress: [{ ...retry, state: "done" }, verifier],
+          });
+        });
+
+        await promptUntil("running []", async (_, root, client) => {
+          const states = (id: string) =>
+            client
+              .updates("subagent_update")
+              .filter((u) => u.sessionId === id)
+              .map((u) => u.state?.state);
+          await vi.waitFor(() => expect(states(verifier.agentId)).toEqual(["idle"]));
+          expect(states(first.agentId)).toEqual(["running", "unknown"]);
+          expect(states(retry.agentId)).toEqual(["running", "unknown", "idle"]);
+          const lastCard = client
+            .updates("tool_call_update")
+            .findLast((u) => u.toolCallId === "toolu_wf" && Array.isArray(u.content));
+          expect(lastCard?.content).toMatchObject([
+            { type: "content" },
+            ...[first, retry, verifier].map(({ agentId }) => ({
+              type: "session",
+              sessionId: agentId,
+            })),
+          ]);
+          expect(rootTurnEnd(client, root)).toMatchObject({
+            background: [
+              { type: "tool_call", toolCallId: "toolu_wf" },
+              { type: "subagent", sessionId: retry.agentId },
+            ],
+          });
+        });
+      });
+
+      it("reannounces a nested Workflow's workers on resume while its final notification is pending", async () => {
+        const notify = Promise.withResolvers<void>();
+        const nested = { ...workflow, parent_task_id: "coordinator" };
+        const worker = {
+          type: "workflow_agent",
+          index: 1,
+          label: "Read",
+          agentId: "reader",
+          state: "start",
+        };
+        scriptTurns(async function* (options) {
+          yield taskEvent(options, "task_started", {
+            task_id: "coordinator",
+            task_type: "local_agent",
+            description: "Coordinator",
+          });
+          yield level(options, [nested]);
+          yield taskEvent(options, "task_started", nested);
+          yield taskEvent(options, "task_progress", {
+            task_id: "wf1",
+            description: "Review",
+            workflow_progress: [worker],
+          });
+          yield taskEvent(options, "task_updated", {
+            task_id: "coordinator",
+            patch: { status: "completed" },
+          });
+          yield level(options, []);
+          yield result(options);
+          yield idleState(options);
+          await notify.promise;
+          yield taskEvent(options, "task_notification", {
+            task_id: "wf1",
+            status: "completed",
+            output_file: "/tmp/tasks/wf1.output",
+            summary: "Done",
+            workflow_progress: [{ ...worker, state: "done" }],
+          });
+        });
+
+        await promptUntil("idle end_turn []", async (agent, root, client) => {
+          await vi.waitFor(() =>
+            expect(rootTurnEnd(client, root)).toMatchObject({ background: [] }),
+          );
+          const start = client.sessionUpdates.length;
+          try {
+            await agent.request(v2.methods.agent.session.resume, { sessionId: root, cwd });
+            const announced = client.sessionUpdates
+              .slice(start)
+              .flatMap(({ sessionId, update }) =>
+                update.sessionUpdate === "subagent_update" ? [[sessionId, update.sessionId]] : [],
+              );
+            const owner = announced.findIndex(
+              ([parent, id]) => parent === root && id === "coordinator",
+            );
+            expect(owner).toBeGreaterThanOrEqual(0);
+            expect(
+              announced.findIndex(([parent, id]) => parent === "coordinator" && id === "reader"),
+            ).toBeGreaterThan(owner);
+          } finally {
+            notify.resolve();
+          }
+          await vi.waitFor(() =>
+            expect(client.sessionUpdates.slice(start)).toContainEqual(
+              expect.objectContaining({
+                sessionId: "coordinator",
+                update: expect.objectContaining({
+                  sessionUpdate: "tool_call_update",
+                  toolCallId: "task_wf1",
+                  content: expect.arrayContaining([{ type: "session", sessionId: "reader" }]),
+                }),
+              }),
+            ),
+          );
+        });
       });
 
       it("sends each listed call's current state before the state snapshot of session/resume", async () => {
