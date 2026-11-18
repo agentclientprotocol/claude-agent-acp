@@ -1,9 +1,11 @@
 /**
  * `--hide-claude-auth`: this integration must never bill a claude.ai
- * subscription. Under the flag the agent hides the claude.ai login method from
- * `initialize`, and refuses with `authRequired` every session and every turn
- * that a subscription would pay for. `v1/acp-agent.ts` decides when the guard
- * applies (flag on, no provider override); this module decides what it refuses.
+ * subscription, except a Claude Enterprise plan. Under the flag the agent hides
+ * the claude.ai login method from `initialize`, and refuses with `authRequired`
+ * every session and every turn that a Free, Pro, Max or Team plan would pay
+ * for. `v1/acp-agent.ts` and `v2/subscription-guard.ts` decide when the guard
+ * applies (flag on, no provider override); {@link claudeAuthRefusal} decides
+ * what it refuses.
  *
  * The guard judges the `AccountInfo` that the SDK caches at `initialize`. That
  * cache never changes during the life of a query, but the CLI itself picks up
@@ -77,6 +79,11 @@ const API_KEY_SOURCES_ABOVE_SUBSCRIPTION: ReadonlySet<string> = new Set([
   "/login managed key",
 ]);
 
+/** `none` is the SDK's explicit no-token source. */
+function hasTokenSource(account: AccountInfo): boolean {
+  return Boolean(account.tokenSource && account.tokenSource !== "none");
+}
+
 /**
  * True when a turn on this account is paid by a claude.ai subscription.
  *
@@ -85,8 +92,8 @@ const API_KEY_SOURCES_ABOVE_SUBSCRIPTION: ReadonlySet<string> = new Set([
  * proves it, and an unknown value keeps the guard on.
  *
  * - `subscriptionType` must be set. Without it the CLI reports no subscription.
- * - `tokenSource` must be absent. The CLI sets it in place of the subscription
- *   when a bearer or OAuth environment token pays for the turn.
+ * - `tokenSource` must be absent, empty, or `none`. A bearer or OAuth
+ *   environment token takes precedence over the subscription.
  * - `apiProvider` must be absent or `firstParty`. The SDK documents that the
  *   Anthropic OAuth login applies only to `firstParty`; for a third-party
  *   backend such as `bedrock`, `vertex`, `foundry` or `gateway` the other
@@ -99,13 +106,27 @@ export function billsClaudeSubscription(account: AccountInfo | undefined): boole
   if (!account?.subscriptionType) {
     return false;
   }
-  if (account.tokenSource) {
+  if (hasTokenSource(account)) {
     return false;
   }
   if (account.apiProvider !== undefined && account.apiProvider !== "firstParty") {
     return false;
   }
   return !API_KEY_SOURCES_ABOVE_SUBSCRIPTION.has(account.apiKeySource ?? "");
+}
+
+/**
+ * True when `subscriptionType` names a Claude Enterprise plan, which the flag
+ * lets pay for turns: Anthropic allows an Enterprise plan in third-party
+ * integrations.
+ *
+ * The SDK's `AccountInfo` carries the CLI's display name, "Claude Enterprise";
+ * older CLIs report the raw plan, "enterprise". Any other value is refused,
+ * including a "Claude <name>" built from a custom `plan_display_name` in the
+ * claude.ai profile: the guard cannot tell which plan that name belongs to.
+ */
+export function isClaudeEnterprisePlan(subscriptionType: string | undefined): boolean {
+  return /^(claude\s+)?enterprise$/i.test(subscriptionType?.trim() ?? "");
 }
 
 /**
@@ -125,10 +146,31 @@ export function holdsNonSubscriptionCredential(account: AccountInfo | undefined)
   if (account.apiProvider !== undefined && account.apiProvider !== "firstParty") {
     return true;
   }
-  if (account.tokenSource) {
+  if (hasTokenSource(account)) {
     return true;
   }
   return API_KEY_SOURCES_ABOVE_SUBSCRIPTION.has(account.apiKeySource ?? "");
+}
+
+/**
+ * The refusal the flag gives a session or turn on `account`, or `undefined`
+ * when the account may run it:
+ *
+ * - a subscription pays, and it is not {@link isClaudeEnterprisePlan}:
+ *   {@link claudeSubscriptionNotSupportedError};
+ * - no subscription pays and the account holds no other credential (signed
+ *   out): {@link claudeLoginRequiredError}.
+ *
+ * Session creation on v1 and v2 and the per-turn guard all decide through
+ * this function.
+ */
+export function claudeAuthRefusal(account: AccountInfo): RequestError | undefined {
+  if (billsClaudeSubscription(account)) {
+    return isClaudeEnterprisePlan(account.subscriptionType)
+      ? undefined
+      : claudeSubscriptionNotSupportedError();
+  }
+  return holdsNonSubscriptionCredential(account) ? undefined : claudeLoginRequiredError();
 }
 
 export function claudeSubscriptionNotSupportedError(): RequestError {
@@ -214,8 +256,8 @@ type GuardOptions = {
  * real account. This guard does not see the residual case the module header
  * names either.
  *
- * A turn is refused when the account bills a subscription, and also when it
- * holds nothing this integration accepts, which is the user signing out in
+ * A turn is refused when the account bills a subscription other than Claude
+ * Enterprise, and also when it holds nothing this integration accepts, which is the user signing out in
  * mid-session. The refusal mirrors the signed-out path exactly (see
  * `failActiveWithSessionFailure` for `auth_required` in `v1/acp-agent.ts`): every
  * client gets the `authRequired` JSON-RPC rejection that starts its own auth
@@ -257,13 +299,7 @@ async function evaluateGuard(options: GuardOptions): Promise<RequestError | unde
       error instanceof Error ? error.message : String(error),
     );
   }
-  if (billsClaudeSubscription(account)) {
-    return claudeSubscriptionNotSupportedError();
-  }
-  if (!holdsNonSubscriptionCredential(account)) {
-    return claudeLoginRequiredError();
-  }
-  return undefined;
+  return claudeAuthRefusal(account);
 }
 
 /** The account the SDK cached at `initialize`. `undefined` when the query

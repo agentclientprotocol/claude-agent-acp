@@ -320,17 +320,25 @@ describe("narrowToGatewayModels", () => {
     expect(narrowed.map((m) => m.value)).toEqual(["sonnet", "sonnet[1m]"]);
   });
 
-  it("leaves no model when the listing matches none", () => {
-    expect(narrowToGatewayModels(MODELS, ["gpt-5", "gemini-3-pro"])).toEqual([]);
-    expect(narrowToGatewayModels(MODELS, [])).toEqual([]);
-    expect(narrowToGatewayModels(MODELS, ["anthropic/openai/gpt-5"])).toEqual([]);
-    // A default row without resolvedModel is not a match on its own.
-    expect(
-      narrowToGatewayModels(
-        [{ value: "default", displayName: "Default", description: "" }, ...MODELS.slice(1)],
-        ["gpt-5"],
-      ),
-    ).toEqual([]);
+  it.each([
+    { listing: ["gpt-5", "gemini-3-pro"] },
+    { listing: [] },
+    { listing: ["anthropic/openai/gpt-5"] },
+  ])("rejects a listing $listing that matches none of the resolved models", ({ listing }) => {
+    expect(() => narrowToGatewayModels(MODELS, listing)).toThrow(
+      "The selected provider offers no compatible Claude models. Choose a different provider and try again.",
+    );
+  });
+
+  it.each([
+    { name: "empty", models: [] },
+    { name: "alias-only", models: MODELS.map(({ resolvedModel: _, ...model }) => model) },
+    {
+      name: "mixed",
+      models: [{ value: "default", displayName: "Default", description: "" }, ...MODELS.slice(1)],
+    },
+  ])("leaves no model when a $name catalog has no match", ({ models }) => {
+    expect(narrowToGatewayModels(models, ["gpt-5"])).toEqual([]);
   });
 });
 

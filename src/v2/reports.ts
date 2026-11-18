@@ -36,6 +36,7 @@ import {
   readContextWindow,
 } from "../context-window.js";
 import { IdleCompaction } from "../idle-compaction.js";
+import type { UnservedMcpServer } from "../mcp-servers.js";
 import { PromptSuggestions } from "../prompt-suggestions.js";
 import {
   informationalNotice,
@@ -47,7 +48,6 @@ import {
 import {
   DEFAULT_CONTEXT_WINDOW,
   getMatchingModelUsage,
-  inferContextWindowFromModel,
   snapshotFromUsage,
   totalTokens,
   ZERO_USAGE,
@@ -79,13 +79,18 @@ export interface ReportsHost {
 /** What the session's query was started with (see {@link SessionReports.configure}). */
 export interface ReportsSetup {
   /** The session's live Claude Code settings, disposed with the reports. */
-  settings: Pick<SettingsManager, "getCompactionSettings" | "dispose">;
+  settings: Pick<
+    SettingsManager,
+    "getCompactionSettings" | "getShowClearContextOnPlanAccept" | "dispose"
+  >;
   /** The client's `settings` option, which the query got as `--settings`. */
   configuredSettings: Settings | undefined;
   /** The query's environment. */
   env: Record<string, string | undefined>;
   /** The names of the client's MCP servers. */
   mcpServers: readonly string[];
+  /** The ones of them that the query started without (see `sdkMcpServers`). */
+  unservedMcpServers: readonly UnservedMcpServer[];
   /**
    * Whether the session asks the user to sign in to an MCP server that needs
    * it (see `SessionElicitations.authenticateMcpServers`): the client renders
@@ -108,7 +113,9 @@ export class SessionReports {
   private readonly compaction: ContextCompactionLifecycle;
   private idleCompaction: IdleCompaction | undefined;
   private settings: ReportsSetup["settings"] | undefined;
+  private configuredSettings: Settings | undefined;
   private clientMcpServers = new Set<string>();
+  private unservedMcpServers: readonly UnservedMcpServer[] = [];
   private mcpOAuth = false;
   private readonly reportedMcpServers = new Set<string>();
   /** The tool uses whose `informational` progress went out as a notice. */
@@ -165,8 +172,10 @@ export class SessionReports {
   /** Called once, before the query's first message. */
   configure(setup: ReportsSetup): void {
     this.clientMcpServers = new Set(setup.mcpServers);
+    this.unservedMcpServers = setup.unservedMcpServers;
     this.mcpOAuth = setup.mcpOAuth;
     this.settings = setup.settings;
+    this.configuredSettings = setup.configuredSettings;
     this.query = setup.query;
     // From the same env the query got.
     this.providerCacheKey = providerCacheKeyFor(setup.env);
@@ -194,9 +203,13 @@ export class SessionReports {
     this.suggestions = previous.suggestions;
   }
 
-  /** The session's MCP servers changed, as a resume of the active session asks. */
-  mcpServersChanged(names: readonly string[]): void {
+  /**
+   * The session's MCP servers are now the ones of `names`, and `unserved`
+   * the ones it goes on without, as a resume of the active session asks.
+   */
+  mcpServersChanged(names: readonly string[], unserved: readonly UnservedMcpServer[]): void {
     this.clientMcpServers = new Set(names);
+    this.unservedMcpServers = unserved;
   }
 
   // --- Turns ---------------------------------------------------------------
@@ -351,6 +364,12 @@ export class SessionReports {
     ]);
   }
 
+  /** Claude Code's `showClearContextOnPlanAccept` for this session's query;
+   *  false before {@link configure}. */
+  showClearContextOnPlanAccept(): boolean {
+    return this.settings?.getShowClearContextOnPlanAccept(this.configuredSettings) ?? false;
+  }
+
   /** The share of the context window in use, in percent, once a request reported it. */
   contextUsedPercent(): number | undefined {
     if (this.contextUsed === undefined || this.contextWindow <= 0) return undefined;
@@ -389,9 +408,6 @@ export class SessionReports {
       if (model && model !== "<synthetic>") {
         this.lastModel = model;
         this.idleCompaction?.noteRequest(event.message.usage, event.message.id || undefined);
-        if (!this.contextWindowAuthoritative && this.contextWindow === DEFAULT_CONTEXT_WINDOW) {
-          this.contextWindow = inferContextWindowFromModel(model) ?? this.contextWindow;
-        }
       }
     } else if (event.type === "message_delta") {
       const usage = event.usage;
@@ -540,8 +556,8 @@ export class SessionReports {
 
   /**
    * The window of model `id` without IPC: one learned from a result of this
-   * or another session on the same backend, else a guess from the model's
-   * names. A guess is then read from Claude Code in the background
+   * or another session on the same backend, else the default. The default is
+   * then replaced by what Claude Code reports in the background
    * (`readContextWindow`), until a result reports the window.
    */
   private seedContextWindow(id: string, info: ModelInfo | undefined): void {
@@ -572,12 +588,18 @@ export class SessionReports {
       );
   }
 
-  /** A notice for each client MCP server that did not start, once per server. */
+  /**
+   * A notice for each client MCP server that did not start, once per server:
+   * the ones that `servers`, the list of `system/init`, has as not started,
+   * and the ones the query started without.
+   */
   private mcpStartupFailures(servers: Array<{ name: string; status: string }> | undefined): void {
-    for (const server of servers ?? []) {
-      if (!this.clientMcpServers.has(server.name) || this.reportedMcpServers.has(server.name)) {
-        continue;
-      }
+    const notStarted = [
+      ...this.unservedMcpServers,
+      ...(servers ?? []).filter((server) => this.clientMcpServers.has(server.name)),
+    ];
+    for (const server of notStarted) {
+      if (this.reportedMcpServers.has(server.name)) continue;
       const notice = mcpServerStartupNotice(server, this.mcpOAuth);
       if (!notice) continue;
       this.reportedMcpServers.add(server.name);

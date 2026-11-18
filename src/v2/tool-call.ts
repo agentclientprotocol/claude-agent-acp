@@ -85,6 +85,9 @@ function v2ToolCallContent(item: ToolCallContent): v2.ToolCallContent {
       return item;
     case "terminal":
       return item;
+    case "session":
+      // A reference to a session, such as a subagent's, is the same in v2.
+      return item;
     default:
       if (isV2Diff(item)) return item;
       // A v1 diff names one path, with old and new texts that can be a

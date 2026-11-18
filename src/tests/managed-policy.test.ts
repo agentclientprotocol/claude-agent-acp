@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { resolveSettings } from "@anthropic-ai/claude-agent-sdk";
-import { applyManagedPolicyEnv } from "../managed-policy.js";
+import { applyManagedPolicyEnv, unloadedPolicySources } from "../managed-policy.js";
 
 type ResolveSettings = typeof resolveSettings;
 
@@ -57,6 +57,25 @@ describe("applyManagedPolicyEnv", () => {
     );
   });
 
+  it("reports a policy source that did not load on stderr, and still applies the rest", async () => {
+    const env: Record<string, string | undefined> = {};
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await applyManagedPolicyEnv(
+      resolverReturning({
+        effective: { env: { FROM_FILE: "1" } },
+        machinePolicy: { didNotLoad: ["profile"] },
+      }),
+      env,
+    );
+
+    expect(env).toEqual({ FROM_FILE: "1" });
+    expect(stderr).toHaveBeenCalledWith(
+      "Managed settings did not load from the macOS MDM profile: its env vars are not applied. " +
+        "Restart the agent to read it again.",
+    );
+  });
+
   it("asks the SDK for the managed tier only", async () => {
     const seen: unknown[] = [];
     const resolve = (async (options: unknown) => {
@@ -67,5 +86,20 @@ describe("applyManagedPolicyEnv", () => {
     await applyManagedPolicyEnv(resolve, {});
 
     expect(seen).toEqual([{ settingSources: [] }]);
+  });
+});
+
+describe("unloadedPolicySources", () => {
+  it.each([
+    // What the SDK reports when every source loaded.
+    [{ machinePolicy: { didNotLoad: false as const } }, undefined],
+    // An SDK before 0.3.323 leaves the member out.
+    [{}, undefined],
+    [
+      { machinePolicy: { didNotLoad: ["registry" as const, "file" as const] } },
+      "the Windows registry policy, the managed-settings file",
+    ],
+  ])("names the sources of %j", (resolved, expected) => {
+    expect(unloadedPolicySources(resolved)).toBe(expected);
   });
 });

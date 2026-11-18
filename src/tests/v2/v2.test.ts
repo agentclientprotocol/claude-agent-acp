@@ -12,14 +12,17 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import {
+  forkSession,
   getSessionInfo,
   getSessionMessages,
   type Options,
+  type Settings,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import { McpOverAcp } from "../../mcp-servers.js";
 import { acpProtocolRouter } from "../../serve.js";
 import { SettingsManager } from "../../settings.js";
 import type { AgentHandle } from "../../v2/agent.js";
@@ -217,6 +220,7 @@ beforeEach(async () => {
   sdk.startFailure = undefined;
   sdk.startGate = undefined;
   sdk.enableRemoteControl = undefined;
+  vi.mocked(forkSession).mockClear();
 });
 
 afterEach(async () => {
@@ -290,13 +294,24 @@ function v2Client({
   };
 }
 
-async function openSession(agent: v2.ClientContext, capabilities: v2.ClientCapabilities = {}) {
+/** Claude Code's setting that offers clearing the context on plan approval. */
+const CLEAR_CONTEXT_SHOWN: Settings = { showClearContextOnPlanAccept: true };
+
+/** `settings` reaches the query as the client's `settings` option (`--settings`). */
+async function openSession(
+  agent: v2.ClientContext,
+  capabilities: v2.ClientCapabilities = {},
+  settings?: Settings,
+) {
   await agent.request(v2.methods.agent.initialize, {
     protocolVersion: v2.PROTOCOL_VERSION,
     info: { name: "v2-test-client", version: "1.0.0" },
     capabilities,
   });
-  const response = await agent.request(v2.methods.agent.session.new, { cwd });
+  const response = await agent.request(v2.methods.agent.session.new, {
+    cwd,
+    ...(settings && { _meta: { claudeCode: { options: { settings } } } }),
+  });
   return { response, claude: sdk.processes.at(-1)! };
 }
 
@@ -573,6 +588,50 @@ describe("ACP v2 core", () => {
     expect(settings).toMatchObject({ apiKeyHelper: "", env: { ANTHROPIC_BASE_URL: baseUrl } });
   });
 
+  it("rejects an incompatible provider listing before a prompt and recovers", async () => {
+    sdk.models = [
+      {
+        value: "sonnet",
+        displayName: "Sonnet",
+        description: "",
+        resolvedModel: "claude-sonnet-5-5",
+      },
+    ];
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      await agent.request(v2.methods.agent.initialize, {
+        protocolVersion: v2.PROTOCOL_VERSION,
+        info: { name: "v2-test-client", version: "1" },
+      });
+      vi.mocked(fetch).mockResolvedValueOnce(Response.json({ data: [{ id: "gpt-5" }] }));
+      await agent.request(v2.methods.agent.providers.set, {
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gateway.example.com",
+      });
+      await expect(agent.request(v2.methods.agent.session.new, { cwd })).rejects.toMatchObject({
+        code: -32603,
+        message: expect.stringContaining(
+          "The selected provider offers no compatible Claude models.",
+        ),
+      });
+      expect(sdk.processes[0].close).toHaveBeenCalledOnce();
+      expect(sdk.processes[0].prompts).toEqual([]);
+      vi.mocked(fetch).mockResolvedValueOnce(
+        Response.json({ data: [{ id: "claude-sonnet-5-5" }] }),
+      );
+      await agent.request(v2.methods.agent.providers.set, {
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://recovered.example.com",
+      });
+      const response = await agent.request(v2.methods.agent.session.new, { cwd });
+      expect(response.configOptions?.find((option) => option.configId === "model")).toMatchObject({
+        options: [expect.objectContaining({ value: "sonnet" })],
+      });
+    });
+  });
+
   describe("a provider change of live sessions", () => {
     const setProvider = (agent: v2.ClientContext) =>
       agent.request(v2.methods.agent.providers.set, {
@@ -816,11 +875,90 @@ describe("ACP v2 core", () => {
       });
     });
 
-    it("stops a session whose query does not start again under the new route", async () => {
+    it("preserves an incompatible provider restart error and resumes after recovery", async () => {
+      sdk.models = [
+        {
+          value: "sonnet",
+          displayName: "Sonnet",
+          description: "",
+          resolvedModel: "claude-sonnet-5-5",
+        },
+      ];
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const { sessionId } = response;
+        vi.mocked(fetch).mockResolvedValueOnce(Response.json({ data: [{ id: "gpt-5" }] }));
+
+        await setProvider(agent);
+
+        expect(sdk.processes).toHaveLength(2);
+        expect(sdk.processes.every((process) => process.close.mock.calls.length === 1)).toBe(true);
+        await expect(
+          agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: PROMPT }),
+        ).rejects.toMatchObject({
+          code: -32603,
+          message:
+            "Internal error: The selected provider offers no compatible Claude models. Choose a different provider and try again. Then resume the session to continue.",
+          data: { providerId: "main" },
+        });
+        expect(sdk.processes.every((process) => process.prompts.length === 0)).toBe(true);
+
+        vi.mocked(fetch).mockResolvedValueOnce(
+          Response.json({ data: [{ id: "claude-sonnet-5-5" }] }),
+        );
+        await agent.request(v2.methods.agent.providers.set, {
+          providerId: "main",
+          apiType: "anthropic",
+          baseUrl: "https://recovered.example.com",
+        });
+        await expect(
+          agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: PROMPT }),
+        ).rejects.toMatchObject({
+          code: -32603,
+          message: expect.stringContaining("Then resume the session to continue."),
+          data: { providerId: "main" },
+        });
+        await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+        const recovered = sdk.processes.at(-1)!;
+        const answer = agent.request(v2.methods.agent.session.prompt, {
+          sessionId,
+          prompt: PROMPT,
+        });
+        const prompt = await recovered.prompt(0);
+        recovered.send(lifecycle(prompt, "started"));
+        expect(await answer).toEqual({ messageId: prompt.uuid });
+        expect(claude.prompts).toEqual([]);
+      });
+    });
+
+    it.each([
+      {
+        name: "an unknown startup failure",
+        failure: new Error("Claude Code could not start"),
+        error: {
+          code: -32603,
+          message:
+            "Internal error: Claude Code could not start again. Resume the session to continue.",
+        },
+      },
+      {
+        name: "a gateway sign-in failure",
+        failure: Object.assign(new Error("Sign in to the gateway."), {
+          startupFailureReason: "gateway_signin_required",
+        }),
+        error: {
+          code: -32000,
+          message:
+            "Authentication required: Sign in to the gateway. Then resume the session to continue.",
+          data: { startupFailureReason: "gateway_signin_required" },
+        },
+      },
+    ])("stops a session after $name under the new route", async ({ failure, error }) => {
       const client = v2Client();
       await client.connect(async (agent) => {
         const { response } = await openSession(agent);
-        sdk.startFailure = new Error("Claude Code could not start");
+        sdk.startFailure = failure;
         await setProvider(agent);
         // The session is still active: v2 ends that only at close.
         await expect(
@@ -828,10 +966,7 @@ describe("ACP v2 core", () => {
             sessionId: response.sessionId,
             prompt: PROMPT,
           }),
-        ).rejects.toMatchObject({
-          code: -32603,
-          message: expect.stringContaining("could not start again. Resume the session"),
-        });
+        ).rejects.toMatchObject(error);
         // A close ends it: it is no longer active then.
         await agent.request(v2.methods.agent.session.close, { sessionId: response.sessionId });
         await expect(
@@ -862,6 +997,27 @@ describe("ACP v2 core", () => {
     // Each prompt is echoed, and the session's state is reported.
     expect(claude.options.extraArgs).toMatchObject({ "replay-user-messages": "" });
     expect(claude.options.env?.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS).toBe("1");
+  });
+
+  it.each([
+    { name: "sends MCP servers as the CLI takes them", delivery: undefined },
+    { name: "lets the client choose the MCP delivery", delivery: "initialize" },
+  ])("$name", async ({ delivery }) => {
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      await agent.request(v2.methods.agent.initialize, {
+        protocolVersion: v2.PROTOCOL_VERSION,
+        info: { name: "v2-test-client", version: "1.0.0" },
+        capabilities: {},
+      });
+      await agent.request(v2.methods.agent.session.new, {
+        cwd,
+        ...(delivery && { _meta: { claudeCode: { options: { mcpServersDelivery: delivery } } } }),
+      });
+    });
+
+    // Unit runs name a CLI with CLAUDE_CODE_EXECUTABLE (see `vitest.config.ts`).
+    expect(sdk.processes[0].options.mcpServersDelivery).toBe(delivery ?? "argv");
   });
 
   it("answers a prompt when Claude Code starts it, and reports the work until the turn's result", async () => {
@@ -1183,6 +1339,57 @@ describe("ACP v2 core", () => {
       },
     ]);
   });
+
+  it.each([{ request: "session/new" }, { request: "a resume of the active session" }] as const)(
+    "goes on without an acp MCP server that gets no endpoint at $request, and reports it",
+    async ({ request }) => {
+      const endpoint = vi
+        .spyOn(McpOverAcp.prototype, "sdkConfig")
+        .mockRejectedValue(new Error("listen EPERM"));
+      onTestFinished(() => endpoint.mockRestore());
+      const mcpServers: v2.McpServer[] = [
+        { type: "acp", name: "tools", serverId: "tools:1" },
+        { type: "stdio", name: "files", command: "/usr/local/bin/mcp-files" },
+      ];
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        await agent.request(v2.methods.agent.initialize, {
+          protocolVersion: v2.PROTOCOL_VERSION,
+          info: { name: "v2-test-client", version: "1.0.0" },
+          capabilities: {},
+        });
+        if (request === "session/new") {
+          await agent.request(v2.methods.agent.session.new, { cwd, mcpServers });
+        } else {
+          const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+          await agent.request(v2.methods.agent.session.resume, { sessionId, cwd, mcpServers });
+        }
+        const claude = sdk.processes.at(-1)!;
+        if (request === "session/new") {
+          expect(Object.keys(claude.options.mcpServers ?? {})).toEqual(["files"]);
+        }
+        // Claude Code lists the servers it was given.
+        claude.send({
+          type: "system",
+          subtype: "init",
+          uuid: randomUUID(),
+          mcp_servers: [{ name: "files", status: "connected" }],
+        });
+        claude.send(result());
+        // The resume sent the session's idle state first.
+        await vi.waitFor(() => expect(client.states().slice(-2)).toEqual(["running", "idle"]));
+      });
+
+      expect(client.sessionUpdates.filter((update) => update.sessionUpdate === "notice")).toEqual([
+        {
+          sessionUpdate: "notice",
+          severity: "warning",
+          title: 'MCP server "tools" failed to start',
+          description: "Its tools are unavailable in this session. listen EPERM",
+        },
+      ]);
+    },
+  );
 
   it("replaces Claude Code's text of /mcp with the server list, before the turn's idle", async () => {
     const client = v2Client();
@@ -1530,7 +1737,7 @@ describe("ACP v2 core", () => {
       }),
     });
     await client.connect(async (agent) => {
-      const { response, claude } = await openSession(agent);
+      const { response, claude } = await openSession(agent, {}, CLEAR_CONTEXT_SHOWN);
       const sessionId = response.sessionId;
       const prompted = agent.request(v2.methods.agent.session.prompt, {
         sessionId,
@@ -1611,7 +1818,7 @@ describe("ACP v2 core", () => {
       }),
     });
     await client.connect(async (agent) => {
-      const { response, claude } = await openSession(agent);
+      const { response, claude } = await openSession(agent, {}, CLEAR_CONTEXT_SHOWN);
       const sessionId = response.sessionId;
       const prompted = agent.request(v2.methods.agent.session.prompt, {
         sessionId,
@@ -1703,6 +1910,62 @@ describe("ACP v2 core", () => {
       await vi.waitFor(() =>
         expect(client.states()).toEqual(["running", "idle", "running", "idle"]),
       );
+    });
+  });
+
+  it.each([
+    ["the turn of another prompt", true],
+    ["a cycle that Claude Code started on its own", false],
+  ])("ends the work once, at its result, when a prompt is folded into %s", async (_, prompted) => {
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      const { response, claude } = await openSession(agent);
+      const ask = () =>
+        agent.request(v2.methods.agent.session.prompt, {
+          sessionId: response.sessionId,
+          prompt: PROMPT,
+        });
+      let opener: SDKUserMessage | undefined;
+      if (prompted) {
+        const first = ask();
+        opener = await claude.prompt(0);
+        claude.send(lifecycle(opener, "started"));
+        await first;
+      }
+      claude.send(cycleStart());
+      await vi.waitFor(() => expect(client.states()).toEqual(["running"]));
+      // As the bundled CLI sends it: a folded prompt's echo comes before its
+      // `started`, and its `completed` before the result of the work.
+      const second = ask();
+      const folded = await claude.prompt(prompted ? 1 : 0);
+      claude.send(echo(folded));
+      claude.send(lifecycle(folded, "started"));
+      await second;
+      for (const event of textDelta("msg_pong", "pong")) claude.send(event);
+      claude.send(assistant("msg_pong", [{ type: "text", text: "pong" }]));
+      claude.send(lifecycle(folded, "completed"));
+      claude.send(
+        result({
+          result: "pong",
+          origin: { kind: prompted ? "human" : "task-notification" },
+          user_message_uuids: [...(opener ? [opener.uuid] : []), folded.uuid],
+        }),
+      );
+      if (opener) claude.send(lifecycle(opener, "completed"));
+      claude.send(sessionState("idle"));
+      await vi.waitFor(() => expect(client.states()).toContain("idle"));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+
+    expect(client.states()).toEqual(["running", "idle"]);
+    expect(
+      client.sessionUpdates.filter((update) => update.sessionUpdate === "agent_message_chunk"),
+    ).toMatchObject([{ messageId: "msg_pong" }]);
+    // The idle carries the result's usage: the result ended the work.
+    expect(client.sessionUpdates.at(-1)).toMatchObject({
+      state: "idle",
+      stopReason: "end_turn",
+      usage: { totalTokens: 6 },
     });
   });
 
@@ -1976,6 +2239,11 @@ describe("ACP v2 core", () => {
               cwd,
               configOptions,
             }),
+            agent.request(v2.methods.agent.session.fork, {
+              sessionId: STORED,
+              cwd,
+              configOptions,
+            }),
           ].map((request) => request.catch((error: unknown) => error)),
         );
       });
@@ -1983,8 +2251,32 @@ describe("ACP v2 core", () => {
       expect(errors).toEqual([
         expect.objectContaining({ code: -32602 }),
         expect.objectContaining({ code: -32602 }),
+        expect.objectContaining({ code: -32602 }),
       ]);
       expect(sdk.processes).toHaveLength(0);
+      // The fork copied no transcript either.
+      expect(forkSession).not.toHaveBeenCalled();
+    });
+
+    it("sets the configOptions of a session/fork on the fork, without an update", async () => {
+      const client = v2Client();
+      const fork = await client.connect(async (agent) => {
+        await initialize(agent);
+        return agent.request(v2.methods.agent.session.fork, {
+          sessionId: STORED,
+          cwd,
+          configOptions: [
+            { configId: "model", type: "id", value: "haiku" },
+            { configId: "mode", type: "id", value: "plan" },
+          ],
+        });
+      });
+
+      const [claude] = sdk.processes;
+      expect(claude.options.resume).toBe(fork.sessionId);
+      expect(claude.setModel).toHaveBeenCalledWith("haiku");
+      expect(values(fork.configOptions)).toMatchObject({ model: "haiku", mode: "plan" });
+      expect(client.notifications).toEqual([]);
     });
 
     it("sets the configOptions of a session/resume on the session, an active one too", async () => {
@@ -2053,7 +2345,7 @@ describe("ACP v2 core", () => {
     expect(error).toMatchObject({ code: -32602 });
   });
 
-  it("replays the stored history, then sends the state, before the resume response", async () => {
+  it("replays the stored history, ends it with replay_complete, then sends the state, before the resume response", async () => {
     vi.mocked(getSessionMessages).mockResolvedValueOnce([
       {
         type: "user",
@@ -2101,12 +2393,13 @@ describe("ACP v2 core", () => {
         messageId: "msg_a",
         content: { type: "text", text: "Done" },
       },
+      { sessionUpdate: "replay_complete" },
       // A snapshot, not a completion: no stop reason.
       { sessionUpdate: "state_update", state: "idle", background: [] },
     ]);
   });
 
-  it("gives a replayed tool call that has no result a final status, before the state", async () => {
+  it("gives a replayed tool call that has no result a final status, before replay_complete", async () => {
     const entry = (type: string, uuid: string, message: unknown) => ({
       type,
       uuid,
@@ -2138,10 +2431,115 @@ describe("ACP v2 core", () => {
       });
     });
 
-    expect(client.sessionUpdates.slice(-2)).toEqual([
+    expect(client.sessionUpdates.slice(-3)).toEqual([
       { sessionUpdate: "tool_call_update", toolCallId: "toolu_make", status: "failed" },
+      { sessionUpdate: "replay_complete" },
       { sessionUpdate: "state_update", state: "idle", background: [] },
     ]);
+  });
+
+  it("ends the replay of an empty history with replay_complete, and sends none without replayFrom", async () => {
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      await agent.request(v2.methods.agent.initialize, {
+        protocolVersion: v2.PROTOCOL_VERSION,
+        info: { name: "v2-test-client", version: "1.0.0" },
+        capabilities: {},
+      });
+      const sessionId = randomUUID();
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+      await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+    });
+
+    expect(client.sessionUpdates).toEqual([
+      { sessionUpdate: "replay_complete" },
+      { sessionUpdate: "state_update", state: "idle", background: [] },
+      // The resume without a replay.
+      { sessionUpdate: "state_update", state: "idle", background: [] },
+    ]);
+  });
+
+  describe("what an active session sends while a resume replays it", () => {
+    const kinds = (updates: v2.SessionUpdate[]) => updates.map((update) => update.sessionUpdate);
+
+    /**
+     * Resumes the active session with a replay whose transcript read waits
+     * for `read`. Meanwhile Claude Code streams a message and asks for a
+     * permission. Returns the resume, once the client had time to receive
+     * what the session sent.
+     */
+    async function resumeWhileWorking(
+      agent: v2.ClientContext,
+      read: Promise<Awaited<ReturnType<typeof getSessionMessages>>>,
+    ) {
+      const { response, claude } = await openSession(agent);
+      vi.mocked(getSessionMessages).mockReturnValueOnce(read);
+      const resume = agent.request(v2.methods.agent.session.resume, {
+        sessionId: response.sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+      await vi.waitFor(() => expect(getSessionMessages).toHaveBeenCalled());
+      for (const message of textDelta("msg_live", "Live")) claude.send(message);
+      const asked = askPermission(claude, "Bash", { command: "make" });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return { resume, asked };
+    }
+
+    it("goes out after replay_complete, a permission request too", async () => {
+      const read = Promise.withResolvers<Awaited<ReturnType<typeof getSessionMessages>>>();
+      let receivedAtRequest: string[] = [];
+      const client = v2Client({
+        answerPermission: () => {
+          receivedAtRequest = kinds(client.sessionUpdates);
+          return { outcome: { outcome: "cancelled" } };
+        },
+      });
+      await client.connect(async (agent) => {
+        const { resume, asked } = await resumeWhileWorking(agent, read.promise);
+        expect(client.sessionUpdates).toEqual([]);
+        expect(client.permissionRequests).toEqual([]);
+        read.resolve([
+          {
+            type: "user",
+            uuid: "u1",
+            session_id: "s",
+            parent_tool_use_id: null,
+            parent_agent_id: null,
+            message: { role: "user", content: "Fix the build" },
+          },
+        ]);
+        await resume;
+        await asked;
+      });
+
+      const received = kinds(client.sessionUpdates);
+      const complete = received.indexOf("replay_complete");
+      // Only the history comes before it.
+      expect(received.slice(0, complete)).toEqual(["user_message", "user_message_chunk"]);
+      expect(received.slice(complete + 1)).toContain("agent_message_chunk");
+      expect(receivedAtRequest).toContain("replay_complete");
+    });
+
+    it("goes out without a replay_complete when the replay fails", async () => {
+      const read = Promise.withResolvers<Awaited<ReturnType<typeof getSessionMessages>>>();
+      const client = v2Client();
+      const error = await client.connect(async (agent) => {
+        const { resume } = await resumeWhileWorking(agent, read.promise);
+        read.reject(new Error("The transcript cannot be read"));
+        const error = await resume.catch((error: unknown) => error);
+        await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(1));
+        return error;
+      });
+
+      expect(error).toMatchObject({ code: -32603 });
+      expect(kinds(client.sessionUpdates)).toContain("agent_message_chunk");
+      expect(kinds(client.sessionUpdates)).not.toContain("replay_complete");
+    });
   });
 
   it("replays a compaction's summary message as the completed compaction, at its place", async () => {
@@ -2467,6 +2865,29 @@ describe("ACP v2 core", () => {
     });
   });
 
+  it("adds the turn's rate limit to a rate-limit failure's error data", async () => {
+    const rateLimit = { status: "rejected", resetsAt: 1700000000, rateLimitType: "five_hour" };
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      const { claude } = await openSession(agent);
+      claude.send(cycleStart());
+      claude.send({
+        type: "rate_limit_event",
+        rate_limit_info: rateLimit,
+        uuid: "00000000-0000-4000-8000-00000000e002",
+        session_id: "session",
+      });
+      claude.send({ ...assistant("msg_limited", []), error: "rate_limit" });
+      claude.send(result({ is_error: true, result: "You've hit your 5-hour limit" }));
+      await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+    });
+
+    expect(client.sessionUpdates.at(-1)).toMatchObject({
+      stopReason: "error",
+      error: { data: { errorKind: "rate_limit", rateLimit } },
+    });
+  });
+
   it.each([
     ["a notice when the turn goes on to end", { result: "" }, "end_turn", 1],
     ["a notice once when the result repeats its text", {}, "end_turn", 1],
@@ -2745,10 +3166,32 @@ describe("ACP v2 core", () => {
     });
   });
 
-  it("offers clearing the context at 0% used after Claude Code mounted a fresh conversation", async () => {
+  it("offers no clearing of the context while Claude Code's showClearContextOnPlanAccept is off, its default", async () => {
     const client = v2Client();
     await client.connect(async (agent) => {
       const { response, claude } = await openSession(agent);
+      // In a turn: a request out of a turn has no clear-context option either way.
+      const prompted = agent.request(v2.methods.agent.session.prompt, {
+        sessionId: response.sessionId,
+        prompt: PROMPT,
+      });
+      claude.send(echo(await claude.prompt(0)));
+      await prompted;
+      await askPermission(claude, "ExitPlanMode", { plan: "Fix it" });
+    });
+
+    expect(client.permissionRequests[0].options.map((option) => option.optionId)).toEqual([
+      "exit-plan-default",
+      "exit-plan-auto",
+      "exit-plan-bypass",
+      "reject",
+    ]);
+  });
+
+  it("offers clearing the context at 0% used after Claude Code mounted a fresh conversation", async () => {
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      const { response, claude } = await openSession(agent, {}, CLEAR_CONTEXT_SHOWN);
       const prompted = agent.request(v2.methods.agent.session.prompt, {
         sessionId: response.sessionId,
         prompt: PROMPT,
@@ -2756,7 +3199,8 @@ describe("ACP v2 core", () => {
       claude.send(echo(await claude.prompt(0)));
       await prompted;
       const planned = assistant("msg_1", [{ type: "text", text: "Planned." }]);
-      planned.message.usage = { input_tokens: 100_000, output_tokens: 0 };
+      // Half of the default 1M window.
+      planned.message.usage = { input_tokens: 500_000, output_tokens: 0 };
       claude.send(planned);
       await vi.waitFor(() =>
         expect(client.sessionUpdates.at(-1)?.sessionUpdate).toBe("agent_message_chunk"),
@@ -3443,6 +3887,68 @@ describe("ACP v2 core", () => {
         sessionUpdate: "state_update",
         state: "running",
       });
+    });
+
+    it("holds what a live subagent's session sends during a replay until after the child's replay_complete", async () => {
+      sdk.subagents = new Map([
+        [
+          "toolu_bg_agent",
+          {
+            agentId: "a5966d",
+            background: true,
+            stoppedByUser: false,
+            agentType: "general-purpose",
+          },
+        ],
+      ]);
+      const client = v2Client();
+      const read = Promise.withResolvers<Awaited<ReturnType<typeof getSessionMessages>>>();
+      let resumedAt = 0;
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const sessionId = response.sessionId;
+        const child = subagent("a5966d", "toolu_bg_agent", { is_backgrounded: true });
+        claude.send(cycleStart());
+        claude.send(child.launch());
+        claude.send({
+          type: "system",
+          subtype: "background_tasks_changed",
+          tasks: [{ task_id: "a5966d", task_type: "local_agent", description: "sleeper" }],
+          uuid: randomUUID(),
+        });
+        claude.send(child.started());
+        claude.send(result({ result: "launched" }));
+        await vi.waitFor(() => expect(client.states().at(-1)).toBe("idle"));
+        vi.mocked(getSessionMessages).mockReturnValueOnce(read.promise);
+        resumedAt = client.notifications.length;
+        const resume = agent.request(v2.methods.agent.session.resume, {
+          sessionId,
+          cwd,
+          replayFrom: { type: "start" },
+        });
+        await vi.waitFor(() => expect(getSessionMessages).toHaveBeenCalled());
+        // The subagent works on while the transcript is read.
+        claude.send(child.says("Live report"));
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(client.notifications.slice(resumedAt)).toEqual([]);
+        read.resolve([
+          {
+            type: "assistant",
+            uuid: "a1",
+            session_id: sessionId,
+            parent_tool_use_id: null,
+            parent_agent_id: null,
+            message: child.launch().message,
+          },
+        ] as never);
+        await resume;
+      });
+
+      const received = updatesOf(client.notifications.slice(resumedAt), "a5966d").map((update) =>
+        update.sessionUpdate === "agent_message_chunk" ? "live report" : update.sessionUpdate,
+      );
+      expect(received).toContain("replay_complete");
+      expect(received.indexOf("live report")).toBeGreaterThan(received.indexOf("replay_complete"));
     });
 
     it.each([
@@ -4155,7 +4661,11 @@ describe("ACP v2 core", () => {
         });
         const changed = path.join(await realpath(cwd), "src", "App.ts");
         const { claude, sessionId, plan } = await client.connect(async (agent) => {
-          const { response, claude } = await openSession(agent, air("agentFileChangeReport"));
+          const { response, claude } = await openSession(
+            agent,
+            air("agentFileChangeReport"),
+            CLEAR_CONTEXT_SHOWN,
+          );
           claude.rewindFiles.mockResolvedValue({ canRewind: true, filesChanged: [changed] });
           const answer = agent.request(v2.methods.agent.session.prompt, {
             sessionId: response.sessionId,

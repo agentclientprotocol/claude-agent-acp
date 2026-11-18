@@ -7,6 +7,7 @@ import {
   resolveSettings,
   type Settings,
 } from "@anthropic-ai/claude-agent-sdk";
+import { unloadedPolicySources } from "./managed-policy.js";
 import { claudeConfigDir } from "./paths.js";
 
 /**
@@ -62,6 +63,9 @@ export class SettingsManager {
   private managedModelSettings: ModelSelectionSettings = {};
   private managedApiKeyHelper?: string;
   private managedCompactionSettings: CompactionSettings = {};
+  private managedShowClearContextOnPlanAccept?: boolean;
+  /** The policy sources last logged as not loaded (see {@link unloadedPolicySources}). */
+  private unloadedPolicy?: string;
   private watchers: fs.FSWatcher[] = [];
   private onChange?: () => void;
   private logger: { log: (...args: any[]) => void; error: (...args: any[]) => void };
@@ -118,6 +122,17 @@ export class SettingsManager {
   private async loadAllSettings(): Promise<void> {
     try {
       const resolved = await resolveSettings({ cwd: this.cwd });
+      // Once per change: a reload after each settings file edit would repeat it.
+      const unloaded = unloadedPolicySources(resolved);
+      if (unloaded !== this.unloadedPolicy) {
+        this.unloadedPolicy = unloaded;
+        if (unloaded) {
+          this.logger.error(
+            `Managed settings did not load from ${unloaded}: the session's settings ` +
+              "and model list do not reflect it. Claude Code reads the policy itself.",
+          );
+        }
+      }
       this.effective = filterEscalatingDefaultMode(resolved);
       // The CLI reads `deniedModels` from managed settings only.
       this.managedDeniedModels = resolved.sources
@@ -146,6 +161,9 @@ export class SettingsManager {
           ?.autoCompactEnabled,
         env: Object.assign({}, ...managed.map((tier) => tier.env)),
       };
+      this.managedShowClearContextOnPlanAccept = managed.findLast(
+        (tier) => tier.showClearContextOnPlanAccept !== undefined,
+      )?.showClearContextOnPlanAccept;
     } catch (error) {
       this.logger.error("Failed to resolve settings:", error);
       this.effective = {};
@@ -153,6 +171,7 @@ export class SettingsManager {
       this.managedModelSettings = {};
       this.managedApiKeyHelper = undefined;
       this.managedCompactionSettings = {};
+      this.managedShowClearContextOnPlanAccept = undefined;
     }
   }
 
@@ -274,6 +293,21 @@ export class SettingsManager {
         this.effective.autoCompactEnabled,
       env: this.getEnvironment(settingsOverride),
     };
+  }
+
+  /**
+   * Whether an approved plan may be continued in a fresh context, as the CLI
+   * resolves `showClearContextOnPlanAccept`: managed settings outrank the
+   * `--settings` override, which outranks the user/project/local files. Off
+   * unless one of them sets it, like the CLI.
+   */
+  getShowClearContextOnPlanAccept(settingsOverride?: Settings): boolean {
+    return (
+      this.managedShowClearContextOnPlanAccept ??
+      settingsOverride?.showClearContextOnPlanAccept ??
+      this.effective.showClearContextOnPlanAccept ??
+      false
+    );
   }
 
   /**

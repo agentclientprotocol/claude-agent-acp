@@ -5,16 +5,19 @@ import {
   SessionNotification,
 } from "@agentclientprotocol/sdk/unstable";
 import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
-import { getSessionMessages, type Options } from "@anthropic-ai/claude-agent-sdk";
+import { forkSession, getSessionMessages, type Options } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../../v1/acp-agent.js";
 import type { AcpClient } from "../../acp-client.js";
 import type { AcpSessionNotification } from "../../acp-subagents.js";
 import { ALLOW_BYPASS } from "../../permissions/modes.js";
 import { NativeSubagentRuntime } from "../../native-subagents.js";
-import { startupFailure } from "../helpers.js";
+import { setModelRefusal, startupFailure } from "../helpers.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+
+/** The session that the mocked SDK `forkSession` makes. */
+const FORK_ID = "3d0f7a52-9b1e-4c7d-8e2a-6f4b5c1d0e9a";
 
 let capturedOptions: Options | undefined;
 let contextUsageResult: (() => Promise<{ rawMaxTokens: number; model?: string }>) | undefined;
@@ -43,9 +46,19 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
     ...actual,
     query: (args: { prompt: unknown; options: Options }) => {
       capturedOptions = args.options;
+      // Like Claude Code's, the stream stays open until the query is closed.
+      let streamClosed = () => {};
+      const closed = new Promise<void>((resolve) => (streamClosed = resolve));
       return makeMockQuery({
         interrupt: () => (interruptImpl ? interruptImpl() : Promise.resolve(undefined)),
-        close: () => closeSpy(),
+        close: () => {
+          closeSpy();
+          streamClosed();
+        },
+        next: async () => {
+          await closed;
+          return { done: true as const, value: undefined };
+        },
         initializationResult: async () => {
           await initGate;
           if (initError) throw initError;
@@ -61,6 +74,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
       });
     },
     getSessionMessages: vi.fn(() => sessionMessagesResult()),
+    forkSession: vi.fn(async () => ({ sessionId: FORK_ID })),
   };
 });
 
@@ -105,6 +119,7 @@ describe("createSession options merging", () => {
     sessionMessages = [];
     sessionMessagesResult = async () => sessionMessages;
     vi.mocked(getSessionMessages).mockClear();
+    vi.mocked(forkSession).mockClear();
     initModels = undefined;
     initGate = undefined;
     initError = undefined;
@@ -598,6 +613,20 @@ describe("createSession options merging", () => {
     });
 
     expect(capturedOptions!.promptSuggestions).toBe(false);
+  });
+
+  it.each([
+    { name: "sends MCP servers as the CLI takes them", delivery: undefined },
+    { name: "lets a caller choose the MCP delivery", delivery: "initialize" as const },
+  ])("$name", async ({ delivery }) => {
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      ...(delivery && { _meta: { claudeCode: { options: { mcpServersDelivery: delivery } } } }),
+    });
+
+    // Unit runs name a CLI with CLAUDE_CODE_EXECUTABLE (see `vitest.config.ts`).
+    expect(capturedOptions!.mcpServersDelivery).toBe(delivery ?? "argv");
   });
 
   it("defaults tools to claude_code preset when not provided", async () => {
@@ -1242,6 +1271,32 @@ describe("createSession options merging", () => {
     expect(capturedOptions!.mcpServers).toHaveProperty("acp-server");
   });
 
+  it("starts the session without an acp server that gets no endpoint", async () => {
+    agent = new ClaudeAcpAgent(
+      {
+        ...createMockClient(),
+        mcpServerOverAcp: async () => {
+          throw new Error("listen EPERM");
+        },
+      },
+      { log: () => {}, error: () => {} },
+    );
+
+    const { sessionId } = await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [
+        { type: "acp", name: "tools", serverId: "tools:1" },
+        { name: "files", command: "node", args: ["files.js"], env: [] },
+      ],
+    });
+
+    expect(Object.keys(capturedOptions!.mcpServers ?? {})).toEqual(["files"]);
+    // What the first turn reports (see "MCP server startup failures").
+    expect(agent.sessions[sessionId].unservedMcpServers).toEqual([
+      { name: "tools", status: "failed", error: "listen EPERM" },
+    ]);
+  });
+
   describe("thinking config from MAX_THINKING_TOKENS", () => {
     let originalMaxThinking: string | undefined;
 
@@ -1489,9 +1544,13 @@ describe("createSession options merging", () => {
     it.each([
       ["an unknown configId", { configId: "nope", value: "x" }],
       ["a boolean for a select", { configId: "model", type: "boolean" as const, value: true }],
-      ["a value the option does not offer", { configId: "model", value: "gpt-4" }],
+      ["a model Claude Code does not know", { configId: "model", value: "gpt-4" }],
     ])("skips an entry with %s and sets the entries after it", async (_name, entry) => {
       const plain = await agent.newSession({ cwd, mcpServers: [] });
+      // An id the option does not list goes to Claude Code, which refuses an unknown one.
+      setModelImpl = async (model) => {
+        throw setModelRefusal(`Model '${model}' not found`, "not_found");
+      };
 
       const response = await agent.newSession({
         cwd,
@@ -1525,7 +1584,7 @@ describe("createSession options merging", () => {
       errors.mockRestore();
     });
 
-    it.each(["newSession", "loadSession", "resumeSession"] as const)(
+    it.each(["newSession", "loadSession", "resumeSession", "unstable_forkSession"] as const)(
       "%s rejects two entries of one configId before it starts a query",
       async (method) => {
         await expect(
@@ -1543,6 +1602,8 @@ describe("createSession options merging", () => {
           data: { configId: "mode" },
         });
         expect(capturedOptions).toBeUndefined();
+        // A fork copies no transcript either.
+        expect(forkSession).not.toHaveBeenCalled();
       },
     );
 
@@ -1570,6 +1631,24 @@ describe("createSession options merging", () => {
         expect(updates.map((u) => u.update.sessionUpdate)).not.toContain("config_option_update");
       },
     );
+
+    it("sets the configOptions of a session/fork on the fork, without an update", async () => {
+      const response = await agent.unstable_forkSession({
+        sessionId: "7f1c5b0e-3c53-4c0c-9d0a-0d6c1f0a2b11",
+        cwd,
+        mcpServers: [],
+        configOptions: [
+          { configId: "model", value: "claude-haiku-4-5" },
+          { configId: "mode", value: "plan" },
+        ],
+      });
+
+      expect(response.sessionId).toBe(FORK_ID);
+      expect(capturedOptions).toMatchObject({ resume: FORK_ID });
+      expect(values(response)).toMatchObject({ model: "claude-haiku-4-5", mode: "plan" });
+      expect(response.modes?.currentModeId).toBe("plan");
+      expect(updates.filter((u) => u.sessionId === FORK_ID)).toEqual([]);
+    });
 
     it("leaves the warning of an Auto mode fallback for the first prompt", async () => {
       const response = await agent.newSession({
@@ -1793,14 +1872,11 @@ describe("createSession options merging", () => {
       const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
       expect(ctxSpy).toHaveBeenCalledOnce();
-      expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);
+      expect(sessionFor(response.sessionId).contextWindowSize).toBe(1_000_000);
       expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(false);
     });
 
-    it("refines a guessed window from getContextUsage in the background", async () => {
-      // The mock model ("claude-sonnet-4-6" / "Claude Sonnet" / "Fast") carries
-      // no "1m" token anywhere, so inference misses and the seed is the default
-      // until the background getContextUsage answers.
+    it("replaces the default window with the one getContextUsage reports, in the background", async () => {
       contextUsageResult = async () => ({ rawMaxTokens: 967000 });
 
       const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
@@ -1818,7 +1894,7 @@ describe("createSession options merging", () => {
       await vi.waitFor(() => expect(contextUsageCalls).toEqual([{ detail: "summary" }]));
     });
 
-    it("keeps the guessed window when getContextUsage reports a non-positive size", async () => {
+    it("keeps the default window when getContextUsage reports a non-positive size", async () => {
       const ctxSpy = vi.fn(async () => ({ rawMaxTokens: 0 }));
       contextUsageResult = ctxSpy;
 
@@ -1826,7 +1902,7 @@ describe("createSession options merging", () => {
       await vi.waitFor(() => expect(ctxSpy).toHaveBeenCalled());
       await new Promise((resolve) => setImmediate(resolve));
 
-      expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);
+      expect(sessionFor(response.sessionId).contextWindowSize).toBe(1_000_000);
       expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(false);
     });
 

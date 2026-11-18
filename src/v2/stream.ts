@@ -16,6 +16,7 @@ import type { ContentBlock } from "@agentclientprotocol/sdk/unstable";
 import type {
   SDKAssistantMessage,
   SDKMemoryRecallMessage,
+  SDKMessage,
   SDKPartialAssistantMessage,
   SDKPermissionDeniedMessage,
   SDKToolProgressMessage,
@@ -40,7 +41,9 @@ import type { AcpSessionNotification } from "../acp-subagents.js";
 import { isCompactSummaryMessage, replayCompactSummary } from "../context-compaction.js";
 import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
-import { AcpToolCallRenderer, V2_CANCELLED } from "../tool-calls/renderer.js";
+import { RetractedToolCalls } from "../tool-calls/retracted.js";
+import { UnansweredServerToolCalls } from "../tool-calls/server-tool-calls.js";
+import { AcpToolCallRenderer, progressToolCallId, V2_CANCELLED } from "../tool-calls/renderer.js";
 import { changedTaskPlanEntries, unregisterHookCallback, type TaskState } from "../tools.js";
 import { recordStreamedDelta, unstreamedRemainder, type StreamedBlock } from "../streamed-text.js";
 import { replayClear, type V2UpdateTranslator } from "./update-translator.js";
@@ -100,6 +103,10 @@ export class SessionOutput {
   private replayCleared: Set<string> | undefined;
   /** The open tool calls whose tool use reached a complete assistant message: Claude Code runs them. */
   private readonly dispatched = new Set<string>();
+  /** The tool uses of the assistant messages, for {@link closeRetracted}. */
+  private readonly retracted = new RetractedToolCalls();
+  /** The server tool calls that still wait for their result, for {@link closeUnanswered}. */
+  private readonly serverToolCalls = new UnansweredServerToolCalls();
   /**
    * Whether the output comes from work that a `session/cancel` stopped, until
    * its idle. The session's streamed deltas still go out,
@@ -151,6 +158,10 @@ export class SessionOutput {
     if (message.parent_tool_use_id !== null && !this.subagent) return;
     if (message.event.type === "message_start") {
       this.streamingMessageId = message.event.message.id;
+      this.serverToolCalls.replyStarted(
+        message.parent_tool_use_id,
+        this.streamingMessageId || undefined,
+      );
       // A message that never reached its consolidated message, such as one an
       // interrupt cut short, leaves its record behind.
       this.streamedBlocks.length = 0;
@@ -173,6 +184,11 @@ export class SessionOutput {
         },
       ),
     );
+    // After the block that shows them, so a client sees the next step start
+    // before the calls it leaves behind end.
+    if (message.event.type === "content_block_start") {
+      this.closeUnanswered(message.parent_tool_use_id, message.event.content_block);
+    }
   }
 
   /**
@@ -185,6 +201,8 @@ export class SessionOutput {
    * cancel, the stopped work's message is dropped (see {@link cancelled}).
    */
   assistant(message: SDKAssistantMessage): void {
+    this.closeRetracted(message);
+    this.retracted.sent(message);
     const messageId = messageIdForGrouping(message);
     for (const block of message.message.content) {
       if (block.type === "tool_use") this.dispatched.add(block.id);
@@ -197,6 +215,9 @@ export class SessionOutput {
         );
     if (ownText) this.streamedBlocks.length = 0;
     if (this.stoppedWork(message)) return;
+    for (const block of message.message.content) {
+      this.closeUnanswered(message.parent_tool_use_id, block, message.message.id || undefined);
+    }
     this.content(content, "assistant", message.parent_tool_use_id, { messageId });
   }
 
@@ -269,16 +290,12 @@ export class SessionOutput {
   }
 
   /**
-   * A tool's progress beat, on its tool call: the beat's own `tool_use_id`
-   * when the client holds that call, else the call it runs in
-   * (`parent_tool_use_id`), such as the Agent call of a subagent's tool or
-   * a heartbeat's derived id. A beat for a call that returned is dropped.
+   * A tool's progress beat, on the tool call it reports on (see
+   * {@link progressToolCallId}, which also says which beats are dropped).
    */
   toolProgress(message: SDKToolProgressMessage): void {
-    const toolCallId = this.emittedToolCalls.has(message.tool_use_id)
-      ? message.tool_use_id
-      : message.parent_tool_use_id;
-    if (toolCallId === null || !this.emittedToolCalls.has(toolCallId)) return;
+    const toolCallId = progressToolCallId(message, this.emittedToolCalls);
+    if (toolCallId === undefined) return;
     // A subagent's beat, on its own session, names the Agent call that runs
     // it. A tool call is never its own parent.
     const parentToolUseId =
@@ -568,20 +585,57 @@ export class SessionOutput {
    * The calls in `keep` stay open, such as one whose task runs in the background.
    */
   closeUnfinished(stopped: boolean, keep: ReadonlySet<string> = new Set()): void {
-    const renderer = new AcpToolCallRenderer(V2_TOOL_CALL_CAPABILITIES);
     for (const toolCallId of [...this.unfinished]) {
       if (keep.has(toolCallId)) continue;
       const ran = this.dispatched.has(toolCallId);
       if (ran && !stopped) continue;
-      const report = renderer.unfinished({ toolCallId, ran, cancelled: stopped });
-      const toolUse = this.toolUseCache[toolCallId];
-      const terminalExit = toolUse && renderer.terminalExit(toolUse);
-      if (terminalExit) report._meta = { ...report._meta, ...terminalExit };
-      this.emittedToolCalls.delete(toolCallId);
-      delete this.toolUseCache[toolCallId];
-      this.toolCallFields.delete(toolCallId);
-      this.emit([{ sessionId: this.sessionId, update: report }]);
+      this.close({ toolCallId, ran, cancelled: stopped });
     }
+  }
+
+  /**
+   * Ends the open tool calls of the messages that `message` says Claude Code
+   * took back (see `RetractedToolCalls`), `cancelled`: no result comes for
+   * them, and a call that ran stays open at the end of the work otherwise.
+   */
+  closeRetracted(message: SDKMessage): void {
+    for (const toolCallId of this.retracted.retractedBy(message)) {
+      if (this.unfinished.has(toolCallId)) {
+        this.close({ toolCallId, ran: this.dispatched.has(toolCallId), retracted: true });
+      }
+    }
+  }
+
+  /**
+   * Records `block`, of a reply in the conversation of `parentToolUseId`, and
+   * ends the open server tool calls that it shows will never get a result
+   * (see `UnansweredServerToolCalls.observe`), `cancelled`: Claude Code gave
+   * up on the reply that made them and asked again, so they end as
+   * `retracted`, as in {@link closeRetracted}.
+   */
+  private closeUnanswered(parentToolUseId: string | null, block: unknown, replyId?: string): void {
+    for (const toolCallId of this.serverToolCalls.observe(parentToolUseId, block, replyId)) {
+      if (this.unfinished.has(toolCallId)) {
+        this.close({ toolCallId, ran: this.dispatched.has(toolCallId), retracted: true });
+      }
+    }
+  }
+
+  /**
+   * Ends the open tool call of `call` without its result, with the report of
+   * `AcpToolCallRenderer.unfinished`. A command's report also ends its
+   * terminal. The call is forgotten, so a late result changes nothing.
+   */
+  private close(call: Parameters<AcpToolCallRenderer["unfinished"]>[0]): void {
+    const renderer = new AcpToolCallRenderer(V2_TOOL_CALL_CAPABILITIES);
+    const report = renderer.unfinished(call);
+    const toolUse = this.toolUseCache[call.toolCallId];
+    const terminalExit = toolUse && renderer.terminalExit(toolUse);
+    if (terminalExit) report._meta = { ...report._meta, ...terminalExit };
+    this.emittedToolCalls.delete(call.toolCallId);
+    delete this.toolUseCache[call.toolCallId];
+    this.toolCallFields.delete(call.toolCallId);
+    this.emit([{ sessionId: this.sessionId, update: report }]);
   }
 
   /** The tool calls that the client holds without a final status. */

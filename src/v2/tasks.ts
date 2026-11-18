@@ -56,7 +56,14 @@ import type {
 import type { Logger } from "../logger.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import { backgroundBashTaskFromToolResult, taskProgressFields } from "../async-tasks.js";
-import { BackgroundOutputTail, type BackgroundOutput } from "../background-output.js";
+import {
+  BackgroundOutputTail,
+  type BackgroundOutput,
+  foregroundCommandToolCall,
+  isCommandTool,
+  type TaskOutput,
+  TaskOutputPoll,
+} from "../background-output.js";
 import {
   childModelOption,
   HANDBACK_TOOL,
@@ -70,13 +77,20 @@ import {
   rfdLabels,
   sendMessageResume,
   subagentIdentity,
+  targetAgentId,
   unexposedControlFallback,
+  withSessionReference,
   type HistoricalSubagent,
   type SubagentIdentity,
   type SubagentModels,
 } from "../native-subagents.js";
 import { subagentLineage } from "../subagent-history.js";
-import { withRunningTerminal, withRunningToolCall } from "../tool-calls/background.js";
+import {
+  streamedTerminals,
+  withRunningTerminal,
+  withRunningToolCall,
+  withStreamedTerminal,
+} from "../tool-calls/background.js";
 import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { AcpToolCallRenderer } from "../tool-calls/renderer.js";
 import type { BackgroundItem, V2Background, WorkStateName } from "./background.js";
@@ -109,6 +123,11 @@ export interface TaskHost {
   /** The root session's modes, for a child's `mode`. */
   modes(): SessionModeState["availableModes"];
   stopTask(taskId: string): Promise<void>;
+  /**
+   * The reader of the end of a shell task's output (Claude Code's
+   * `get_task_output`), or undefined when the query does not have the control.
+   */
+  taskOutput(): ((taskId: string) => Promise<TaskOutput>) | undefined;
 }
 
 /** Where a permission request or elicitation goes: the root session or a child. */
@@ -133,7 +152,7 @@ export interface RequestTarget {
   openRequest<T>(signal: AbortSignal, send: (signal: AbortSignal) => Promise<T>): Promise<T>;
 }
 
-type ChildState = "idle" | "running" | "requires_action";
+type ChildState = "idle" | "running" | "requires_action" | "unknown";
 
 type IdleOutcome =
   | { stopReason: "end_turn" }
@@ -178,6 +197,11 @@ type Child = {
   description: string | undefined;
   /** Whether a run of it is going on: its foreground work. */
   working: boolean;
+  /**
+   * Whether the adapter stopped following it while a run of it went on (see
+   * `conversationReset`): its state is `unknown`.
+   */
+  unobservable: boolean;
   /** The state its stream was told last. */
   reportedState: ChildState | undefined;
   /** How its last run ended. */
@@ -272,6 +296,12 @@ export class SessionTasks {
     }
   >();
   /**
+   * The output polls of the commands that run in the foreground, by tool call
+   * id. A poll stays here after its task ended, stopped, until the command's
+   * tool result asks whether its terminal got output.
+   */
+  private readonly foreground = new Map<string, TaskOutputPoll>();
+  /**
    * The tool calls whose tasks go on in the background, by task id. A call
    * that the adapter started for its task (see {@link adoptTasks}) has the
    * task's description as its `title` instead of a tool use.
@@ -316,6 +346,11 @@ export class SessionTasks {
     string,
     { initial: AcpSessionNotification; message?: string; delegationId?: string }
   >();
+  /**
+   * The agent that each TaskStop or SendMessage call names (`targetAgentId`),
+   * until the call's final update.
+   */
+  private readonly targetByToolCall = new Map<string, string>();
   /** The restore of a subagent from the session's history, while it reads it (see {@link restore}). */
   private restoring: Promise<void> | undefined;
 
@@ -437,6 +472,22 @@ export class SessionTasks {
     // A fast command can end before its result: then its terminal exits with it.
     const runningTerminal =
       command && this.started.has(command.taskId) ? command.toolCallId : undefined;
+    // The output that a foreground command's terminal showed as it ran is
+    // replaced by the result's, when the result carries the command's output
+    // (see `streamedTerminals`). The output file's tail goes on for a command
+    // that went to the background.
+    const shown: string[] = [];
+    for (const { tool_use_id: toolCallId } of results) {
+      const poll = this.foreground.get(toolCallId);
+      if (!poll) continue;
+      this.foreground.delete(toolCallId);
+      if (poll.end()) shown.push(toolCallId);
+    }
+    const streamed = streamedTerminals(
+      shown,
+      command?.toolCallId,
+      (message as { tool_result_meta?: unknown }).tool_result_meta,
+    );
     if (command && runningTerminal) {
       this.terminals.set(command.taskId, {
         toolCallId: command.toolCallId,
@@ -464,7 +515,11 @@ export class SessionTasks {
         (TASK_TOOLS.has(toolUse.name) ? structuredTaskId : undefined) ??
         [...this.started].find(([, task]) => task.toolUseId === toolCallId)?.[0];
       const task = taskId === undefined ? undefined : this.level.get(taskId);
-      if (!task || task.taskType === "local_bash" || task.taskType === "local_agent") continue;
+      if (!task || task.taskType === "local_agent") continue;
+      // Claude Code reports a Monitor's task as `local_bash`, like a shell
+      // command's. A command is its display terminal; the call of a tool that
+      // starts a task is the entity of that task, so it is kept.
+      if (task.taskType === "local_bash" && !TASK_TOOLS.has(toolUse.name)) continue;
       this.toolCalls.set(taskId!, {
         toolCallId,
         output,
@@ -480,7 +535,10 @@ export class SessionTasks {
       message,
       (notification) =>
         withRunningToolCall(
-          withRunningTerminal(notification as Notification, runningTerminal),
+          withRunningTerminal(
+            withStreamedTerminal(notification as Notification, streamed),
+            runningTerminal,
+          ),
           runningToolCalls,
         ) as AcpSessionNotification,
     );
@@ -633,6 +691,7 @@ export class SessionTasks {
    */
   withdrawAll(): void {
     this.closed = true;
+    this.stopForeground();
     for (const agentId of this.agentRequests.keys()) this.withdraw(agentId);
   }
 
@@ -817,6 +876,7 @@ export class SessionTasks {
    * `error`, as the root's work does.
    */
   queryEnded(error: { code: number; message: string } | undefined): void {
+    this.stopForeground();
     for (const [taskId, terminal] of this.terminals) {
       terminal.tail?.stop();
       if (error) this.exitTerminal(taskId);
@@ -831,18 +891,24 @@ export class SessionTasks {
   }
 
   /**
-   * Claude Code mounted a fresh conversation (`conversation_reset`). Its
-   * subagents end, deeper ones first, as on v1 (`finishAll`): each
-   * child that works goes `idle` with no stop reason, since nothing says how
-   * its run ended, after its unfinished tool calls end `failed`. Then every
-   * child is forgotten: a later event of one
-   * changes nothing, and a child not announced yet stays unexposed. Claude
-   * Code's tasks (the live subagents, background commands and other tasks)
-   * stay as its task events report them.
+   * Claude Code mounted a fresh conversation (`conversation_reset`). Every
+   * child is forgotten: a later event of one changes nothing, and a child not
+   * announced yet stays unexposed. Claude Code's tasks (the live subagents,
+   * background commands and other tasks) stay as its task events report them,
+   * so a child that works may go on working, unobserved. As on v1
+   * (`finishAll`), each such child, deeper ones first, goes `unknown`, as the
+   * RFD requires when a child can no longer be observed, on its stream and in
+   * its parent's mirror, and loses its `cancel` capability: a forgotten child
+   * cannot be stopped. Nothing says that its run or its tool calls ended, so
+   * its unfinished tool calls keep their status. A child that is idle keeps
+   * its state.
    */
   conversationReset(): void {
     for (const child of [...this.parentsFirst()].reverse()) {
-      if (child.working) this.endRun(child, undefined);
+      if (!child.working) continue;
+      child.working = false;
+      child.unobservable = true;
+      this.sendChildState(child, "unknown", { capabilities: null });
     }
     this.publish();
     for (const child of this.children.values()) this.configs.forget(child.sessionId);
@@ -857,6 +923,7 @@ export class SessionTasks {
     this.hiddenSendMessages.clear();
     this.shownSendMessages.clear();
     this.handbacks.clear();
+    this.targetByToolCall.clear();
   }
 
   /**
@@ -893,6 +960,7 @@ export class SessionTasks {
   private taskStarted(message: Extract<SDKMessage, { subtype: "task_started" }>): void {
     const isAgent = message.task_type === "local_agent" || message.subagent_type !== undefined;
     if (!isAgent) {
+      this.followForeground(message);
       this.started.set(message.task_id, {
         ...(message.tool_use_id !== undefined ? { toolUseId: message.tool_use_id } : {}),
         ...(message.parent_task_id !== undefined ? { parentTaskId: message.parent_task_id } : {}),
@@ -1068,6 +1136,11 @@ export class SessionTasks {
               },
       );
     }
+    // A foreground command's output is read no more: a tool call that gets no
+    // result, such as one of a reply that Claude Code took back, would
+    // otherwise be read until the query ends.
+    const commandToolCall = this.started.get(taskId)?.toolUseId;
+    if (commandToolCall !== undefined) this.foreground.get(commandToolCall)?.stop();
     this.started.delete(taskId);
     const terminal = this.terminals.get(taskId);
     if (terminal && !terminal.ending) {
@@ -1137,6 +1210,7 @@ export class SessionTasks {
       title: undefined,
       description: undefined,
       working: true,
+      unobservable: false,
       reportedState: undefined,
       outcome: undefined,
       openRequests: 0,
@@ -1373,9 +1447,45 @@ export class SessionTasks {
    * Rewrites an update of `output`, the output of the root or of `child`: an
    * update of an Agent or Task call goes out as {@link launchUpdate} says,
    * and Claude Code's late result of a call that the child's stop ended
-   * goes nowhere.
+   * goes nowhere. A tool call that the client is shown and that operates on
+   * an announced child of another session gets the RFD's `session` reference
+   * (see {@link withTarget}).
    */
   private route(
+    output: SessionOutput,
+    notification: AcpSessionNotification,
+    child: Child | undefined,
+  ): AcpSessionNotification[] {
+    return this.routed(output, notification, child).map((shown) =>
+      this.withTarget(shown, output.sessionId),
+    );
+  }
+
+  /**
+   * `notification`, an update that the client is shown on the session
+   * `shownOn`, with a `session` reference when it is of a TaskStop or
+   * SendMessage call that names an announced child by its agent id, or of a
+   * SendMessage call that resumed one and stays shown (see
+   * {@link requestShows}), as on v1 (`NativeSubagentRuntime.withTarget`).
+   */
+  private withTarget(
+    notification: AcpSessionNotification,
+    shownOn: string,
+  ): AcpSessionNotification {
+    const { update } = notification;
+    if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") {
+      return notification;
+    }
+    const agentId = this.targetByToolCall.get(update.toolCallId);
+    if (FINAL_STATUSES.has(update.status)) this.targetByToolCall.delete(update.toolCallId);
+    const child =
+      this.childByToolUse.get(update.toolCallId) ??
+      (agentId !== undefined ? this.children.get(agentId) : undefined);
+    if (!child?.announced || child.sessionId === shownOn) return notification;
+    return withSessionReference(notification, child.sessionId);
+  }
+
+  private routed(
     output: SessionOutput,
     notification: AcpSessionNotification,
     child: Child | undefined,
@@ -1386,6 +1496,8 @@ export class SessionTasks {
     }
     if (child?.stopped.has(update.toolCallId)) return [];
     const toolName = (update._meta?.claudeCode as { toolName?: unknown } | undefined)?.toolName;
+    const agentId = targetAgentId(toolName, update.rawInput);
+    if (agentId !== undefined) this.targetByToolCall.set(update.toolCallId, agentId);
     if (toolName === "SendMessage") this.senderByToolUse.set(update.toolCallId, output.sessionId);
     const message =
       this.sendMessageUpdate(output, notification, toolName) ??
@@ -1594,16 +1706,15 @@ export class SessionTasks {
   /**
    * A run of `child` ended: its unfinished tool calls get their final status,
    * except its background work, then its idle goes out, as v2 asks. A stopped
-   * run's end `cancelled`, and a failed run's or an unexplained end's
-   * (`undefined`, an idle with no stop reason) `failed`. At a completed end, a
+   * run's end `cancelled`, and a failed run's `failed`. At a completed end, a
    * tool call that Claude dropped before it ran ends `cancelled`, as on the
    * root (see `SessionOutput.closeUnfinished`).
    */
-  private endRun(child: Child, outcome: IdleOutcome | undefined): void {
+  private endRun(child: Child, outcome: IdleOutcome): void {
     if (!child.working) {
       // A later report of the same failure can give its error text.
       if (
-        outcome?.stopReason === "error" &&
+        outcome.stopReason === "error" &&
         outcome.error &&
         child.outcome?.stopReason === "error" &&
         !child.outcome.error
@@ -1614,10 +1725,10 @@ export class SessionTasks {
       return;
     }
     const keep = this.backgroundWork(child.sessionId);
-    if (outcome?.stopReason === "end_turn") {
+    if (outcome.stopReason === "end_turn") {
       child.output!.closeUnfinished(false, keep);
     } else {
-      const status = outcome?.stopReason === "cancelled" ? "cancelled" : "failed";
+      const status = outcome.stopReason === "cancelled" ? "cancelled" : "failed";
       const ended = child.output!.finishUnfinished(status, keep, { exitTerminals: true });
       for (const toolCallId of ended) child.stopped.add(toolCallId);
     }
@@ -1659,6 +1770,7 @@ export class SessionTasks {
   }
 
   private childState(child: Child): ChildState {
+    if (child.unobservable) return "unknown";
     if (!child.working) return "idle";
     return child.openRequests > 0 ? "requires_action" : "running";
   }
@@ -1679,12 +1791,21 @@ export class SessionTasks {
     this.sendChildState(child, state);
   }
 
-  private sendChildState(child: Child, state: ChildState): void {
+  private sendChildState(
+    child: Child,
+    state: ChildState,
+    capabilities?: { capabilities: null },
+  ): void {
     child.reportedState = state;
     const snapshot = stateObject(state, state === "idle" ? child.outcome : undefined);
     this.host.send({
       sessionId: child.parentSessionId,
-      update: { sessionUpdate: "subagent_update", sessionId: child.sessionId, state: snapshot },
+      update: {
+        sessionUpdate: "subagent_update",
+        sessionId: child.sessionId,
+        ...capabilities,
+        state: snapshot,
+      },
     });
     this.host.send({
       sessionId: child.sessionId,
@@ -1961,6 +2082,37 @@ export class SessionTasks {
         : undefined;
   }
 
+  /**
+   * Starts reading the output of the foreground command that the task
+   * `started` runs (see `foregroundCommandToolCall`) into its terminal, until
+   * its tool result or the end of its task (see {@link TaskOutputPoll}). A
+   * subagent's command goes to the subagent's session, and gets no poll
+   * before that session is announced.
+   */
+  private followForeground(started: Extract<SDKMessage, { subtype: "task_started" }>): void {
+    const read = this.host.taskOutput();
+    const toolCallId = foregroundCommandToolCall(started);
+    if (!read || toolCallId === undefined || this.foreground.has(toolCallId)) return;
+    const parent =
+      started.parent_task_id === undefined ? undefined : this.children.get(started.parent_task_id);
+    const output = started.parent_task_id === undefined ? this.rootOutput : parent?.output;
+    if (!output?.holds(toolCallId) || !isCommandTool(output.toolUses()[toolCallId]?.name)) return;
+    const taskId = started.task_id;
+    this.foreground.set(
+      toolCallId,
+      new TaskOutputPoll(
+        () => read(taskId),
+        async (text) => output.emitV1([terminalOutput(output.sessionId, toolCallId, text)]),
+      ),
+    );
+  }
+
+  /** Stops the output polls of the foreground commands: the query or the session ended. */
+  private stopForeground(): void {
+    for (const poll of this.foreground.values()) poll.stop();
+    this.foreground.clear();
+  }
+
   private followOutput(taskId: string, outputFilePath: string | undefined): void {
     const terminal = this.terminals.get(taskId);
     if (!terminal || !outputFilePath || !this.host.reportsBackground) return;
@@ -2044,6 +2196,8 @@ function stateObject(state: ChildState, outcome: IdleOutcome | undefined): v2.St
       return { state: "running" };
     case "requires_action":
       return { state: "requires_action" };
+    case "unknown":
+      return { state: "unknown" };
     default:
       return { state: "idle", ...(outcome ?? {}) } as v2.StateUpdate;
   }

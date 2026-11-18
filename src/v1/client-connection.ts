@@ -4,6 +4,7 @@ import {
   CompleteElicitationNotification,
   CreateElicitationRequest,
   CreateElicitationResponse,
+  McpServerAcp,
   methods,
   ReadTextFileRequest,
   ReadTextFileResponse,
@@ -13,8 +14,10 @@ import {
   WriteTextFileRequest,
   WriteTextFileResponse,
 } from "@agentclientprotocol/sdk/unstable";
+import type { McpHttpServerConfig } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient } from "../acp-client.js";
 import { AcpSessionNotification, asSdkSessionNotification } from "../acp-subagents.js";
+import type { McpOverAcp } from "../mcp-servers.js";
 import { ChangedMetaFilter } from "./tool-calls/changed-meta-filter.js";
 import type { AcpPermissionRequest } from "../permissions/presentation.js";
 
@@ -25,7 +28,10 @@ import type { AcpPermissionRequest } from "../permissions/presentation.js";
  * construction.
  */
 export class ClientConnection implements AcpClient {
-  constructor(private readonly ctx: AgentContext) {}
+  constructor(
+    private readonly ctx: AgentContext,
+    private readonly mcp: McpOverAcp,
+  ) {}
 
   sessionUpdate(params: AcpSessionNotification): Promise<void> {
     return this.ctx.notify(methods.client.session.update, asSdkSessionNotification(params));
@@ -69,6 +75,10 @@ export class ClientConnection implements AcpClient {
 
   extNotification(method: string, params: Record<string, unknown>): Promise<void> {
     return this.ctx.notify(method, params);
+  }
+
+  mcpServerOverAcp(server: McpServerAcp): Promise<McpHttpServerConfig> {
+    return this.mcp.sdkConfig(this.ctx, server);
   }
 }
 
@@ -125,5 +135,9 @@ export class ChangedMetaClient implements AcpClient {
 
   extNotification(method: string, params: Record<string, unknown>): Promise<void> {
     return this.inner.extNotification(method, params);
+  }
+
+  mcpServerOverAcp(server: McpServerAcp): Promise<McpHttpServerConfig> {
+    return this.inner.mcpServerOverAcp(server);
   }
 }

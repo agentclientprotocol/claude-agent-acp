@@ -38,6 +38,7 @@ const OPTION_REBUILDS_SESSION = {
   maxThinkingTokens: true,
   maxTurns: true,
   mcpServers: true,
+  mcpServersDelivery: true,
   model: true,
   outputFormat: true,
   pathToClaudeCodeExecutable: true,

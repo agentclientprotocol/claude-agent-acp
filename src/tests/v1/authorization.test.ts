@@ -8,6 +8,8 @@ import { ClaudeAcpAgent } from "../../v1/acp-agent.js";
 import { AcpClient } from "../../acp-client.js";
 import {
   billsClaudeSubscription,
+  holdsNonSubscriptionCredential,
+  isClaudeEnterprisePlan,
   CLAUDE_LOGIN_REQUIRED_MESSAGE,
   CLAUDE_SUBSCRIPTION_NOT_SUPPORTED_MESSAGE,
   CLAUDE_SUBSCRIPTION_NOT_SUPPORTED_REASON,
@@ -372,6 +374,32 @@ describe("authorization", () => {
       return { cwd: process.cwd(), mcpServers: [] };
     }
 
+    describe("tokenSource", () => {
+      it.each([
+        [undefined, false],
+        ["", false],
+        ["none", false],
+        ["ANTHROPIC_AUTH_TOKEN", true],
+        ["CLAUDE_CODE_OAUTH_TOKEN", true],
+        ["a-future-token-source", true],
+      ] as const)("classifies tokenSource %s", (tokenSource, hasToken) => {
+        const account = { tokenSource, apiProvider: "firstParty" } satisfies AccountInfo;
+        expect(holdsNonSubscriptionCredential(account)).toBe(hasToken);
+        expect(billsClaudeSubscription({ ...account, subscriptionType: "pro" })).toBe(!hasToken);
+      });
+
+      it.each([
+        { apiKeySource: "ANTHROPIC_API_KEY" },
+        { apiKeySource: "apiKeyHelper" },
+        { apiKeySource: "/login managed key" },
+        { apiProvider: "bedrock" },
+      ] as const)("preserves an accepted credential beside tokenSource none: %j", (credential) => {
+        const account = { tokenSource: "none", subscriptionType: "pro", ...credential };
+        expect(holdsNonSubscriptionCredential(account)).toBe(true);
+        expect(billsClaudeSubscription(account)).toBe(false);
+      });
+    });
+
     describe("billsClaudeSubscription", () => {
       /** Every member of the SDK's `ApiKeySource` enum, plus a value no
        *  current CLI emits: the field is an open `string`, so an unknown one
@@ -439,12 +467,40 @@ describe("authorization", () => {
       });
     });
 
+    describe("isClaudeEnterprisePlan", () => {
+      it.each([
+        ["Claude Enterprise", true],
+        ["enterprise", true],
+        [" claude  ENTERPRISE ", true],
+        ["Claude Team", false],
+        ["Claude Max", false],
+        ["pro", false],
+        // A custom `plan_display_name` does not say which plan it belongs to.
+        ["Claude Enterprise Trial", false],
+        ["Claude Acme Enterprise", false],
+        ["", false],
+        [undefined, false],
+      ])("classifies subscriptionType %j", (subscriptionType, expected) => {
+        expect(isClaudeEnterprisePlan(subscriptionType)).toBe(expected);
+      });
+    });
+
     describe("fails closed at session creation", () => {
       /** What the flag does with an account at session creation. */
       type Verdict = "subscription" | "signedOut" | "allowed";
 
       const CASES: Array<{ name: string; account: AccountInfo; verdict: Verdict }> = [
         { name: "a logged-out CLI", account: {}, verdict: "signedOut" },
+        {
+          name: "the SDK reporting no token",
+          account: { tokenSource: "none", apiProvider: "firstParty" },
+          verdict: "signedOut",
+        },
+        {
+          name: "a subscription with no token",
+          account: { tokenSource: "none", subscriptionType: "pro", apiProvider: "firstParty" },
+          verdict: "subscription",
+        },
         {
           name: "an account with no key in use",
           account: { apiKeySource: "none" },
@@ -470,6 +526,16 @@ describe("authorization", () => {
           name: "a bearer token",
           account: { tokenSource: "ANTHROPIC_AUTH_TOKEN" },
           verdict: "allowed",
+        },
+        {
+          name: "a Claude Enterprise plan",
+          account: { subscriptionType: "Claude Enterprise", apiProvider: "firstParty" },
+          verdict: "allowed",
+        },
+        {
+          name: "a Claude Team plan",
+          account: { subscriptionType: "Claude Team", apiProvider: "firstParty" },
+          verdict: "subscription",
         },
         { name: "bedrock", account: { apiProvider: "bedrock" }, verdict: "allowed" },
         { name: "vertex", account: { apiProvider: "vertex" }, verdict: "allowed" },
@@ -753,15 +819,26 @@ describe("authorization", () => {
         prompt: [{ type: "text" as const, text: "hello" }],
       });
 
-      it("rejects a turn when the live account became a subscription", async () => {
+      it.each([
+        [{ subscriptionType: "pro", apiKeySource: "none" }, refusal],
+        [
+          { tokenSource: "none", apiProvider: "firstParty" },
+          {
+            code: AUTH_REQUIRED_CODE,
+            message: `Authentication required: ${LOGIN_REQUIRED_MESSAGE}`,
+            data: undefined,
+          },
+        ],
+        [{ tokenSource: "none", subscriptionType: "pro", apiProvider: "firstParty" }, refusal],
+      ])("rejects a turn before insertion for account %j", async (account, expectedRefusal) => {
         const [agent] = await createAgentMock();
         hideClaudeAuth();
-        // Spawn-time account passes; the store changes underneath the session.
-        const accountInfo = vi.fn(async () => ({ subscriptionType: "pro", apiKeySource: "none" }));
+        // Start with a legal session, then exercise the per-turn policy independently.
+        const accountInfo = vi.fn(async () => account);
         mockAccount(SIGNED_IN_WITH_KEY, { accountInfo });
         const { sessionId } = await agent.newSession(newSessionParams());
 
-        await expect(agent.prompt(promptParams(sessionId))).rejects.toMatchObject(refusal);
+        await expect(agent.prompt(promptParams(sessionId))).rejects.toMatchObject(expectedRefusal);
         expect(accountInfo).toHaveBeenCalledTimes(1);
         // Refused before anything reached the SDK: no turn was queued.
         expect(agent.sessions[sessionId].turnQueue ?? []).toHaveLength(0);
@@ -890,10 +967,13 @@ describe("authorization", () => {
         expect(accountInfo).not.toHaveBeenCalled();
       });
 
-      it("lets the turn through when the live account is not a subscription", async () => {
+      it.each([
+        ["an API key", { apiKeySource: "ANTHROPIC_API_KEY" }],
+        ["a Claude Enterprise plan", { subscriptionType: "Claude Enterprise" }],
+      ])("lets the turn through when the live account is %s", async (_case, account) => {
         const [agent] = await createAgentMock();
         hideClaudeAuth();
-        const accountInfo = vi.fn(async () => ({ apiKeySource: "ANTHROPIC_API_KEY" }));
+        const accountInfo = vi.fn(async () => account);
         mockAccount(SIGNED_IN_WITH_KEY, { accountInfo });
         const { sessionId } = await agent.newSession(newSessionParams());
 

@@ -55,3 +55,25 @@ describe("claudeCliPath", () => {
     expect(await claudeCliPath()).toMatch(/@anthropic-ai\/claude-agent-sdk-[^/]+\/claude(\.exe)?$/);
   });
 });
+
+describe("mcpServersDelivery", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it.each([
+    {
+      name: "is initialize for the CLI that it ships",
+      cli: "",
+      delivery: "initialize",
+    },
+    {
+      name: "is argv for a CLAUDE_CODE_EXECUTABLE CLI",
+      cli: "/opt/claude",
+      delivery: "argv",
+    },
+  ])("$name", async ({ cli, delivery }) => {
+    vi.stubEnv("CLAUDE_CODE_EXECUTABLE", cli);
+    const { mcpServersDelivery } = await load();
+
+    expect(mcpServersDelivery()).toBe(delivery);
+  });
+});

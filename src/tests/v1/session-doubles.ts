@@ -10,6 +10,7 @@ import { randomUUID } from "crypto";
 import { SessionBackgroundWork } from "../../v1/background-work.js";
 import { PromptSuggestions } from "../../prompt-suggestions.js";
 import { SessionTitles } from "../../session-titles.js";
+import { DEFAULT_CONTEXT_WINDOW } from "../../session-usage.js";
 
 /** Stand-in agent for a `SessionTitles` whose test doesn't care about titles:
  *  swallows the publish and the log, and never matches the identity check. */
@@ -70,6 +71,7 @@ export function mockSessionState(
       dispose: vi.fn(),
       getSettings: () => ({}),
       getApiKeyHelper: () => undefined,
+      getShowClearContextOnPlanAccept: () => false,
       getCwd: () => process.cwd(),
     },
     accumulatedUsage: {
@@ -86,7 +88,7 @@ export function mockSessionState(
     abortController: new AbortController(),
     emitRawSDKMessages: false,
     forwardSubagentText: false,
-    contextWindowSize: 200000,
+    contextWindowSize: DEFAULT_CONTEXT_WINDOW,
     contextWindowAuthoritative: false,
     providerCacheKey: "default",
     taskState: new Map(),

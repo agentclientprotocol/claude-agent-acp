@@ -17,6 +17,7 @@ import {
   type CompleteElicitationNotification,
   type CreateElicitationRequest,
   type CreateElicitationResponse,
+  type McpServer,
 } from "@agentclientprotocol/sdk/unstable";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import {
@@ -32,12 +33,12 @@ import packageJson from "../../package.json" with { type: "json" };
 import { messageIdForGrouping } from "../sdk-to-acp.js";
 import type { Logger } from "../logger.js";
 import { customAgents } from "../session-config-options.js";
-import { claudeCliPath } from "../claude-cli.js";
+import { claudeCliPath, mcpServersDelivery } from "../claude-cli.js";
 import { clientSystemPrompt, sessionSystemPrompt } from "../client-system-prompt.js";
 import type { ElicitationSupport } from "../elicitation.js";
 import { forkSession } from "../fork-session.js";
 import { supportsMcpOAuth } from "../mcp-oauth.js";
-import { sdkMcpServers } from "../mcp-servers.js";
+import { McpOverAcp, sdkMcpServers } from "../mcp-servers.js";
 import { ALLOW_BYPASS, autoModeDisabled } from "../permissions/modes.js";
 import {
   readHistoryAcrossCompactions,
@@ -72,6 +73,7 @@ import { subagentHooks } from "./child-config.js";
 import { modelSwitchHook, SessionConfig } from "./config.js";
 import { fileChangePreviewHook } from "./file-preview.js";
 import { canUseTool, denyingStoppedWork } from "./permissions.js";
+import { ReplayHolds } from "./replay-hold.js";
 import { reportHooks } from "./reports.js";
 import { savedSessionStatus } from "../session-status.js";
 import { SessionRestarts, type SetupParams } from "./restarts.js";
@@ -79,6 +81,7 @@ import { V2Session, type SessionConnection } from "./session.js";
 import {
   afterSetupResponse,
   clientOptions,
+  REPLAY_COMPLETE,
   replayEndUpdate,
   sessionModels,
   withClientHooks,
@@ -101,13 +104,15 @@ export function v2AgentApp(
   onAgent: (agent: AgentHandle) => void,
 ): v2.AgentApp {
   let agent!: V2Agent;
+  const mcp = new McpOverAcp();
   return (
     v2
       .agent({ name: "claude-code-acp" })
       .onConnect((connection) => {
-        agent = new V2Agent(connection.client, logger ?? console);
+        agent = new V2Agent(connection.client, logger ?? console, mcp);
         onAgent(agent);
       })
+      .onNotification(v2.methods.agent.mcp.message, mcp.handleNotification)
       .onRequest(v2.methods.agent.initialize, ({ params }) => agent.initialize(params))
       .onRequest(v2.methods.agent.auth.login, ({ params }) => agent.auth.login(params))
       .onRequest(v2.methods.agent.auth.logout, () => agent.auth.logout())
@@ -152,7 +157,7 @@ class V2Agent implements AgentHandle, SessionConnection {
    * connection ends, so its requests fail with what happened, not -32002,
    * until a resume starts it again.
    */
-  private readonly stopped = new Map<string, string>();
+  private readonly stopped = new Map<string, string | RequestError>();
   /**
    * The query starts that run, by session id, until each settles (see
    * {@link startSession}). A resume, close or dispose of a session waits for
@@ -165,6 +170,8 @@ class V2Agent implements AgentHandle, SessionConnection {
    * response, and nothing of the session after it.
    */
   private readonly resuming = new Map<string, Set<Promise<unknown>>>();
+  /** What the resumes that replay hold back until their `replay_complete` (see `replay-hold.ts`). */
+  private readonly replays = new ReplayHolds();
   readonly translator = new V2UpdateTranslator();
   readonly auth: V2Auth;
   /** The `--hide-claude-auth` subscription guard (see `subscription-guard.ts`). */
@@ -183,6 +190,8 @@ class V2Agent implements AgentHandle, SessionConnection {
   constructor(
     private readonly ctx: v2.AgentContext,
     readonly logger: Logger,
+    /** Serves the client's `acp` MCP servers to Claude Code (see `mcp-servers.ts`). */
+    private readonly mcp: McpOverAcp,
   ) {
     this.auth = new V2Auth(ctx, logger, {
       routeChanged: () => this.restarts.reroute(),
@@ -195,12 +204,18 @@ class V2Agent implements AgentHandle, SessionConnection {
       logger,
       active: (sessionId) => this.sessions.get(sessionId),
       start: (sessionId, params) => this.restartSession(sessionId, params),
-      lost: async (sessionId, previous) => {
+      lost: async (sessionId, previous, error) => {
         await previous.retire();
         if (this.sessions.get(sessionId) === previous) {
           this.stop(
             sessionId,
-            "Claude Code could not start again. Resume the session to continue.",
+            error instanceof RequestError
+              ? new RequestError(
+                  error.code,
+                  `${error.message} Then resume the session to continue.`,
+                  error.data,
+                )
+              : "Claude Code could not start again. Resume the session to continue.",
           );
         }
       },
@@ -210,10 +225,48 @@ class V2Agent implements AgentHandle, SessionConnection {
 
   // --- SessionConnection ---------------------------------------------------
 
+  /** Sends the update, after the `replay_complete` of a replay that holds it (see {@link heldBy}). */
   send(notification: v2.UpdateSessionNotification): void {
-    this.ctx.notify(v2.methods.client.session.update, notification).catch((error) => {
-      this.logger.error(`Failed to send a ${notification.update.sessionUpdate} update:`, error);
-    });
+    const send = () => {
+      this.ctx.notify(v2.methods.client.session.update, notification).catch((error) => {
+        this.logger.error(`Failed to send a ${notification.update.sessionUpdate} update:`, error);
+      });
+    };
+    const held = this.heldBy(notification.sessionId);
+    if (held === undefined) send();
+    else this.replays.defer(held, send);
+  }
+
+  /**
+   * The session whose replay holds what the session `sessionId` sends now
+   * (see `replay-hold.ts`): itself, or the root session of a subagent's
+   * session.
+   */
+  private heldBy(sessionId: string): string | undefined {
+    if (!this.replays.any) return undefined;
+    if (this.replays.holds(sessionId)) return sessionId;
+    const root = this.ownerOfChild(sessionId)?.sessionId;
+    return root !== undefined && this.replays.holds(root) ? root : undefined;
+  }
+
+  /**
+   * Sends a request of the session `sessionId` to the client, after the
+   * `replay_complete` of a replay that holds it (see {@link heldBy}). A
+   * request that `signal` withdrew while it waited is not sent, and rejects.
+   */
+  private afterReplay<T>(
+    sessionId: string | undefined,
+    signal: AbortSignal,
+    send: () => Promise<T>,
+  ): Promise<T> {
+    const held = sessionId === undefined ? undefined : this.heldBy(sessionId);
+    if (held === undefined) return send();
+    return new Promise((resolve, reject) =>
+      this.replays.defer(held, () => {
+        if (signal.aborted) reject(new Error("The request was withdrawn"));
+        else send().then(resolve, reject);
+      }),
+    );
   }
 
   requestPermission(
@@ -221,23 +274,29 @@ class V2Agent implements AgentHandle, SessionConnection {
     signal: AbortSignal,
   ): Promise<v2.RequestPermissionResponse> {
     // Aborting `signal` sends `$/cancel_request`, and stops waiting for the answer.
-    return this.ctx.request(v2.methods.client.session.requestPermission, request, {
-      cancellationSignal: signal,
-      stopWaitingOnCancel: true,
-    });
+    return this.afterReplay(request.sessionId, signal, () =>
+      this.ctx.request(v2.methods.client.session.requestPermission, request, {
+        cancellationSignal: signal,
+        stopWaitingOnCancel: true,
+      }),
+    );
   }
 
   createElicitation(
     request: CreateElicitationRequest,
     signal: AbortSignal,
   ): Promise<CreateElicitationResponse> {
+    // An elicitation of a request, not of a session, names no session.
+    const sessionId = (request as { sessionId?: unknown }).sessionId;
     // The v1 types accept a property schema with any tag; the v2 types accept
     // one only in a received value. An MCP server's schema is relayed
     // unchanged, as on v1, so this cast does not check it.
-    return this.ctx.request(
-      v2.methods.client.elicitation.create,
-      request as v2.CreateElicitationRequest,
-      { cancellationSignal: signal, stopWaitingOnCancel: true },
+    return this.afterReplay(typeof sessionId === "string" ? sessionId : undefined, signal, () =>
+      this.ctx.request(
+        v2.methods.client.elicitation.create,
+        request as v2.CreateElicitationRequest,
+        { cancellationSignal: signal, stopWaitingOnCancel: true },
+      ),
     );
   }
 
@@ -252,9 +311,9 @@ class V2Agent implements AgentHandle, SessionConnection {
   }
 
   /** The session's query ended: a later `session/resume` starts it again from its transcript. */
-  private stop(sessionId: string, message: string): void {
+  private stop(sessionId: string, reason: string | RequestError): void {
     this.sessions.delete(sessionId);
-    this.stopped.set(sessionId, message);
+    this.stopped.set(sessionId, reason);
     this.translator.forget(sessionId);
     this.auth.sessionEnded(sessionId);
     this.guard.sessionEnded(sessionId);
@@ -337,17 +396,22 @@ class V2Agent implements AgentHandle, SessionConnection {
 
   /**
    * Copies the session's transcript into a new session (`forkSession`), and
-   * starts it from the copy, so the client can prompt it at once.
+   * starts it from the copy, so the client can prompt it at once. The
+   * request's `configOptions` are set on the fork, over what the copy starts
+   * with.
    */
   async forkSession(params: v2.ForkSessionRequest): Promise<v2.ForkSessionResponse> {
     if (this.ownerOfChild(params.sessionId)) throw restrictedChild(params.sessionId, "fork");
-    // Rejects a bad `cwd` or MCP server before the transcript is copied.
+    // Rejects bad `configOptions`, a bad `cwd` or MCP server before the transcript is copied.
+    const initial = initialConfigRequests(params.sessionId, params.configOptions);
     await validatedSetup(params);
     const { sessionId } = await forkSession(v1ForkSessionRequest(params), {
       logger: this.logger,
       messageIdForGrouping,
     });
     const session = await this.startSession(sessionId, params, sessionId);
+    // The entries are the fork's: only the copy gave it its id.
+    await session.setInitialConfigOptions(initial.map((entry) => ({ ...entry, sessionId })));
     const response = { sessionId, ...(await this.setupFields(session)) };
     this.afterSetup(session, params);
     return response;
@@ -355,10 +419,17 @@ class V2Agent implements AgentHandle, SessionConnection {
 
   /**
    * Resumes a stored session, or attaches to a live one. With `replayFrom:
-   * { type: "start" }` the stored history replays first. Either way, the
-   * state snapshot goes out after any replay and before the response. The
-   * request's `configOptions` are set before the replay, on an active session
-   * too.
+   * { type: "start" }` the stored history replays first, and
+   * `replay_complete` ends it, also when the history is empty. Either way,
+   * the state snapshot goes out after any replay and before the response.
+   * The request's `configOptions` are set before the replay, on an active
+   * session too.
+   *
+   * From the request to `replay_complete`, the session and its subagent
+   * sessions send only the replay. What they send besides, such as the
+   * output of work that goes on in an active session, goes out after
+   * `replay_complete` (see `replay-hold.ts`). A resume that fails sends no
+   * `replay_complete`, and then what the session held.
    */
   resumeSession(params: v2.ResumeSessionRequest): Promise<v2.ResumeSessionResponse> {
     const { sessionId } = params;
@@ -385,24 +456,63 @@ class V2Agent implements AgentHandle, SessionConnection {
     }
     if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "resume");
     const initial = initialConfigRequests(sessionId, params.configOptions);
+    // No await before it: nothing of the session goes out between the request and the hold.
+    const release = replayFrom != null ? this.replays.begin(sessionId) : undefined;
+    try {
+      return await this.resumeHeld(params, initial, release);
+    } finally {
+      // A resume that failed before its `replay_complete`.
+      release?.();
+    }
+  }
+
+  /**
+   * {@link resume}, once the request is valid. `release` ends the hold of a
+   * resume that replays.
+   */
+  private async resumeHeld(
+    params: v2.ResumeSessionRequest,
+    initial: v2.SetSessionConfigOptionRequest[],
+    release: (() => void) | undefined,
+  ): Promise<v2.ResumeSessionResponse> {
+    const { sessionId, replayFrom } = params;
+    // The replay: the messages before each compaction too, unless reading them fails.
+    const acrossCompactions = (chain: Promise<SessionMessage[]>, cwd: string) => {
+      const messages = chain.then((read) =>
+        readHistoryAcrossCompactions(sessionId, read, this.logger, cwd),
+      );
+      // A resume that fails before the replay leaves them unawaited.
+      chain.catch(() => {});
+      messages.catch(() => {});
+      return messages;
+    };
     await this.restarts.settled(sessionId);
     // A concurrent resume of this session started its query: this one then
     // attaches to the session that it started.
     await this.startSettled(sessionId);
     let session = this.sessions.get(sessionId);
-    let history: Promise<SessionMessage[]> | undefined;
-    // The replay: the messages before each compaction too, unless reading them fails.
     let replayed: Promise<SessionMessage[]> | undefined;
     if (session) {
+      // Read first, so the history ends as close to the request as it can.
+      // The session's work goes on, and what it sends from the request on
+      // follows `replay_complete`: an update that the history had too would
+      // reach the client twice.
+      if (replayFrom != null) {
+        replayed = acrossCompactions(
+          getSessionMessages(sessionId, { dir: session.cwd }),
+          session.cwd,
+        );
+      }
       // Resuming the active session synchronizes it again. Its work goes on,
       // and the request's MCP servers and additional directories replace the
       // session's.
       const request = await validatedSetup(params);
       assertCwdOf(session, request.cwd, "resume it");
-      await session.setMcpServers({
-        ...clientOptions(params._meta)?.mcpServers,
-        ...sdkMcpServers(request.mcpServers),
-      });
+      const served = await this.sdkMcpServers(sessionId, request.mcpServers);
+      await session.setMcpServers(
+        { ...clientOptions(params._meta)?.mcpServers, ...served.configs },
+        served.unserved,
+      );
       if (!sameDirectories(request.additionalDirectories ?? [], session.additionalDirectories)) {
         // The SDK cannot change them on a running query: it restarts with
         // them at its next turn boundary (see `restarts.ts`).
@@ -413,25 +523,57 @@ class V2Agent implements AgentHandle, SessionConnection {
       }
     } else {
       // One read of the transcript serves the replay and the resumed model.
-      history = replayFrom != null ? getSessionMessages(sessionId, { dir: params.cwd }) : undefined;
+      const history =
+        replayFrom != null ? getSessionMessages(sessionId, { dir: params.cwd }) : undefined;
       // The read across compactions overlaps the start of the query.
-      replayed = history?.then((messages) =>
-        readHistoryAcrossCompactions(sessionId, messages, this.logger, params.cwd),
-      );
-      // A failed start leaves them unawaited.
-      history?.catch(() => {});
-      replayed?.catch(() => {});
+      if (history) replayed = acrossCompactions(history, params.cwd);
       session = await this.startSession(sessionId, params, sessionId, history);
     }
     await session.setInitialConfigOptions(initial);
     let subagents: SubagentReplay | undefined;
-    if (replayFrom != null) {
-      const cwd = session.cwd;
-      const messages = await (replayed ??
-        getSessionMessages(sessionId, { dir: cwd }).then((chain) =>
-          readHistoryAcrossCompactions(sessionId, chain, this.logger, cwd),
-        ));
+    if (replayed) {
+      const messages = await replayed;
       subagents = await session.tasks.loadReplay(messages);
+      this.replay(session, messages, subagents);
+      release?.();
+      // A notice is not history, so it follows `replay_complete`.
+      subagents?.reportMissingHistory();
+    }
+    // The current title, after the replay and before the state.
+    await session.reports.publishTitle();
+    for (const notification of session.resumeSnapshot()) this.send(notification);
+    const response = await this.setupFields(session);
+    this.afterSetup(session, params);
+    // A replayed child's state that comes before the response is history to
+    // the client, also after the child's `replay_complete`: the children's
+    // current states follow the response. The ACP SDK (2.7.0)
+    // gives a request handler no responder and no after-response hook, so the
+    // order rests on two things that its source shows and its API does not
+    // promise. `registerAppRequest` queues the response in the microtask that
+    // follows this handler's return, with no macrotask in between, so the
+    // timer runs after it. And `Connection.sendMessage` writes in call order,
+    // so what the timer sends is written after the response. The timer is
+    // set in the same synchronous step as the `return`: an `await` between
+    // them would let it run first. The v1 core's `afterSetupResponse` relies
+    // on the same.
+    if (subagents) setTimeout(() => subagents.afterResponse(), 0);
+    return response;
+  }
+
+  /**
+   * Replays `messages`, the history of `session`, with the histories of its
+   * subagents (`subagents`), and ends the replay: each replayed child's
+   * `replay_complete` (see `SubagentReplay.finish`), then the session's. An
+   * AIR client that declared `loadReplayEnd` gets AIR's own mark after it.
+   * All in one synchronous step, as `ReplayHolds.replay` requires.
+   */
+  private replay(
+    session: V2Session,
+    messages: SessionMessage[],
+    subagents: SubagentReplay | undefined,
+  ): void {
+    const { sessionId } = session;
+    this.replays.replay(() => {
       session.output.replay(
         messages,
         subagents?.hooks(session.output, messages),
@@ -439,21 +581,10 @@ class V2Agent implements AgentHandle, SessionConnection {
         session.tasks.replayedBackground(sessionId),
       );
       subagents?.finish();
+      this.send({ sessionId, update: REPLAY_COMPLETE });
       const end = replayEndUpdate(this.clientCapabilities);
       if (end) this.send({ sessionId, update: end });
-    }
-    // The current title, after the replay and before the state.
-    await session.reports.publishTitle();
-    for (const notification of session.resumeSnapshot()) this.send(notification);
-    const response = await this.setupFields(session);
-    this.afterSetup(session, params);
-    // The response ends the replay, and the replayed children's states before
-    // it are history: their current states follow it. Nothing enforces that
-    // the timer runs after the response goes out; it relies on the response
-    // being written when this handler returns, as the v1 core's
-    // `afterSetupResponse` does.
-    if (subagents) setTimeout(() => subagents.afterResponse(), 0);
-    return response;
+    });
   }
 
   async listSessions(params: v2.ListSessionsRequest): Promise<v2.ListSessionsResponse> {
@@ -652,6 +783,7 @@ class V2Agent implements AgentHandle, SessionConnection {
   /** The error of a request of `sessionId`, which is not running. */
   private inactive(sessionId: string): RequestError {
     const stopped = this.stopped.get(sessionId);
+    if (stopped instanceof RequestError) return stopped;
     return stopped !== undefined
       ? RequestError.internalError({ sessionId }, stopped)
       : RequestError.sessionNotFound(sessionId);
@@ -820,6 +952,7 @@ class V2Agent implements AgentHandle, SessionConnection {
       configuredSettings: opened.configured,
       env: opened.env,
       mcpServers: opened.request.mcpServers.map((server) => server.name),
+      unservedMcpServers: opened.unservedMcpServers,
       mcpOAuth: this.elicitation.url && supportsMcpOAuth(q),
       query: q,
       model: { id: models.models.currentModelId, info: models.allowlistedModelInfo },
@@ -832,6 +965,22 @@ class V2Agent implements AgentHandle, SessionConnection {
       staleRoute: this.auth.routeGeneration !== opened.routeGeneration,
     });
     return session;
+  }
+
+  /**
+   * The SDK configs of a setup request's MCP servers. An `acp` server is
+   * served to Claude Code over this connection (see `mcp-servers.ts`). One
+   * that gets no endpoint is in `unserved`, and the session goes on without
+   * it.
+   */
+  private async sdkMcpServers(sessionId: string, servers: readonly McpServer[]) {
+    const served = await sdkMcpServers(servers, (server) => this.mcp.sdkConfig(this.ctx, server));
+    for (const server of served.unserved) {
+      this.logger.error(
+        `Session ${sessionId} runs without MCP server ${server.name}: ${server.error}`,
+      );
+    }
+    return served;
   }
 
   /**
@@ -854,6 +1003,8 @@ class V2Agent implements AgentHandle, SessionConnection {
   ) {
     const request = await validatedSetup(params);
     const client = clientOptions(params._meta);
+    const served = await this.sdkMcpServers(sessionId, request.mcpServers);
+    const mcpServers = { ...client?.mcpServers, ...served.configs };
     // After a provider change that is still listing its models.
     await this.auth.routeSettled();
     // The resumed transcript's last model and mode.
@@ -895,8 +1046,6 @@ class V2Agent implements AgentHandle, SessionConnection {
       process.env.CLAUDE_CODE_THINKING_DISPLAY,
       this.logger,
     );
-    const mcpServers = { ...client?.mcpServers, ...sdkMcpServers(request.mcpServers) };
-
     const clientPrompt = clientSystemPrompt(request.systemPrompt);
     const input = new Pushable<SDKUserMessage>();
     // A client can turn the affordance off (`_meta.claudeCode.options`). Then
@@ -930,6 +1079,8 @@ class V2Agent implements AgentHandle, SessionConnection {
       // AIR gets it, so no other client's session spends a request on it.
       // Before the client's options: `promptSuggestions: false` turns it off.
       ...(this.air.client ? { promptSuggestions: true } : {}),
+      // Before the client's options: its own `mcpServersDelivery` wins.
+      mcpServersDelivery: mcpServersDelivery(),
       ...client,
       // The checkpoints that AIR's file-change reports read (see
       // `file-changes.ts`), only for a client that declared them, as on v1.
@@ -1067,6 +1218,7 @@ class V2Agent implements AgentHandle, SessionConnection {
           client,
           effortSettings: () => mergeEffortSettings(settings.getSettings(), configured),
           recommendedValue: this.air.recommendedValue,
+          narrowsModels: routing.narrowsModels,
         },
         (notification) => session.output.emitV1([notification]),
         this.logger,
@@ -1086,6 +1238,7 @@ class V2Agent implements AgentHandle, SessionConnection {
       env: options.env ?? {},
       request,
       mcpServers,
+      unservedMcpServers: served.unserved,
       routeGeneration,
     };
   }

@@ -46,6 +46,7 @@ import {
   stripLocalCommandMetadata,
 } from "../../message-filters.js";
 import type { AcpClient } from "../../acp-client.js";
+import type { UnservedMcpServer } from "../../mcp-servers.js";
 import type { SDKMessageFilter } from "../../new-session-meta.js";
 import { SessionTitles } from "../../session-titles.js";
 import { SessionBackgroundWork } from "../../v1/background-work.js";
@@ -4202,7 +4203,13 @@ describe("subagent transcript replay", () => {
               ];
             }
             case "tool_call":
-              return [`${on} tool_call ${u.toolCallId}`];
+              return [
+                `${on} tool_call ${u.toolCallId}` +
+                  (u.content ?? [])
+                    .filter((item: any) => item.type === "session")
+                    .map((item: any) => ` session=${item.sessionId}`)
+                    .join(""),
+              ];
             case "config_option_update":
               return traceModels
                 ? u.configOptions.map(
@@ -4635,6 +4642,37 @@ describe("subagent transcript replay", () => {
         "aaa111 tool_call toolu_sib",
         "bbb222 session_message toolu_sib from=aaa111 Ping sibling",
       ]);
+    });
+
+    it("references a replayed child from a TaskStop call that names it by its agent id", async () => {
+      const trace = await replayRfd(
+        [
+          user("u1", "Go"),
+          // The child is not announced yet: a call that names it references nothing.
+          assistant("a1", [toolUse("toolu_early", "TaskStop", { task_id: "abc123" })]),
+          user("u2", [toolResult("toolu_early", "No such task")]),
+          assistant("a2", [
+            toolUse("toolu_agent", "Agent", { subagent_type: "Explore", prompt: "Look around" }),
+          ]),
+          user("u3", [toolResult("toolu_agent", "Async agent launched")]),
+          assistant("a3", [toolUse("toolu_stop", "TaskStop", { task_id: "abc123" })]),
+          user("u4", [toolResult("toolu_stop", "Stopped abc123")]),
+        ],
+        {
+          abc123: {
+            meta: { agentType: "Explore", toolUseId: "toolu_agent", requestShape: "background" },
+            records: [user("c1", "Look around")],
+          },
+        },
+      );
+
+      expect(trace.filter((line) => line.includes("tool_call"))).toEqual([
+        "root tool_call toolu_early",
+        "root tool_call toolu_stop session=abc123",
+      ]);
+      expect(
+        trace.findIndex((line) => line.startsWith("root subagent_update abc123")),
+      ).toBeLessThan(trace.indexOf("root tool_call toolu_stop session=abc123"));
     });
 
     it("replays a child's hand-back as its message to the parent, instead of the launch's result", async () => {
@@ -5342,6 +5380,7 @@ describe("permission request cancellation", () => {
       settingsManager: {
         dispose: vi.fn(),
         getApiKeyHelper: () => undefined,
+        getShowClearContextOnPlanAccept: () => false,
         getCwd: () => "/test",
       } as any,
       accumulatedUsage: {
@@ -5357,7 +5396,7 @@ describe("permission request cancellation", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       forwardSubagentText: false,
-      contextWindowSize: 200000,
+      contextWindowSize: 1_000_000,
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
@@ -5983,6 +6022,7 @@ describe("permission request cancellation", () => {
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
     const session = injectSession(agent, "session-1");
+    session.settingsManager.getShowClearContextOnPlanAccept = () => true;
     session.modes.availableModes = [
       { id: "default", name: "Manual" },
       { id: "acceptEdits", name: "Accept edits" },
@@ -9108,6 +9148,66 @@ describe("subagent permission attribution (issue #851)", () => {
         sessionId: "agent-42",
         state: { state: "idle" },
       });
+    });
+
+    it("reports a child that still works at a conversation reset as unknown, without its cancel", async () => {
+      const updates = await run([
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },
+        {
+          type: "conversation_reset",
+          new_conversation_id: randomUUID(),
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        // The reset forgot the child: its later end changes nothing.
+        taskNotification("toolu_parent", "completed"),
+      ]);
+
+      expect(subagentTraffic(updates).at(-1)?.update).toEqual({
+        sessionUpdate: "subagent_update",
+        sessionId: "agent-42",
+        capabilities: null,
+        state: { state: "unknown" },
+      });
+    });
+
+    it("references an announced child from a TaskStop call that names it by its agent id", async () => {
+      const toolResult = (toolUseId: string, content: string) => ({
+        type: "user",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: toolUseId, content }],
+        },
+      });
+      const updates = await run([
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },
+        rootToolUse("toolu_stop", "TaskStop", { task_id: "agent-42" }),
+        toolResult("toolu_stop", "Stopped agent-42"),
+        // A task that is no child session.
+        rootToolUse("toolu_bash", "TaskStop", { task_id: "bash_1" }),
+        toolResult("toolu_bash", "Stopped bash_1"),
+      ]);
+
+      const references = (toolCallId: string) =>
+        updates.flatMap(({ sessionId, update }) =>
+          (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+          update.toolCallId === toolCallId &&
+          update.content != null
+            ? [
+                `${sessionId} ${JSON.stringify(update.content.filter((item) => item.type === "session"))}`,
+              ]
+            : [],
+        );
+      // The first report and the result both carry content, which replaces
+      // what the client holds, so both carry the reference.
+      expect(references("toolu_stop")).toEqual([
+        'test-session [{"type":"session","sessionId":"agent-42"}]',
+        'test-session [{"type":"session","sessionId":"agent-42"}]',
+      ]);
+      expect(references("toolu_bash")).toEqual(["test-session []", "test-session []"]);
     });
   });
 
@@ -12323,7 +12423,7 @@ describe("stop reason propagation", () => {
     expect(JSON.stringify(updates)).not.toContain("agent_message_chunk");
     const usageUpdates = updates.filter((update) => update.update.sessionUpdate === "usage_update");
     expect(usageUpdates.at(-1)?.update).toEqual(
-      expect.objectContaining({ used: 170910, size: 200000 }),
+      expect.objectContaining({ used: 170910, size: 1_000_000 }),
     );
   });
 
@@ -13309,6 +13409,30 @@ describe("stop reason propagation", () => {
     expect((err as { data: unknown }).data).toEqual({ errorKind: "rate_limit" });
   });
 
+  it("adds the turn's rate limit to a rate-limit failure's data", async () => {
+    const agent = createMockAgent();
+    const rateLimit = { status: "rejected", resetsAt: 1700000000, rateLimitType: "five_hour" };
+    injectSession(agent, [
+      {
+        type: "rate_limit_event",
+        rate_limit_info: rateLimit,
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+      createAssistantError("rate_limit"),
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: "You've hit your 5-hour limit · resets 5:30pm (America/Los_Angeles)",
+      }),
+    ]);
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
+    ).rejects.toMatchObject({ data: { errorKind: "rate_limit", rateLimit } });
+  });
+
   it.each(
     [false, true].flatMap((typedFailures) =>
       [undefined, "authentication_failed" as const].map((staleError) => ({
@@ -13936,10 +14060,81 @@ describe("model refusal fallback handling", () => {
       ),
     ).toBe(false);
   });
+
+  // Claude Code takes the response of a model that refuses back, stops its
+  // tool call without a result, and retries on the fallback model. Its notice,
+  // or the first message of the retry, names the message that it took back.
+  // Nothing else ends the call: the prompt used to fail with
+  // `incomplete_tool_call` at the turn's end, although the retry answered.
+  it.each<[string, { notice: boolean; retry: boolean }]>([
+    ["the fallback notice", { notice: true, retry: false }],
+    ["the first message of the retry", { notice: false, retry: true }],
+  ])(
+    "ends the tool call of a response that Claude Code took back, named by %s",
+    async (_name, names) => {
+      const { agent, sessionUpdate } = createCapturingAgent();
+      const assistant = (id: string, block: Record<string, unknown>) => ({
+        type: "assistant",
+        message: {
+          id,
+          type: "message",
+          role: "assistant",
+          model: "claude-fable-5",
+          content: [block],
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+      });
+      const refused = assistant("msg_refused", {
+        type: "tool_use",
+        id: "toolu_refused",
+        name: "Read",
+        input: { file_path: "/a.log" },
+      });
+      injectGeneratorSession(
+        agent,
+        makeGenerator([
+          refused,
+          refusalFallbackMessage(names.notice ? { retracted_message_uuids: [refused.uuid] } : {}),
+          {
+            ...assistant("msg_retry", { type: "text", text: "The logs are clean." }),
+            ...(names.retry && { supersedes: [refused.uuid] }),
+          },
+          successResult(),
+        ]),
+        modelStateOverrides,
+      );
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "test" }],
+      });
+      expect(response.stopReason).toBe("end_turn");
+
+      const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
+      const closed = updates.findIndex(
+        (u) => u.toolCallId === "toolu_refused" && u.status === "failed",
+      );
+      expect(JSON.stringify(updates[closed])).toContain(
+        "Claude Code replaced the response that made this tool call",
+      );
+      // Before the retry's answer.
+      expect(closed).toBeLessThan(
+        updates.findIndex((u) => u.content?.text === "The logs are clean."),
+      );
+    },
+  );
 });
 
 describe("MCP server startup failures", () => {
-  function setup(mcpServersStatus: { name: string; status: string; source?: string }[]) {
+  function setup(
+    mcpServersStatus: { name: string; status: string; source?: string }[],
+    unservedMcpServers?: UnservedMcpServer[],
+  ) {
     const sessionUpdate = vi.fn(async () => {});
     const agent = new ClaudeAcpAgent({ sessionUpdate } as unknown as AcpClient, {
       log: () => {},
@@ -13997,6 +14192,7 @@ describe("MCP server startup failures", () => {
           { name: "client-api", type: "http", url: "https://example.com/mcp", headers: [] },
         ],
       },
+      unservedMcpServers,
     });
     const updates = () =>
       sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
@@ -14022,6 +14218,29 @@ describe("MCP server startup failures", () => {
         severity: "warning",
         title: 'MCP server "client-fs" failed to start',
         description: "Its tools are unavailable in this session. Run /mcp for the error.",
+      },
+    ]);
+  });
+
+  it("sends one notice, with the error, for a server the query started without", async () => {
+    // Claude Code was not given the server, so its init does not list it.
+    const { agent, updates } = setup(
+      [{ name: "client-api", status: "connected", source: "dynamic" }],
+      [{ name: "client-acp", status: "failed", error: "listen EPERM" }],
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { session: { notices: {} } },
+    });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    expect(updates().filter((u) => u.sessionUpdate === "notice")).toEqual([
+      {
+        sessionUpdate: "notice",
+        severity: "warning",
+        title: 'MCP server "client-acp" failed to start',
+        description: "Its tools are unavailable in this session. listen EPERM",
       },
     ]);
   });
@@ -14831,8 +15050,9 @@ describe("session/fork", () => {
   const modes = { currentModeId: "plan", availableModes: [] };
 
   /** An agent whose sessions start without Claude Code: each one gets a
-   *  scripted query that runs `turn` for every prompt. */
-  function forkingAgent(turn: (prompt: any) => any[] = () => []) {
+   *  scripted query that runs `turn` for every prompt, after it sent `backlog`
+   *  with no prompt open. */
+  function forkingAgent(turn: (prompt: any) => any[] = () => [], backlog: any[] = []) {
     const updates: SessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
       { sessionUpdate: async (n: SessionNotification) => updates.push(n) } as unknown as AcpClient,
@@ -14846,6 +15066,7 @@ describe("session/fork", () => {
         const sessionId = options.resume as string;
         const input = new Pushable<any>();
         async function* answer() {
+          yield* backlog;
           for await (const prompt of input) yield* turn(prompt);
         }
         agent.sessions[sessionId] = mockSessionState(
@@ -14925,6 +15146,57 @@ describe("session/fork", () => {
     expect(createSession).toHaveBeenCalledTimes(1);
     expect(agent.sessions["fork-id"]).toBe(forked);
   });
+
+  // After a bridge restart, Claude Code runs a cron cycle and a background
+  // task's follow-up before the first prompt. Nothing read the stream until
+  // then, and the prompt took the cron cycle's result as its own.
+  it.each(["resumeSession", "loadSession"] as const)(
+    "reads what Claude Code sends before the first prompt after %s (#1621)",
+    async (method) => {
+      const state = (state: "running" | "idle") => ({
+        type: "system",
+        subtype: "session_state_changed",
+        state,
+        uuid: randomUUID(),
+        session_id: "resumed-id",
+      });
+      const usage = (input: number, output: number) => ({
+        input_tokens: input,
+        output_tokens: output,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      });
+      const { agent } = forkingAgent(
+        (prompt) => [
+          userEcho(prompt),
+          state("running"),
+          successfulResultMessage({ usage: usage(7, 3) }),
+          state("idle"),
+        ],
+        [
+          // A cron prompt: its result has no origin.
+          state("running"),
+          successfulResultMessage({ usage: usage(111, 11) }),
+          state("idle"),
+          state("running"),
+          successfulResultMessage({ origin: { kind: "task-notification" }, usage: usage(222, 22) }),
+          state("idle"),
+        ],
+      );
+      // Only a load replays the transcript.
+      if (method === "loadSession") vi.mocked(getSessionMessages).mockResolvedValueOnce([]);
+      await agent[method]({ sessionId: "resumed-id", cwd: "/workspace", mcpServers: [] });
+      // The reader starts after the response.
+      await vi.waitFor(() => expect(agent.sessions["resumed-id"].lastSessionState).toBe("idle"));
+
+      const response = await agent.prompt({
+        sessionId: "resumed-id",
+        prompt: [{ type: "text", text: "go on" }],
+      });
+
+      expect(response.usage).toMatchObject({ inputTokens: 7, outputTokens: 3 });
+    },
+  );
 
   it("fails when the forked session cannot start", async () => {
     const { agent, createSession } = forkingAgent();
@@ -15259,6 +15531,7 @@ describe("session/close", () => {
       settingsManager: {
         dispose: vi.fn(),
         getApiKeyHelper: () => undefined,
+        getShowClearContextOnPlanAccept: () => false,
         getCwd: () => "/test",
       } as any,
       accumulatedUsage: {
@@ -15275,7 +15548,7 @@ describe("session/close", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       forwardSubagentText: false,
-      contextWindowSize: 200000,
+      contextWindowSize: 1_000_000,
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
@@ -15383,6 +15656,7 @@ describe("session/delete", () => {
       settingsManager: {
         dispose: vi.fn(),
         getApiKeyHelper: () => undefined,
+        getShowClearContextOnPlanAccept: () => false,
         getCwd: () => "/test",
       } as any,
       accumulatedUsage: {
@@ -15399,7 +15673,7 @@ describe("session/delete", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       forwardSubagentText: false,
-      contextWindowSize: 200000,
+      contextWindowSize: 1_000_000,
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
@@ -15548,6 +15822,7 @@ describe("getOrCreateSession param change detection", () => {
       settingsManager: {
         dispose: vi.fn(),
         getApiKeyHelper: () => undefined,
+        getShowClearContextOnPlanAccept: () => false,
         getCwd: () => "/test",
       } as any,
       accumulatedUsage: {
@@ -15564,7 +15839,7 @@ describe("getOrCreateSession param change detection", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       forwardSubagentText: false,
-      contextWindowSize: 200000,
+      contextWindowSize: 1_000_000,
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
@@ -16123,7 +16398,7 @@ describe("usage_update computation", () => {
             cacheCreationInputTokens: 100,
             webSearchRequests: 0,
             costUSD: 0.01,
-            contextWindow: 1000000,
+            contextWindow: 200000,
             maxOutputTokens: 16384,
           },
         },
@@ -16138,10 +16413,10 @@ describe("usage_update computation", () => {
     expect(usageUpdates[0].update.used).toBe(1800);
     // First prompt of a session has no prior result to learn the window from,
     // so the mid-stream update falls back to the default context window.
-    expect(usageUpdates[0].update.size).toBe(200000);
+    expect(usageUpdates[0].update.size).toBe(1_000_000);
     expect(usageUpdates[0].update.cost).toBeUndefined();
     expect(usageUpdates[1].update.used).toBe(1800);
-    expect(usageUpdates[1].update.size).toBe(1000000);
+    expect(usageUpdates[1].update.size).toBe(200000);
     expect(usageUpdates[1].update.cost).toBeDefined();
   });
 
@@ -16231,46 +16506,6 @@ describe("usage_update computation", () => {
     expect(usageUpdates[2].update.cost).toBeDefined();
   });
 
-  it("mid-stream size is inferred from a 1M model name before the first result", async () => {
-    // On the very first prompt there is no learned context window yet, so the
-    // mid-stream update would otherwise fall back to 200k. A "-1m" suffix in
-    // the SDK model ID is enough signal to emit 1_000_000 up front.
-    const { agent, updates } = createMockAgentWithCapture();
-    injectSession(agent, [
-      createStreamEvent("message_start", {
-        model: "claude-opus-4-6-1m",
-        usage: {
-          input_tokens: 2000,
-          output_tokens: 1000,
-          cache_read_input_tokens: 0,
-          cache_creation_input_tokens: 0,
-        },
-      }),
-      createResultMessageWithModel({
-        modelUsage: {
-          "claude-opus-4-6-1m": {
-            inputTokens: 2000,
-            outputTokens: 1000,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0.02,
-            contextWindow: 1000000,
-            maxOutputTokens: 16384,
-          },
-        },
-      }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
-    ]);
-
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
-
-    const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
-    expect(usageUpdates).toHaveLength(2);
-    expect(usageUpdates[0].update.size).toBe(1000000);
-    expect(usageUpdates[1].update.size).toBe(1000000);
-  });
-
   it("duplicate stream_event totals do not re-emit usage_update", async () => {
     // A message_delta whose cumulative totals match the prior snapshot should
     // not trigger a duplicate usage_update — only the result adds cost on top.
@@ -16318,11 +16553,11 @@ describe("usage_update computation", () => {
   it("mid-stream size uses the session's learned context window", async () => {
     // Session state persists the model's context window across prompts, so a
     // mid-stream update in a later prompt reports the real size immediately
-    // instead of snapping back to the 200k default before the result arrives.
+    // instead of snapping back to the 1M default before the result arrives.
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
       createStreamEvent("message_start", {
-        model: "claude-opus-4-20250514",
+        model: "claude-sonnet-4-5",
         usage: {
           input_tokens: 2000,
           output_tokens: 1000,
@@ -16332,106 +16567,36 @@ describe("usage_update computation", () => {
       }),
       createResultMessageWithModel({
         modelUsage: {
-          "claude-opus-4-20250514": {
+          "claude-sonnet-4-5": {
             inputTokens: 2000,
             outputTokens: 1000,
             cacheReadInputTokens: 0,
             cacheCreationInputTokens: 0,
             webSearchRequests: 0,
             costUSD: 0.02,
-            contextWindow: 1000000,
+            contextWindow: 200000,
             maxOutputTokens: 16384,
           },
         },
       }),
       { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
-    // Simulate a prior prompt having learned the 1M window for this model.
-    agent.sessions["test-session"].contextWindowSize = 1000000;
+    // Simulate a prior prompt having learned the 200K window for this model.
+    agent.sessions["test-session"].contextWindowSize = 200000;
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
     const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdates).toHaveLength(2);
-    expect(usageUpdates[0].update.size).toBe(1000000);
-    expect(usageUpdates[1].update.size).toBe(1000000);
-  });
-
-  it("switching to a 1M model seeds the context window from the heuristic", async () => {
-    // The heuristic runs at config-change time so mid-stream updates in the
-    // next prompt already report 1M — without waiting for message_start or
-    // the next `result` to correct us.
-    const { agent, updates } = createMockAgentWithCapture();
-    injectSession(agent, [
-      createStreamEvent("message_start", {
-        model: "claude-opus-4-6-1m",
-        usage: {
-          input_tokens: 2000,
-          output_tokens: 1000,
-          cache_read_input_tokens: 0,
-          cache_creation_input_tokens: 0,
-        },
-      }),
-      createResultMessageWithModel({
-        modelUsage: {
-          "claude-opus-4-6-1m": {
-            inputTokens: 2000,
-            outputTokens: 1000,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0.02,
-            contextWindow: 1000000,
-            maxOutputTokens: 16384,
-          },
-        },
-      }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
-    ]);
-    const session = agent.sessions["test-session"];
-    expect(session.contextWindowSize).toBe(200000);
-
-    await (agent as any).applyConfigOptionValue(
-      "test-session",
-      session,
-      "model",
-      "claude-opus-4-6-1m",
-    );
-    expect(session.contextWindowSize).toBe(1000000);
-
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
-
-    const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
-    expect(usageUpdates).toHaveLength(2);
-    expect(usageUpdates[0].update.size).toBe(1000000);
-    expect(usageUpdates[1].update.size).toBe(1000000);
-  });
-
-  it("infers the 1M window from a model's description when the ID lacks a 1m token (issue #596)", async () => {
-    // Semantic aliases like `default` resolve to a 1M-context model but carry
-    // no "1m" token in the modelId — the SDK signals 1M only via the
-    // human-facing displayName/description (e.g. "Opus 4.7 with 1M context").
-    // Inference must read those so the session reports the correct window from
-    // the first mid-stream update instead of the 200k placeholder.
-    const { agent } = createMockAgentWithCapture();
-    injectSession(agent, [{ type: "system", subtype: "session_state_changed", state: "idle" }]);
-    const session = agent.sessions["test-session"];
-    session.models = { currentModelId: "claude-sonnet-4-6", availableModels: [] };
-    session.modelInfos = [
-      { value: "default", displayName: "Default", description: "Opus 4.7 with 1M context" },
-    ] as any;
-    expect(session.contextWindowSize).toBe(200000);
-
-    await (agent as any).applyConfigOptionValue("test-session", session, "model", "default");
-
-    expect(session.contextWindowSize).toBe(1000000);
+    expect(usageUpdates[0].update.size).toBe(200000);
+    expect(usageUpdates[1].update.size).toBe(200000);
   });
 
   it("result with no matching modelUsage preserves the learned window", async () => {
     // A turn whose `result.modelUsage` doesn't contain the current top-level
     // model (e.g. no top-level assistant message, or only a subagent ran) must
-    // not clobber the window learned on a prior turn — otherwise the next
-    // prompt's mid-stream updates regress to the 200k default.
+    // not clobber the window learned on a prior turn: the next prompt's
+    // mid-stream updates would report the other model's window, or the default.
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
       createResultMessageWithModel({
@@ -16451,11 +16616,11 @@ describe("usage_update computation", () => {
       { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
     const session = agent.sessions["test-session"];
-    session.contextWindowSize = 1000000;
+    session.contextWindowSize = 500000;
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
-    expect(session.contextWindowSize).toBe(1000000);
+    expect(session.contextWindowSize).toBe(500000);
     // The emit itself falls back to session.contextWindowSize, which is
     // unchanged from the learned value.
     const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
@@ -16468,11 +16633,11 @@ describe("usage_update computation", () => {
     // When the user switches models mid-session, the window learned for the
     // previous model would otherwise persist into the next prompt's first
     // mid-stream update. applyConfigOptionValue should reset it so the next
-    // turn's first update falls back to the heuristic (here: 200k default).
+    // turn's first update falls back to the default window.
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
       createStreamEvent("message_start", {
-        model: "claude-sonnet-4-6",
+        model: "claude-opus-5-5",
         usage: {
           input_tokens: 1000,
           output_tokens: 500,
@@ -16482,14 +16647,14 @@ describe("usage_update computation", () => {
       }),
       createResultMessageWithModel({
         modelUsage: {
-          "claude-sonnet-4-6": {
+          "claude-opus-5-5": {
             inputTokens: 1000,
             outputTokens: 500,
             cacheReadInputTokens: 0,
             cacheCreationInputTokens: 0,
             webSearchRequests: 0,
             costUSD: 0.01,
-            contextWindow: 200000,
+            contextWindow: 967000,
             maxOutputTokens: 16384,
           },
         },
@@ -16497,23 +16662,23 @@ describe("usage_update computation", () => {
       { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
     const session = agent.sessions["test-session"];
-    session.contextWindowSize = 1000000;
-    session.models = { ...session.models, currentModelId: "claude-opus-4-6-1m" };
+    // The window learned for the previous model.
+    session.contextWindowSize = 200000;
+    session.models = { ...session.models, currentModelId: "claude-sonnet-4-5" };
 
-    // User flips the selector to a 200k model.
     await (agent as any).applyConfigOptionValue(
       "test-session",
       session,
       "model",
-      "claude-sonnet-4-6",
+      "claude-opus-5-5",
     );
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
     const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdates).toHaveLength(2);
-    expect(usageUpdates[0].update.size).toBe(200000);
-    expect(usageUpdates[1].update.size).toBe(200000);
+    expect(usageUpdates[0].update.size).toBe(1_000_000);
+    expect(usageUpdates[1].update.size).toBe(967000);
   });
 
   it("non-usage stream events do not re-emit usage_update", async () => {
@@ -17000,9 +17165,8 @@ describe("usage_update computation", () => {
     //    ModelInfo.resolvedModel — otherwise a later read never hits.
     //  - READ: switching to a picker value whose resolvedModel is that key seeds
     //    the window synchronously from the cache, with NO getContextUsage.
-    // 777_000 is chosen so it can only come from the cache: text inference on the
-    // resolved id "…-9[1m]" would yield 1_000_000 (the "1m" token), the default
-    // is 200_000, and the pre-switch sentinel is 123_456.
+    // 777_000 is chosen so it can only come from the cache: the default is
+    // 1_000_000, and the pre-switch sentinel is 123_456.
     //
     // The `contextWindowCache` is module-global and this file does not
     // vi.resetModules() per test, so it persists across tests. This test stays
@@ -17039,7 +17203,7 @@ describe("usage_update computation", () => {
 
     // Now switch to a picker value that resolves to the cached id. Seed a
     // sentinel and a getContextUsage spy first: a cache miss would surface as
-    // 1_000_000 (inference on the "1m" id), and any IPC as a spy call.
+    // the 1_000_000 default, and any IPC as a spy call.
     const getContextUsage = vi.fn(async () => ({ rawMaxTokens: 200000 }));
     (session.query as any).getContextUsage = getContextUsage;
     session.contextWindowSize = 123_456;
@@ -17076,9 +17240,8 @@ describe("usage_update computation", () => {
   it("scopes the window cache per provider: a switch on a different provider does not read another provider's window", async () => {
     // The window is a property of (model id, provider). A turn on provider-A
     // learns 500_000 for RESOLVED_ID; a switch to the SAME resolved id on
-    // provider-B must NOT read it (falls to inference → 1_000_000 for the "1m"
-    // id), while a switch on provider-A DOES read it (500_000). All three
-    // outcomes are distinct: cached 500_000 vs inference 1_000_000 vs default.
+    // provider-B must NOT read it (falls to the 1_000_000 default), while a
+    // switch on provider-A DOES read it (500_000).
     // Uses a unique resolved id ("claude-provkey-probe[1m]") so the module-global
     // cache (not reset per test in this file) can't cross this test with others.
     const RESOLVED_ID = "claude-provkey-probe[1m]";
@@ -17128,7 +17291,7 @@ describe("usage_update computation", () => {
     ];
 
     // A DIFFERENT provider seeing the same resolved id must not inherit A's
-    // window — it falls to inference (1_000_000), not the cached 500_000.
+    // window — it falls to the default (1_000_000), not the cached 500_000.
     agent.sessions["session-B"] = mockSessionState({
       providerCacheKey: "apiType-B https://b.example",
       models: { currentModelId: "default", availableModels: [] },
@@ -17195,8 +17358,8 @@ describe("usage_update computation", () => {
     // The bad window was ignored — the prior window is preserved.
     expect(session.contextWindowSize).toBe(900_000);
 
-    // And it never reached the cache: a switch to that id falls to inference
-    // (1_000_000 for the "1m" id), not the bad 0.
+    // And it never reached the cache: a switch to that id falls to the
+    // default (1_000_000), not the bad 0.
     session.contextWindowSize = 123_456; // sentinel
     session.models = { currentModelId: "default", availableModels: [] };
     session.modelInfos = [
@@ -17220,69 +17383,6 @@ describe("usage_update computation", () => {
     expect(session.contextWindowSize).toBe(1_000_000);
   });
 
-  it("does not let the message_start heuristic clobber an authoritative 200k window", async () => {
-    // An authoritative window can legitimately equal DEFAULT_CONTEXT_WINDOW
-    // (e.g. a third-party backend serving a 200k lane under a "[1m]"-spelled
-    // id). The message_start upgrade must key off the authoritative flag, not
-    // the value — otherwise the "1m" text match overwrites the cache-seeded
-    // 200k with 1M mid-stream on every turn.
-    const { agent, updates } = createMockAgentWithCapture();
-    injectSession(agent, [
-      createStreamEvent("message_start", {
-        model: "claude-authprobe-1[1m]",
-        usage: {
-          input_tokens: 100,
-          output_tokens: 10,
-          cache_read_input_tokens: 0,
-          cache_creation_input_tokens: 0,
-        },
-      }),
-      // Empty modelUsage: the result settles the turn without supplying a
-      // window of its own, so the assertion isolates the message_start path.
-      createResultMessageWithModel({ modelUsage: {} }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
-    ]);
-    const session = agent.sessions["test-session"]!;
-    // Simulate a cache-seeded authoritative window that equals the default.
-    session.contextWindowSize = 200000;
-    session.contextWindowAuthoritative = true;
-
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
-
-    expect(session.contextWindowSize).toBe(200000);
-    const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
-    for (const u of usageUpdates) {
-      expect(u.update.size).toBe(200000);
-    }
-  });
-
-  it("still upgrades a heuristic default window from the message_start model id", async () => {
-    // Companion to the authoritative-200k test: with no authoritative seed the
-    // old behavior stands — a "1m"-carrying live model id upgrades the default
-    // mid-stream so usage_update reports the right size before the result.
-    const { agent } = createMockAgentWithCapture();
-    injectSession(agent, [
-      createStreamEvent("message_start", {
-        model: "claude-authprobe-2[1m]",
-        usage: {
-          input_tokens: 100,
-          output_tokens: 10,
-          cache_read_input_tokens: 0,
-          cache_creation_input_tokens: 0,
-        },
-      }),
-      // Empty modelUsage: settles the turn without a window of its own.
-      createResultMessageWithModel({ modelUsage: {} }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
-    ]);
-    const session = agent.sessions["test-session"]!;
-    expect(session.contextWindowAuthoritative).toBe(false);
-
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
-
-    expect(session.contextWindowSize).toBe(1_000_000);
-  });
-
   it("caches the turn's window under the bare assistant-message id too, so resolvedModel-less rows can hit", async () => {
     // Seed-time reads fall back to the picker value / verbatim live id when a
     // model row carries no resolvedModel (the synthesized out-of-allowlist
@@ -17290,8 +17390,7 @@ describe("usage_update computation", () => {
     // assistant message's bare `.model`, not the "[1m]"-decorated modelUsage
     // key, so the result handler must write both spellings — otherwise such
     // rows silently never hit the cache. 555_000 can only come from the cache:
-    // inference on the bare id (no "1m" token) yields the 200_000 default, and
-    // the pre-switch sentinel is 123_456.
+    // the default is 1_000_000, and the pre-switch sentinel is 123_456.
     const BARE_ID = "claude-bareprobe-7";
     const { agent } = createMockAgentWithCapture();
     injectSession(agent, [
@@ -20086,6 +20185,7 @@ describe("post-error recovery", () => {
       settingsManager: {
         dispose: vi.fn(),
         getApiKeyHelper: () => undefined,
+        getShowClearContextOnPlanAccept: () => false,
         getCwd: () => "/test",
       } as any,
       accumulatedUsage: {
@@ -20102,7 +20202,7 @@ describe("post-error recovery", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       forwardSubagentText: false,
-      contextWindowSize: 200000,
+      contextWindowSize: 1_000_000,
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
@@ -20462,6 +20562,7 @@ describe("post-error recovery", () => {
       {
         settingsManager: {
           getApiKeyHelper: () => undefined,
+          getShowClearContextOnPlanAccept: () => false,
           getCwd: () => "/test",
           dispose: vi.fn(() => {
             throw new Error("dispose boom");
@@ -23145,6 +23246,258 @@ describe("terminal of a command in the background", () => {
   });
 });
 
+// A client that appends terminal chunks sees the output of a command in the
+// foreground as it runs: Claude Code streams none, so the adapter reads the
+// command's task with `get_task_output` from its `task_started` until the Bash
+// result, whose output then replaces what the terminal showed.
+describe("output of a command in the foreground", () => {
+  /** Claude Code's result for a command that an interrupt stopped (CLI 2.1.325, shortened). */
+  const STOP_NOTICE =
+    "The user doesn't want to proceed with this tool use. The tool use was rejected. " +
+    "Correction to the text above: this call was stopped while running, not refused before it ran.";
+
+  /**
+   * A turn that runs `make test` in the foreground until `done` resolves. The
+   * command's tool result comes once `resulted` resolves too.
+   *
+   * With `cancelled`, a `session/cancel` (`cancel`) ends the turn at `done`.
+   * Claude Code's interrupt then stops the command, whose result is the
+   * `notice` for the model, stamped as not executed. A command that ended
+   * just before the interrupt has its `output` as its result instead.
+   */
+  function foregroundCommand(
+    done: Promise<void>,
+    resulted: Promise<void>,
+    cancelled?: { cancel: () => Promise<void>; result: "notice" | "output" },
+  ) {
+    return (input: Pushable<any>) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        yield userEcho((await iter.next()).value);
+        yield {
+          type: "assistant",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          message: {
+            id: "msg_fg",
+            role: "assistant",
+            model: "claude-sonnet-4-20250514",
+            content: [
+              { type: "tool_use", id: "toolu_fg", name: "Bash", input: { command: "make test" } },
+            ],
+            usage: {
+              input_tokens: 0,
+              output_tokens: 0,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+          },
+        };
+        // What CLI 2.1.325 sends once the command has run for about 3 s.
+        yield {
+          type: "system",
+          subtype: "task_started",
+          task_id: "fg1",
+          task_type: "local_bash",
+          description: "make test",
+          tool_use_id: "toolu_fg",
+          is_backgrounded: false,
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        await done;
+        await cancelled?.cancel();
+        const stopped = cancelled?.result === "notice";
+        yield {
+          type: "system",
+          subtype: "task_notification",
+          task_id: "fg1",
+          tool_use_id: "toolu_fg",
+          status: stopped ? "stopped" : "completed",
+          output_file: "",
+          summary: "",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        await resulted;
+        yield {
+          type: "user",
+          ...(stopped
+            ? {
+                message: {
+                  role: "user",
+                  content: [
+                    {
+                      type: "tool_result",
+                      tool_use_id: "toolu_fg",
+                      is_error: true,
+                      content: STOP_NOTICE,
+                    },
+                  ],
+                },
+                tool_use_result: "User rejected tool use",
+                tool_result_meta: [{ id: "toolu_fg", non_execution_kind: "user-rejected" }],
+              }
+            : {
+                message: {
+                  role: "user",
+                  content: [
+                    { type: "tool_result", tool_use_id: "toolu_fg", content: "line1\nline2" },
+                  ],
+                },
+                tool_use_result: {
+                  stdout: "line1\nline2",
+                  stderr: "",
+                  interrupted: false,
+                  isImage: false,
+                },
+              }),
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield cancelled
+          ? { ...successfulResultMessage(), is_error: true, terminal_reason: "aborted_tools" }
+          : successfulResultMessage();
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      })();
+  }
+
+  /** The terminal output of each report about the Bash call. */
+  const outputs = (updates: SessionNotification[]) =>
+    updates.flatMap(({ update }): ({ delta: string } | { snapshot: string })[] => {
+      if (update.sessionUpdate !== "tool_call_update" || update.toolCallId !== "toolu_fg")
+        return [];
+      const meta = update._meta as Record<string, { data: string } | undefined> | undefined;
+      if (meta?.terminal_output_delta) return [{ delta: meta.terminal_output_delta.data }];
+      if (meta?.terminal_output) return [{ snapshot: meta.terminal_output.data }];
+      return [];
+    });
+
+  /**
+   * Starts the turn for a client with `capabilities`. The query answers
+   * `get_task_output` with what `written` returns. With `cancelledResult`, the
+   * client cancels the turn once `taskEnds` is called (see `foregroundCommand`).
+   */
+  async function start(
+    capabilities: ClientCapabilities,
+    written: () => string,
+    cancelledResult?: "notice" | "output",
+  ) {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      { sessionUpdate: async (n: SessionNotification) => void updates.push(n) } as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await initializeClient(agent, capabilities);
+    const done = Promise.withResolvers<void>();
+    const resulted = Promise.withResolvers<void>();
+    injectGeneratorSession(
+      agent,
+      foregroundCommand(
+        done.promise,
+        resulted.promise,
+        cancelledResult && {
+          cancel: () => agent.cancel({ sessionId: "test-session" }),
+          result: cancelledResult,
+        },
+      ),
+    );
+    const getTaskOutput = vi.fn(async (taskId: string) => {
+      expect(taskId).toBe("fg1");
+      const output = written();
+      return { output, total_bytes: Buffer.byteLength(output), truncated: false };
+    });
+    // Not in the SDK's `Query` type (see `supportsTaskOutput`).
+    Object.assign(agent.sessions["test-session"]!.query, { getTaskOutput });
+    const prompt = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test it" }],
+    });
+    return {
+      updates,
+      getTaskOutput,
+      prompt,
+      taskEnds: done.resolve,
+      resultComes: resulted.resolve,
+    };
+  }
+
+  /** Runs the turn for a client with `capabilities`. The command prints
+   *  `line1` and, once the client was sent it (or after 1.5 s), `line2`. */
+  async function run(capabilities: ClientCapabilities) {
+    let written = "line1\n";
+    const turn = await start(capabilities, () => written);
+    await vi
+      .waitFor(() => expect(outputs(turn.updates)).not.toEqual([]), { timeout: 1500 })
+      .catch(() => {});
+    written = "line1\nline2";
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    // Claude Code drops the output of a command that ended (CLI 2.1.325).
+    written = "";
+    turn.taskEnds();
+    turn.resultComes();
+    await turn.prompt;
+    return { outputs: outputs(turn.updates), reads: turn.getTaskOutput.mock.calls.length };
+  }
+
+  it("appends the output while the command runs, then replaces it with the result's", async () => {
+    expect((await run({ _meta: { terminal_output_delta: true } })).outputs).toEqual([
+      { delta: "line1\n" },
+      { delta: "line2" },
+      { snapshot: "line1\nline2" },
+    ]);
+  });
+
+  it("sends a client that appends no chunks the output with the result, as before", async () => {
+    expect(await run({ _meta: { terminal_output: true } })).toEqual({
+      outputs: [{ snapshot: "line1\nline2" }],
+      reads: 0,
+    });
+  });
+
+  // The result of a command that a cancel stopped is Claude Code's notice for
+  // the model: it must not replace the output that the user was reading.
+  it.each([
+    {
+      result: "notice" as const,
+      name: "keeps what the terminal showed, and appends Claude Code's notice",
+      expected: [{ delta: "line1\n" }, { delta: STOP_NOTICE }],
+    },
+    {
+      result: "output" as const,
+      name: "replaces what the terminal showed with the output of a command that had ended",
+      expected: [{ delta: "line1\n" }, { snapshot: "line1\nline2" }],
+    },
+  ])("at a cancel, $name", async ({ result, expected }) => {
+    const turn = await start({ _meta: { terminal_output_delta: true } }, () => "line1\n", result);
+    await vi.waitFor(() => expect(outputs(turn.updates)).toHaveLength(1), { timeout: 1500 });
+    turn.taskEnds();
+    turn.resultComes();
+
+    await expect(turn.prompt).resolves.toMatchObject({ stopReason: "cancelled" });
+    await vi.waitFor(() => expect(outputs(turn.updates)).toEqual(expected), { timeout: 1500 });
+  });
+
+  // A tool call that gets no result, such as one of a reply that Claude Code
+  // took back, must not be read until the query closes.
+  it("reads no more output once the command's task ended", async () => {
+    // The command prints nothing, so no read tells that it ended.
+    const turn = await start({ _meta: { terminal_output_delta: true } }, () => "");
+    await vi.waitFor(() => expect(turn.getTaskOutput).toHaveBeenCalled(), { timeout: 1500 });
+    turn.taskEnds();
+    // The task's end reaches the agent a few steps later.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const reads = turn.getTaskOutput.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 700));
+
+    expect(turn.getTaskOutput).toHaveBeenCalledTimes(reads);
+    turn.resultComes();
+    await turn.prompt;
+  });
+});
+
 describe("deferred settlement for live background subagents (issues #864/#866)", () => {
   // A turn whose terminal result arrives while background subagents IT
   // spawned are still live must NOT settle at that result: ACP allows
@@ -23687,6 +24040,8 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
           return messageGenerator();
         });
         await declareBackgroundSubagents(agent);
+        agent.sessions["test-session"]!.settingsManager.getShowClearContextOnPlanAccept = () =>
+          true;
 
         const prompt = agent.prompt({
           sessionId: "test-session",
@@ -23801,6 +24156,8 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
           return messageGenerator();
         });
         await declareBackgroundSubagents(agent);
+        agent.sessions["test-session"]!.settingsManager.getShowClearContextOnPlanAccept = () =>
+          true;
         const session = agent.sessions["test-session"]!;
 
         const prompt = agent.prompt({
@@ -26207,6 +26564,38 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
         ]);
       });
 
+      // A scheduler fire is not an autonomous origin: its result has no
+      // `origin`, so it takes the user lane with no turn to claim it.
+      it("ends the task at the result of the cycle that a fire started (#1620)", async () => {
+        const { agent, asyncTaskUpdates } = await airAgent();
+        injectGeneratorSession(agent, (input) => {
+          async function* messageGenerator() {
+            const iter = input[Symbol.asyncIterator]();
+            yield userEcho((await iter.next()).value);
+            yield running();
+            yield assistantText("working");
+            yield resultMessage();
+            // The overdue ScheduleWakeup fires at once, before the prompt's idle.
+            yield lifecycleStarted({ wakeup_source: "loop_wakeup" });
+            yield assistantText("That wakeup was stale");
+            yield resultMessage();
+            // One idle covers both results.
+            yield idle();
+          }
+          return messageGenerator();
+        });
+
+        await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+        await agent.sessions["test-session"]?.consumer;
+
+        // The stream ending closes an open task as failed, so a task that only the
+        // end of the stream ended would not be completed.
+        expect(asyncTaskUpdates().map((update) => update.state ?? update.sessionUpdate)).toEqual([
+          "async_task_spawned",
+          "completed",
+        ]);
+      });
+
       it("leaves the task as before for a started frame without a known wakeup source", async () => {
         const updates = await autonomousTurn((afterRunning) =>
           afterRunning
@@ -28294,6 +28683,64 @@ describe("turn steering (_session/steering)", () => {
     expect(agent.sessions["test-session"].owedTrailingIdles).toBe(0);
   });
 
+  // The same guard when the autonomous cycle's result is stamped with the
+  // original prompt: answersPendingPrompt then routes it to the user lane, and
+  // its idle must still not settle the turn while the steered work runs.
+  it.each(["end_turn", "refusal"] as const)(
+    "does not settle a steered turn on an autonomous %s result naming the original prompt",
+    async (stopReason) => {
+      const timeline: string[] = [];
+      const agent = new ClaudeAcpAgent(timelineClient(timeline), {
+        log: () => {},
+        error: () => {},
+      });
+
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const u1 = await iter.next();
+          yield userEcho(u1.value);
+          yield createAssistantText("working on it");
+          const steered = await iter.next();
+          yield { ...interruptedCycleResult(), user_message_uuid: u1.value.uuid };
+          yield userEcho(steered.value);
+          // A background cycle's result, stamped with the original prompt only.
+          yield {
+            ...createResultMessage(),
+            stop_reason: stopReason,
+            origin: { kind: "task-notification" },
+            user_message_uuid: u1.value.uuid,
+            user_message_uuids: [u1.value.uuid],
+          };
+          yield idleMessage(); // that cycle's trailer
+          yield createAssistantText("STEERED-OK");
+          yield createResultMessage();
+          yield idleMessage();
+        }
+        return messageGenerator();
+      });
+
+      const turn = agent
+        .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "start" }] })
+        .then((response) => {
+          timeline.push(`prompt:${response.stopReason}`);
+          return response;
+        });
+      await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+      await agent.steer({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "also handle X" }],
+      });
+
+      await turn;
+      await agent.sessions["test-session"]?.consumer;
+
+      // The turn keeps one stop reason across its cycles, so a refusal trailer's
+      // reason is reported; what matters here is that the prompt ends last.
+      expect(timeline).toEqual(["working on it", "STEERED-OK", `prompt:${stopReason}`]);
+    },
+  );
+
   it("always injects at 'now' priority, ignoring any client-supplied priority", async () => {
     const agent = createMockAgent();
     const captured: any[] = [];
@@ -28392,6 +28839,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       settingsManager: {
         dispose: vi.fn(),
         getApiKeyHelper: () => undefined,
+        getShowClearContextOnPlanAccept: () => false,
         getCwd: () => "/test",
       } as any,
       accumulatedUsage: {
@@ -28408,7 +28856,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       forwardSubagentText: false,
-      contextWindowSize: 200000,
+      contextWindowSize: 1_000_000,
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
@@ -30302,6 +30750,7 @@ describe("agent selection config option", () => {
         settingsManager: {
           dispose: vi.fn(),
           getApiKeyHelper: () => undefined,
+          getShowClearContextOnPlanAccept: () => false,
           getCwd: () => "/test",
         } as any,
         accumulatedUsage: {
@@ -30318,7 +30767,7 @@ describe("agent selection config option", () => {
         abortController: new AbortController(),
         emitRawSDKMessages: false,
         forwardSubagentText: false,
-        contextWindowSize: 200000,
+        contextWindowSize: 1_000_000,
         contextWindowAuthoritative: false,
         providerCacheKey: "default",
         taskState: new Map(),

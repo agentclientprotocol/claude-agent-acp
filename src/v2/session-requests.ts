@@ -35,9 +35,13 @@ export function v1NewSessionRequest(params: v2.NewSessionRequest): NewSessionReq
   };
 }
 
-/** The v1 request of a v2 `session/fork`. */
+/**
+ * The v1 request of a v2 `session/fork`. Without `configOptions`: the fork
+ * applies them once it started (see {@link initialConfigRequests}).
+ */
 export function v1ForkSessionRequest(params: v2.ForkSessionRequest): ForkSessionRequest {
-  const { mcpServers, systemPrompt, ...request } = params;
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { mcpServers, systemPrompt, configOptions, ...request } = params;
   return {
     ...request,
     ...(mcpServers ? { mcpServers: v1McpServers(mcpServers) } : {}),
@@ -129,9 +133,9 @@ export function v2AvailableCommands(commands: AvailableCommand[]): v2.AvailableC
 /**
  * The v1 list of the MCP servers of a v2 setup request, or undefined for no
  * list. A request with two servers of the same `name`, or with a transport
- * that the agent does not advertise in `session.mcp` (such as `acp` or a
- * custom `_` type), fails with invalid params (-32602): `sdkMcpServers` would
- * otherwise drop the server without telling the client.
+ * that the agent does not advertise in `session.mcp` (such as a custom `_`
+ * type), fails with invalid params (-32602): `sdkMcpServers` would otherwise
+ * drop the server without telling the client.
  */
 function v1McpServers(servers: v2.McpServer[] | null | undefined): McpServer[] | undefined {
   if (servers == null) return undefined;
@@ -142,7 +146,8 @@ function v1McpServers(servers: v2.McpServer[] | null | undefined): McpServer[] |
 /**
  * v2 requires a `type` on every transport and makes the empty lists optional.
  * `sdkMcpServers` recognizes a v1 stdio server by its missing `type`, so the
- * v2 tag is dropped. {@link v1McpServers} has already rejected every other transport.
+ * v2 tag is dropped. An `acp` server is the same in both versions.
+ * {@link v1McpServers} has already rejected every other transport.
  */
 function v1McpServer(server: v2.McpServer): McpServer {
   if (v2.McpServer.isStdio(server)) {
@@ -152,5 +157,6 @@ function v1McpServer(server: v2.McpServer): McpServer {
   if (v2.McpServer.isHttp(server)) {
     return { ...server, headers: server.headers ?? [] };
   }
+  if (v2.McpServer.isAcp(server)) return server;
   throw new Error(`Unreachable: MCP server of type ${server.type} passed the transport check`);
 }

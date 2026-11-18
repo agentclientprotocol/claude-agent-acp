@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
+import * as os from "node:os";
 import { resolveSettings } from "@anthropic-ai/claude-agent-sdk";
 import { SettingsManager } from "../settings.js";
 
@@ -88,5 +89,32 @@ describe("model selection settings policy", () => {
       availableModels: ["claude-haiku-4-5"],
       modelOverrides: { "claude-haiku-4-5": "inline-haiku" },
     });
+  });
+});
+
+describe("a managed policy source that did not load", () => {
+  let manager: SettingsManager;
+  afterEach(() => manager?.dispose());
+
+  it("is logged once while the same source stays unloaded", async () => {
+    vi.mocked(resolveSettings).mockResolvedValue({
+      effective: {},
+      provenance: {},
+      sources: [],
+      machinePolicy: { didNotLoad: ["profile"] },
+    });
+    const error = vi.fn();
+    manager = new SettingsManager(process.cwd(), { logger: { log: () => {}, error } });
+    await manager.initialize();
+    // Another cwd resolves the settings again.
+    await manager.setCwd(os.tmpdir());
+
+    expect(resolveSettings).toHaveBeenCalledTimes(2);
+    expect(error.mock.calls).toEqual([
+      [
+        "Managed settings did not load from the macOS MDM profile: the session's settings " +
+          "and model list do not reflect it. Claude Code reads the policy itself.",
+      ],
+    ]);
   });
 });
