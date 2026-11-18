@@ -2561,9 +2561,11 @@ describe("ACP v2 prompts", () => {
     // Claude Code keeps its stream open while the session lives.
     scriptTurns();
     const client = v2Client();
+    let root = "";
     await client.app.connectWith(connectRouter(), async (agent) => {
       await initializeV2(agent);
       const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      root = sessionId;
       await writeSubagentHistory(
         sessionId,
         [transcriptRecord(sessionId, "r1", null, { role: "user", content: "Explore it" })],
@@ -2606,26 +2608,17 @@ describe("ACP v2 prompts", () => {
         sessionId: "response",
         update: { sessionUpdate: "response" },
       } as never);
-      await vi.waitFor(() =>
-        expect(
-          client.sessionUpdates.filter(
-            ({ sessionId, update }) =>
-              sessionId === "abc123" && update.sessionUpdate === "state_update",
-          ),
-        ).toHaveLength(2),
-      );
       await client.authUpdate(1);
     });
 
     const child = client.sessionUpdates.flatMap(({ sessionId, update }) =>
       sessionId === "abc123" || sessionId === "response" ? [update] : [],
     );
-    // The child's past `running` does not replay; its last state goes once,
-    // after the child's own `replay_complete`. That state is history to the
-    // client, so the child's current state follows the response: its process
-    // is gone, so it is idle.
+    // The child's past `running` does not replay. Its current state goes
+    // once, after its own `replay_complete` and before the response: its
+    // process is gone, so it is idle.
     // The child's model, from its transcript, goes right after its
-    // announcement. It does not go again after the response: it is unchanged.
+    // announcement. It does not go again after the replay: it is unchanged.
     const model = expect.objectContaining({
       sessionUpdate: "config_option_update",
       configOptions: [
@@ -2645,7 +2638,23 @@ describe("ACP v2 prompts", () => {
       { sessionUpdate: "replay_complete" },
       { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn", background: [] },
       { sessionUpdate: "response" },
-      { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn", background: [] },
+    ]);
+    // On the parent, the child's states before the parent's `replay_complete`
+    // are history: its announcement and its end. Its current state follows
+    // the `replay_complete`, before the response.
+    const parent = client.sessionUpdates.flatMap(({ sessionId, update }) => {
+      if (sessionId === "response") return ["response"];
+      if (sessionId !== root) return [];
+      if (update.sessionUpdate === "replay_complete") return ["replay_complete"];
+      if (update.sessionUpdate !== "subagent_update") return [];
+      return [`subagent ${(update as { state?: { state: string } }).state?.state}`];
+    });
+    expect(parent).toEqual([
+      "subagent running",
+      "subagent idle",
+      "replay_complete",
+      "subagent idle",
+      "response",
     ]);
     // The current state on the parent grants nothing: the child cannot run again here.
     expect(
@@ -6595,7 +6604,7 @@ describe("ACP v2 requests that subagents make", () => {
       });
     });
 
-    it("sends a live child's configuration again after a replay's response, when the replay sent another", async () => {
+    it("sends a live child's configuration again after a replay, when the replay sent another", async () => {
       scriptTurns(async function* (options) {
         yield toolUseMessage(options, "toolu_agent-1", "Agent", {
           description: "Explore the project",
@@ -6666,9 +6675,6 @@ describe("ACP v2 requests that subagents make", () => {
           sessionId: "agent-1",
           update: { sessionUpdate: "response" },
         } as never);
-        await vi.waitFor(() =>
-          expect(client.sessionUpdates.at(-1)?.update.sessionUpdate).toBe("config_option_update"),
-        );
         await client.authUpdate(1);
       });
 
@@ -6685,12 +6691,22 @@ describe("ACP v2 requests that subagents make", () => {
         ];
       });
       // The replay sends the model of the child's response. The live child's
-      // configuration has its mode too, so it goes again after the response.
+      // configuration has its mode too, so it goes again after the replay,
+      // before the response.
       expect(configurations).toEqual([
         "model=claude-sonnet-4-6",
-        "response",
         "mode=acceptEdits model=claude-sonnet-4-6 agent=Explore",
+        "response",
       ]);
+      // The live child's work has ended, so the replay reports its current
+      // state too: once on its own stream, before the response.
+      const states = client.sessionUpdates.flatMap(({ sessionId, update }) => {
+        if (sessionId !== "agent-1") return [];
+        if (update.sessionUpdate === "response") return ["response"];
+        if (update.sessionUpdate !== "state_update") return [];
+        return [(update as { state: string }).state];
+      });
+      expect(states).toEqual(["idle", "response"]);
     });
 
     it("names a replayed child's model by the session's model list, on a resume of a closed session", async () => {
@@ -6742,15 +6758,6 @@ describe("ACP v2 requests that subagents make", () => {
           sessionId: "agent-1",
           update: { sessionUpdate: "response" },
         } as never);
-        // The child's current state follows the response.
-        await vi.waitFor(() =>
-          expect(
-            client.sessionUpdates.filter(
-              ({ sessionId, update }) =>
-                sessionId === "agent-1" && update.sessionUpdate === "state_update",
-            ),
-          ).toHaveLength(2),
-        );
         await client.authUpdate(1);
       });
 
