@@ -356,7 +356,12 @@ export class SessionConfig {
 
   preparePrompt(): Promise<NativeConfiguration | undefined> {
     return this.serialized(() =>
-      prepareNativePrompt(this.session.query, this.session.models, this.modelInfos),
+      prepareNativePrompt(
+        this.session.query,
+        this.session.models,
+        this.modelInfos,
+        this.effort.pinned,
+      ),
     );
   }
 

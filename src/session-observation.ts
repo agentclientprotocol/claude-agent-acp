@@ -98,8 +98,14 @@ export async function selectNativeModel(
       await query.applyFlagSettings(effortFlagSettings(effort, before.ultracode ?? ultracode));
       const complete = await readNativeConfiguration(query);
       await publish(complete);
-      if (complete.effort !== before.effort)
-        throw new Error("Claude Code could not restore native effort", { cause: error });
+      if (
+        complete.model !== before.model ||
+        complete.size !== before.size ||
+        complete.effort !== before.effort
+      )
+        throw new Error("Claude Code could not restore native model, context and effort", {
+          cause: error,
+        });
     } catch (restoration) {
       query.close();
       throw Object.assign(
@@ -118,6 +124,7 @@ export async function prepareNativePrompt(
   query: NativeQuery,
   models: { native?: NativeConfiguration; verifiedModel?: string },
   offered: readonly ModelInfo[],
+  requestedEffort?: string,
 ): Promise<NativeConfiguration | undefined> {
   if (!models.native) return undefined;
   const actual = await readNativeConfiguration(query);
@@ -128,6 +135,12 @@ export async function prepareNativePrompt(
     throw RequestError.invalidRequest(
       undefined,
       "The native model changed after selection. Reconnect and select it again before prompting.",
+    );
+  }
+  if (requestedEffort !== undefined && actual.effort !== requestedEffort) {
+    throw RequestError.invalidRequest(
+      undefined,
+      "The native effort changed after selection. Reconnect and select it again before prompting.",
     );
   }
   models.verifiedModel = undefined;

@@ -11554,3 +11554,178 @@ describe("fresh native configuration on cold resume", () => {
     },
   );
 });
+
+describe("r2 native configuration obligations", () => {
+  type Driver = {
+    prompt(): Promise<unknown>;
+    resume(): Promise<unknown>;
+    effort(value: string): Promise<unknown>;
+    reopen(): Promise<unknown>;
+  };
+
+  async function coldNative(protocol: "v1" | "v2", run: (driver: Driver) => Promise<void>) {
+    if (protocol === "v2") {
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        const close = () => agent.request(v2.methods.agent.session.close, { sessionId });
+        const resume = () => agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+        await close();
+        await resume();
+        await run({
+          prompt: () =>
+            agent.request(v2.methods.agent.session.prompt, {
+              sessionId,
+              prompt: text("native turn"),
+            }),
+          resume,
+          effort: (value) =>
+            agent.request(v2.methods.agent.session.setConfigOption, {
+              sessionId,
+              configId: "effort",
+              type: "id",
+              value,
+            }),
+          reopen: async () => {
+            await close();
+            return resume();
+          },
+        });
+        await client.authUpdate(1);
+      });
+    } else {
+      await v1
+        .client({ name: "native-r2-test" })
+        .onNotification(
+          "_auth/status_update",
+          (params) => params,
+          () => {},
+        )
+        .onNotification(v1.methods.client.session.update, () => {})
+        .connectWith(connectRouter() as unknown as v1.Stream, async (agent) => {
+          await agent.request(v1.methods.agent.initialize, {
+            protocolVersion: v1.PROTOCOL_VERSION,
+          });
+          const { sessionId } = await agent.request(v1.methods.agent.session.new, {
+            cwd,
+            mcpServers: [],
+          });
+          const close = () => agent.request(v1.methods.agent.session.close, { sessionId });
+          const resume = () =>
+            agent.request(v1.methods.agent.session.resume, { sessionId, cwd, mcpServers: [] });
+          await close();
+          await resume();
+          await run({
+            prompt: () =>
+              agent.request(v1.methods.agent.session.prompt, {
+                sessionId,
+                prompt: text("native turn"),
+              }),
+            resume,
+            effort: (value) =>
+              agent.request(v1.methods.agent.session.setConfigOption, {
+                sessionId,
+                configId: "effort",
+                value,
+              }),
+            reopen: async () => {
+              await close();
+              return resume();
+            },
+          });
+        });
+    }
+  }
+
+  function nativeState() {
+    const model = "claude-sonnet-4-6";
+    let externalEffort: string | undefined;
+    sdk.contextUsage = async () => ({ model, totalTokens: 42, rawMaxTokens: 777777 });
+    sdk.settings = async () => ({
+      effective: {
+        effortLevel:
+          externalEffort ??
+          String(
+            sdk.flagSettings.findLast((flags) => flags.effortLevel !== undefined)?.effortLevel ??
+              "high",
+          ),
+      },
+    });
+    sdk.initializationResult = async () => ({
+      models: [
+        {
+          value: "sonnet",
+          resolvedModel: model,
+          displayName: "Sonnet",
+          description: "",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "high"],
+          supportsAutoMode: true,
+        },
+      ],
+    });
+    const setModel = vi.fn(sdkDefaults.setModel);
+    sdk.setModel = setModel;
+    return {
+      setModel,
+      changeEffort: () => {
+        externalEffort = "high";
+      },
+    };
+  }
+
+  it.each(["v1", "v2"] as const)(
+    "%s refuses changed explicit effort before input and keeps a later plain use",
+    async (protocol) => {
+      const native = nativeState();
+      const echoed = scriptTurns(async function* (options) {
+        yield result(options);
+        yield idleState(options);
+      });
+      await coldNative(protocol, async (driver) => {
+        await driver.effort("low");
+        expect((await sdk.settings()).effective?.effortLevel).toBe("low");
+        native.changeEffort();
+        await expect(driver.prompt()).rejects.toMatchObject({ code: -32600 });
+        expect(echoed).toEqual([]);
+        const setters = sdk.flagSettings.length;
+        await driver.reopen();
+        await driver.prompt();
+        expect(echoed).toHaveLength(1);
+        expect(sdk.flagSettings).toHaveLength(setters);
+      });
+      expect(native.setModel).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["v1", "v2"] as const)(
+    "%s resumes an active observed session without permitting controls",
+    async (protocol) => {
+      const native = nativeState();
+      const running = Promise.withResolvers<void>();
+      const finish = Promise.withResolvers<void>();
+      scriptTurns(async function* (options) {
+        running.resolve();
+        await finish.promise;
+        yield result(options);
+        yield idleState(options);
+      });
+      await coldNative(protocol, async (driver) => {
+        const prompted = driver.prompt();
+        try {
+          await running.promise;
+          const attachments = sdk.queryOptions.length;
+          await expect(driver.resume()).resolves.toBeDefined();
+          expect(sdk.queryOptions).toHaveLength(attachments);
+          await expect(driver.effort("high")).rejects.toMatchObject({ code: -32600 });
+        } finally {
+          finish.resolve();
+          await prompted;
+        }
+      });
+      expect(native.setModel).not.toHaveBeenCalled();
+      expect(sdk.flagSettings).toEqual([]);
+    },
+  );
+});

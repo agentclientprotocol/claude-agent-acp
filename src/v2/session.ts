@@ -1,4 +1,4 @@
-import type { NativeConfiguration } from "../session-observation.js";
+import { readNativeConfiguration, type NativeConfiguration } from "../session-observation.js";
 /**
  * One ACP v2 session, served straight from its Claude Code query.
  *
@@ -1160,7 +1160,7 @@ export class V2Session implements RequestTarget {
     if (this.clearContext.promptStarted(uuid)) this.fileChanges?.contextCleared(uuid);
     const pending = this.pending.get(uuid);
     if (pending?.nativeConfiguration)
-      pending.nativeConfiguration = await this.config.preparePrompt();
+      pending.nativeConfiguration = await readNativeConfiguration(this.query!);
     this.inserted(uuid);
     this.openTurn(uuid);
   }

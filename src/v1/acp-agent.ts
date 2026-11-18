@@ -2627,6 +2627,7 @@ export class ClaudeAcpAgent {
             session.query,
             session.models,
             session.modelInfos,
+            session.effortPinnedLevel,
           );
           if (turn.settled || session.queryClosed || session.tornDown)
             throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
@@ -9633,11 +9634,7 @@ export class ClaudeAcpAgent {
     const session = this.sessions[sessionId];
     if (!session?.models.native) return;
     await this.serializeConfigurationChange(sessionId, async () => {
-      if (this.claudeIsWorking(sessionId, session))
-        throw RequestError.invalidRequest(
-          undefined,
-          "Claude is working. Try again when the turn ends.",
-        );
+      if (this.claudeIsWorking(sessionId, session)) return;
       await this.publishNativeConfiguration(sessionId, session, session.models.native!);
     });
   }

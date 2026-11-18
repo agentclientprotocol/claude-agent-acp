@@ -4,6 +4,7 @@ import { makeMockQuery } from "./helpers.js";
 import { setSelectedModel } from "../session-config-options.js";
 import {
   readNativeConfiguration,
+  prepareNativePrompt,
   matchesNativeModel,
   selectNativeEffort,
   type NativeConfiguration,
@@ -215,4 +216,30 @@ describe("standard native model verification", () => {
       ).toBe(true);
     },
   );
+
+  it.each(["model", "context"] as const)(
+    "r2 refuses model compensation when %s changes during effort restoration",
+    async (field) => {
+      const test = nativeQuery();
+      test.applyFlagSettings.mockImplementation(async () => {
+        if (field === "model") test.state.model = "different";
+        else test.state.rawMaxTokens = 200000;
+      });
+      await expect(
+        setSelectedModel(test.query, { value: "sonnet[1m]" }, test.native),
+      ).rejects.toThrow("Native restoration failed");
+      expect(test.close).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("r2 keeps unknown effort unknown and refuses only the explicit pre-input obligation", async () => {
+    const test = nativeQuery();
+    Object.assign(test.query, { getSettings: async () => ({}) });
+    const models = { native: await readNativeConfiguration(test.query) };
+    expect(await prepareNativePrompt(test.query, models, [])).toMatchObject({ effort: undefined });
+    await expect(prepareNativePrompt(test.query, models, [], "low")).rejects.toThrow(
+      "effort changed after selection",
+    );
+    expect(test.applyFlagSettings).not.toHaveBeenCalled();
+  });
 });
