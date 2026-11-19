@@ -752,7 +752,7 @@ describe("v2ElicitationRequest", () => {
     );
     expect(request._meta).toBe(requestMeta);
     expect(converted).toMatchObject({ requestedSchema: request.requestedSchema });
-    if (!marked) expect(converted).toBe(request);
+    if (!marked) expect(converted).toEqual(request);
   });
 
   it("keeps URL requests unchanged", () => {

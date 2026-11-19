@@ -74,7 +74,6 @@ import {
   v1NewSessionRequest,
 } from "./session-requests.js";
 import { SessionCommands } from "./commands.js";
-import { v2ElicitationRequest } from "./elicitation.js";
 import { V2UpdateTranslator } from "./update-translator.js";
 import { airInitializeMeta, airSupport, NO_AIR, type AirSupport } from "./air.js";
 import { V2Auth } from "./auth.js";

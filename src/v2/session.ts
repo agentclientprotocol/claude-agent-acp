@@ -463,8 +463,8 @@ export class V2Session implements RequestTarget {
     // Throws invalid params for content that Claude cannot take.
     const request: PromptRequest = v1PromptRequest(params);
     const key = params.idempotencyKey;
-    if (key == null) return this.submit(params, request, guard, { uuid: randomUUID() });
-    return this.keys.once(key, (attempt) => this.submit(params, request, guard, attempt));
+    if (key == null) return this.submit(params, request, guard, { uuid: randomUUID() }, signal);
+    return this.keys.once(key, (attempt) => this.submit(params, request, guard, attempt, signal));
   }
 
   /**
@@ -484,6 +484,7 @@ export class V2Session implements RequestTarget {
     request: PromptRequest,
     guard: ((query: Query) => Promise<void> | undefined) | undefined,
     { uuid, stored }: KeyedAttempt,
+    signal: AbortSignal,
   ): Promise<v2.PromptResponse> {
     const remoteControl = this.remoteControl.mayRun(request.prompt);
     const guarded = guard && !remoteControl ? guard : undefined;
