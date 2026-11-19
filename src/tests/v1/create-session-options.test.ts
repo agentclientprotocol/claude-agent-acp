@@ -28,6 +28,8 @@ let initModels: Record<string, unknown>[] | undefined;
 /** Holds the CLI initialization until the test resolves it. */
 let initGate: Promise<void> | undefined;
 let initError: Error | undefined;
+/** When set, the SDK refuses the query's options with it: `query()` throws. */
+let optionsRefusal: Error | undefined;
 let setModelImpl: ((model: string) => Promise<void>) | undefined;
 let interruptImpl: (() => Promise<undefined>) | undefined;
 let closeSpy: ReturnType<typeof vi.fn<() => void>>;
@@ -45,6 +47,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   return {
     ...actual,
     query: (args: { prompt: unknown; options: Options }) => {
+      if (optionsRefusal) throw optionsRefusal;
       capturedOptions = args.options;
       // Like Claude Code's, the stream stays open until the query is closed.
       let streamClosed = () => {};
@@ -123,6 +126,7 @@ describe("createSession options merging", () => {
     initModels = undefined;
     initGate = undefined;
     initError = undefined;
+    optionsRefusal = undefined;
     setModelImpl = undefined;
     interruptImpl = undefined;
     closeSpy = vi.fn<() => void>();
@@ -1746,6 +1750,27 @@ describe("createSession options merging", () => {
       await expect(agent.newSession({ cwd: process.cwd(), mcpServers: [] })).rejects.toBe(
         initError,
       );
+    });
+
+    it("disposes the settings of a session whose options the SDK refuses", async () => {
+      // What SDK 0.3.328 throws from `query()` for a hook matcher without `hooks`.
+      optionsRefusal = new Error(
+        "The session was not started, because the hooks option can't be sent to Claude Code: " +
+          "hooks.PreToolUse[0].hooks must be an array of callbacks. Fix that value and try again.",
+      );
+      // The module that the agent of this test loaded (see `beforeEach`).
+      const { SettingsManager } = await import("../../settings.js");
+      const initialized = vi.spyOn(SettingsManager.prototype, "initialize");
+      const disposed = vi.spyOn(SettingsManager.prototype, "dispose");
+
+      await expect(agent.newSession({ cwd: process.cwd(), mcpServers: [] })).rejects.toBe(
+        optionsRefusal,
+      );
+
+      expect(initialized).toHaveBeenCalled();
+      expect(disposed).toHaveBeenCalledTimes(initialized.mock.calls.length);
+      initialized.mockRestore();
+      disposed.mockRestore();
     });
   });
 

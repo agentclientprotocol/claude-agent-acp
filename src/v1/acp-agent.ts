@@ -7743,16 +7743,18 @@ export class ClaudeAcpAgent {
     }
   }
 
-  /** Release a query that was spawned but never registered as a session. */
+  /** Release a query that was spawned but never registered as a session, or
+   *  the settings and input of one that the SDK refused to create (`q` is
+   *  undefined). */
   private discardUnregisteredQuery(
-    q: Query,
+    q: Query | undefined,
     input: Pushable<SDKUserMessage>,
     settingsManager: SettingsManager,
   ): void {
     settingsManager.dispose();
     input.end();
     try {
-      q.close();
+      q?.close();
     } catch (error) {
       this.logger.error("Failed to close unregistered Claude query", error);
     }
@@ -10415,10 +10417,19 @@ export class ClaudeAcpAgent {
       throw new Error("Cancelled");
     }
 
-    const q = query({
-      prompt: input,
-      options,
-    });
+    let q: Query;
+    try {
+      q = query({
+        prompt: input,
+        options,
+      });
+    } catch (error) {
+      // The SDK refuses options that it cannot send to Claude Code, e.g. a
+      // client's hook matcher without `hooks`: "hooks.PreToolUse[0].hooks must
+      // be an array of callbacks".
+      this.discardUnregisteredQuery(undefined, input, settingsManager);
+      throw error;
+    }
     this.authStatus.useSettings(
       settingsManager,
       configuredSettingsObject,
