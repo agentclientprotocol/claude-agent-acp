@@ -74,8 +74,14 @@ export function normalizeFastModeDisabledReason(
 
 /** Build the Fast mode config option. When the Client supports boolean config
  *  options we expose a native `type: "boolean"` toggle; otherwise we degrade to
- *  a two-value `select` ("on"/"off") so older Clients still get a usable
+ *  a two-value `select` ("off"/"on") so older Clients still get a usable
  *  control.
+ *
+ *  Its category is `speed`, the unstable ACP category of an option that
+ *  changes how fast the model responds, in v1 and v2. A category needs no
+ *  capability: a Client that does not know `speed` handles it as any unknown
+ *  category. ACP asks for a `speed` select's values from slowest to fastest,
+ *  so the fallback lists off before on.
  *
  *  `disabledReason` (the SDK's `fast_mode_disabled_reason`) is folded into the
  *  description while the toggle reads off, so a user whose account or provider
@@ -92,7 +98,7 @@ export function createFastModeConfigOption(
     id: FAST_MODE_CONFIG_ID,
     name: "Fast mode",
     description: explanation ? `${FAST_MODE_DESCRIPTION} — ${explanation}` : FAST_MODE_DESCRIPTION,
-    category: "model_config",
+    category: "speed",
   } as const;
 
   if (useBooleanOption) {
@@ -104,8 +110,8 @@ export function createFastModeConfigOption(
     type: "select",
     currentValue: enabled ? FAST_MODE_ON : FAST_MODE_OFF,
     options: [
-      { value: FAST_MODE_ON, name: "On" },
       { value: FAST_MODE_OFF, name: "Off" },
+      { value: FAST_MODE_ON, name: "On" },
     ],
   };
 }

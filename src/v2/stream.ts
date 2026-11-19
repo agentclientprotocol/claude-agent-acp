@@ -46,6 +46,7 @@ import { UnansweredServerToolCalls } from "../tool-calls/server-tool-calls.js";
 import { AcpToolCallRenderer, progressToolCallId, V2_CANCELLED } from "../tool-calls/renderer.js";
 import { changedTaskPlanEntries, unregisterHookCallback, type TaskState } from "../tools.js";
 import { recordStreamedDelta, unstreamedRemainder, type StreamedBlock } from "../streamed-text.js";
+import { forkCursorUpdate, hasForkCursor } from "../session-cursors.js";
 import { replayClear, type V2UpdateTranslator } from "./update-translator.js";
 
 /** Every v2 client gets the same tool call reports: v2 diffs and display terminals. */
@@ -406,7 +407,9 @@ export class SessionOutput {
    * messages and its tool calls, as the live session sent them. Subagent
    * transcripts are left out, as live. The client may hold the replayed
    * messages already, so each message is cleared before its first chunk.
-   * `hooks` replays the subagents' own histories to their sessions.
+   * `hooks` replays the subagents' own histories to their sessions. Each
+   * user message of the root session that a fork can start before gets its
+   * session cursor right after it (see `session-cursors.ts`).
    *
    * A replayed tool call that the history gives no result, such as one that
    * ran when Claude Code was killed, ends `failed` after the replay, as v2
@@ -425,7 +428,7 @@ export class SessionOutput {
     this.replayHooks = hooks;
     const unfinished = (this.replayUnfinished = new Set());
     try {
-      for (const message of messages) {
+      for (const [index, message] of messages.entries()) {
         if (message.parent_tool_use_id !== null || isReplayHiddenMetaMessage(message)) continue;
         // Claude Code's sign-in message, which the live session did not show either.
         if (message.type === "assistant" && isSyntheticLoginMessage(message.message)) continue;
@@ -457,6 +460,10 @@ export class SessionOutput {
             { messageId: message.uuid, replay: true },
             running,
           );
+          // The client cannot fork a subagent's session, so a child gets no cursors.
+          if (!this.subagent && hasForkCursor(messages, index)) {
+            this.send(forkCursorUpdate(message.uuid));
+          }
         }
         hooks?.replayed(message);
       }

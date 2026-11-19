@@ -80,6 +80,7 @@ import { modelSwitchHook, SessionConfig } from "./config.js";
 import { v2ElicitationRequest } from "./elicitation.js";
 import { fileChangePreviewHook } from "./file-preview.js";
 import { canUseTool, denyingStoppedWork } from "./permissions.js";
+import { PromptKeys } from "./prompt-keys.js";
 import { ReplayHolds } from "./replay-hold.js";
 import { reportHooks } from "./reports.js";
 import { savedSessionStatus } from "../session-status.js";
@@ -178,6 +179,13 @@ class V2Agent implements AgentHandle, SessionConnection {
   private readonly resuming = new Map<string, Set<Promise<unknown>>>();
   /** What the resumes that replay hold back until their `replay_complete` (see `replay-hold.ts`). */
   private readonly replays = new ReplayHolds();
+  /**
+   * The `idempotencyKey`s of each session's prompts, from the session's
+   * start to `session/close` or the end of the connection (see
+   * `prompt-keys.ts`). A restart of the session's query, and a resume of a
+   * session whose query ended, keep the record.
+   */
+  private readonly promptKeys = new Map<string, PromptKeys>();
   readonly translator = new V2UpdateTranslator();
   readonly auth: V2Auth;
   /** The `--hide-claude-auth` subscription guard (see `subscription-guard.ts`). */
@@ -703,6 +711,8 @@ class V2Agent implements AgentHandle, SessionConnection {
     // its updates go out before the close response.
     await this.setupSettled(sessionId);
     this.stopped.delete(sessionId);
+    // A closed session is no longer active here: only its stored messages keep their keys.
+    this.promptKeys.delete(sessionId);
     const session = this.sessions.get(sessionId);
     if (session) {
       await session.close();
@@ -827,6 +837,7 @@ class V2Agent implements AgentHandle, SessionConnection {
     const sessions = [...this.sessions.values()];
     this.sessions.clear();
     this.stopped.clear();
+    this.promptKeys.clear();
     await Promise.all(sessions.map((session) => session.close()));
   }
 
@@ -956,7 +967,18 @@ class V2Agent implements AgentHandle, SessionConnection {
       query: q,
       model: { id: models.models.currentModelId, info: models.allowlistedModelInfo },
     });
-    session.start(q, config, opened.mcpServers, resume !== undefined);
+    let keys = this.promptKeys.get(sessionId);
+    if (!keys) {
+      const { cwd } = opened.request;
+      keys = new PromptKeys(
+        sessionId,
+        () => storedPromptIds(sessionId, cwd, this.logger),
+        this.logger,
+      );
+      this.promptKeys.set(sessionId, keys);
+    }
+    keys.queryStarted(resume !== undefined);
+    session.start(q, config, opened.mcpServers, keys, resume !== undefined);
     this.sessions.set(sessionId, session);
     this.stopped.delete(sessionId);
     // A route change during the start did not find this session live.
@@ -1273,6 +1295,22 @@ async function validatedSetup(
     }
   }
   return request;
+}
+
+/**
+ * The uuids of the user messages in the stored history of the session
+ * `sessionId`, as a replay reads it: the messages before each compaction too.
+ */
+async function storedPromptIds(sessionId: string, cwd: string, logger: Logger): Promise<string[]> {
+  const messages = await readHistoryAcrossCompactions(
+    sessionId,
+    await getSessionMessages(sessionId, { dir: cwd }),
+    logger,
+    cwd,
+  );
+  return messages.flatMap((message) =>
+    message.type === "user" && message.uuid ? [message.uuid] : [],
+  );
 }
 
 /** A request of the active `session` names its `cwd`, as `session/resume` must. */

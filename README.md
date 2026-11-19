@@ -75,9 +75,14 @@ with replay, which `replay_complete` ends, `session/close`, `session/prompt`, `s
 compaction, display terminals for commands, permission requests, elicitation, providers, auth, and
 [subagents](docs/subagent-sessions.md). Steering is v1 only for now.
 
-Two parts of the draft are not served yet. `session/prompt` takes an `idempotencyKey` and does not
-use it, so a prompt that a client sends again with the same key is inserted again. The adapter
-announces no session cursors, so `session/fork` with a `cursorId` fails with `-32602`.
+`session/prompt` takes an `idempotencyKey`: a prompt that a client sends again with the same key
+is inserted once, and the retry gets the first `messageId`. The key is known for as long as Claude
+Code stores the message, also after a restart.
+
+The adapter announces a session cursor (`cursor_update`) before each user message that follows
+another entry of the conversation, live and in a replay. `session/fork` with its `cursorId` copies
+the history before that message, and fails with `-32602` for any other `cursorId`. A v1 client gets
+no cursors yet.
 
 v2 is served by the v2 agent in `src/v2/`, which runs straight on Claude
 Code instead of translating to v1. A v2 client that declares JetBrains AIR

@@ -8,7 +8,8 @@
  * - A prompt is pushed to Claude Code at once, with a uuid. Its response is
  *   the prompt's insertion: the `command_lifecycle` frame `started` for that
  *   uuid, or the prompt's echo, whichever comes first. `cancelled`,
- *   `discarded` or `refused` fails the prompt.
+ *   `discarded` or `refused` fails the prompt. A prompt with an
+ *   `idempotencyKey` is pushed once per key (see `prompt-keys.ts`).
  * - The foreground work is Claude Code's turn: it starts with a prompt's
  *   `started` frame or echo, or with the main conversation's output (a
  *   cycle that Claude Code starts on its own, such as after a background
@@ -68,6 +69,7 @@ import { modelRefusalFallback, noticeUpdate } from "../session-notices.js";
 import { planModeUpdate } from "../exit-plan.js";
 import { resetPlanUpdates } from "../plans.js";
 import type { PromptSuggestionForms } from "../prompt-suggestions.js";
+import { forkCursorUpdate, promptGetsCursor } from "../session-cursors.js";
 import type { ClearContextReset } from "../clear-context-coordinator.js";
 import { agentFileChangeReportMeta } from "../file-change-audit.js";
 import type { AirSupport } from "./air.js";
@@ -82,6 +84,7 @@ import {
   TurnReport,
   type TurnEnd,
 } from "./outcome.js";
+import type { KeyedAttempt, PromptKeys } from "./prompt-keys.js";
 import { StoppedWork } from "./stopped-work.js";
 import { SessionReports } from "./reports.js";
 import { SessionElicitations } from "./elicitation.js";
@@ -180,6 +183,12 @@ export class V2Session implements RequestTarget {
   private lifecycleFrames = false;
   /** What the open turn's assistant messages reported about its end (see {@link TurnReport}). */
   private readonly turnReport = new TurnReport();
+  /**
+   * Whether the conversation holds an entry: the query resumed a stored one,
+   * or a prompt of this session was inserted. A prompt that follows one gets
+   * a session cursor (see {@link inserted}).
+   */
+  private hasHistory = false;
   /** Set by `session/close`, or when the query ends: nothing more goes out. */
   private closed = false;
   private closing: Promise<void> | undefined;
@@ -198,6 +207,8 @@ export class V2Session implements RequestTarget {
   private readonly fileChanges: TurnFileChanges | undefined;
   config!: SessionConfig;
   commands!: SessionCommands;
+  /** The `idempotencyKey`s of the session's prompts. Set by {@link start}. */
+  private keys!: PromptKeys;
   /** ExitPlanMode's "clear context" option (see {@link ClearContext}). */
   readonly clearContext: ClearContext;
   /** The `/mcp` prompts not inserted yet, by uuid, and the open turn's (see `SessionCommands`). */
@@ -349,12 +360,21 @@ export class V2Session implements RequestTarget {
 
   /**
    * Starts reading the query. Called once, after its initialization.
-   * `mcpServers` are the servers the query started with.
+   * `mcpServers` are the servers the query started with, and `keys` the
+   * record of the session's prompt keys, which outlives this query.
    */
-  start(query: Query, config: SessionConfig, mcpServers: McpServers, resumed = false): void {
+  start(
+    query: Query,
+    config: SessionConfig,
+    mcpServers: McpServers,
+    keys: PromptKeys,
+    resumed = false,
+  ): void {
     this.query = query;
     this.config = config;
+    this.keys = keys;
     this.usage = new ResultUsage(resumed);
+    this.hasHistory = resumed;
     this.mcpServers = JSON.stringify(mcpServers);
     this.commands = new SessionCommands(query);
     void this.consume(query);
@@ -420,6 +440,11 @@ export class V2Session implements RequestTarget {
    * order, and a cancel or close answers a prompt that waits for it with
    * -32800 as any prompt not inserted yet. Its refusal answers the prompt.
    * The adapter's `/remote-control` is not guarded.
+   *
+   * A prompt with an `idempotencyKey` inserts at most one message for the
+   * key (see `prompt-keys.ts`): a retry of a prompt that is not answered yet
+   * gets that prompt's outcome, and a retry of an inserted one its
+   * `messageId`, and neither goes to Claude Code again.
    */
   prompt(
     params: v2.PromptRequest,
@@ -430,6 +455,29 @@ export class V2Session implements RequestTarget {
     }
     // Throws invalid params for content that Claude cannot take.
     const request: PromptRequest = v1PromptRequest(params);
+    const key = params.idempotencyKey;
+    if (key == null) return this.submit(params, request, guard, { uuid: randomUUID() });
+    return this.keys.once(key, (attempt) => this.submit(params, request, guard, attempt));
+  }
+
+  /**
+   * Sends the prompt to Claude Code as the message `attempt.uuid` (see
+   * {@link prompt}).
+   *
+   * `attempt.stored` looks the prompt's key up in the session's stored
+   * history, where a message of an earlier connection can be. The lookup runs
+   * in the prompt's turn among the session's prompts. A stored message
+   * answers the prompt with its `messageId`: nothing is inserted, titled or
+   * sent. A `session/cancel` during the lookup answers the prompt with
+   * -32800 like any prompt not inserted yet, also when the message is
+   * stored: the client's next retry then gets the `messageId`.
+   */
+  private submit(
+    params: v2.PromptRequest,
+    request: PromptRequest,
+    guard: ((query: Query) => Promise<void> | undefined) | undefined,
+    { uuid, stored }: KeyedAttempt,
+  ): Promise<v2.PromptResponse> {
     const remoteControl = this.remoteControl.mayRun(request.prompt);
     const guarded = guard && !remoteControl ? guard : undefined;
     // A prompt that the guard refuses titles nothing and sends no notice.
@@ -438,15 +486,19 @@ export class V2Session implements RequestTarget {
       // The notice of a mode fallback at the session's start, which sends it at once.
       void this.config.promptSent();
     };
-    if (!guarded) sent();
-    const uuid = randomUUID();
     const message = { ...promptToClaude(request), uuid };
-    // Only a prompt that goes to Claude Code gets a file-change report, as on
-    // v1: the adapter's `/remote-control` registers it once it passes the
-    // prompt on (below).
-    if (!remoteControl) this.fileChanges?.requested(uuid, params._meta);
-    const localCommand = this.commands.localCommand(request.prompt);
-    if (localCommand) this.localCommands.set(uuid, localCommand);
+    /** What a prompt that is new to the session registers before it goes to Claude Code. */
+    const accept = () => {
+      if (!guarded) sent();
+      // Only a prompt that goes to Claude Code gets a file-change report, as
+      // on v1: the adapter's `/remote-control` registers it once it passes
+      // the prompt on (below).
+      if (!remoteControl) this.fileChanges?.requested(uuid, params._meta);
+      const localCommand = this.commands.localCommand(request.prompt);
+      if (localCommand) this.localCommands.set(uuid, localCommand);
+    };
+    // A prompt whose key the stored history may hold is new only once the lookup says so.
+    if (!stored) accept();
     return new Promise((resolve, reject) => {
       const pending: PendingPrompt = { prompt: params.prompt, pushed: false, resolve, reject };
       this.pending.set(uuid, pending);
@@ -456,6 +508,17 @@ export class V2Session implements RequestTarget {
         .then(() => this.interrupting)
         .then(async () => {
           if (answered()) return;
+          if (stored) {
+            const messageId = await stored();
+            if (answered()) return;
+            if (messageId !== undefined) {
+              this.pending.delete(uuid);
+              resolve({ messageId });
+              this.checkBoundary();
+              return;
+            }
+            accept();
+          }
           if (guarded) {
             try {
               // Set by `start`, which runs before the agent lists the session.
@@ -1146,12 +1209,22 @@ export class V2Session implements RequestTarget {
     this.openTurn(uuid);
   }
 
+  /**
+   * The prompt `uuid` is inserted: its `user_message` goes out, and its
+   * response. A prompt that follows an entry of the conversation also gets
+   * its session cursor, which `session/fork` takes to copy the history
+   * before the prompt (see `session-cursors.ts`). The cursor is announced at
+   * once, and a fork finds it once Claude Code stored the message. A slash
+   * command gets none.
+   */
   private inserted(uuid: string): void {
     const prompt = this.pending.get(uuid);
     if (!prompt) return;
     this.pending.delete(uuid);
     this.fileChanges?.promptStarted(uuid);
     this.send({ sessionUpdate: "user_message", messageId: uuid, content: prompt.prompt });
+    if (this.hasHistory && promptGetsCursor(prompt.prompt)) this.send(forkCursorUpdate(uuid));
+    this.hasHistory = true;
     prompt.resolve({ messageId: uuid });
   }
 
