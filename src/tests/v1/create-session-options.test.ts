@@ -596,23 +596,33 @@ describe("createSession options merging", () => {
     expect(capturedOptions?.env?.HOME).toBe("/custom/home");
   });
 
-  it("asks the SDK for a predicted follow-up prompt per turn", async () => {
-    await agent.newSession({
-      cwd: process.cwd(),
-      mcpServers: [],
+  describe("the predicted follow-up prompt", () => {
+    const AIR = { _meta: { jetbrains: { air: { version: 1, capabilities: [] } } } };
+    const ADVERTISED = { session: { promptSuggestions: {} } };
+
+    // Claude Code spends a request per turn on a prediction: only a client
+    // that gets the prediction has it on.
+    it.each<[string, ClientCapabilities, true | undefined]>([
+      ["AIR", AIR as ClientCapabilities, true],
+      ["a client that advertises session.promptSuggestions", ADVERTISED, true],
+      ["no other client", {}, undefined],
+    ])("asks the SDK for it for %s", async (_, clientCapabilities, asked) => {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities });
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(capturedOptions!.promptSuggestions).toBe(asked);
     });
 
-    expect(capturedOptions!.promptSuggestions).toBe(true);
-  });
+    it("lets a caller turn it off", async () => {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: ADVERTISED });
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { claudeCode: { options: { promptSuggestions: false } } },
+      });
 
-  it("lets a caller turn the predicted follow-up prompt off", async () => {
-    await agent.newSession({
-      cwd: process.cwd(),
-      mcpServers: [],
-      _meta: { claudeCode: { options: { promptSuggestions: false } } },
+      expect(capturedOptions!.promptSuggestions).toBe(false);
     });
-
-    expect(capturedOptions!.promptSuggestions).toBe(false);
   });
 
   it.each([

@@ -4789,19 +4789,43 @@ describe("ACP v2 core", () => {
       },
     );
 
-    it.each([
-      ["an AIR client", air(), true],
-      ["any other client", {}, false],
+    /** The `prompt_suggestion` that Claude Code sends after a result. */
+    const suggestion = (text: string) => ({
+      type: "prompt_suggestion",
+      suggestion: text,
+      uuid: randomUUID(),
+      session_id: "session",
+    });
+
+    /**
+     * The predicted prompts that the session's updates carried, in order: the
+     * texts of each list, tagged with the form that carried it. An empty list
+     * clears the prediction.
+     */
+    const predictions = (updates: v2.SessionUpdate[]) =>
+      updates.flatMap((update): Array<[string, string[]]> => {
+        if (v2.SessionUpdate.isPromptSuggestionsUpdate(update)) {
+          const texts = update.suggestions.map(({ prompt }) =>
+            prompt.map((block) => (block.type === "text" ? block.text : block.type)).join(""),
+          );
+          return [["update", texts]];
+        }
+        const meta = update._meta as { promptSuggestions?: { suggestions: { text: string }[] } };
+        return update.sessionUpdate === "session_info_update" && meta?.promptSuggestions
+          ? [["meta", meta.promptSuggestions.suggestions.map(({ text }) => text)]]
+          : [];
+      });
+
+    const SUGGESTIONS_CLIENT: v2.ClientCapabilities = { session: { promptSuggestions: {} } };
+
+    it.each<[string, v2.ClientCapabilities, string | undefined]>([
+      ["an AIR client", air(), "meta"],
+      ["a client that advertises session.promptSuggestions", SUGGESTIONS_CLIENT, "update"],
+      ["any other client", {}, undefined],
     ])(
       "sends %s the predicted follow-up prompt, cleared at the next prompt and at a reset",
-      async (_, capabilities, predicted) => {
+      async (_, capabilities, form) => {
         const client = v2Client();
-        const suggestion = (text: string) => ({
-          type: "prompt_suggestion",
-          suggestion: text,
-          uuid: randomUUID(),
-          session_id: "session",
-        });
         const { claude, sessionId } = await client.connect(async (agent) => {
           const { response, claude } = await openSession(agent, capabilities);
           const prompt = async (index: number) => {
@@ -4837,16 +4861,80 @@ describe("ACP v2 core", () => {
           return { claude, sessionId: response.sessionId };
         });
 
-        const sent = updatesOf(client.notifications, sessionId).flatMap((update) => {
-          const meta = update._meta as { promptSuggestions?: { suggestions: unknown } } | null;
-          return update.sessionUpdate === "session_info_update" && meta?.promptSuggestions
-            ? [meta.promptSuggestions.suggestions]
-            : [];
-        });
-        expect(sent).toEqual(
-          predicted ? [[{ text: "Run the tests" }], [], [{ text: "Commit" }], []] : [],
+        expect(predictions(updatesOf(client.notifications, sessionId))).toEqual(
+          form
+            ? [
+                [form, ["Run the tests"]],
+                [form, []],
+                [form, ["Commit"]],
+                [form, []],
+              ]
+            : [],
         );
-        expect(claude.options.promptSuggestions).toBe(predicted ? true : undefined);
+        expect(claude.options.promptSuggestions).toBe(form ? true : undefined);
+      },
+    );
+
+    /**
+     * Scenario:
+     * 1. A second prompt arrives while the first turn runs. The first turn's
+     *    result and its prediction come before Claude Code takes the prompt in.
+     * 2. The second turn ends with a prediction.
+     * 3. Claude Code starts a cycle on its own.
+     * Expected:
+     * - `prompt_suggestions_update` follows ACP: the prediction that does not
+     *   account for the waiting prompt is dropped, and the list is withdrawn
+     *   when the cycle starts.
+     * - AIR's `_meta` form keeps its rules: both predictions go out, and the
+     *   second stays until the next prompt.
+     */
+    it.each<[string, v2.ClientCapabilities, Array<[string, string[]]>]>([
+      [
+        "prompt_suggestions_update",
+        SUGGESTIONS_CLIENT,
+        [
+          ["update", ["Commit"]],
+          ["update", []],
+        ],
+      ],
+      [
+        "AIR's _meta",
+        air(),
+        [
+          ["meta", ["Outrun"]],
+          ["meta", ["Commit"]],
+        ],
+      ],
+    ])(
+      "handles work that a prediction does not account for by the rules of %s",
+      async (_, capabilities, expected) => {
+        const client = v2Client();
+        const sessionId = await client.connect(async (agent) => {
+          const { response, claude } = await openSession(agent, capabilities);
+          const send = () =>
+            agent.request(v2.methods.agent.session.prompt, {
+              sessionId: response.sessionId,
+              prompt: PROMPT,
+            });
+          const first = send();
+          claude.send(echo(await claude.prompt(0)));
+          await first;
+          const second = send();
+          const waiting = await claude.prompt(1);
+          claude.send(result());
+          claude.send(suggestion("Outrun"));
+          claude.send(echo(waiting));
+          await second;
+          claude.send(result());
+          claude.send(suggestion("Commit"));
+          claude.send(sessionState("idle"));
+          await vi.waitFor(() => expect(client.states().at(-1)).toBe("idle"));
+          claude.send(cycleStart());
+          await vi.waitFor(() => expect(client.states().at(-1)).toBe("running"));
+          return response.sessionId;
+        });
+
+        expect(predictions(updatesOf(client.notifications, sessionId))).toEqual(expected);
       },
     );
 

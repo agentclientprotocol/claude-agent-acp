@@ -859,8 +859,9 @@ A failed command restores the previous state.
 
 After a turn, the Claude Code CLI can predict the prompt the user is likely to send next.
 The adapter asks for it with the SDK option `promptSuggestions: true` and forwards the one prediction of the turn.
+It asks only in a session of AIR or of a client that advertises `session.promptSuggestions`, on v1 and v2: a prediction costs a request per turn, and no other client would get it.
 
-ACP has no field for a composer prefill, so the prediction travels outside the AIR namespace:
+AIR reads the prediction from a `_meta` key outside the AIR namespace, which the adapter used before ACP had an update for it:
 
 ```json
 {
@@ -869,8 +870,19 @@ ACP has no field for a composer prefill, so the prediction travels outside the A
 }
 ```
 
-The key names no vendor, so another client can read it.
+The key names no vendor.
 The adapter sends it only to an AIR client; see the [compatibility rule](#compatibility-rule).
+
+Any client that advertises `session.promptSuggestions` gets the same prediction as ACP's unstable `prompt_suggestions_update`, on v1 and v2:
+
+```json
+{
+  "sessionUpdate": "prompt_suggestions_update",
+  "suggestions": [{ "prompt": [{ "type": "text", "text": "Run the tests" }] }]
+}
+```
+
+An AIR client that advertises the capability gets both.
 
 AIR shows the first non-blank `suggestions[].text` as gray text in an empty composer.
 Tab fills the composer with it and sends nothing.
@@ -881,6 +893,11 @@ Tab fills the composer with it and sends nothing.
 - on a `conversation_reset`, because the prediction was drawn from the transcript the reset dropped.
 
 A prediction the next prompt outran — the user sent it before the adapter read the prediction off the SDK stream — is dropped instead of published.
+
+`prompt_suggestions_update` follows two more rules of ACP, which the `_meta` form does not:
+
+- a prediction that arrives while Claude works, such as on a prompt that was queued before the turn's result, is dropped;
+- on v2, the list is withdrawn when foreground work starts without a prompt, such as a cycle that Claude Code starts after a background task ends.
 
 The CLI predicts nothing on the first turn of a session, after an API error, in plan mode, and at the account's usage limit, so many turns end with no prediction.
 A client must treat a turn without one as normal.

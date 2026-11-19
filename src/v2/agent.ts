@@ -42,6 +42,11 @@ import { supportsMcpOAuth } from "../mcp-oauth.js";
 import { McpOverAcp, sdkMcpServers } from "../mcp-servers.js";
 import { ALLOW_BYPASS, autoModeDisabled } from "../permissions/modes.js";
 import {
+  clientTakesPromptSuggestions,
+  promptSuggestionOptions,
+  type PromptSuggestionForms,
+} from "../prompt-suggestions.js";
+import {
   readHistoryAcrossCompactions,
   readResumedTail,
   resumedModelFromTranscript,
@@ -195,6 +200,8 @@ class V2Agent implements AgentHandle, SessionConnection {
   elicitation: ElicitationSupport = { form: false, url: false };
   /** The AIR extensions that the client takes (see `air.ts`). */
   air: AirSupport = NO_AIR;
+  /** The forms of the predicted follow-up prompt that the client takes, read at `initialize`. */
+  promptSuggestions: PromptSuggestionForms = { meta: false, update: false };
 
   constructor(
     private readonly ctx: v2.AgentContext,
@@ -342,6 +349,10 @@ class V2Agent implements AgentHandle, SessionConnection {
       url: request.capabilities?.elicitation?.url != null,
     };
     this.air = airSupport(request.capabilities);
+    this.promptSuggestions = {
+      meta: this.air.client,
+      update: clientTakesPromptSuggestions(request.capabilities?.session),
+    };
     const { authMethods, auth, _meta } = this.auth.initialize(request.capabilities);
     const airMeta = airInitializeMeta(this.air);
     return {
@@ -1085,10 +1096,11 @@ class V2Agent implements AgentHandle, SessionConnection {
       // client stops one at a time: `session/cancel` must leave listed work
       // running. Before the client's options.
       perTaskStopAffordance: true,
-      // AIR's predicted follow-up prompt (see `reports.ts`), as on v1. Only
-      // AIR gets it, so no other client's session spends a request on it.
+      // The predicted follow-up prompt (see `reports.ts`): only AIR and a
+      // client that advertised `session.promptSuggestions` get it, so no
+      // other client's session spends a request on it.
       // Before the client's options: `promptSuggestions: false` turns it off.
-      ...(this.air.client ? { promptSuggestions: true } : {}),
+      ...promptSuggestionOptions(this.promptSuggestions),
       // Before the client's options: its own `mcpServersDelivery` wins.
       mcpServersDelivery: mcpServersDelivery(),
       ...client,

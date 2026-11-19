@@ -68,6 +68,7 @@ import type { UnservedMcpServer } from "../mcp-servers.js";
 import { modelRefusalFallback, noticeUpdate } from "../session-notices.js";
 import { planModeUpdate } from "../exit-plan.js";
 import { resetPlanUpdates } from "../plans.js";
+import type { PromptSuggestionForms } from "../prompt-suggestions.js";
 import { forkCursorUpdate, promptGetsCursor } from "../session-cursors.js";
 import type { ClearContextReset } from "../clear-context-coordinator.js";
 import { agentFileChangeReportMeta } from "../file-change-audit.js";
@@ -105,6 +106,8 @@ export interface SessionConnection {
   ): Promise<v2.RequestPermissionResponse>;
   /** The elicitation modes that the client advertised. */
   readonly elicitation: ElicitationSupport;
+  /** The forms of the predicted follow-up prompt that the client takes, read at `initialize`. */
+  readonly promptSuggestions: PromptSuggestionForms;
   createElicitation(
     request: CreateElicitationRequest,
     signal: AbortSignal,
@@ -261,7 +264,7 @@ export class V2Session implements RequestTarget {
     this.reports = new SessionReports({
       sessionId,
       logger: connection.logger,
-      airClient: connection.air.client,
+      promptSuggestions: connection.promptSuggestions,
       emit: (notifications) => this.output.emitV1(notifications),
       isBusy: () => this.foreground || this.pending.size > 0 || this.requests.size > 0,
       compact: () => this.compact(),
