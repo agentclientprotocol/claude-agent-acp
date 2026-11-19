@@ -8889,68 +8889,83 @@ describe("ACP v2 terminal of a command in the background", () => {
         },
       );
 
-      it("stays completed when its task ends before the result names it", async () => {
-        scriptTurns(async function* (options) {
-          yield toolUseMessage(options, "toolu_mon", "Monitor", { command: "tail -f app.log" });
-          yield level(options, [localBashMonitor]);
-          yield taskEvent(options, "task_started", {
-            ...localBashMonitor,
-            tool_use_id: "toolu_mon",
+      it.each([
+        ["with a task_notification", true],
+        ["without a task event", false],
+      ])(
+        "stays completed when its task ends before the result names it, %s",
+        async (_name, notify) => {
+          scriptTurns(async function* (options) {
+            yield toolUseMessage(options, "toolu_mon", "Monitor", { command: "tail -f app.log" });
+            yield level(options, [localBashMonitor]);
+            yield taskEvent(options, "task_started", {
+              ...localBashMonitor,
+              tool_use_id: "toolu_mon",
+            });
+            if (notify) {
+              yield monitorEvent(options, "task_notification", {
+                tool_use_id: "toolu_mon",
+                status: "completed",
+                output_file: "/tmp/tasks/mon1.output",
+                summary: "Done",
+              });
+            }
+            yield level(options, []);
+            yield {
+              ...toolResultMessage(options, "toolu_mon", {
+                content: "Monitor started (task mon1).",
+              }),
+              tool_use_result: { taskId: "mon1", timeoutMs: 0, persistent: true },
+            };
+            yield result(options);
+            yield idleState(options);
           });
-          yield monitorEvent(options, "task_notification", {
-            tool_use_id: "toolu_mon",
-            status: "completed",
-            output_file: "/tmp/tasks/mon1.output",
-            summary: "Done",
-          });
-          yield level(options, []);
-          yield {
-            ...toolResultMessage(options, "toolu_mon", { content: "Monitor started (task mon1)." }),
-            tool_use_result: { taskId: "mon1", timeoutMs: 0, persistent: true },
-          };
-          yield result(options);
-          yield idleState(options);
-        });
-        const client = await promptUntil("idle end_turn []");
+          const client = await promptUntil("idle end_turn []");
 
-        expect(toolCallTrace(client, "toolu_mon")).toEqual([
-          "running []",
-          "pending",
-          "completed",
-          "idle end_turn []",
-        ]);
-        expect(backgroundTrace(client).join(" ")).not.toContain("task_mon1");
-      });
-
-      it("ends a kept call completed when the level names a local_bash task that is not its own", async () => {
-        scriptTurns(async function* (options) {
-          yield toolUseMessage(options, "toolu_ps", "PowerShell", { command: "Start-Job" });
-          yield taskEvent(options, "task_started", {
-            task_id: "ps1",
-            task_type: "local_bash",
-            description: "PowerShell job",
-            tool_use_id: "toolu_ps",
-          });
-          yield {
-            ...toolResultMessage(options, "toolu_ps", { content: "job started" }),
-            tool_use_result: { taskId: "ps1" },
-          };
-          yield level(options, [
-            { task_id: "ps1", task_type: "local_bash", description: "PowerShell job" },
+          expect(toolCallTrace(client, "toolu_mon")).toEqual([
+            "running []",
+            "pending",
+            "completed",
+            "idle end_turn []",
           ]);
-          yield result(options);
-          yield idleState(options);
-        });
-        const client = await promptUntil("idle end_turn []");
+          expect(backgroundTrace(client).join(" ")).not.toContain("task_mon1");
+        },
+      );
 
-        expect(toolCallTrace(client, "toolu_ps")).toEqual([
-          "running []",
-          "pending",
-          "completed",
-          "idle end_turn []",
-        ]);
-        expect(backgroundTrace(client).join(" ")).not.toContain("task_ps1");
-      });
+      it.each([
+        ["with task_type at task_started", "local_bash"],
+        ["without task_type at task_started", undefined],
+      ])(
+        "ends a PowerShell call with a local_bash task completed, %s",
+        async (_name, startedType) => {
+          scriptTurns(async function* (options) {
+            yield toolUseMessage(options, "toolu_ps", "PowerShell", { command: "Start-Job" });
+            yield taskEvent(options, "task_started", {
+              task_id: "ps1",
+              ...(startedType ? { task_type: startedType } : {}),
+              description: "PowerShell job",
+              tool_use_id: "toolu_ps",
+            });
+            yield {
+              ...toolResultMessage(options, "toolu_ps", { content: "job started" }),
+              tool_use_result: { taskId: "ps1" },
+            };
+            yield level(options, [
+              { task_id: "ps1", task_type: "local_bash", description: "PowerShell job" },
+            ]);
+            yield result(options);
+            yield idleState(options);
+          });
+          const client = await promptUntil("idle end_turn []");
+
+          expect(toolCallTrace(client, "toolu_ps")).toEqual(
+            startedType
+              ? ["running []", "pending", "completed", "idle end_turn []"]
+              : ["running []", "pending", "in_progress", "completed", "idle end_turn []"],
+          );
+          expect(backgroundTrace(client).join(" ")).not.toContain("task_ps1");
+        },
+      );
 
       it("keeps a paused call paused when the task paused before the level named it", async () => {
         scriptTurns(async function* (options) {

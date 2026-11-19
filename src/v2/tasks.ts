@@ -499,9 +499,10 @@ export class SessionTasks {
         [...this.started].find(([, task]) => task.toolUseId === toolCallId)?.[0];
       if (taskId === undefined) continue;
       const task = this.level.get(taskId);
-      // A call outside TASK_TOOLS finds its task only through `this.started`,
-      // so its type is known here: a call that is not its task's entity ends
-      // with the result, also when the level names the task only later.
+      // A call outside TASK_TOOLS finds its task only through `this.started`.
+      // When task_started gave the task's type, a call that is not its task's
+      // entity ends with its result. Otherwise `levelChanged` ends it once a
+      // level gives the type.
       if (!keepsTaskCall(toolUse.name, task?.taskType ?? this.started.get(taskId)?.taskType))
         continue;
       if (!task) {
@@ -1159,6 +1160,7 @@ export class SessionTasks {
       ambient?: boolean;
     }>,
   ): void {
+    const previous = this.level;
     this.level = new Map(
       tasks.map((task) => [
         task.task_id,
@@ -1171,6 +1173,11 @@ export class SessionTasks {
         },
       ]),
     );
+    // A task that left the live set ended, also when no task event said so: a
+    // call whose task leaves the level before its result must not be kept.
+    for (const taskId of previous.keys()) {
+      if (!this.level.has(taskId)) this.endedTasks.add(taskId);
+    }
     for (const [taskId, terminal] of this.terminals) {
       if (this.level.get(taskId)?.ambient === false) terminal.leveled = true;
     }
