@@ -6,6 +6,7 @@ import {
   matchDeniedModels,
   type ModelInfo,
   type Query,
+  type SDKControlInitializeResponse,
   type Settings,
 } from "@anthropic-ai/claude-agent-sdk";
 import { AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY, withAirMeta } from "./air-extension.js";
@@ -440,6 +441,87 @@ function normalizeModelId(value: string): string {
       .replace(/-fast$/, "")
       .replace(/-\d{8}$/, "")
   );
+}
+
+/** The user's env (environment and settings) and merged `modelOverrides`. */
+export type GatewayFamilyPinUser = {
+  env: Record<string, string | undefined>;
+  modelOverrides?: Record<string, string>;
+};
+
+/**
+ * `ANTHROPIC_DEFAULT_<FAMILY>_MODEL` for each family alias that resolves to a
+ * model the gateway does not list: the newest listed version, as the gateway
+ * spells it (`claude-sonnet-5` when Sonnet 5.5 is missing). Skips families
+ * the gateway serves, defaults the user set in `user.env`, and a resolved
+ * model that is a `user.modelOverrides` target: Claude Code applies an
+ * override only to the id it resolves, so a pin would turn it off.
+ */
+export function gatewayFamilyPins(
+  sdkModels: readonly ModelInfo[],
+  listedModelIds: readonly string[],
+  user: GatewayFamilyPinUser,
+): Record<string, string> {
+  const listed = new Set(listedModelIds.map(normalizeModelId));
+  const overrideTargets = new Set(
+    Object.values(user.modelOverrides ?? {}).map((target) => normalizeModelId(target)),
+  );
+  const pins: Record<string, string> = {};
+  for (const family of MODEL_FAMILY_ALIASES) {
+    const key = `ANTHROPIC_DEFAULT_${family.toUpperCase()}_MODEL`;
+    const resolved = sdkModels.find((model) => model.value === family)?.resolvedModel;
+    if (!resolved || user.env[key]) continue;
+    const resolvedId = normalizeModelId(resolved);
+    if (listed.has(resolvedId) || overrideTargets.has(resolvedId)) continue;
+    const pattern = new RegExp(`^claude-${family}-(\\d+)(?:-(\\d+))?$`);
+    let best: { id: string; major: number; minor: number } | undefined;
+    for (const id of listedModelIds) {
+      // Not a `-fast` (Bedrock: `-fast-v1:0`), 1M-context (`[1m]`, `-1m`) or
+      // OpenRouter `:free`/`:batch` variant.
+      if (/-fast(?:-v\d+(?::\d+)?)?$|\[\d+m\]$|-\d+m$|:[a-z][a-z0-9-]*$/i.test(id.trim())) continue;
+      const match = normalizeModelId(id).match(pattern);
+      if (!match) continue;
+      const major = Number(match[1]);
+      const minor = Number(match[2] ?? 0);
+      if (
+        !best ||
+        major > best.major ||
+        (major === best.major && minor > best.minor) ||
+        // Same version: the shorter, undated id.
+        (major === best.major && minor === best.minor && id.length < best.id.length)
+      ) {
+        best = { id, major, minor };
+      }
+    }
+    if (best) pins[key] = best.id;
+  }
+  return pins;
+}
+
+/**
+ * Applies `gatewayFamilyPins` through the flag settings, resending `flagEnv`
+ * (the provider route), and returns the initialize response after them, or
+ * `initialization` when no pin applies or a call fails. `supportedModels`
+ * keeps the startup list, so `reinitialize` reads the models again. It also
+ * cancels pending hook callbacks: call it before the first prompt.
+ */
+export async function withGatewayFamilyPins(
+  query: Pick<Query, "applyFlagSettings" | "reinitialize">,
+  initialization: SDKControlInitializeResponse,
+  listedModelIds: readonly string[],
+  user: GatewayFamilyPinUser,
+  flagEnv: Record<string, string> | undefined,
+  logger: ModelLogger,
+): Promise<SDKControlInitializeResponse> {
+  const pins = gatewayFamilyPins(initialization.models, listedModelIds, user);
+  if (Object.keys(pins).length === 0) return initialization;
+  try {
+    await query.applyFlagSettings({ env: { ...flagEnv, ...pins } });
+    return await query.reinitialize();
+  } catch (error) {
+    logger.error("Could not set the gateway's family defaults:", error);
+    return initialization;
+  }
 }
 
 /** A path that no model id starts with. Nothing enforces that no

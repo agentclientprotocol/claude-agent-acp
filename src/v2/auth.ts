@@ -56,6 +56,8 @@ export interface SessionRouting {
    * project settings could restore another `ANTHROPIC_BASE_URL` otherwise.
    */
   settings?: Settings;
+  /** The model ids the provider's gateway listed, if it listed them. */
+  listedModels?: readonly string[];
   /** The models the session offers: those the provider's gateway listed. */
   models(models: ModelInfo[]): ModelInfo[];
   /** Whether {@link models} narrows the models to a gateway's list. */
@@ -243,6 +245,7 @@ export class V2Auth {
     const env = createEnvForProvider(config);
     return {
       env,
+      ...(config?.listedModels ? { listedModels: config.listedModels } : {}),
       ...(config ? { settings: { apiKeyHelper: "", env } } : {}),
       models: (models) =>
         config?.listedModels

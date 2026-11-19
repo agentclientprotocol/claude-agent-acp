@@ -1,7 +1,11 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { randomUUID } from "crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { createServer } from "node:http";
+import os from "node:os";
+import path from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
+import type { ModelInfo, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk/unstable";
 import {
   aliasResumedModelRow,
@@ -10,8 +14,10 @@ import {
   deniedModelIds,
   matchResumedModel,
   modelEntryFor,
+  withGatewayFamilyPins,
 } from "../session-model.js";
 import { effortFlagSettings, settingsEffortForModel } from "../session-effort.js";
+import { Pushable } from "../utils.js";
 
 // Mirrors a real `supportedModels()` response: alias rows carry
 // `resolvedModel`, and "Sonnet 5" has no `major.minor` dot unlike older
@@ -496,6 +502,62 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("model resolution (real SDK)
       q.return(undefined);
     }
   }, 30000);
+});
+
+// The pins rely on Claude Code recomputing its model list on `reinitialize`,
+// which the SDK does not document. A local gateway that answers nothing keeps
+// the CLI off the network, so no API key is needed.
+describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("gateway family pins (real SDK)", () => {
+  it("resolves the family alias to the pinned model after reinitialize", async () => {
+    const gateway = createServer((_, res) => res.writeHead(404).end());
+    await new Promise<void>((resolve) => gateway.listen(0, "127.0.0.1", resolve));
+    const { port } = gateway.address() as { port: number };
+    const route = { ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}` };
+    const home = await mkdtemp(path.join(os.tmpdir(), "acp-pins-"));
+    // No prompt: the session only starts.
+    const input = new Pushable<SDKUserMessage>();
+    const q = query({
+      prompt: input,
+      options: {
+        sessionId: randomUUID(),
+        cwd: home,
+        settingSources: [],
+        settings: { env: route },
+        env: {
+          PATH: process.env.PATH,
+          HOME: home,
+          CLAUDE_CONFIG_DIR: path.join(home, ".claude"),
+          ANTHROPIC_API_KEY: "sk-ant-test",
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+          ...route,
+        },
+      },
+    });
+    try {
+      const startup = await q.initializationResult();
+      const sonnet = startup.models.find((model) => model.value === "sonnet");
+      expect(sonnet?.resolvedModel).not.toBe("claude-sonnet-4-6");
+      const pinned = await withGatewayFamilyPins(
+        q,
+        startup,
+        ["claude-sonnet-4-6"],
+        { env: {} },
+        route,
+        {
+          log: vi.fn(),
+          error: vi.fn(),
+        },
+      );
+      expect(pinned.models.find((model) => model.value === "sonnet")?.resolvedModel).toBe(
+        "claude-sonnet-4-6",
+      );
+    } finally {
+      input.end();
+      q.close();
+      gateway.close();
+      await rm(home, { recursive: true, force: true, maxRetries: 5 });
+    }
+  }, 60000);
 });
 
 describe("settingsEffortForModel", () => {

@@ -377,6 +377,7 @@ import {
   resolveModelPreference,
   type SessionModelState,
   withCurrentModelInfo,
+  withGatewayFamilyPins,
 } from "../session-model.js";
 import {
   createEnvForProvider,
@@ -10500,6 +10501,20 @@ export class ClaudeAcpAgent {
       const { availableModels: settingsAvailableModels, modelOverrides: settingsModelOverrides } =
         settingsManager.getModelSelectionSettings(configuredSettingsObject);
       const resumedModel = await resumedModelHint;
+      // Pin the families the gateway lacks (`withGatewayFamilyPins`).
+      if (resolvedProvider?.listedModels) {
+        initializationResult = await withGatewayFamilyPins(
+          q,
+          initializationResult,
+          resolvedProvider.listedModels,
+          {
+            env: { ...env, ...settingsManager.getSettings().env, ...configuredSettingsObject?.env },
+            modelOverrides: settingsModelOverrides,
+          },
+          settings?.env,
+          this.logger,
+        );
+      }
       // A resumed Fable 5.2 session lists Fable 5.2 as `fable`, as a new
       // session does (see `aliasResumedModelRow`).
       const sdkModels = aliasResumedModelRow(
