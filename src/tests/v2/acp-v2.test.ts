@@ -529,11 +529,11 @@ describe("ACP v2 sessions", () => {
       linear: { type: "http", url: "https://mcp.linear.app/mcp" },
     });
     expect(response).not.toHaveProperty("modes");
-    expect(response.configOptions?.map((option) => option.configId)).toEqual(["mode", "model"]);
+    expect(response.configOptions?.map((option) => option.configId)).toEqual(["model", "mode"]);
     for (const option of response.configOptions ?? []) {
       expect(option).not.toHaveProperty("id");
     }
-    expect(response.configOptions?.[0]).toMatchObject({ category: "mode", type: "select" });
+    expect(response.configOptions?.[1]).toMatchObject({ category: "mode", type: "select" });
     // The commands come in the response, so no update repeats them.
     expect(response.availableCommands).toEqual(SESSION_COMMANDS);
     expect(client.updates("available_commands_update")).toEqual([]);
@@ -726,7 +726,7 @@ describe("ACP v2 sessions", () => {
       const resumed = await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
       expect(sdk.queryOptions.at(-1)?.resume).toBe(sessionId);
       expect(resumed).not.toHaveProperty("modes");
-      expect(resumed.configOptions?.[0].configId).toBe("mode");
+      expect(resumed.configOptions?.map((option) => option.configId)).toEqual(["model", "mode"]);
 
       // Both cores replay only from the start. Another cursor is rejected,
       // and the session is not resumed without its replay.
@@ -1117,7 +1117,7 @@ describe("ACP v2 sessions", () => {
       },
     );
 
-    expect(response.configOptions[0]).toMatchObject({ configId: "mode", currentValue: "plan" });
+    expect(response.configOptions[1]).toMatchObject({ configId: "mode", currentValue: "plan" });
     expect(client.updates("current_mode_update")).toEqual([]);
     // The client also gets the change as an update, before the response.
     expect(updatesBeforeResponse).toEqual([
@@ -1203,13 +1203,22 @@ describe("ACP v2 sessions", () => {
       // Every v2 client takes boolean options. The built-in subagents are no
       // main-thread agent.
       expect(values(created.configOptions)).toEqual({
-        mode: ["select", "auto"],
         model: ["select", "claude-opus-4-8"],
         effort: ["select", "default"],
         fast: ["boolean", false],
         ultracode: ["boolean", false],
+        mode: ["select", "auto"],
         agent: ["select", "default"],
       });
+      // The client lists them in this order.
+      expect(created.configOptions?.map((option) => option.configId)).toEqual([
+        "model",
+        "effort",
+        "fast",
+        "ultracode",
+        "mode",
+        "agent",
+      ]);
       expect(created.configOptions?.find((option) => option.configId === "agent")).toMatchObject({
         options: [
           { value: "default", name: "Default" },
@@ -1458,10 +1467,16 @@ describe("ACP v2 sessions", () => {
 
       // Effort, Fast mode and ultracode show only on a model that has them.
       expect(values(response.configOptions)).toEqual({
-        mode: ["select", "auto"],
         model: ["select", "claude-haiku-4-5"],
+        mode: ["select", "auto"],
         agent: ["select", "default"],
       });
+      // The rebuilt list keeps the order of session/new.
+      expect(response.configOptions.map((option) => option.configId)).toEqual([
+        "model",
+        "mode",
+        "agent",
+      ]);
       // The pin the new model cannot run is cleared in Claude Code too.
       expect(sdk.flagSettings).toEqual([{ effortLevel: "high" }, { effortLevel: null }]);
     });
@@ -6549,10 +6564,10 @@ describe("ACP v2 requests that subagents make", () => {
           : [],
       );
       // The hook's options, then all of them again with the model of the
-      // child's response, the mode first.
+      // child's response, in the root session's order: the model first.
       expect(configurations).toEqual([
-        ["mode=acceptEdits", "effort=high", "agent=Explore"],
-        ["mode=acceptEdits", "model=claude-sonnet-4-6", "effort=high", "agent=Explore"],
+        ["effort=high", "mode=acceptEdits", "agent=Explore"],
+        ["model=claude-sonnet-4-6", "effort=high", "mode=acceptEdits", "agent=Explore"],
       ]);
     });
 
@@ -6698,7 +6713,7 @@ describe("ACP v2 requests that subagents make", () => {
       // before the response.
       expect(configurations).toEqual([
         "model=claude-sonnet-4-6",
-        "mode=acceptEdits model=claude-sonnet-4-6 agent=Explore",
+        "model=claude-sonnet-4-6 mode=acceptEdits agent=Explore",
         "response",
       ]);
       // The live child's work has ended, so the replay reports its current

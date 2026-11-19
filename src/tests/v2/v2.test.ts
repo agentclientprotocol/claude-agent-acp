@@ -999,11 +999,11 @@ describe("ACP v2 core", () => {
     });
   });
 
-  it("answers session/new with the mode and model options and the commands", async () => {
+  it("answers session/new with the model and mode options and the commands", async () => {
     const client = v2Client();
     const { response, claude } = await client.connect((agent) => openSession(agent));
 
-    expect(response.configOptions?.map((option) => option.configId)).toEqual(["mode", "model"]);
+    expect(response.configOptions?.map((option) => option.configId)).toEqual(["model", "mode"]);
     expect(response.availableCommands).toEqual([
       {
         type: "command",

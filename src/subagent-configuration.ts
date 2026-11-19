@@ -2,7 +2,8 @@
  * The configuration of a subagent's session, as its hooks report it. Both
  * the v1 core (`ClaudeAcpAgent.subagentConfigurationHook`, for both forms of
  * subagent sessions) and the v2 core (`v2/child-config.ts`)
- * build a child's config options with these.
+ * build a child's config options with these, and send them in the root
+ * session's order (`orderedConfigOptions` in `session-config-options.ts`).
  */
 import type { SessionConfigOption, SessionModeState } from "@agentclientprotocol/sdk/unstable";
 import type { AgentInfo, HookInput } from "@anthropic-ai/claude-agent-sdk";
@@ -77,20 +78,4 @@ export function subagentHookOptions(
     });
   }
   return options;
-}
-
-/**
- * A child's configuration, as it goes to the client: every option it holds,
- * the mode first, then the model, the effort and the model config, then the
- * rest in the order they came.
- */
-export function orderedSubagentConfiguration(
-  options: Iterable<SessionConfigOption>,
-): SessionConfigOption[] {
-  const priority = ["mode", "model", "thought_level", "model_config"];
-  const rank = (option: SessionConfigOption) => {
-    const index = priority.indexOf(option.category ?? "");
-    return index < 0 ? priority.length : index;
-  };
-  return [...options].sort((left, right) => rank(left) - rank(right));
 }

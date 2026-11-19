@@ -295,9 +295,9 @@ describe("createSession options merging", () => {
         .at(-1)
         ?.map((option) => [option.id, option.currentValue]),
     ).toEqual([
-      ["mode", "plan"],
       ["model", "child-model"],
       ["effort", "low"],
+      ["mode", "plan"],
       ["agent", "Explore"],
     ]);
     expect(
@@ -1485,6 +1485,16 @@ describe("createSession options merging", () => {
       expect(sessionId).toBeDefined();
       expect(capturedOptions!.persistSession).toBeUndefined();
       expect(options).toEqual(created);
+    });
+
+    it("lists the options of session/new as model, effort, mode", async () => {
+      const created = await agent.newSession({ cwd, mcpServers: [] });
+      // The client lists them in this order.
+      expect(created.configOptions?.map((option) => option.id)).toEqual([
+        "model",
+        "effort",
+        "mode",
+      ]);
     });
 
     it("answers session/options of a held session with its current options, without a query", async () => {

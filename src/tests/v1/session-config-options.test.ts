@@ -38,18 +38,6 @@ const MOCK_MODELS = {
 
 const MOCK_CONFIG_OPTIONS = [
   {
-    id: "mode",
-    name: "Mode",
-    type: "select",
-    category: "mode",
-    currentValue: "default",
-    options: MOCK_MODES.availableModes.map((m) => ({
-      value: m.id,
-      name: m.name,
-      description: m.description,
-    })),
-  },
-  {
     id: "model",
     name: "Model",
     type: "select",
@@ -74,6 +62,18 @@ const MOCK_CONFIG_OPTIONS = [
       { value: "medium", name: "Medium" },
       { value: "high", name: "High" },
     ],
+  },
+  {
+    id: "mode",
+    name: "Mode",
+    type: "select",
+    category: "mode",
+    currentValue: "default",
+    options: MOCK_MODES.availableModes.map((m) => ({
+      value: m.id,
+      name: m.name,
+      description: m.description,
+    })),
   },
 ];
 
