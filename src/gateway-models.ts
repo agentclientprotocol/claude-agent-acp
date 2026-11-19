@@ -163,8 +163,9 @@ function stringField(entries: unknown[], field: string): string[] {
 
 /**
  * Reads `endpoint` page by page; `parse` returns `undefined` for a body it does
- * not understand. A 4xx answer on any page means the gateway has no listing:
- * the result is `undefined`, and nothing is narrowed.
+ * not understand. A 401/403 answer means the gateway rejected the token and is
+ * surfaced as a {@link GatewayListingError}; any other 4xx answer means the
+ * gateway has no listing: the result is `undefined`, and nothing is narrowed.
  */
 async function listPages(
   endpoint: string,
@@ -194,6 +195,11 @@ async function listPages(
       body = await response.text();
     } catch (error) {
       throw failure(`failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (response.status === 401 || response.status === 403) {
+      // A rejected or expired token is not a gateway without a listing: say so,
+      // so `providers/set` fails instead of offering models the gateway refuses.
+      throw failure(`returned ${response.status}: the gateway rejected the token`);
     }
     if (response.status >= 400 && response.status < 500) {
       logger.log(

@@ -88,7 +88,7 @@ describe("listGatewayModels", () => {
 });
 
 describe("gateways without a listing", () => {
-  it.each([400, 401, 403, 404, 405, 429])("returns undefined for a %s answer", async (status) => {
+  it.each([400, 404, 405, 429])("returns undefined for a %s answer", async (status) => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => new Response("no", { status })),
@@ -97,6 +97,25 @@ describe("gateways without a listing", () => {
     await expect(listGatewayModels("https://gateway.example", {}, logger)).resolves.toBe(undefined);
     await expect(listBedrockModels("https://gateway.example", {}, logger)).resolves.toBe(undefined);
   });
+});
+
+describe("a rejected gateway token", () => {
+  it.each([401, 403])(
+    "surfaces a %s answer instead of treating it as no listing",
+    async (status) => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => new Response("nope", { status })),
+      );
+
+      await expect(listGatewayModels("https://gateway.example", {}, logger)).rejects.toThrow(
+        `Model listing GET /v1/models returned ${status}: the gateway rejected the token`,
+      );
+      await expect(listBedrockModels("https://gateway.example", {}, logger)).rejects.toThrow(
+        `Model listing GET /foundation-models returned ${status}: the gateway rejected the token`,
+      );
+    },
+  );
 });
 
 describe("listing request guards", () => {
