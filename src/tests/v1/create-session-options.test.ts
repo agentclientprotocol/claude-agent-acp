@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, onTestFinished, vi } from "vitest";
 import {
   CreateElicitationRequest,
   RequestError,
@@ -643,13 +643,19 @@ describe("createSession options merging", () => {
       own: "initialize",
     },
   ])("$name", async ({ option, own }) => {
+    // A CLI that CLAUDE_CODE_EXECUTABLE names gets both in flags.
+    // `vitest.config.ts` sets the variable for unit runs only.
+    vi.stubEnv("CLAUDE_CODE_EXECUTABLE", "/usr/bin/false");
+    onTestFinished(() => {
+      vi.unstubAllEnvs();
+    });
+
     await agent.newSession({
       cwd: process.cwd(),
       mcpServers: [],
       ...(own && { _meta: { claudeCode: { options: { [option]: own } } } }),
     });
 
-    // Unit runs name a CLI with CLAUDE_CODE_EXECUTABLE (see `vitest.config.ts`).
     expect((capturedOptions as Record<string, unknown>)[option]).toBe(own ?? "argv");
   });
 
