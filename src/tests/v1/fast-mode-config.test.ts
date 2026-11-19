@@ -54,7 +54,7 @@ describe("createFastModeConfigOption", () => {
       id: FAST_MODE_CONFIG_ID,
       name: "Fast mode",
       description: expect.any(String),
-      category: "model_config",
+      category: "speed",
       type: "boolean",
       currentValue: true,
     });
@@ -102,16 +102,17 @@ describe("createFastModeConfigOption", () => {
     );
   });
 
-  it("falls back to an on/off select when the client did not opt in", () => {
+  it("falls back to a select that lists off before on when the client did not opt in", () => {
     const option = createFastModeConfigOption(false, false);
     expect(option).toMatchObject({
       id: FAST_MODE_CONFIG_ID,
       type: "select",
-      category: "model_config",
+      category: "speed",
       currentValue: FAST_MODE_OFF,
+      // ACP: the values of a `speed` select go from slowest to fastest.
       options: [
-        { value: FAST_MODE_ON, name: "On" },
         { value: FAST_MODE_OFF, name: "Off" },
+        { value: FAST_MODE_ON, name: "On" },
       ],
     });
     expect(option).not.toHaveProperty("currentValue", true);
