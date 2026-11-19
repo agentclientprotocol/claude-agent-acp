@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.109.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.108.1...v0.109.0) (2026-11-19)
+
+
+### Features
+
+* announce session cursors on v2 and fork at a cursor ([#1658](https://github.com/agentclientprotocol/claude-agent-acp/issues/1658)) ([5075d2e](https://github.com/agentclientprotocol/claude-agent-acp/commit/5075d2e0dffed68c4c1417d67c1c1e3ed43e6549))
+* insert one message per idempotencyKey on v2 session/prompt ([#1657](https://github.com/agentclientprotocol/claude-agent-acp/issues/1657)) ([1c0792e](https://github.com/agentclientprotocol/claude-agent-acp/commit/1c0792ea8cbdfb96ac2afb1f675e4309446d0e5c))
+* order config options as model, effort, fast, ultracode, mode, agent ([#1666](https://github.com/agentclientprotocol/claude-agent-acp/issues/1666)) ([f31da7f](https://github.com/agentclientprotocol/claude-agent-acp/commit/f31da7f9f5264eb2b57fbda577ac35141eb530c8))
+* report Fast mode in the speed config option category ([#1659](https://github.com/agentclientprotocol/claude-agent-acp/issues/1659)) ([8990c24](https://github.com/agentclientprotocol/claude-agent-acp/commit/8990c2441d3d45cb4781cd81316b3ffbafee85ee))
+* send the predicted next prompt as prompt_suggestions_update ([#1660](https://github.com/agentclientprotocol/claude-agent-acp/issues/1660)) ([f20ed1d](https://github.com/agentclientprotocol/claude-agent-acp/commit/f20ed1d96ac786af36b6bee3b4d5925a85b6d7ae))
+
+
+### Bug Fixes
+
+* send a session's settings to Claude Code over stdin ([#1669](https://github.com/agentclientprotocol/claude-agent-acp/issues/1669)) ([a768a9f](https://github.com/agentclientprotocol/claude-agent-acp/commit/a768a9f50c65b66b9f2d5806909a1db643fe3b6e))
+* update to @anthropic-ai/claude-agent-sdk 0.3.328 ([#1668](https://github.com/agentclientprotocol/claude-agent-acp/issues/1668)) ([6e30711](https://github.com/agentclientprotocol/claude-agent-acp/commit/6e307116d461af22fb5d42eb4b8fbdb3643c6d6c))
+
 ## [0.108.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.108.0...v0.108.1) (2026-11-18)
 
 
