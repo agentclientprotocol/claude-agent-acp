@@ -30656,10 +30656,12 @@ describe("agent selection config option", () => {
       const q = {
         supportedAgents: async () => [
           { name: "claude", description: "catch-all" },
+          { name: "claude-code-guide", description: "guide" },
           { name: "Explore", description: "search" },
           { name: "general-purpose", description: "gp" },
           { name: "Plan", description: "architect" },
           { name: "statusline-setup", description: "status" },
+          { name: "web-fetch", description: "fetch" },
           { name: "my-reviewer", description: "Reviews code" },
           { name: "my-writer", description: "Writes docs" },
         ],
