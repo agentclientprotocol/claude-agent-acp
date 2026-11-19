@@ -30161,7 +30161,7 @@ describe("streamEventToAcpNotifications", () => {
         name: "mcp__demo__search",
         type: "mcp_tool_use" as const,
         partialJson: '{"query":"custom MCP query","options":',
-        title: "mcp__demo__search",
+        title: "demo: search",
         rawInput: { query: "custom MCP query" },
       },
     ])("refines $case before the full JSON object completes", (testCase) => {
