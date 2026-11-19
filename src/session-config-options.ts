@@ -1,7 +1,8 @@
 /**
  * The config options of a session, as both the v1 core and the v2 core
- * build them: mode, model, effort, Fast mode, ultracode and the main-thread
- * agent.
+ * build them: model, effort, Fast mode, ultracode, mode and the main-thread
+ * agent. A client gets them in that order (`orderedConfigOptions`), for a
+ * root session and for a subagent's session.
  */
 import {
   RequestError,
@@ -15,7 +16,7 @@ import {
   AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
   clientSupportsAirCapability,
 } from "./air-extension.js";
-import { AGENT_CONFIG_ID, DEFAULT_AGENT_ID } from "./session-config-ids.js";
+import { AGENT_CONFIG_ID, DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
 import { buildEffortConfigOption } from "./session-effort.js";
 import {
   createFastModeConfigOption,
@@ -105,6 +106,36 @@ export type ConfigOptionPresentation = {
   useRecommendedValue: boolean;
 };
 
+/**
+ * The ids of a session's config options, in the order a client gets them.
+ * An option is ranked by its id and not by its `category`, which the agent
+ * option lacks.
+ */
+const CONFIG_OPTION_ORDER: readonly string[] = [
+  MODEL_CONFIG_ID,
+  EFFORT_CONFIG_ID,
+  FAST_MODE_CONFIG_ID,
+  ULTRACODE_CONFIG_ID,
+  MODE_CONFIG_ID,
+  AGENT_CONFIG_ID,
+];
+
+/**
+ * `options` as a client gets them, for a root session and for a subagent's
+ * session: in {@link CONFIG_OPTION_ORDER}'s order, then each option with
+ * another id, in the order it came.
+ */
+export function orderedConfigOptions(
+  options: Iterable<SessionConfigOption>,
+): SessionConfigOption[] {
+  const rank = (option: SessionConfigOption) => {
+    const index = CONFIG_OPTION_ORDER.indexOf(option.id);
+    return index < 0 ? CONFIG_OPTION_ORDER.length : index;
+  };
+  return [...options].sort((left, right) => rank(left) - rank(right));
+}
+
+/** The config options of a root session, in the order a client gets them. */
 export function buildConfigOptions(
   modes: SessionModeState,
   models: SessionModelState,
@@ -116,7 +147,7 @@ export function buildConfigOptions(
   presentation?: ConfigOptionPresentation,
   ultracode?: UltracodeOptionState,
 ): SessionConfigOption[] {
-  const options: SessionConfigOption[] = [SessionModeManager.configOption(modes)];
+  const options: SessionConfigOption[] = [];
   // A gateway that lists none of the SDK's models leaves no model to offer, so
   // there is no model option at all.
   if (models.availableModels.length > 0) {
@@ -151,6 +182,8 @@ export function buildConfigOptions(
     options.push(createUltracodeConfigOption(ultracode.enabled, ultracode.useBooleanOption));
   }
 
+  options.push(SessionModeManager.configOption(modes));
+
   // Only surface the Agent picker when there's a real choice — i.e. the user
   // has configured at least one custom agent (built-ins are filtered out in
   // discoverCustomAgents). With none configured, "Default" would be the only
@@ -173,7 +206,9 @@ export function buildConfigOptions(
     });
   }
 
-  return options;
+  // The statements above already follow CONFIG_OPTION_ORDER. Sorting by it
+  // keeps this list and a subagent's list on the one definition.
+  return orderedConfigOptions(options);
 }
 
 /**

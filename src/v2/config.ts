@@ -1,6 +1,6 @@
 /**
- * The config options of a v2 session: its permission mode, model,
- * effort, Fast mode, ultracode and main-thread agent. Claude Code owns them
+ * The config options of a v2 session: its model, effort, Fast mode,
+ * ultracode, permission mode and main-thread agent. Claude Code owns them
  * all. The session sets each on the query when the client picks a value, and
  * follows the changes it learns of (an approved plan's mode, a model switch
  * that the adapter did not make, the Fast mode state that Claude Code

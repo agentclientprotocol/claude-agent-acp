@@ -963,10 +963,11 @@ describe("NativeSubagentRuntime in the RFD form", () => {
       update.sessionUpdate === "config_option_update" ? [update.configOptions] : [],
     );
     expect(configs).toHaveLength(4);
+    // The effort and the mode came first: a child's list has the root's order.
     expect(configs.at(-1)?.map((option) => [option.id, option.currentValue])).toEqual([
-      ["mode", "plan"],
       ["model", "fallback-model"],
       ["effort", "low"],
+      ["mode", "plan"],
     ]);
     expect(
       configs.at(-1)?.every((option) => option.type === "select" && option.options.length === 1),
