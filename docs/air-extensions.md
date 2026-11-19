@@ -859,6 +859,7 @@ A failed command restores the previous state.
 
 After a turn, the Claude Code CLI can predict the prompt the user is likely to send next.
 The adapter asks for it with the SDK option `promptSuggestions: true` and forwards the one prediction of the turn.
+It asks only in a session of AIR or of a client that advertises `session.promptSuggestions`, on v1 and v2: a prediction costs a request per turn, and no other client would get it.
 
 AIR reads the prediction from a `_meta` key outside the AIR namespace, which the adapter used before ACP had an update for it:
 

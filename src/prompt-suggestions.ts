@@ -3,6 +3,8 @@
  *
  * With `promptSuggestions` on, the CLI emits one `prompt_suggestion` message
  * after a turn's `result` holding the prompt it expects the user to send next.
+ * The adapter turns it on only for a client that takes the prediction
+ * ({@link promptSuggestionOptions}).
  * It reaches the client in up to two forms:
  *
  * - `prompt_suggestions_update`, ACP's unstable session update, for a client
@@ -21,6 +23,7 @@
  * turns that end with no prediction at all.
  */
 import type { SessionNotification } from "@agentclientprotocol/sdk/unstable";
+import type { Options } from "@anthropic-ai/claude-agent-sdk";
 
 type SuggestionUpdate = SessionNotification["update"];
 
@@ -41,6 +44,24 @@ export function clientTakesPromptSuggestions(
   session: { promptSuggestions?: unknown } | null | undefined,
 ): boolean {
   return session?.promptSuggestions != null;
+}
+
+/** Whether a client takes the prediction in any form. */
+function takesPrediction(forms: PromptSuggestionForms): boolean {
+  return forms.meta || forms.update;
+}
+
+/**
+ * The SDK option that makes Claude Code predict the next prompt, for a
+ * session whose client takes the prediction in a form. Empty for any other
+ * client: a prediction costs a request per turn, and none of it would reach
+ * that client. Both cores spread it before the client's own options, so
+ * `_meta.claudeCode.options.promptSuggestions: false` turns the prediction off.
+ */
+export function promptSuggestionOptions(
+  forms: PromptSuggestionForms,
+): Pick<Options, "promptSuggestions"> {
+  return takesPrediction(forms) ? { promptSuggestions: true } : {};
 }
 
 /** The `_meta` key the suggestion travels under. It names no vendor. */
@@ -148,7 +169,7 @@ export class PromptSuggestions {
    * client that takes neither: nothing of a prediction goes to it.
    */
   static forClient(forms: PromptSuggestionForms): PromptSuggestions | undefined {
-    return forms.meta || forms.update ? new PromptSuggestions(forms) : undefined;
+    return takesPrediction(forms) ? new PromptSuggestions(forms) : undefined;
   }
 
   private constructor(forms: PromptSuggestionForms) {

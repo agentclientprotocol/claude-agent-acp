@@ -98,7 +98,11 @@ import {
   toGoalSnapshot,
 } from "./goal-extension.js";
 import { checklistPlanUpdate, resetPlanUpdates, type SubagentChecklists } from "../plans.js";
-import { clientTakesPromptSuggestions, PromptSuggestions } from "../prompt-suggestions.js";
+import {
+  clientTakesPromptSuggestions,
+  promptSuggestionOptions,
+  PromptSuggestions,
+} from "../prompt-suggestions.js";
 import { savedSessionStatus, SESSION_STATUS_CAPABILITY } from "../session-status.js";
 import {
   applyInitialConfigOptions,
@@ -10190,6 +10194,10 @@ export class ClaudeAcpAgent {
     const subagentConfigHook = subagentForm(this.clientCapabilities)
       ? this.subagentConfigurationHook(sessionId)
       : undefined;
+    const suggestionForms = {
+      meta: this.toolCallCapabilities.air.client,
+      update: clientTakesPromptSuggestions(this.clientCapabilities?.session),
+    };
     const options: Options = {
       systemPrompt,
       settingSources: ["user", "project", "local"],
@@ -10208,12 +10216,14 @@ export class ClaudeAcpAgent {
       // One predicted follow-up prompt per turn, published as
       // `prompt_suggestions_update` or, for AIR, as
       // `session_info_update._meta.promptSuggestions` (see
-      // `prompt-suggestions.ts`). It rides the turn's own
+      // `prompt-suggestions.ts`). Only AIR and a client that advertised
+      // `session.promptSuggestions` get it, so no other client's session
+      // spends a request on it. It rides the turn's own
       // prompt cache, and the user can turn it off in settings.json
       // (`promptSuggestionEnabled`) or with CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false.
       // Before `userProvidedOptions`, so a client that passes
       // `promptSuggestions: false` keeps it off.
-      promptSuggestions: true,
+      ...promptSuggestionOptions(suggestionForms),
       // Before `userProvidedOptions`, so a client's own `mcpServersDelivery` wins.
       mcpServersDelivery: mcpServersDelivery(),
       ...userProvidedOptions,
@@ -10711,10 +10721,7 @@ export class ClaudeAcpAgent {
           settingsManager.getApiKeyHelper(configuredSettingsObject),
         )?.kind,
         fileChangeReporter,
-        promptSuggestions: PromptSuggestions.forClient({
-          meta: this.toolCallCapabilities.air.client,
-          update: clientTakesPromptSuggestions(this.clientCapabilities?.session),
-        }),
+        promptSuggestions: PromptSuggestions.forClient(suggestionForms),
       };
       const registered = this.sessions[sessionId];
       registered.idleCompaction = new IdleCompaction(
