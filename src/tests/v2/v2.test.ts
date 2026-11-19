@@ -2591,6 +2591,117 @@ describe("ACP v2 core", () => {
     ]);
   });
 
+  describe("session cursors", () => {
+    const stored = (type: "user" | "assistant", uuid: string, message: unknown) => ({
+      type,
+      uuid,
+      session_id: "s",
+      parent_tool_use_id: null,
+      parent_agent_id: null,
+      message,
+    });
+    /** Two turns: a fork can start before the second prompt, and not before the first. */
+    const twoTurns = [
+      stored("user", "u1", { role: "user", content: "Build it" }),
+      stored("assistant", "a1", {
+        id: "msg_a",
+        role: "assistant",
+        content: [{ type: "text", text: "Built." }],
+      }),
+      stored("user", "u2", { role: "user", content: "Test it" }),
+    ] as never;
+    const cursorOf = (messageId: string) => ({
+      sessionUpdate: "cursor_update",
+      cursorId: `before:${messageId}`,
+      capabilities: { fork: {} },
+      anchor: { type: "user_message", messageId, position: "before" },
+    });
+
+    it("announces a cursor before a prompt that follows another, and none for a slash command", async () => {
+      const client = v2Client();
+      const ids = await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const ids: string[] = [];
+        for (const [index, text] of ["Build it", "Test it", "/context"].entries()) {
+          const answer = agent.request(v2.methods.agent.session.prompt, {
+            sessionId: response.sessionId,
+            prompt: [{ type: "text", text }],
+          });
+          claude.send(lifecycle(await claude.prompt(index), "started"));
+          ids.push((await answer).messageId);
+          claude.send(result());
+          await vi.waitFor(() =>
+            expect(client.states().filter((state) => state === "idle")).toHaveLength(index + 1),
+          );
+        }
+        return ids;
+      });
+
+      const kinds = client.sessionUpdates.filter((update) =>
+        ["user_message", "cursor_update"].includes(update.sessionUpdate),
+      );
+      // The first prompt has nothing before it. The cursor follows its message.
+      expect(kinds).toEqual([
+        expect.objectContaining({ sessionUpdate: "user_message", messageId: ids[0] }),
+        expect.objectContaining({ sessionUpdate: "user_message", messageId: ids[1] }),
+        cursorOf(ids[1]!),
+        expect.objectContaining({ sessionUpdate: "user_message", messageId: ids[2] }),
+      ]);
+    });
+
+    it("replays the cursor of each user message after it, with the id of the live one", async () => {
+      vi.mocked(getSessionMessages).mockResolvedValueOnce(twoTurns);
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        await agent.request(v2.methods.agent.initialize, {
+          protocolVersion: v2.PROTOCOL_VERSION,
+          info: { name: "v2-test-client", version: "1.0.0" },
+          capabilities: {},
+        });
+        await agent.request(v2.methods.agent.session.resume, {
+          sessionId: randomUUID(),
+          cwd,
+          replayFrom: { type: "start" },
+        });
+      });
+
+      const replayed = client.sessionUpdates.slice(
+        0,
+        client.sessionUpdates.findIndex((update) => update.sessionUpdate === "replay_complete"),
+      );
+      expect(replayed.map((update) => update.sessionUpdate)).toEqual([
+        "user_message",
+        "user_message_chunk",
+        "agent_message",
+        "agent_message_chunk",
+        "user_message",
+        "user_message_chunk",
+        "cursor_update",
+      ]);
+      expect(replayed.at(-1)).toEqual(cursorOf("u2"));
+    });
+
+    it.each([
+      ["forks the history before a cursor's message", "before:u2", { upToMessageId: "a1" }],
+      ["rejects a cursor that the history does not have", "before:u9", undefined],
+    ])("%s", async (_, cursorId, forkedAt) => {
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { response } = await openSession(agent);
+        const { sessionId } = response;
+        vi.mocked(getSessionMessages).mockResolvedValueOnce(twoTurns);
+        const fork = agent.request(v2.methods.agent.session.fork, { sessionId, cwd, cursorId });
+        if (forkedAt) {
+          await fork;
+          expect(forkSession).toHaveBeenCalledExactlyOnceWith(sessionId, forkedAt);
+        } else {
+          await expect(fork).rejects.toMatchObject({ code: -32602, data: { cursorId } });
+          expect(forkSession).not.toHaveBeenCalled();
+        }
+      });
+    });
+  });
+
   it("ends the replay of an empty history with replay_complete, and sends none without replayFrom", async () => {
     const client = v2Client();
     await client.connect(async (agent) => {

@@ -153,6 +153,42 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("v2 core with Claude Code", 
     expect(userMessages()).toHaveLength(1);
     expect(states(sessionId).filter((update) => update.state === "running")).toHaveLength(1);
   }, 180_000);
+  it("forks at the cursor before a prompt, with the history that came before it", async () => {
+    const sessionId = await newSession("default");
+    const kinds = (id: string, kind: string) =>
+      updates.flatMap(({ sessionId: session, update }) =>
+        session === id && update.sessionUpdate === kind ? [update] : [],
+      );
+    const idles = () => states(sessionId).filter((update) => update.state === "idle").length;
+    await prompt(sessionId, "Reply with exactly the single word: one");
+    await until(() => idles() === 1);
+    const second = await prompt(sessionId, "Reply with exactly the single word: two");
+    await until(() => idles() === 2);
+    // The first prompt has nothing before it: only the second has a cursor.
+    const [cursor, ...others] = kinds(sessionId, "cursor_update") as v2.CursorUpdate[];
+    expect(others).toEqual([]);
+    expect(cursor).toMatchObject({
+      capabilities: { fork: {} },
+      anchor: { type: "user_message", messageId: second.messageId, position: "before" },
+    });
+
+    const fork = await agent.request(v2.methods.agent.session.fork, {
+      sessionId,
+      cwd,
+      cursorId: cursor!.cursorId,
+    });
+    await agent.request(v2.methods.agent.session.close, { sessionId: fork.sessionId });
+    await agent.request(v2.methods.agent.session.resume, {
+      sessionId: fork.sessionId,
+      cwd,
+      replayFrom: { type: "start" },
+    });
+    const replayedPrompts = kinds(fork.sessionId, "user_message_chunk").map(
+      (update) => (update as { content: { text?: string } }).content.text,
+    );
+    expect(replayedPrompts).toEqual(["Reply with exactly the single word: one"]);
+    expect(kinds(fork.sessionId, "agent_message_chunk")).not.toEqual([]);
+  }, 240_000);
 
   // No prompt: it costs no API usage.
   it("lists the tools of an MCP server that the client serves over ACP", async () => {
