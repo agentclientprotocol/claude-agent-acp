@@ -192,7 +192,7 @@ import {
 import { AuthStatusReporter, cliLogout } from "../auth-status-reporter.js";
 import { terminalAuthMethods as authMethodsForTerminal } from "../auth-methods.js";
 import { McpOverAcp, sdkMcpServers, type UnservedMcpServer } from "../mcp-servers.js";
-import { claudeCliPath, mcpServersDelivery } from "../claude-cli.js";
+import { claudeCliPath, cliDelivery } from "../claude-cli.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
@@ -10226,8 +10226,9 @@ export class ClaudeAcpAgent {
       // Before `userProvidedOptions`, so a client that passes
       // `promptSuggestions: false` keeps it off.
       ...promptSuggestionOptions(suggestionForms),
-      // Before `userProvidedOptions`, so a client's own `mcpServersDelivery` wins.
-      mcpServersDelivery: mcpServersDelivery(),
+      // Before `userProvidedOptions`, so a client's own `mcpServersDelivery`
+      // and `settingsDelivery` win.
+      ...cliDelivery(userProvidedOptions?.extraArgs),
       ...userProvidedOptions,
       // Claude Code uses the same checkpoint store for /rewind. Enable it only
       // for clients that negotiated per-turn file-change reports; this avoids

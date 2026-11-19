@@ -630,17 +630,27 @@ describe("createSession options merging", () => {
   });
 
   it.each([
-    { name: "sends MCP servers as the CLI takes them", delivery: undefined },
-    { name: "lets a caller choose the MCP delivery", delivery: "initialize" as const },
-  ])("$name", async ({ delivery }) => {
+    { name: "sends MCP servers as the CLI takes them", option: "mcpServersDelivery" },
+    {
+      name: "lets a caller choose the MCP delivery",
+      option: "mcpServersDelivery",
+      own: "initialize",
+    },
+    { name: "sends settings as the CLI takes them", option: "settingsDelivery" },
+    {
+      name: "lets a caller choose settings delivery",
+      option: "settingsDelivery",
+      own: "initialize",
+    },
+  ])("$name", async ({ option, own }) => {
     await agent.newSession({
       cwd: process.cwd(),
       mcpServers: [],
-      ...(delivery && { _meta: { claudeCode: { options: { mcpServersDelivery: delivery } } } }),
+      ...(own && { _meta: { claudeCode: { options: { [option]: own } } } }),
     });
 
     // Unit runs name a CLI with CLAUDE_CODE_EXECUTABLE (see `vitest.config.ts`).
-    expect(capturedOptions!.mcpServersDelivery).toBe(delivery ?? "argv");
+    expect((capturedOptions as Record<string, unknown>)[option]).toBe(own ?? "argv");
   });
 
   it("defaults tools to claude_code preset when not provided", async () => {

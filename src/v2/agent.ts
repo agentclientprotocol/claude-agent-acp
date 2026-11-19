@@ -35,7 +35,7 @@ import { messageIdForGrouping } from "../sdk-to-acp.js";
 import type { Logger } from "../logger.js";
 import { customAgents } from "../session-config-options.js";
 import { restrictedChild } from "../acp-subagents.js";
-import { claudeCliPath, mcpServersDelivery } from "../claude-cli.js";
+import { claudeCliPath, cliDelivery } from "../claude-cli.js";
 import { clientSystemPrompt, sessionSystemPrompt } from "../client-system-prompt.js";
 import type { ElicitationSupport } from "../elicitation.js";
 import { forkSession } from "../fork-session.js";
@@ -1102,8 +1102,9 @@ class V2Agent implements AgentHandle, SessionConnection {
       // other client's session spends a request on it.
       // Before the client's options: `promptSuggestions: false` turns it off.
       ...promptSuggestionOptions(this.promptSuggestions),
-      // Before the client's options: its own `mcpServersDelivery` wins.
-      mcpServersDelivery: mcpServersDelivery(),
+      // Before the client's options: its own `mcpServersDelivery` and
+      // `settingsDelivery` win.
+      ...cliDelivery(client?.extraArgs),
       ...client,
       // The checkpoints that AIR's file-change reports read (see
       // `file-changes.ts`), only for a client that declared them, as on v1.
