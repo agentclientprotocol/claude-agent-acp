@@ -73,6 +73,8 @@ const sdk = vi.hoisted(() => ({
   previewGate: undefined as Promise<void> | undefined,
   /** When set, Claude Code fails to start with it. */
   startFailure: undefined as Error | undefined,
+  /** When set, the SDK refuses the query's options with it: `query()` throws. */
+  optionsRefusal: undefined as Error | undefined,
   /** When set, Claude Code's start waits for it. */
   startGate: undefined as Promise<void> | undefined,
   /** When set, the query serves Remote Control with it (`enableRemoteControl`). */
@@ -86,6 +88,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   return {
     ...actual,
     query: ({ prompt, options }: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => {
+      if (sdk.optionsRefusal) throw sdk.optionsRefusal;
       const queue: Array<IteratorResult<Record<string, unknown>> | Error> = [];
       let wake = () => {};
       const prompts: SDKUserMessage[] = [];
@@ -219,6 +222,7 @@ beforeEach(async () => {
   sdk.subagents = new Map();
   sdk.previewGate = undefined;
   sdk.startFailure = undefined;
+  sdk.optionsRefusal = undefined;
   sdk.startGate = undefined;
   sdk.enableRemoteControl = undefined;
   vi.mocked(forkSession).mockClear();
@@ -3535,6 +3539,31 @@ describe("ACP v2 core", () => {
     });
 
     expect(error).toBeDefined();
+    expect(disposed).toHaveBeenCalledTimes(initialized.mock.calls.length);
+    initialized.mockRestore();
+    disposed.mockRestore();
+  });
+
+  it("disposes the settings of a session whose options the SDK refuses", async () => {
+    // What SDK 0.3.328 throws from `query()` for a hook matcher without `hooks`.
+    sdk.optionsRefusal = new Error(
+      "The session was not started, because the hooks option can't be sent to Claude Code: " +
+        "hooks.PreToolUse[0].hooks must be an array of callbacks. Fix that value and try again.",
+    );
+    const initialized = vi.spyOn(SettingsManager.prototype, "initialize");
+    const disposed = vi.spyOn(SettingsManager.prototype, "dispose");
+    const client = v2Client();
+    const error = await client.connect(async (agent) => {
+      await agent.request(v2.methods.agent.initialize, {
+        protocolVersion: v2.PROTOCOL_VERSION,
+        info: { name: "v2-test-client", version: "1.0.0" },
+        capabilities: {},
+      });
+      return agent.request(v2.methods.agent.session.new, { cwd }).catch((error: unknown) => error);
+    });
+
+    expect(error).toMatchObject({ data: { details: sdk.optionsRefusal.message } });
+    expect(initialized).toHaveBeenCalled();
     expect(disposed).toHaveBeenCalledTimes(initialized.mock.calls.length);
     initialized.mockRestore();
     disposed.mockRestore();

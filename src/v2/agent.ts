@@ -26,6 +26,7 @@ import {
   listSessions,
   query,
   type Options,
+  type Query,
   type SDKUserMessage,
   type SessionMessage,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -1175,7 +1176,16 @@ class V2Agent implements AgentHandle, SessionConnection {
       ...(resume !== undefined ? { resume } : { sessionId }),
       ...(persist ? {} : { persistSession: false }),
     };
-    const q = query({ prompt: input, options });
+    let q: Query;
+    try {
+      q = query({ prompt: input, options });
+    } catch (error) {
+      // The SDK refuses options that it cannot send to Claude Code, e.g. a
+      // client's hook matcher without `hooks`: "hooks.PreToolUse[0].hooks must
+      // be an array of callbacks".
+      settings.dispose();
+      throw error;
+    }
     let initialization;
     try {
       initialization = await q.initializationResult();
