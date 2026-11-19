@@ -70,9 +70,15 @@ export function v2ElicitationRequest(
       return [name, rest];
     }),
   );
+  const fields = Object.entries(requestedSchema.properties ?? {})
+    .filter(([, property]) => isCustomAnswer(property._meta))
+    .map(([key]) => key);
   return {
     ...request,
     requestedSchema: { ...requestedSchema, properties },
+    ...(fields.length === 0
+      ? {}
+      : { _meta: withAirMeta(request._meta, AIR_CUSTOM_ANSWER_FIELDS_KEY, fields) }),
   } as v2.CreateElicitationRequest;
 }
 
@@ -278,21 +284,6 @@ export class SessionElicitations {
       releases.add(release);
     });
   }
-}
-
-/** Copies AIR companion keys into request metadata. The v2 property types do not retain `_meta`. */
-export function v2ElicitationRequest(
-  request: CreateElicitationRequest,
-): v2.CreateElicitationRequest {
-  if (!CreateElicitationRequest.isForm(request)) return request as v2.CreateElicitationRequest;
-  const fields = Object.entries(request.requestedSchema.properties ?? {})
-    .filter(([, property]) => isCustomAnswer(property._meta))
-    .map(([key]) => key);
-  if (fields.length === 0) return request as v2.CreateElicitationRequest;
-  return {
-    ...request,
-    _meta: withAirMeta(request._meta, AIR_CUSTOM_ANSWER_FIELDS_KEY, fields),
-  } as v2.CreateElicitationRequest;
 }
 
 function isCustomAnswer(meta: unknown): boolean {
