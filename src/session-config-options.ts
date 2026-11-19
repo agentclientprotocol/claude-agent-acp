@@ -44,12 +44,25 @@ import {
 // personas, so we filter them out and only surface the Agent picker when the
 // user (or a plugin/project) has configured custom agents. Update this set if
 // the SDK's built-in roster changes.
+//
+// The set is matched by name because `AgentInfo` does not say where an agent
+// comes from. `getContextUsage().agents` lists only the agents that are not
+// built in, but session setup does not wait for that request (see
+// `readContextWindow`).
+//
+// Claude Code does not list two of them in every session: `web-fetch` only
+// where its staged rollout or `CLAUDE_CODE_WEB_FETCH_AGENT=1` turns it on, and
+// `claude-code-guide` only where the adapter's environment sets
+// `CLAUDE_CODE_ENTRYPOINT` (the SDK sets `sdk-ts` when it is unset, and Claude
+// Code leaves the agent out for that value).
 export const BUILTIN_AGENT_NAMES = new Set([
   "claude",
+  "claude-code-guide",
   "general-purpose",
   "Explore",
   "Plan",
   "statusline-setup",
+  "web-fetch",
 ]);
 
 // Value of the synthetic "Default" entry in the agent picker, which maps to the
