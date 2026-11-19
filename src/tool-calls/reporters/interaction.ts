@@ -197,7 +197,11 @@ export class GenericReporter implements ToolReporter {
 
   toolUse(input: unknown): ToolUseFacts {
     if (this.toolName !== "Other") {
-      return { title: this.toolName || "Unknown Tool", kind: "other" };
+      const mcp = mcpToolName(this.toolName);
+      return {
+        title: mcp ? `${mcp.server}: ${mcp.tool}` : this.toolName || "Unknown Tool",
+        kind: "other",
+      };
     }
     let json;
     try {
@@ -211,6 +215,22 @@ export class GenericReporter implements ToolReporter {
       display: [textContent(`\`\`\`json\n${json}\`\`\``)],
     };
   }
+}
+
+/**
+ * Splits `mcp__<server>__<tool>` the way Claude Code does: the server is the
+ * segment up to the next `__`, the tool is the whole rest. `server` is the
+ * normalized name, not the config key.
+ */
+export function mcpToolName(name: string): { server: string; tool: string } | undefined {
+  const prefix = "mcp__";
+  if (!name.startsWith(prefix)) return undefined;
+  const rest = name.slice(prefix.length);
+  const separator = rest.indexOf("__");
+  if (separator <= 0) return undefined;
+  const tool = rest.slice(separator + 2);
+  if (!tool) return undefined;
+  return { server: rest.slice(0, separator), tool };
 }
 
 /**
