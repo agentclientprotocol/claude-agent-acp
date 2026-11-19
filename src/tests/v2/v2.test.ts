@@ -1024,9 +1024,23 @@ describe("ACP v2 core", () => {
   });
 
   it.each([
-    { name: "sends MCP servers as the CLI takes them", delivery: undefined },
-    { name: "lets the client choose the MCP delivery", delivery: "initialize" },
-  ])("$name", async ({ delivery }) => {
+    { name: "sends MCP servers as the CLI takes them", option: "mcpServersDelivery" },
+    {
+      name: "lets the client choose the MCP delivery",
+      option: "mcpServersDelivery",
+      own: "initialize",
+    },
+    { name: "sends settings as the CLI takes them", option: "settingsDelivery" },
+    {
+      name: "lets the client choose settings delivery",
+      option: "settingsDelivery",
+      own: "initialize",
+    },
+  ])("$name", async ({ option, own }) => {
+    // A CLI that CLAUDE_CODE_EXECUTABLE names gets both in flags.
+    // `vitest.config.ts` sets the variable for unit runs only.
+    vi.stubEnv("CLAUDE_CODE_EXECUTABLE", "/usr/bin/false");
+
     const client = v2Client();
     await client.connect(async (agent) => {
       await agent.request(v2.methods.agent.initialize, {
@@ -1036,12 +1050,11 @@ describe("ACP v2 core", () => {
       });
       await agent.request(v2.methods.agent.session.new, {
         cwd,
-        ...(delivery && { _meta: { claudeCode: { options: { mcpServersDelivery: delivery } } } }),
+        ...(own && { _meta: { claudeCode: { options: { [option]: own } } } }),
       });
     });
 
-    // Unit runs name a CLI with CLAUDE_CODE_EXECUTABLE (see `vitest.config.ts`).
-    expect(sdk.processes[0].options.mcpServersDelivery).toBe(delivery ?? "argv");
+    expect((sdk.processes[0].options as Record<string, unknown>)[option]).toBe(own ?? "argv");
   });
 
   it("answers a prompt when Claude Code starts it, and reports the work until the turn's result", async () => {

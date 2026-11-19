@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, onTestFinished, vi } from "vitest";
 import {
   CreateElicitationRequest,
   RequestError,
@@ -630,17 +630,33 @@ describe("createSession options merging", () => {
   });
 
   it.each([
-    { name: "sends MCP servers as the CLI takes them", delivery: undefined },
-    { name: "lets a caller choose the MCP delivery", delivery: "initialize" as const },
-  ])("$name", async ({ delivery }) => {
+    { name: "sends MCP servers as the CLI takes them", option: "mcpServersDelivery" },
+    {
+      name: "lets a caller choose the MCP delivery",
+      option: "mcpServersDelivery",
+      own: "initialize",
+    },
+    { name: "sends settings as the CLI takes them", option: "settingsDelivery" },
+    {
+      name: "lets a caller choose settings delivery",
+      option: "settingsDelivery",
+      own: "initialize",
+    },
+  ])("$name", async ({ option, own }) => {
+    // A CLI that CLAUDE_CODE_EXECUTABLE names gets both in flags.
+    // `vitest.config.ts` sets the variable for unit runs only.
+    vi.stubEnv("CLAUDE_CODE_EXECUTABLE", "/usr/bin/false");
+    onTestFinished(() => {
+      vi.unstubAllEnvs();
+    });
+
     await agent.newSession({
       cwd: process.cwd(),
       mcpServers: [],
-      ...(delivery && { _meta: { claudeCode: { options: { mcpServersDelivery: delivery } } } }),
+      ...(own && { _meta: { claudeCode: { options: { [option]: own } } } }),
     });
 
-    // Unit runs name a CLI with CLAUDE_CODE_EXECUTABLE (see `vitest.config.ts`).
-    expect(capturedOptions!.mcpServersDelivery).toBe(delivery ?? "argv");
+    expect((capturedOptions as Record<string, unknown>)[option]).toBe(own ?? "argv");
   });
 
   it("defaults tools to claude_code preset when not provided", async () => {

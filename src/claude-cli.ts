@@ -31,26 +31,44 @@ export async function claudeCliPath(): Promise<string> {
   return installedClaudeCliPath();
 }
 
+/** How an option reaches the Claude CLI: in a flag, or over stdin in the SDK's initialize request. */
+type Delivery = NonNullable<Options["mcpServersDelivery"]>;
+
 /**
- * How a session's MCP servers reach the CLI of {@link claudeCliPath}, unless
- * the client's options name a `mcpServersDelivery`.
+ * The SDK options that say how a session's MCP servers and its `settings`
+ * reach the CLI of {@link claudeCliPath}. A client's own options replace them.
  *
  * - `'initialize'` for the CLI that the adapter ships: over stdin, in the
- *   SDK's initialize request. A server's `env` and `headers`, such as the
- *   bearer token of an MCP-over-ACP endpoint (see `McpOverAcp`), stay off the
- *   CLI's command line, which other users of the machine can read. Only a
- *   launch that the client's options give `--sdk-url` still gets them there.
+ *   SDK's initialize request.
  * - `'argv'` for a CLI that `CLAUDE_CODE_EXECUTABLE` names: in the
- *   `--mcp-config` flag, so on its command line, as before SDK 0.3.326. Its
- *   version is not known, and the SDK ends the session at startup when the CLI
- *   cannot read the servers from the initialize request (e.g. 2.1.323).
+ *   `--mcp-config` and `--settings` flags, as before SDK 0.3.326. Its version
+ *   is not known, and a CLI that cannot take them over stdin fails the session
+ *   at startup (2.1.323: "too old to read MCP servers from the initialize
+ *   request", "unknown option '--initialize-fields=settings'").
+ * - `settings` stay `'argv'` when the client's `extraArgs` hold `settings`:
+ *   Claude Code refuses to start with both ("--initialize-fields=settings
+ *   cannot be used with --settings"), and in the flag the `settings` option
+ *   replaces that argument. They also stay `'argv'` with `sdk-url` in the
+ *   `extraArgs`: such a session cannot read the request at launch, and the SDK
+ *   sends its MCP servers in the flag for the same reason.
  *
- * The adapter always sets the option. It names the CLI to start
+ * The SDK reads `settingsDelivery` (0.3.328) but does not declare it in
+ * `sdk.d.ts`, so nothing fails to compile if a later SDK drops it. The v2
+ * integration tests check the delivery against the real CLI.
+ *
+ * `mcpServersDelivery` is always set. The adapter names the CLI to start
  * (`pathToClaudeCodeExecutable`), and for such an app the SDK prints a
  * `DeprecationWarning` when a session has MCP servers and the option is unset.
  */
-export function mcpServersDelivery(): NonNullable<Options["mcpServersDelivery"]> {
-  return process.env.CLAUDE_CODE_EXECUTABLE ? "argv" : "initialize";
+export function cliDelivery(clientExtraArgs: Options["extraArgs"]): {
+  mcpServersDelivery: Delivery;
+  settingsDelivery: Delivery;
+} {
+  const delivery = process.env.CLAUDE_CODE_EXECUTABLE ? "argv" : "initialize";
+  const settingsInFlag = Object.keys(clientExtraArgs ?? {}).some(
+    (name) => name === "settings" || name === "sdk-url" || name.startsWith("sdk-url="),
+  );
+  return { mcpServersDelivery: delivery, settingsDelivery: settingsInFlag ? "argv" : delivery };
 }
 
 function bundledClaudeCliPath(directory: string): string {
