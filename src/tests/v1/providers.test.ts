@@ -938,6 +938,56 @@ describe("providers", () => {
       await agent.unstable_setProvider(provider);
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
+
+    it("restarts a live query only when the provider configuration changes", async () => {
+      const [agent, mockQuery] = await createAgentMock();
+      mockQueryWithModels(mockQuery);
+      stubListing(["claude-sonnet-5"]);
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      const provider = {
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gateway.example",
+        headers: { authorization: "Bearer first", "x-fixture": "1" },
+      } as const;
+      await agent.unstable_setProvider(provider);
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      await agent.unstable_setProvider({
+        ...provider,
+        headers: { "x-fixture": "1", authorization: "Bearer first" },
+      });
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+
+      await agent.unstable_setProvider({
+        ...provider,
+        headers: { ...provider.headers, authorization: "Bearer second" },
+      });
+      expect(mockQuery).toHaveBeenCalledTimes(2);
+
+      await agent.unstable_disableProvider({ providerId: "main" });
+      await agent.unstable_disableProvider({ providerId: "main" });
+      expect(mockQuery).toHaveBeenCalledTimes(3);
+    });
+
+    it("restarts when a repeated provider set discovers a previously missing model list", async () => {
+      const [agent, mockQuery] = await createAgentMock();
+      mockQueryWithModels(mockQuery);
+      stubListing(["claude-sonnet-5"]).mockResolvedValueOnce(
+        new Response("not found", { status: 404 }),
+      );
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      const provider = {
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gateway.example",
+      } as const;
+      await agent.unstable_setProvider(provider);
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      await agent.unstable_setProvider(provider);
+      expect(mockQuery).toHaveBeenCalledTimes(2);
+    });
   });
 });
 

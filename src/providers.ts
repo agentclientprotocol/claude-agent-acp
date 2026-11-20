@@ -6,6 +6,7 @@
  * {@link ProviderConfig} and gateway login, and builds the query env of its
  * sessions with {@link createEnvForProvider}.
  */
+import { isDeepStrictEqual } from "node:util";
 import {
   RequestError,
   type AuthenticateRequest,
@@ -190,6 +191,23 @@ export function createEnvForProvider(config: ProviderConfig | null): Record<stri
 function sameHeaders(a: Record<string, string>, b: Record<string, string>): boolean {
   const aKeys = Object.keys(a);
   return aKeys.length === Object.keys(b).length && aKeys.every((key) => b[key] === a[key]);
+}
+
+export function sameProviderConfig(
+  current: ProviderConfig | undefined,
+  next: ProviderConfig | undefined,
+): boolean {
+  if (current === next) return true;
+  return (
+    current !== undefined &&
+    next !== undefined &&
+    current.apiType === next.apiType &&
+    current.baseUrl === next.baseUrl &&
+    sameHeaders(current.headers, next.headers) &&
+    isDeepStrictEqual(current.vertex, next.vertex) &&
+    isDeepStrictEqual(current.listedModels, next.listedModels) &&
+    current.bedrockRegionPrefix === next.bedrockRegionPrefix
+  );
 }
 
 /**
