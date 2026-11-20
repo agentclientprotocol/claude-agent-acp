@@ -9,7 +9,7 @@
  * `session_state_changed`.
  */
 import { randomUUID } from "node:crypto";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
@@ -65,6 +65,8 @@ const DEFAULT_MODELS: Array<Record<string, unknown>> = [
 const sdk = vi.hoisted(() => ({
   processes: [] as FakeClaudeCode[],
   models: [] as Array<Record<string, unknown>>,
+  /** What `reinitialize` reports, once the session's settings changed. */
+  reinitModels: undefined as Array<Record<string, unknown>> | undefined,
   /** What `mcpServerStatus` reports. */
   mcpServers: [] as Array<{ name: string; status: string }>,
   /** The subagents of the session's transcript, by the id of their launch call. */
@@ -156,6 +158,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         stopTask: fake.stopTask,
         close: fake.close,
         applyFlagSettings: fake.applyFlagSettings,
+        reinitialize: async () => ({ models: sdk.reinitModels ?? sdk.models }),
         rewindFiles: fake.rewindFiles,
         mcpServerStatus: async () => sdk.mcpServers,
         ...(sdk.enableRemoteControl ? { enableRemoteControl: sdk.enableRemoteControl } : {}),
@@ -219,6 +222,7 @@ beforeEach(async () => {
   sdk.processes = [];
   sdk.mcpServers = [];
   sdk.models = DEFAULT_MODELS;
+  sdk.reinitModels = undefined;
   sdk.subagents = new Map();
   sdk.previewGate = undefined;
   sdk.startFailure = undefined;
@@ -624,6 +628,104 @@ describe("ACP v2 core", () => {
         } as v2.SetSessionConfigOptionRequest);
         expect(sdk.processes[0].setModel).toHaveBeenLastCalledWith(ids[2]);
       });
+    },
+  );
+
+  it.each([
+    {
+      listed: ["claude-sonnet-5", "claude-haiku-5-5"],
+      pins: { ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-5" },
+    },
+    { listed: ["claude-sonnet-5-5", "claude-sonnet-5", "claude-haiku-5-5"], pins: undefined },
+    // A family default in the user's settings.json is kept.
+    {
+      listed: ["claude-sonnet-5", "claude-haiku-5-5"],
+      pins: undefined,
+      userSettings: { env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-4-6" } },
+    },
+    // So is a modelOverrides target the gateway does not list.
+    {
+      listed: ["claude-sonnet-5", "claude-haiku-5-5"],
+      pins: undefined,
+      userSettings: { modelOverrides: { "claude-sonnet-5-5": "my-gw-sonnet" } },
+      resolved: "my-gw-sonnet",
+    },
+  ])(
+    "runs Sonnet on a listed version when the gateway lacks its default: $listed $userSettings",
+    async ({
+      listed,
+      pins,
+      userSettings,
+      resolved = "claude-sonnet-5-5",
+    }: {
+      listed: string[];
+      pins?: object;
+      userSettings?: object;
+      resolved?: string;
+    }) => {
+      if (userSettings) {
+        const configDir = path.join(tempDir, "claude");
+        await mkdir(configDir, { recursive: true });
+        await writeFile(path.join(configDir, "settings.json"), JSON.stringify(userSettings));
+      }
+      sdk.models = [
+        {
+          value: "sonnet",
+          resolvedModel: resolved,
+          displayName: "Sonnet",
+          description: "",
+        },
+        {
+          value: "haiku",
+          resolvedModel: "claude-haiku-5-5",
+          displayName: "Haiku",
+          description: "",
+        },
+      ];
+      // What Claude Code reports once `sonnet` resolves to the pinned model.
+      sdk.reinitModels = [
+        {
+          value: "sonnet",
+          resolvedModel: "claude-sonnet-5",
+          displayName: "Sonnet 5",
+          description: "",
+        },
+        {
+          value: "haiku",
+          resolvedModel: "claude-haiku-5-5",
+          displayName: "Haiku",
+          description: "",
+        },
+      ];
+      vi.mocked(fetch).mockResolvedValueOnce(Response.json({ data: listed.map((id) => ({ id })) }));
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        await agent.request(v2.methods.agent.initialize, {
+          protocolVersion: v2.PROTOCOL_VERSION,
+          info: { name: "test", version: "1" },
+          capabilities: {},
+        });
+        await agent.request(v2.methods.agent.providers.set, {
+          providerId: "main",
+          apiType: "anthropic",
+          baseUrl: "https://gateway.example",
+        });
+        const response = await agent.request(v2.methods.agent.session.new, { cwd });
+        if (pins) {
+          expect(
+            response.configOptions?.find((option) => option.configId === "model"),
+          ).toMatchObject({ options: [{ value: "sonnet" }, { value: "haiku" }] });
+        }
+      });
+      const { applyFlagSettings } = sdk.processes[0];
+      if (pins) {
+        // With the route, which the flag settings already hold.
+        expect(applyFlagSettings).toHaveBeenCalledWith({
+          env: expect.objectContaining({ ANTHROPIC_BASE_URL: "https://gateway.example", ...pins }),
+        });
+      } else {
+        expect(applyFlagSettings).not.toHaveBeenCalled();
+      }
     },
   );
 
