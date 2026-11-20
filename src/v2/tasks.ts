@@ -78,6 +78,7 @@ import {
   endWaitsForMessages,
   HANDBACK_TOOL,
   handbackMessage,
+  handbackReportText,
   isNativeSubagentControlTool,
   launchReply,
   linkedSessionMessages,
@@ -485,6 +486,7 @@ export class SessionTasks {
     // Before the result's own updates: a SendMessage call whose message
     // reached its child is that message.
     this.sendMessageResumed(message, results, toolUses);
+    this.handbackResult(output, message, results);
 
     const command = backgroundBashTaskFromToolResult(
       content,
@@ -1794,17 +1796,48 @@ export class SessionTasks {
     if (update.status !== "completed" || !handback.message) {
       return [unexposedControlFallback(handback.initial, notification, child.sessionId)];
     }
-    if (handback.delegationId !== undefined) child.handedBack.add(handback.delegationId);
-    const [outgoing, incoming] = linkedSessionMessages(
+    this.publishHandback(
+      child,
+      handback.delegationId ?? update.toolCallId,
+      handback.message,
       update.toolCallId,
+    );
+    return [];
+  }
+
+  /** A launch result carries the report when Claude Code sends no child stream. */
+  private handbackResult(
+    output: SessionOutput,
+    message: SDKUserMessage,
+    results: ToolResultBlock[],
+  ): void {
+    if (results.length !== 1 || results[0]!.is_error) return;
+    const text = handbackReportText(message.tool_use_result);
+    if (text === undefined) return;
+    const launchId = results[0]!.tool_use_id;
+    const child = this.childByToolUse.get(launchId);
+    if (!child) return;
+    if (!child.announced) this.announce(child, output.sessionId);
+    this.publishHandback(child, launchId, text, `${launchId}:handback`);
+  }
+
+  private publishHandback(
+    child: Child,
+    delegationId: string,
+    text: string,
+    messageId: string,
+  ): void {
+    if (child.handedBack.has(delegationId)) return;
+    child.handedBack.add(delegationId);
+    const [outgoing, incoming] = linkedSessionMessages(
+      messageId,
       child.sessionId,
       child.parentSessionId,
-      handback.message,
+      text,
     );
-    // Sent here, in order: an output routes each update once the ones before it went out.
+    // Sent in order: each output routes its updates after the preceding ones.
     child.output!.emitV1([outgoing!]);
     this.outputOf(child.parentSessionId)?.emitV1([incoming!]);
-    return [];
   }
 
   /**

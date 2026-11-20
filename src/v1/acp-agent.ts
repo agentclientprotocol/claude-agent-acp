@@ -221,6 +221,7 @@ import {
 } from "../client-system-prompt.js";
 import {
   readSubagentMessages,
+  airSubagentMessages,
   subagentHistory,
   subagentLaunchIds,
   subagentLaunchedBy,
@@ -6914,6 +6915,7 @@ export class ClaudeAcpAgent {
 
             let content: typeof message.message.content;
             let toolUseResult = message.type === "user" ? message.tool_use_result : undefined;
+            if (message.type === "user") await subagents.toolResult(message);
             if (
               message.type === "assistant" &&
               (message.parent_tool_use_id === null || forwardsSubagentText())
@@ -8496,7 +8498,8 @@ export class ClaudeAcpAgent {
             this.logger,
           );
           registerLaunches(childMessages);
-          for (const childMessage of childMessages) await replayMessage(childMessage);
+          for (const childMessage of airSubagentMessages(childMessages))
+            await replayMessage(childMessage);
         }
       }
       // The RFD form announces a child right after its launch, then sends its
