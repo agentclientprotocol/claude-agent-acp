@@ -30,6 +30,12 @@ import {
   type SDKUserMessage,
   type SessionMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import {
+  STEER_METHOD,
+  parseSteerRequest,
+  type SteerRequest,
+  type SteerResponse,
+} from "../steering.js";
 import packageJson from "../../package.json" with { type: "json" };
 import { messageIdForGrouping } from "../sdk-to-acp.js";
 import type { Logger } from "../logger.js";
@@ -143,6 +149,7 @@ export function v2AgentApp(
         agent.setConfigOption(params),
       )
       .onRequest(v2.methods.agent.session.prompt, ({ params }) => agent.prompt(params))
+      .onRequest(STEER_METHOD, parseSteerRequest, ({ params }) => agent.steer(params))
       .onRequest(v2.methods.agent.terminal.cancel, ({ params }) =>
         agent.cancelItem(params.sessionId, { terminalId: params.terminalId }),
       )
@@ -357,7 +364,7 @@ class V2Agent implements AgentHandle, SessionConnection {
     const { authMethods, auth, _meta } = this.auth.initialize(request.capabilities);
     const airMeta = airInitializeMeta(this.air);
     return {
-      ...(airMeta ? { _meta: airMeta } : {}),
+      _meta: { ...airMeta, steering: { supported: true } },
       protocolVersion: v2.PROTOCOL_VERSION,
       info: { name: packageJson.name, title: "Claude Agent", version: packageJson.version },
       capabilities: {
@@ -399,6 +406,19 @@ class V2Agent implements AgentHandle, SessionConnection {
     } catch (error) {
       return Promise.reject(error);
     }
+  }
+
+  async steer({ sessionId, prompt, _meta }: SteerRequest): Promise<SteerResponse> {
+    const session = this.session(sessionId, STEER_METHOD);
+    const request = { sessionId, prompt };
+    if (session.injectSteer(request)) return { outcome: "injected" };
+    if (_meta?.steering?.idleBehavior === "promptRequired") {
+      return { outcome: "promptRequired", reason: "noRunningTurn" };
+    }
+    // V2 answers a prompt at insertion, so guard and runtime refusals can
+    // reach the extension caller without waiting for turn completion.
+    await this.prompt(request);
+    return { outcome: "startedNewTurn" };
   }
 
   async newSession(params: v2.NewSessionRequest): Promise<v2.NewSessionResponse> {

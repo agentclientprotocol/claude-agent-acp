@@ -629,6 +629,10 @@ export class SessionTasks {
     };
   }
 
+  hasOpenRequests(): boolean {
+    return this.agentRequests.size > 0;
+  }
+
   /**
    * Whether the root's foreground work, through the subagents that it waits
    * on (those it does not run in the background), waits on the user: each of

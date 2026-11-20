@@ -30,7 +30,7 @@ import { toolUpdateFromDiffToolResponse } from "../../diff.js";
 import { ToolCallFieldTracker } from "../../tool-calls/field-tracker.js";
 import { ClaudeAcpAgent, runPromptWithCancellation } from "../../v1/acp-agent.js";
 import { computeSessionFingerprint } from "../../v1/session-fingerprint.js";
-import type { SteerRequest } from "../../v1/steering.js";
+import type { SteerRequest } from "../../steering.js";
 import { buildConfigOptions, discoverCustomAgents } from "../../session-config-options.js";
 import { createFastModeConfigOption } from "../../session-fast-mode.js";
 import {

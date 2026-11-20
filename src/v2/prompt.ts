@@ -64,8 +64,8 @@ export function v1ContentBlock(block: v2.ContentBlock): ContentBlock {
     return annotations != null ? { ...rest, annotations: v1Annotations(annotations) } : rest;
   }
   throw RequestError.invalidParams(
-    { type: block.type },
-    `Content blocks of type ${block.type} are not supported`,
+    { type: block?.type },
+    `Content blocks of type ${block?.type ?? "unknown"} are not supported`,
   );
 }
 

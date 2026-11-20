@@ -81,9 +81,12 @@ export class StoppedWork {
     this.interruptReach = foreground ? 2 : 1;
   }
 
-  /** The interrupt failed: Claude Code stops nothing. */
-  interruptFailed(): void {
+  /** The interrupt failed: steers already acknowledged as injected can still run. */
+  interruptFailed(steers: readonly string[]): void {
     this.interruptReach = 0;
+    for (const uuid of steers) {
+      if (this.abandoned.delete(uuid) && this.droppingFor === uuid) this.endDropping();
+    }
   }
 
   /** A `status: requesting` frame, with the prompts that the request serves. */
