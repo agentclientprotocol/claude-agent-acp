@@ -451,8 +451,9 @@ export type GatewayFamilyPinUser = {
 
 /**
  * `ANTHROPIC_DEFAULT_<FAMILY>_MODEL` for each family alias that resolves to a
- * model the gateway does not list: the newest listed version, as the gateway
- * spells it (`claude-sonnet-5` when Sonnet 5.5 is missing). Skips families
+ * model the gateway does not list. Prefers the newest listed version at or
+ * below the resolved version, then the newest listed version if no such
+ * version exists. Uses the id as the gateway spells it. Skips families
  * the gateway serves, defaults the user set in `user.env`, and a resolved
  * model that is a `user.modelOverrides` target: Claude Code applies an
  * override only to the id it resolves, so a pin would turn it off.
@@ -474,7 +475,10 @@ export function gatewayFamilyPins(
     const resolvedId = normalizeModelId(resolved);
     if (listed.has(resolvedId) || overrideTargets.has(resolvedId)) continue;
     const pattern = new RegExp(`^claude-${family}-(\\d+)(?:-(\\d+))?$`);
-    let best: { id: string; major: number; minor: number } | undefined;
+    const resolvedVersion = resolvedId.match(pattern);
+    const resolvedMajor = resolvedVersion ? Number(resolvedVersion[1]) : undefined;
+    const resolvedMinor = Number(resolvedVersion?.[2] ?? 0);
+    let best: { id: string; major: number; minor: number; newerThanResolved: boolean } | undefined;
     for (const id of listedModelIds) {
       // Not a `-fast` (Bedrock: `-fast-v1:0`), 1M-context (`[1m]`, `-1m`) or
       // OpenRouter `:free`/`:batch` variant.
@@ -483,14 +487,19 @@ export function gatewayFamilyPins(
       if (!match) continue;
       const major = Number(match[1]);
       const minor = Number(match[2] ?? 0);
+      const newerThanResolved =
+        resolvedMajor !== undefined &&
+        (major > resolvedMajor || (major === resolvedMajor && minor > resolvedMinor));
+      if (newerThanResolved && best?.newerThanResolved === false) continue;
       if (
         !best ||
+        (best.newerThanResolved && !newerThanResolved) ||
         major > best.major ||
         (major === best.major && minor > best.minor) ||
         // Same version: the shorter, undated id.
         (major === best.major && minor === best.minor && id.length < best.id.length)
       ) {
-        best = { id, major, minor };
+        best = { id, major, minor, newerThanResolved };
       }
     }
     if (best) pins[key] = best.id;
@@ -500,10 +509,10 @@ export function gatewayFamilyPins(
 
 /**
  * Applies `gatewayFamilyPins` through the flag settings, resending `flagEnv`
- * (the provider route), and returns the initialize response after them, or
- * `initialization` when no pin applies or a call fails. `supportedModels`
- * keeps the startup list, so `reinitialize` reads the models again. It also
- * cancels pending hook callbacks: call it before the first prompt.
+ * (the provider route). `supportedModels` keeps the startup list, so
+ * `reinitialize` reads the models again. It also cancels pending hook callbacks,
+ * so call it before the first prompt. If the refresh fails, restore the flag
+ * environment before returning the startup list.
  */
 export async function withGatewayFamilyPins(
   query: Pick<Query, "applyFlagSettings" | "reinitialize">,
@@ -514,14 +523,33 @@ export async function withGatewayFamilyPins(
   logger: ModelLogger,
 ): Promise<SDKControlInitializeResponse> {
   const pins = gatewayFamilyPins(initialization.models, listedModelIds, user);
-  if (Object.keys(pins).length === 0) return initialization;
+  const pinKeys = Object.keys(pins);
+  if (pinKeys.length === 0) return initialization;
   try {
     await query.applyFlagSettings({ env: { ...flagEnv, ...pins } });
-    return await query.reinitialize();
   } catch (error) {
     logger.error("Could not set the gateway's family defaults:", error);
     return initialization;
   }
+  try {
+    return await query.reinitialize();
+  } catch (error) {
+    logger.error("Could not refresh models after setting the gateway's family defaults:", error);
+  }
+  try {
+    // Removing a flag env key leaves its value in the CLI's process environment.
+    // Clear the live pins before restoring the original flag settings.
+    const clearedPins = Object.fromEntries(pinKeys.map((key) => [key, ""]));
+    await query.applyFlagSettings({ env: { ...clearedPins, ...flagEnv } });
+    await query.applyFlagSettings({ env: flagEnv ?? null });
+  } catch (error) {
+    logger.error("Could not restore the gateway's original flag environment:", error);
+    throw RequestError.internalError(
+      undefined,
+      "Could not restore the gateway's model settings. Try starting the session again.",
+    );
+  }
+  return initialization;
 }
 
 /** A path that no model id starts with. Nothing enforces that no

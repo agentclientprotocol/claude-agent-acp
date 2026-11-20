@@ -508,7 +508,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("model resolution (real SDK)
 // which the SDK does not document. A local gateway that answers nothing keeps
 // the CLI off the network, so no API key is needed.
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("gateway family pins (real SDK)", () => {
-  it("resolves the family alias to the pinned model after reinitialize", async () => {
+  it("restores the live alias after a failed refresh and pins it on retry", async () => {
     const gateway = createServer((_, res) => res.writeHead(404).end());
     await new Promise<void>((resolve) => gateway.listen(0, "127.0.0.1", resolve));
     const { port } = gateway.address() as { port: number };
@@ -536,18 +536,28 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("gateway family pins (real S
     try {
       const startup = await q.initializationResult();
       const sonnet = startup.models.find((model) => model.value === "sonnet");
+      expect(sonnet?.resolvedModel).toBeDefined();
       expect(sonnet?.resolvedModel).not.toBe("claude-sonnet-4-6");
-      const pinned = await withGatewayFamilyPins(
-        q,
-        startup,
-        ["claude-sonnet-4-6"],
-        { env: {} },
-        route,
+      const listed = ["claude-sonnet-4-6"];
+      const user = { env: {} };
+      const logger = { log: vi.fn(), error: vi.fn() };
+      const fallback = await withGatewayFamilyPins(
         {
-          log: vi.fn(),
-          error: vi.fn(),
+          applyFlagSettings: (settings) => q.applyFlagSettings(settings),
+          reinitialize: vi.fn().mockRejectedValue(new Error("refresh failed")),
         },
+        startup,
+        listed,
+        user,
+        route,
+        logger,
       );
+      expect(fallback).toBe(startup);
+      const restored = await q.reinitialize();
+      expect(restored.models.find((model) => model.value === "sonnet")?.resolvedModel).toBe(
+        sonnet?.resolvedModel,
+      );
+      const pinned = await withGatewayFamilyPins(q, restored, listed, user, route, logger);
       expect(pinned.models.find((model) => model.value === "sonnet")?.resolvedModel).toBe(
         "claude-sonnet-4-6",
       );
