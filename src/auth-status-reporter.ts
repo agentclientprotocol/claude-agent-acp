@@ -20,13 +20,19 @@ import {
   AUTH_STATUS_PROBE_TIMEOUT_MS,
   type AuthStatus,
   type AuthStatusKind,
+  cliAuthIdentity,
   fromAccountInfo,
-  fromCliStatus,
   mergeAuthStatus,
+  parseCliAuthStatus,
   sameAuthStatus,
   toAcpAuthStatus,
 } from "./auth-status.js";
 import { claudeCliPath } from "./claude-cli.js";
+import {
+  claudeAuthRefusal,
+  isClaudeEnterprisePlan,
+  shouldHideClaudeAuth,
+} from "./hide-claude-auth.js";
 import type { SettingsManager } from "./settings.js";
 
 const execFileAsync = promisify(execFile);
@@ -81,8 +87,7 @@ export class AuthStatusReporter {
   private probeRuns = 0;
   /** The latest-started probe run that published its read. */
   private publishedRun = 0;
-  /** The last `auth/status_update` payload sent, as JSON. */
-  private sentAcp?: string;
+  private acpStatus: AcpAuthStatus = { state: "unknown" };
 
   constructor(private readonly options: AuthStatusReporterOptions) {}
 
@@ -100,28 +105,24 @@ export class AuthStatusReporter {
    * reach here at all (see the epoch check in the probe and the guards at
    * session create).
    */
-  set(next: AuthStatus | undefined): void {
+  set(next: AuthStatus | undefined, refused = false): void {
     if (!next) {
       return;
     }
-    if (sameAuthStatus(this.current, next)) {
+    if (!sameAuthStatus(this.current, next)) {
+      this.current = next;
+      // Older clients still get the actual identity, including one the guard refused.
+      void Promise.resolve()
+        .then(() => this.options.push(next))
+        .catch((error) => {
+          this.options.logger.error("Failed to send _auth/status_update:", error);
+        });
+    }
+    const acp = toAcpAuthStatus(next, refused);
+    if (JSON.stringify(acp) === JSON.stringify(this.acpStatus)) {
       return;
     }
-    this.current = next;
-    // ACP notifications get no reply, and clients that do not know the method
-    // drop it silently — send unconditionally and never fail a caller on it.
-    void Promise.resolve()
-      .then(() => this.options.push(next))
-      .catch((error) => {
-        this.options.logger.error("Failed to send _auth/status_update:", error);
-      });
-    // Compared on its own payload: two identities can map to the same one.
-    const acp = toAcpAuthStatus(next);
-    const sent = JSON.stringify(acp);
-    if (sent === this.sentAcp) {
-      return;
-    }
-    this.sentAcp = sent;
+    this.acpStatus = acp;
     void Promise.resolve()
       .then(() => this.options.pushAcp(acp))
       .catch((error) => {
@@ -152,7 +153,7 @@ export class AuthStatusReporter {
     } else {
       await this.probe();
     }
-    return toAcpAuthStatus(this.current);
+    return this.acpStatus;
   }
 
   /** A login or a logout: any probe already running read the world before it. */
@@ -224,8 +225,11 @@ export class AuthStatusReporter {
       return;
     }
     const fromSession = fromAccountInfo(account, apiKeyHelper);
-    if (fromSession) {
-      this.set(mergeAuthStatus(this.current, fromSession, "session"));
+    if (account && fromSession) {
+      this.set(
+        mergeAuthStatus(this.current, fromSession, "session"),
+        shouldHideClaudeAuth() && claudeAuthRefusal(account) !== undefined,
+      );
     } else if (!this.loggedUninformativeAccount) {
       this.loggedUninformativeAccount = true;
       this.options.logger.log(
@@ -308,18 +312,19 @@ export class AuthStatusReporter {
       }
       stdout = failed.stdout;
     }
-    let status = fromCliStatus(stdout, apiKeyHelper);
+    const cli = parseCliAuthStatus(stdout);
+    if (!cli) {
+      logger.error("claude auth status returned unparseable output");
+      return undefined;
+    }
+    let status = cliAuthIdentity(cli, apiKeyHelper);
     if (!context && status?.kind === "api_key" && status.detail === "API key helper") {
       try {
         const resolved = await resolveSettings({ cwd: process.cwd() });
-        status = fromCliStatus(stdout, filterEscalatingDefaultMode(resolved).apiKeyHelper);
+        status = cliAuthIdentity(cli, filterEscalatingDefaultMode(resolved).apiKeyHelper);
       } catch {
         logger.error("Could not resolve auth source settings");
       }
-    }
-    if (!status) {
-      logger.error("claude auth status returned unparseable output");
-      return undefined;
     }
     if (epoch !== this.epoch) {
       // A login or logout landed while this probe was running; the newer
@@ -338,7 +343,14 @@ export class AuthStatusReporter {
     // same login (no organization, say). Keep those extra fields rather than
     // regressing the payload; a different identity replaces it wholesale.
     const merged = mergeAuthStatus(this.current, status, "cli");
-    this.set(merged);
+    // The CLI names the effective credential, not the SDK's accountInfo tokenSource.
+    // An OAuth setup token can carry a plan but, like an API key, is allowed.
+    const refused =
+      shouldHideClaudeAuth() &&
+      status.kind === "account" &&
+      cli.authMethod !== "oauth_token" &&
+      !isClaudeEnterprisePlan(cli.subscriptionType);
+    this.set(merged, refused);
     this.options.onProbe?.(status.kind);
     return merged;
   }

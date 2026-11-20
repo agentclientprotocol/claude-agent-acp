@@ -228,7 +228,9 @@ The adapter keeps them where they are.
 
 ## Auth source display
 
-The connection-scoped `_auth/status_update` continues to report agent-owned authentication, not client-owned `providers/set` routing. The adapter also reports the same identity through the ACP `auth/status` method and `auth/status_update` notification (advertised as `auth.status`), with `kind`, `detail` and `plan` under the account's `_meta.claudeCode`. The account's `description` carries the `detail` too, e.g. `label: "Anthropic API key"` with `description: "ANTHROPIC_API_KEY"`. Each notification is sent when its own payload changed. `auth/status` answers with the identity last reported and starts a new read, whose change arrives as a notification. When the active key source is `apiKeyHelper`, the adapter reads the effective helper command through SDK `resolveSettings` / the session's `SettingsManager`, including programmatic settings overrides.
+The connection-scoped `_auth/status_update` reports agent-owned authentication, not client-owned `providers/set` routing. The adapter also reports that login through the ACP `auth/status` method and `auth/status_update` notification (advertised as `auth.status`). Under `--hide-claude-auth`, a subscription the integration cannot use is `unauthenticated`, with no active account; the legacy notification still describes the stored login. Enterprise subscriptions, API keys, and setup tokens remain usable.
+
+For a reported account, `_meta.claudeCode` carries `kind`, `detail` and `plan`. The account's `description` carries the `detail` too, e.g. `label: "Anthropic API key"` with `description: "ANTHROPIC_API_KEY"`. Each notification is sent when its own payload changed. `auth/status` answers with the identity last reported and starts a new read, whose change arrives as a notification. When the active key source is `apiKeyHelper`, the adapter reads the effective helper command through SDK `resolveSettings` / the session's `SettingsManager`, including programmatic settings overrides.
 
 A command containing the whole word `central` and the word sequence `proxy start` is displayed as:
 
