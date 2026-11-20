@@ -4744,6 +4744,14 @@ export class ClaudeAcpAgent {
           await asyncTasks.autonomousTurnStarted();
         }
 
+        // Before the message's updates are routed: a subagent's message names
+        // its child session, and an end that waited for such messages is
+        // reported (see `NativeSubagentRuntime.messageCame`). Awaited only
+        // when an end is reported, so that no cancel runs between any other
+        // message and its handling.
+        const reported = subagents.messageCame(message, sendUpdate);
+        if (reported) await reported;
+
         switch (message.type) {
           case "system":
             switch (message.subtype) {
@@ -5309,6 +5317,10 @@ export class ClaudeAcpAgent {
                     subagentType: message.subagent_type,
                     description: message.description,
                     prompt: message.prompt,
+                    launchTool: message.tool_use_id
+                      ? session.toolUseCache[message.tool_use_id]?.name
+                      : undefined,
+                    parentTaskId: message.parent_task_id,
                   },
                   sendUpdate,
                 );
@@ -5348,7 +5360,11 @@ export class ClaudeAcpAgent {
                   message.status,
                   sendUpdate,
                   message.tool_use_id,
-                  { reason: message.reason },
+                  {
+                    reason: message.reason,
+                    foreground:
+                      session.liveBackgroundTasks.get(message.task_id)?.backgrounded === false,
+                  },
                 );
                 await asyncTasks.taskNotification({
                   task_id: message.task_id,
@@ -5399,7 +5415,11 @@ export class ClaudeAcpAgent {
                     message.patch.status,
                     sendUpdate,
                     undefined,
-                    { error: message.patch.status === "failed" ? message.patch.error : undefined },
+                    {
+                      error: message.patch.status === "failed" ? message.patch.error : undefined,
+                      foreground:
+                        session.liveBackgroundTasks.get(message.task_id)?.backgrounded === false,
+                    },
                   );
                   const parentToolUseId = session.liveBackgroundTasks.get(
                     message.task_id,

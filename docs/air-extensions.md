@@ -1313,6 +1313,10 @@ This section covers only the AIR bridge.
   The source is the `task_started` prompt, else the Agent or Task input `prompt`.
   A resumed generation gets the SendMessage `message` text.
   The field is absent when the adapter has no prompt. The adapter does not truncate it.
+- A forked skill (`context: fork`, such as `/code-review`) is a child session too, without an Agent or Task call.
+  The parent of one that Claude runs with the Skill tool is the session that made the Skill call, which stays a tool call.
+  The parent of one that the user types is the root session.
+  Claude Code sends the output of a typed one only when the command ends: its `subagent_state_update` follows that output.
 - Without either signal, Agent and Task stay ordinary tool calls. AIR gets `_meta.jetbrains.air.subagent: true` on them.
   Child interactions stay on the root session.
 - A client that uses the older `_meta["subagent-transcript"]` capability or the `forwardSubagentText` session option keeps the flat child transcript.

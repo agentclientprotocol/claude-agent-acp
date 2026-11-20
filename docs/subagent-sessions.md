@@ -32,6 +32,25 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
     message to the parent instead, in both transcripts and linked the same way.
   - A launch whose child is never exposed is shown as a tool call after all, with its final
     status.
+- A forked skill (a skill with `context: fork`, such as `/code-review`) is a child session too.
+  Claude Code runs it as a subagent that no Agent or Task call launched:
+  - When Claude runs it with the Skill tool, the child is announced on the session that made the
+    Skill call, once Claude Code reports its task. The Skill call stays a tool call of that session,
+    with the skill's result. The skill's prompt is a `session_message` in the child's transcript
+    only, with the Skill call's tool use id.
+  - When the user types it, there is no call: the child is announced on the root session, and the
+    command's output is the root's message. Claude Code (2.1.328) sends such a child's messages
+    only when the command ends, after it reports the task's end. The adapter keeps the child
+    `running` until they came, so its `idle` follows its tool calls and text. They all arrive at
+    once: the child's transcript is not live.
+  - A subagent that a typed skill launches gets no session: Claude Code reports the end of its
+    task before the Agent call that launched it. That call is a tool call of the skill's child,
+    with its final status.
+  - After a `session/cancel` of the root session, a typed skill's messages are the output of
+    stopped work, which the adapter drops: the child reports `idle` with `cancelled` and no more.
+    After a `session/cancel` of the child itself, they still go to the child, before its `idle`
+    with `cancelled`.
+  - A replay shows no child for a forked skill. The Skill call stays a tool call.
 - On v1, the parent's prompt turn ends at its result, also while a background child that it
   launched or resumed still runs. The child's updates and requests follow the prompt response: the
   RFD has a client keep receiving child events after it. The parent's summary when the child ends
@@ -48,10 +67,11 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
   carries the RFD's `session` content, `{ "type": "session", "sessionId": "<child>" }`, after its
   other content: a TaskStop call whose `task_id`, or a SendMessage call whose `to`, is the child's
   agent id; a SendMessage call that resumed the child and stays shown because a permission request
-  showed it first; and, on v1, an Agent or Task call that stays shown for the same reason. A
-  `tool_call_update` without content carries none, since it would replace the content the client
-  holds. A call that names the child by its name gets no reference: Claude Code resolves the
-  name, and the adapter cannot tell which agent it picked.
+  showed it first; on v1, an Agent or Task call that stays shown for the same reason; and the
+  Skill call that launched a forked skill's child. A `tool_call_update` without content carries
+  none, since it would replace the content the client holds. A call that names the child by its
+  name gets no reference: Claude Code resolves the name, and the adapter cannot tell which agent it
+  picked.
 - `session/cancel` on the parent interrupts Claude Code, which stops the foreground children that
   the turn waits on. Background children keep running, as the RFD prefers; a client stops one with
   its own `cancel`. Each stopped child reports `idle` with `cancelled` from Claude Code's own

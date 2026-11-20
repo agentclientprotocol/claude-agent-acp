@@ -4233,6 +4233,35 @@ describe("subagent transcript replay", () => {
       }
     }
 
+    it("replays a forked skill as its Skill call, without a child", async () => {
+      const trace = await replayRfd(
+        [
+          user("u1", "Review it"),
+          assistant("a1", [toolUse("toolu_skill", "Skill", { skill: "code-review" })]),
+          user("u2", [
+            toolResult("toolu_skill", 'Skill "code-review" completed (forked execution).'),
+          ]),
+        ],
+        {
+          // Claude Code 2.1.328 names no call in the metadata of a forked skill's agent.
+          fork9: {
+            meta: {
+              agentType: "general-purpose",
+              isBuiltIn: true,
+              spawnDepth: 1,
+              requestShape: "foreground",
+            },
+            records: [
+              user("f1", "Review the diff"),
+              assistant("f2", [{ type: "text", text: "Off by one." }]),
+            ],
+          },
+        },
+      );
+
+      expect(trace).toEqual(["root user_message_chunk Review it", "root tool_call toolu_skill"]);
+    });
+
     it("announces a worktree child with its recorded cwd, and clears it when the worktree is gone", async () => {
       const worktree = "/tmp/proj/.claude/worktrees/agent-wt1";
       const trace = await replayRfd(
@@ -8174,6 +8203,251 @@ describe("subagent permission attribution (issue #851)", () => {
           error: { code: -32603, message: "Context too small" },
         },
       });
+    });
+
+    describe("a forked skill", () => {
+      /**
+       * The frames of the forked skill `agentId`, as Claude Code 2.1.328 sends
+       * them for `/code-review`. Its messages carry `launchId`: the id of the
+       * Skill call that Claude made, or `forked-command-code-review` for a
+       * skill that the user typed, which no call launched.
+       */
+      const fork = (agentId: string, launchId: string) => {
+        const system = (subtype: string, more: Record<string, unknown>) => ({
+          type: "system",
+          subtype,
+          task_id: agentId,
+          skip_transcript: true,
+          ambient: true,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          ...more,
+        });
+        return {
+          started: (more: Record<string, unknown> = {}) =>
+            system("task_started", {
+              description: "/code-review",
+              subagent_type: "general-purpose",
+              is_backgrounded: false,
+              spawn_depth: 1,
+              task_type: "local_agent",
+              prompt: "Review the diff",
+              ...more,
+            }),
+          ended: (more: Record<string, unknown> = {}) =>
+            system("task_notification", {
+              status: "completed",
+              output_file: "",
+              summary: "/code-review",
+              ...more,
+            }),
+          /** Its call `toolUseId` of the Bash tool. */
+          runs: (toolUseId: string) => ({
+            ...rootToolUse(toolUseId, "Bash", { command: "git diff HEAD" }),
+            parent_tool_use_id: launchId,
+            agent_id: agentId,
+            subagent_type: "general-purpose",
+          }),
+          /** The result of its call `toolUseId`. */
+          ran: (toolUseId: string) => ({
+            type: "user",
+            parent_tool_use_id: launchId,
+            agent_id: agentId,
+            subagent_type: "general-purpose",
+            uuid: randomUUID(),
+            session_id: "test-session",
+            message: {
+              role: "user",
+              content: [{ type: "tool_result", tool_use_id: toolUseId, content: "done" }],
+            },
+          }),
+        };
+      };
+      /** The output of a typed command, as the root's message. */
+      const commandOutput = (text: string) => ({
+        type: "assistant",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+        message: {
+          id: randomUUID(),
+          model: "<synthetic>",
+          role: "assistant",
+          type: "message",
+          stop_reason: "end_turn",
+          content: [{ type: "text", text }],
+        },
+      });
+      /** Where each Bash call and text went, and each announcement and end of a child, in order. */
+      const story = (updates: AcpSessionNotification[]) =>
+        updates.flatMap(({ sessionId, update }) =>
+          update.sessionUpdate === "agent_message_chunk"
+            ? [`${sessionId}: ${(update.content as { text: string }).text}`]
+            : update.sessionUpdate === "tool_call" && update.toolCallId.startsWith("toolu_diff")
+              ? [`${sessionId}: ${update.toolCallId}`]
+              : update.sessionUpdate === "subagent_update" && update.state
+                ? [
+                    `${sessionId}: ${update.sessionId} ${update.state.state}` +
+                      ("stopReason" in update.state ? ` ${update.state.stopReason}` : ""),
+                  ]
+                : [],
+        );
+
+      it.each([
+        ["task_notification", (typed: ReturnType<typeof fork>) => [typed.ended()], "end_turn"],
+        [
+          "terminal task_updated patch",
+          () => [{ ...taskUpdated({ status: "completed" }), task_id: "a995b1" }],
+          "end_turn",
+        ],
+        [
+          // As seen live, when the client cancels the child session.
+          "task's stop, which Claude Code reports twice",
+          (typed: ReturnType<typeof fork>) => [
+            { ...taskUpdated({ status: "killed" }), task_id: "a995b1" },
+            typed.ended({ status: "stopped" }),
+          ],
+          "cancelled",
+        ],
+      ])(
+        "that the user typed gets its messages, which come after its %s, before its idle",
+        async (_, ended, stopReason) => {
+          const typed = fork("a995b1", "forked-command-code-review");
+          const updates = await run([
+            typed.started(),
+            ...ended(typed),
+            typed.runs("toolu_diff"),
+            commandOutput("Off by one."),
+          ]);
+
+          expect(story(updates)).toEqual([
+            "test-session: a995b1 running",
+            "a995b1: toolu_diff",
+            `test-session: a995b1 idle ${stopReason}`,
+            "test-session: Off by one.",
+          ]);
+        },
+      );
+
+      it("that the user typed and launched a subagent stays running through that subagent's messages", async () => {
+        const typed = fork("a71bcc", "forked-command-code-review");
+        const nested = fork("ac5905", "toolu_agent");
+        const updates = await run([
+          typed.started(),
+          // Claude Code reports the subagent's task as it runs, and holds its
+          // messages along with the skill's own.
+          nested.started({ tool_use_id: "toolu_agent", parent_task_id: "a71bcc" }),
+          nested.ended({ tool_use_id: "toolu_agent" }),
+          typed.ended(),
+          {
+            ...rootToolUse("toolu_agent", "Agent", { description: "Echo", prompt: "Echo nested" }),
+            parent_tool_use_id: "forked-command-code-review",
+            agent_id: "a71bcc",
+          },
+          nested.runs("toolu_diff_nested"),
+          nested.ran("toolu_diff_nested"),
+          typed.ran("toolu_agent"),
+          typed.runs("toolu_diff"),
+          commandOutput("DONE"),
+        ]);
+
+        // The subagent's task ended before its Agent call came: it gets no session.
+        expect(story(updates)).toEqual([
+          "test-session: a71bcc running",
+          "a71bcc: toolu_diff",
+          "test-session: a71bcc idle end_turn",
+          "test-session: DONE",
+        ]);
+      });
+
+      it("that the user typed and a cancel of the root stopped shows none of its messages, and ends cancelled", async () => {
+        const updates: AcpSessionNotification[] = [];
+        const agent = new ClaudeAcpAgent(
+          {
+            sessionUpdate: async (update: AcpSessionNotification) => {
+              updates.push(update);
+            },
+          } as unknown as AcpClient,
+          { log: () => {}, error: () => {} },
+        );
+        await agent.initialize({
+          protocolVersion: 1,
+          clientCapabilities: { subagents: {} } as ClientCapabilities,
+        });
+        const typed = fork("a41595", "forked-command-code-review");
+        const cancelled = Promise.withResolvers<void>();
+        injectGeneratorSession(agent, async function* (input: Pushable<any>) {
+          const { value } = await input[Symbol.asyncIterator]().next();
+          yield typed.started();
+          await cancelled.promise;
+          // As seen live: the task's end, what Claude Code held, the prompt's
+          // echo, and a result of no turn.
+          yield typed.ended({ status: "stopped" });
+          yield typed.runs("toolu_diff");
+          yield typed.ran("toolu_diff");
+          yield userEcho(value);
+          yield { ...successResult(), num_turns: 0 };
+          yield { type: "system", subtype: "session_state_changed", state: "idle" };
+        } as never);
+        const prompt = agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "/code-review" }],
+        });
+        await vi.waitFor(() => expect(story(updates)).toEqual(["test-session: a41595 running"]));
+
+        await agent.cancel({ sessionId: "test-session" });
+        cancelled.resolve();
+
+        await expect(prompt).resolves.toMatchObject({ stopReason: "cancelled" });
+        await vi.waitFor(() =>
+          expect(story(updates)).toEqual([
+            "test-session: a41595 running",
+            "test-session: a41595 idle cancelled",
+          ]),
+        );
+      });
+
+      it.each([
+        ["Claude", [], null, "test-session"],
+        [
+          "a subagent",
+          [{ ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" }],
+          "toolu_parent",
+          "agent-42",
+        ],
+      ])(
+        "that %s called with the Skill tool is announced on the caller's session",
+        async (_, before, callerLaunch, caller) => {
+          const called = fork("a66033", "toolu_skill");
+          const updates = await run([
+            ...before,
+            {
+              ...rootToolUse("toolu_skill", "Skill", { skill: "code-review" }),
+              parent_tool_use_id: callerLaunch,
+              ...(callerLaunch ? { agent_id: "agent-42" } : {}),
+            },
+            called.started({
+              tool_use_id: "toolu_skill",
+              ...(callerLaunch ? { parent_task_id: "agent-42" } : {}),
+            }),
+            called.runs("toolu_diff"),
+            called.ended({ tool_use_id: "toolu_skill" }),
+          ]);
+
+          expect(story(updates).filter((line) => line.includes("a66033"))).toEqual([
+            `${caller}: a66033 running`,
+            "a66033: toolu_diff",
+            `${caller}: a66033 idle end_turn`,
+          ]);
+          // The Skill call stays a tool call of the session that made it.
+          expect(
+            updates.find(
+              ({ update }) =>
+                update.sessionUpdate === "tool_call" && update.toolCallId === "toolu_skill",
+            )?.sessionId,
+          ).toBe(caller);
+        },
+      );
     });
 
     describe("session/cancel on a child session", () => {
