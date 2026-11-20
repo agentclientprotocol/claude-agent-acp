@@ -136,8 +136,7 @@ export function computeSessionFingerprint(params: {
     canonicalJson({
       cwd: params.cwd,
       mcpServers: servers,
-      additionalDirectories: params.additionalDirectories,
-      additionalRoots: meta?.additionalRoots,
+      additionalDirectories: params.additionalDirectories ?? meta?.additionalRoots ?? [],
       systemPrompt: meta?.systemPrompt,
       clientSystemPrompt: params.systemPrompt ?? undefined,
       disableBuiltInTools: meta?.disableBuiltInTools,

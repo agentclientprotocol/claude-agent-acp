@@ -1943,7 +1943,7 @@ export class ClaudeAcpAgent {
    * the same `cwd`, additional directories and `_meta` would answer with, or
    * `session/load` and `session/resume` of `sessionId`.
    *
-   * A session that this connection holds answers with what it has now.
+   * A held session answers from memory if load/resume would reuse its query.
    * Otherwise a query starts as the session's would, without MCP servers, and
    * closes once its options are read (`optionsOnly` in `createSession`). The
    * query does not persist: it stores no session, and it does not write to
@@ -1951,24 +1951,23 @@ export class ClaudeAcpAgent {
    * hooks in it, as in every query.
    *
    * It sends no update, and it creates, loads and changes no session. A
-   * `sessionId` without a stored conversation fails with `-32002`.
+   * `sessionId` that is neither held nor stored fails with `-32002`.
    */
   async sessionOptions(params: SessionOptionsRequest): Promise<SessionOptionsResponse> {
     while (this.providerUpdate) await this.providerUpdate;
-    const held = params.sessionId != null ? this.sessions[params.sessionId] : undefined;
-    if (held) {
-      await this.validateCwd(params.cwd, params.additionalDirectories);
-      return { modes: held.modes, configOptions: held.configOptions };
-    }
-    const { modes, configOptions } = await this.createSession(
-      {
-        cwd: params.cwd,
-        mcpServers: [],
-        additionalDirectories: params.additionalDirectories,
-        _meta: params._meta,
-      },
-      { resume: params.sessionId ?? undefined, optionsOnly: true },
-    );
+    const setup = {
+      cwd: params.cwd,
+      mcpServers: [],
+      additionalDirectories: params.additionalDirectories,
+      _meta: params._meta,
+    };
+    const { modes, configOptions } =
+      params.sessionId == null
+        ? await this.createSession(setup, { optionsOnly: true })
+        : await this.getOrCreateSession(
+            { ...setup, sessionId: params.sessionId },
+            { optionsOnly: true },
+          );
     return { modes, configOptions };
   }
 
@@ -2125,7 +2124,7 @@ export class ClaudeAcpAgent {
     let result: NewSessionResponse;
     if (this.sessions[params.sessionId]) {
       const resumedSession = await readResumedSession(params.sessionId, this.logger);
-      result = await this.getOrCreateSession(params, resumedSession);
+      result = await this.getOrCreateSession(params, { resumedSession });
       timing.phase("session-ready");
       await this.replaySessionHistory(params.sessionId, resumedSession.messages);
     } else {
@@ -2815,14 +2814,10 @@ export class ClaudeAcpAgent {
   }
 
   /**
-   * Starts a new query for the session `sessionId`, which ran on this
-   * connection and whose query is gone: it resumes the stored conversation.
-   * `resume` names the Claude session, which shares the ACP session id, so the
-   * new query continues the same conversation under the same id. Claude Code
-   * writes the conversation at the first prompt, so resuming a session that was
-   * never prompted fails with `sessionNotFound`, and keeps failing. Such a
-   * session starts a fresh query under the same id instead: it has no history
-   * to lose, and the client keeps a session it can use.
+   * Starts the query that a held session would resume with. Claude Code writes
+   * the conversation at the first prompt. If there's nothing to resume, start
+   * fresh: a replacement keeps the session's id; an options probe keeps neither
+   * query nor id.
    */
   private async recreateLiveSession(
     params: NewSessionRequest,
@@ -2831,6 +2826,7 @@ export class ClaudeAcpAgent {
       permissionMode?: PermissionMode;
       resumedModelHint?: string | Promise<string | undefined>;
       replacingSession?: Session;
+      optionsOnly?: boolean;
     },
   ): Promise<NewSessionResponse> {
     try {
@@ -2841,11 +2837,10 @@ export class ClaudeAcpAgent {
       )) {
         throw error;
       }
-      this.logger.log(
-        `session ${sessionId} was never persisted; starting a fresh query under the same id`,
-      );
+      this.logger.log(`session ${sessionId} has no stored conversation; starting a fresh query`);
       return await this.createSession(params, {
-        reuseSessionId: sessionId,
+        // A probe doesn't claim the id of the session it is describing.
+        ...(options.optionsOnly ? { optionsOnly: true } : { reuseSessionId: sessionId }),
         permissionMode: options.permissionMode,
         replacingSession: options.replacingSession,
       });
@@ -9879,7 +9874,10 @@ export class ClaudeAcpAgent {
       systemPrompt?: NewSessionRequest["systemPrompt"];
       _meta?: NewSessionRequest["_meta"];
     },
-    resumedSession?: ResumedSessionSnapshot,
+    {
+      resumedSession,
+      optionsOnly,
+    }: { resumedSession?: ResumedSessionSnapshot; optionsOnly?: boolean } = {},
   ): Promise<NewSessionResponse> {
     // Reject a bad `cwd` or prompt before reusing or tearing down a live session.
     await this.validateCwd(params.cwd, params.additionalDirectories);
@@ -9888,7 +9886,17 @@ export class ClaudeAcpAgent {
     // A recreated live session keeps its mode, not the mode of the transcript.
     const livePermissionMode = existingSession?.modes.currentModeId as PermissionMode | undefined;
     if (existingSession) {
-      const fingerprint = computeSessionFingerprint(params);
+      // `session/options` cannot supply MCP servers or a system prompt. Their
+      // absence in a probe is not a request to replace the held session's.
+      const fingerprint = computeSessionFingerprint(
+        optionsOnly
+          ? {
+              ...params,
+              mcpServers: existingSession.creationParams?.mcpServers,
+              systemPrompt: existingSession.creationParams?.systemPrompt,
+            }
+          : params,
+      );
       if (fingerprint === existingSession.sessionFingerprint) {
         return {
           sessionId: params.sessionId,
@@ -9897,11 +9905,8 @@ export class ClaudeAcpAgent {
         };
       }
 
-      // Session-defining params changed (e.g. cwd pointed at a git worktree,
-      // MCP servers reconfigured, or the skill set changed). Tear down the
-      // existing session and recreate it so the underlying Query process picks
-      // up the new values.
-      await this.teardownSession(params.sessionId);
+      // Load/resume replaces the query. An options probe leaves it running.
+      if (!optionsOnly) await this.teardownSession(params.sessionId);
     }
 
     const sessionParams = {
@@ -9913,6 +9918,7 @@ export class ClaudeAcpAgent {
     };
     const creation = {
       permissionMode: livePermissionMode,
+      optionsOnly,
       ...(resumedSession ? { resumedModelHint: resumedSession.model } : {}),
     };
     // A live session may never have been prompted, so it may have no stored
@@ -10021,7 +10027,10 @@ export class ClaudeAcpAgent {
     // We want to create a new session id unless it is resume,
     // but not resume + forkSession.
     let sessionId;
-    if (creationOpts.publicSessionId) {
+    if (creationOpts.optionsOnly) {
+      // The transcript to read is `resume`. No callback from this query owns that session.
+      sessionId = randomUUID();
+    } else if (creationOpts.publicSessionId) {
       sessionId = creationOpts.publicSessionId;
     } else if (creationOpts.forkSession) {
       sessionId = randomUUID();
@@ -10418,7 +10427,14 @@ export class ClaudeAcpAgent {
       },
       ...(creationOpts.resume !== undefined && { resume: creationOpts.resume }),
       ...(creationOpts.forkSession !== undefined && { forkSession: creationOpts.forkSession }),
-      ...(creationOpts.optionsOnly ? { persistSession: false } : {}),
+      // The probe neither reports session updates through our hooks nor
+      // starts the MCP servers in the client's options or workspace settings.
+      ...(creationOpts.optionsOnly && {
+        persistSession: false,
+        hooks: userProvidedOptions?.hooks,
+        strictMcpConfig: true,
+        mcpServers: {},
+      }),
       abortController,
     };
 
@@ -10473,7 +10489,9 @@ export class ClaudeAcpAgent {
           (error.message === "Query closed before response received" ||
             error.message.includes("No conversation found with session ID"))
         ) {
-          throw RequestError.sessionNotFound(sessionId);
+          throw RequestError.sessionNotFound(
+            creationOpts.optionsOnly ? creationOpts.resume : sessionId,
+          );
         }
         throw startupFailureError(error) ?? error;
       }
