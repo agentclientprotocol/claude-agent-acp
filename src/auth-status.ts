@@ -202,15 +202,15 @@ export function gatewayAuthStatus(baseUrl?: string): AuthStatus {
  * information", not "logged out" — an empty read must never be mapped to
  * `none`, or it destroys what the CLI probe already established.
  *
- * `tokenSource` is deliberately not a signal: the CLI sets it to the OAuth
- * token's origin (`CLAUDE_CODE_OAUTH_TOKEN`,
- * `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`, …), never to a key source, so it
- * cannot attribute a key and carries no plan of its own.
+ * `ANTHROPIC_AUTH_TOKEN` identifies the accepted bearer credential. Other
+ * token origins (`CLAUDE_CODE_OAUTH_TOKEN`, its file descriptor, …) carry no
+ * plan of their own, so those reads leave the CLI's subscription report intact.
  */
 export function accountInfoHasIdentitySignal(account: AccountInfo | undefined): boolean {
   if (!account) return false;
   return Boolean(
     account.apiKeySource ||
+    account.tokenSource === "ANTHROPIC_AUTH_TOKEN" ||
     account.subscriptionType ||
     (account.apiProvider && account.apiProvider !== "firstParty"),
   );
@@ -230,6 +230,7 @@ export function fromAccountInfo(
     apiProvider: account.apiProvider,
     subscriptionType: account.subscriptionType,
     apiKeySource: account.apiKeySource,
+    tokenSource: account.tokenSource,
     email: account.email,
     organization: account.organization,
     apiKeyHelper,
@@ -238,8 +239,13 @@ export function fromAccountInfo(
 
 /** Pre-session mapping from `claude auth status --json` stdout. Returns
  *  `undefined` when the output is not the expected JSON object, so callers can
- *  report "not known" instead of guessing. */
-export function fromCliStatus(stdout: string, apiKeyHelper?: string): AuthStatus | undefined {
+ *  report "not known" instead of guessing. `authTokenPresent` describes
+ *  ANTHROPIC_AUTH_TOKEN in the CLI's effective env, including settings.json. */
+export function fromCliStatus(
+  stdout: string,
+  apiKeyHelper?: string,
+  authTokenPresent = false,
+): AuthStatus | undefined {
   let parsed: unknown;
   try {
     parsed = JSON.parse(stdout);
@@ -267,6 +273,11 @@ export function fromCliStatus(stdout: string, apiKeyHelper?: string): AuthStatus
     !status.apiKeySource &&
     !status.subscriptionType
   ) {
+    // Both environment tokens produce this CLI payload. The caller reads the
+    // effective env to distinguish a bearer token from a setup-token login.
+    if (authTokenPresent) {
+      return mapAuthFields({ tokenSource: "ANTHROPIC_AUTH_TOKEN" });
+    }
     return { kind: "account", label: "Claude subscription", detail: "OAuth token" };
   }
   return mapAuthFields({
@@ -295,6 +306,7 @@ function mapAuthFields(fields: {
   subscriptionType?: string;
   planTier?: string;
   apiKeySource?: string;
+  tokenSource?: string;
   email?: string;
   organization?: string;
   apiKeyHelper?: string;
@@ -324,6 +336,13 @@ function mapAuthFields(fields: {
       kind: "api_key",
       label: "Anthropic API key",
       ...(detail ? { detail } : {}),
+    };
+  }
+  if (fields.tokenSource === "ANTHROPIC_AUTH_TOKEN") {
+    return {
+      kind: "api_key",
+      label: "Anthropic API key",
+      detail: "ANTHROPIC_AUTH_TOKEN",
     };
   }
   if (subscriptionType) {

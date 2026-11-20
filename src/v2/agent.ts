@@ -212,7 +212,7 @@ class V2Agent implements AgentHandle, SessionConnection {
   ) {
     this.auth = new V2Auth(ctx, logger, {
       routeChanged: () => this.restarts.reroute(),
-      probed: (kind) => this.guard.probed(kind),
+      probed: (kind, appliesTo) => this.guard.probed(kind, appliesTo),
     });
     this.guard = new SubscriptionGuard(this.auth, logger, (sessionId) =>
       this.restarts.accountMayHaveChanged(sessionId),
@@ -1058,9 +1058,8 @@ class V2Agent implements AgentHandle, SessionConnection {
       this.logger,
       { allowBypass, allowAuto },
     );
-    // The settings stay live for the idle compaction (see `reports.ts`) until the session
-    // ends. They keep the values they read: their cwd and key helper.
-    const authStarted = this.auth.sessionStarting(settings);
+    // Auth probes use the client's launch env and inline settings, before provider routing.
+    const authStarted = this.auth.sessionStarting(settings, configured, client?.env);
     const routeGeneration = this.auth.routeGeneration;
     const routing = this.auth.routing();
     const thinking = resolveThinkingConfig(
@@ -1204,7 +1203,11 @@ class V2Agent implements AgentHandle, SessionConnection {
     }
     authStarted(sessionId, initialization.account);
     try {
-      this.guard.sessionStarted(sessionId, initialization.account, settings.getApiKeyHelper());
+      this.guard.sessionStarted(
+        sessionId,
+        initialization.account,
+        settings.getApiKeyHelper(configured),
+      );
     } catch (error) {
       q.close();
       settings.dispose();
