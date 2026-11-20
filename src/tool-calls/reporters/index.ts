@@ -11,6 +11,7 @@ import {
   PlanToolReporter,
   ReportFindingsReporter,
   SkillReporter,
+  StructuredOutputReporter,
 } from "./interaction.js";
 import { ReadReporter } from "./read.js";
 import { GlobReporter, GrepReporter } from "./search.js";
@@ -18,6 +19,7 @@ import { WebFetchReporter, WebSearchReporter } from "./web.js";
 
 const bash = new BashReporter();
 const reporters: Record<string, ToolReporter> = {
+  StructuredOutput: new StructuredOutputReporter(),
   Agent: new AgentReporter(),
   Task: new AgentReporter(),
   Bash: bash,

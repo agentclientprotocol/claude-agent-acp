@@ -41,6 +41,7 @@
  * parent, and a notice after the root's `replay_complete` says that subagent
  * history is missing, as it does for a child whose transcript cannot be read.
  */
+import path from "node:path";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk/unstable";
 import type { SessionMessage } from "@anthropic-ai/claude-agent-sdk";
@@ -53,6 +54,7 @@ import {
   nativeSubagentState,
   responseModelEntry,
   rfdLabels,
+  withSessionReference,
   type SubagentModels,
 } from "../native-subagents.js";
 import {
@@ -76,7 +78,14 @@ import { taskNotificationsOf } from "../task-notifications.js";
 import type { V2UpdateTranslator } from "./update-translator.js";
 import { REPLAY_COMPLETE } from "./setup.js";
 import { SessionOutput, type ReplayHooks } from "./stream.js";
-import { sameDirectory } from "./tasks.js";
+import { sameDirectory, workflowWorkerState } from "./tasks.js";
+import { findTranscript } from "../resumed-session.js";
+import {
+  readWorkflowLaunches,
+  workflowCalls,
+  type HistoricalWorkflowWorker,
+} from "./workflow-history.js";
+import { workflowWorkerMessage } from "./workflow-transcript.js";
 
 /** What the replay needs of its root session. */
 export interface ReplayHost {
@@ -101,11 +110,19 @@ const NO_LIVE_CHILDREN: LiveChildren = { working: () => false, configuration: ()
 
 /** A replayed child, with the output of its session once announced. */
 type ReplayChild = SharedReplayChild & { output?: SessionOutput };
+type WorkflowChild = {
+  parent: string;
+  callId: string;
+  state: v2.StateUpdate;
+  output: SessionOutput;
+  replayed: boolean;
+};
 
 export class SubagentReplay {
   private readonly transcript: ReplayTranscript<ReplayChild>;
   /** Children whose transcript could not be read: only their association is replayed. */
   private withoutHistory = 0;
+  private readonly workflowChildren = new Map<string, WorkflowChild>();
   private rootOutput: SessionOutput | undefined;
 
   private constructor(
@@ -114,6 +131,7 @@ export class SubagentReplay {
     /** The transcript of each child, by agent id. */
     private readonly transcripts: Map<string, SessionMessage[]>,
     private readonly live: LiveChildren,
+    private readonly workflowLaunches: Map<string, Map<string, HistoricalWorkflowWorker[]>>,
   ) {
     this.transcript = new ReplayTranscript(history);
   }
@@ -127,20 +145,61 @@ export class SubagentReplay {
     messages: SessionMessage[],
     live: LiveChildren = NO_LIVE_CHILDREN,
   ): Promise<SubagentReplay | undefined> {
-    if (!messages.some((message) => launchIdsOf(message).length > 0)) return undefined;
+    if (!messages.some((m) => launchIdsOf(m).length || workflowCalls(m).length)) return undefined;
     const history = await subagentHistory(host.sessionId);
     const transcripts = new Map<string, SessionMessage[]>();
-    const queue = messages.flatMap(launchIdsOf);
-    while (queue.length > 0) {
-      const record = history.agents.get(queue.shift()!);
-      if (!record || transcripts.has(record.agentId)) continue;
-      const transcript = (
-        await readSubagentMessages(host.sessionId, record.agentId, history, host.logger)
-      ).map((message) => ({ ...message, parent_tool_use_id: null }));
-      transcripts.set(record.agentId, transcript);
-      queue.push(...transcript.flatMap(launchIdsOf));
+    const workflowLaunches = new Map<string, Map<string, HistoricalWorkflowWorker[]>>();
+    let rootFile: string | undefined;
+    const queue: { owner: string; messages: SessionMessage[]; file?: string }[] = [
+      { owner: host.sessionId, messages },
+    ];
+    for (const source of queue) {
+      const children: { id: string; file?: string }[] = [];
+      for (const id of source.messages.flatMap(launchIdsOf)) {
+        const record = history.agents.get(id);
+        if (record) children.push({ id: record.agentId });
+      }
+      if (
+        source.messages.some((m) => workflowCalls(m).length) &&
+        /^[a-zA-Z0-9_-]+$/.test(host.sessionId)
+      ) {
+        rootFile ??= await findTranscript(host.sessionId);
+        if (rootFile) {
+          const folder = rootFile.slice(0, -".jsonl".length);
+          const ownerFile =
+            source.file ??
+            (source.owner === host.sessionId
+              ? rootFile
+              : path.join(folder, "subagents", "agent-" + source.owner + ".jsonl"));
+          const groups = await readWorkflowLaunches(
+            host.sessionId,
+            source.owner,
+            folder,
+            ownerFile,
+            source.messages,
+          );
+          workflowLaunches.set(source.owner, groups);
+          for (const group of groups.values())
+            for (const worker of group)
+              children.push({ id: worker.agent.agentId, file: worker.file });
+        }
+      }
+      for (const child of children) {
+        if (transcripts.has(child.id) || child.id === host.sessionId) continue;
+        const records = await readSubagentMessages(
+          host.sessionId,
+          child.id,
+          child.file && !history.dir ? { ...history, dir: host.cwd } : history,
+          host.logger,
+        );
+        const transcript = child.file
+          ? records.flatMap((record) => workflowWorkerMessage(record) ?? [])
+          : records.map((message) => ({ ...message, parent_tool_use_id: null }));
+        transcripts.set(child.id, transcript);
+        queue.push({ owner: child.id, messages: transcript, file: child.file });
+      }
     }
-    return new SubagentReplay(host, history, transcripts, live);
+    return new SubagentReplay(host, history, transcripts, live, workflowLaunches);
   }
 
   /** The hooks of the replay of the root session's history (`messages`). */
@@ -170,6 +229,11 @@ export class SubagentReplay {
     }
     for (const child of announced) {
       this.host.send({ sessionId: child.sessionId, update: REPLAY_COMPLETE });
+    }
+    // A worker may own ordinary Agent children; their historical states above
+    // must reach that worker before its own replay_complete.
+    for (const [id, child] of this.workflowChildren) {
+      if (child.replayed) this.host.send({ sessionId: id, update: REPLAY_COMPLETE });
     }
   }
 
@@ -202,7 +266,22 @@ export class SubagentReplay {
    * The v1 core sends the same after the response (`currentStates`): on v1
    * the response is what separates a replayed child state from a current one.
    */
-  currentStates(): void {
+  currentStates(snapshot: readonly v2.UpdateSessionNotification[]): void {
+    // The live snapshot can report a finished worker too, while its Workflow
+    // is still open. Use its observed state in preference to the run journal.
+    const live = new Set(
+      snapshot
+        .filter(({ update }) => update.sessionUpdate === "state_update")
+        .map(({ sessionId }) => sessionId),
+    );
+    for (const [id, child] of this.workflowChildren) {
+      if (!child.replayed || live.has(id)) continue;
+      this.host.send({
+        sessionId: child.parent,
+        update: { sessionUpdate: "subagent_update", sessionId: id, state: child.state },
+      });
+      this.host.send({ sessionId: id, update: { sessionUpdate: "state_update", ...child.state } });
+    }
     for (const child of this.transcript.children.values()) {
       if (!child.announced) continue;
       if (!this.live.working(child.sessionId)) this.sendEndState(child);
@@ -272,6 +351,44 @@ export class SubagentReplay {
     const { update } = notification;
     if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") {
       return [notification];
+    }
+    const workers = this.workflowLaunches.get(output.sessionId)?.get(update.toolCallId);
+    if (workers?.length) {
+      let linked = notification;
+      for (const { agent } of workers) {
+        const id = agent.agentId;
+        let child = this.workflowChildren.get(id);
+        if (!child) {
+          const outcome = workflowWorkerState(agent);
+          const state: v2.StateUpdate =
+            outcome && outcome !== "running"
+              ? ({ state: "idle", ...outcome } as v2.StateUpdate)
+              : { state: "unknown" };
+          const childOutput = new SessionOutput(
+            id,
+            this.cwdOf(output.sessionId),
+            this.host.translator,
+            (update) => this.host.send({ sessionId: id, update }),
+            this.host.logger,
+            true,
+          );
+          child = {
+            parent: output.sessionId,
+            callId: update.toolCallId,
+            state,
+            output: childOutput,
+            replayed: false,
+          };
+          this.workflowChildren.set(id, child);
+          this.host.send({
+            sessionId: output.sessionId,
+            update: { sessionUpdate: "subagent_update", sessionId: id, title: agent.label },
+          });
+        }
+        if (child.parent === output.sessionId && child.callId === update.toolCallId)
+          linked = withSessionReference(linked, id);
+      }
+      return [linked];
     }
     const sendMessage = this.transcript.sendMessages.find(
       (call) => call.toolUseId === update.toolCallId,
@@ -343,6 +460,27 @@ export class SubagentReplay {
   /** After a message that launched children: each is announced, and its history replays. */
   private replayed(message: SessionMessage, parent: SessionOutput): void {
     if (message.type !== "assistant") return;
+    for (const call of workflowCalls(message)) {
+      for (const { agent } of this.workflowLaunches.get(parent.sessionId)?.get(call) ?? []) {
+        const child = this.workflowChildren.get(agent.agentId);
+        if (!child || child.parent !== parent.sessionId || child.callId !== call || child.replayed)
+          continue;
+        child.replayed = true;
+        const records = this.transcripts.get(agent.agentId) ?? [];
+        if (!records.length) this.withoutHistory++;
+        this.transcript.scan(records, agent.agentId);
+        child.output.replay(records, this.ownerHooks(child.output, undefined));
+        // Keep this worker's history, including its state, in the turn that launched it.
+        this.host.send({
+          sessionId: parent.sessionId,
+          update: {
+            sessionUpdate: "subagent_update",
+            sessionId: agent.agentId,
+            state: child.state,
+          },
+        });
+      }
+    }
     for (const launchId of launchIdsOf(message)) {
       const child = this.transcript.children.get(launchId);
       if (!child || child.announced) continue;
@@ -476,8 +614,10 @@ export class SubagentReplay {
 
   private outputOf(sessionId: string): SessionOutput | undefined {
     if (sessionId === this.host.sessionId) return this.rootOutput;
-    return [...this.transcript.children.values()].find((child) => child.sessionId === sessionId)
-      ?.output;
+    return (
+      this.workflowChildren.get(sessionId)?.output ??
+      [...this.transcript.children.values()].find((child) => child.sessionId === sessionId)?.output
+    );
   }
 
   private cwdOf(sessionId: string): string {

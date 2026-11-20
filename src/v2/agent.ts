@@ -555,14 +555,14 @@ class V2Agent implements AgentHandle, SessionConnection {
       release?.();
       // A notice is not history, so it follows `replay_complete`.
       subagents?.reportMissingHistory();
-      // A `subagent_update` after its parent's `replay_complete` is current,
-      // and so is a `state_update` of the child: the replayed children's
-      // current states go out here, before the snapshot and the response.
-      subagents?.currentStates();
     }
     // The current title, after the replay and before the state.
     await session.reports.publishTitle();
-    for (const notification of session.resumeSnapshot()) this.send(notification);
+    const snapshot = session.resumeSnapshot();
+    // Every parent's replay is complete. Supply the current states that
+    // the live snapshot does not carry, before the resume response.
+    subagents?.currentStates(snapshot);
+    for (const notification of snapshot) this.send(notification);
     const response = await this.setupFields(session);
     this.afterSetup(session, params);
     return response;
