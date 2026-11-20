@@ -3,6 +3,7 @@ import {
   type SessionConfigOption,
   type SessionNotification,
 } from "@agentclientprotocol/sdk/unstable";
+import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { realpath } from "node:fs/promises";
 import path from "node:path";
 import type { AcpSessionNotification, SubagentForm, SubagentState } from "./acp-subagents.js";
@@ -56,7 +57,7 @@ export type NativeSubagent = {
   promptIds?: Set<string>;
   /** The RFD form: the calls that delegated to the child, whose runs ended. */
   endedRuns?: Set<string>;
-  /** The RFD form: the calls that delegated to the child, whose runs handed back a report. */
+  /** The calls that delegated to the child, whose runs handed back a report. */
   handedBack?: Set<string>;
   /** Whether a message of it came (see `NativeSubagentRuntime.messageCame`). */
   heard?: boolean;
@@ -713,8 +714,8 @@ export class NativeSubagentRuntime {
       await this.reportConfiguration(announcedChild.sessionId, update.configOptions, update._meta);
       return null;
     }
-    if (this.form === "rfd" && announcedChild?.announced) {
-      const handback = await this.routeRfdHandback(notification, announcedChild);
+    if (announcedChild?.announced) {
+      const handback = await this.routeHandback(notification, announcedChild);
       if (handback !== undefined) return handback;
     }
     if (owner) return this.toChild(owner, notification, toolCallId);
@@ -816,6 +817,50 @@ export class NativeSubagentRuntime {
     if (task.parentTaskId === undefined) return this.rootSessionId;
     const parent = this.children.get(task.parentTaskId);
     return parent?.announced ? parent.sessionId : undefined;
+  }
+
+  /** A launch result can carry the report even when the SDK sends no child stream. */
+  async toolResult(message: SDKUserMessage): Promise<void> {
+    if (!this.enabled || !Array.isArray(message.message.content)) return;
+    const results = message.message.content.filter((block) => block.type === "tool_result");
+    const result = results[0];
+    if (results.length !== 1 || result?.type !== "tool_result" || result.is_error) return;
+    const text = handbackReportText(message.tool_use_result);
+    if (text === undefined) return;
+    const launchId = result.tool_use_id;
+    const child = this.childByParentToolUse.get(launchId);
+    if (!child) return;
+    await this.announce(child);
+    await this.publishHandback(child, launchId, text, `${launchId}:handback`);
+  }
+
+  private async publishHandback(
+    child: NativeSubagent,
+    delegationId: string,
+    text: string,
+    messageId: string,
+  ): Promise<void> {
+    if (child.handedBack?.has(delegationId)) return;
+    (child.handedBack ??= new Set()).add(delegationId);
+    if (this.form === "air") {
+      await this.publish({
+        sessionId: child.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          messageId,
+          content: { type: "text", text },
+        },
+      });
+    } else {
+      for (const view of linkedSessionMessages(
+        messageId,
+        child.sessionId,
+        child.parentSessionId,
+        text,
+      )) {
+        await this.publish(view);
+      }
+    }
   }
 
   async taskStarted(task: TaskStarted, deliver: Publish): Promise<void> {
@@ -1630,12 +1675,12 @@ export class NativeSubagentRuntime {
   }
 
   /**
-   * The RFD form: an update of a SubagentHandback call of the announced
-   * `child`, which its report replaces: the child's message to its parent,
-   * see {@link linkedSessionMessages}. A failed call delivered nothing, so the
+   * An update of a SubagentHandback call of the announced `child`, which its
+   * report replaces. RFD also sends the parent an incoming session message.
+   * A failed call delivered nothing, so the
    * child is shown the call after all. `undefined` for any other update.
    */
-  private async routeRfdHandback(
+  private async routeHandback(
     notification: AcpSessionNotification,
     child: NativeSubagent,
   ): Promise<AcpSessionNotification | null | undefined> {
@@ -1658,15 +1703,12 @@ export class NativeSubagentRuntime {
     if (!isFinalToolCallStatus(update.status)) return null;
     this.handbacks.delete(update.toolCallId);
     if (update.status === "completed" && handback.message) {
-      for (const view of linkedSessionMessages(
-        update.toolCallId,
-        child.sessionId,
-        child.parentSessionId,
+      await this.publishHandback(
+        child,
+        handback.delegationId ?? update.toolCallId,
         handback.message,
-      )) {
-        await this.publish(view);
-      }
-      if (handback.delegationId) (child.handedBack ??= new Set()).add(handback.delegationId);
+        update.toolCallId,
+      );
       return null;
     }
     return unexposedControlFallback(handback.initial, notification, child.sessionId);
@@ -2240,6 +2282,15 @@ export function withSessionReference(
  * structured result.
  */
 export const HANDBACK_TOOL = "SubagentHandback";
+
+/** The report in an Agent result whose text only points to the hand-back message. */
+export function handbackReportText(result: unknown): string | undefined {
+  const report = result as
+    { status?: unknown; handbackReport?: { text?: unknown } } | null | undefined;
+  if (report?.status !== "completed") return undefined;
+  const text = report.handbackReport?.text;
+  return typeof text === "string" && text.trim() ? text : undefined;
+}
 
 /** The report of a SubagentHandback call, from its input. */
 export function handbackMessage(input: unknown): string | undefined {

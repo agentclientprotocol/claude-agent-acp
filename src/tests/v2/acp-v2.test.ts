@@ -7267,6 +7267,36 @@ describe("ACP v2 requests that subagents make", () => {
       expect(shownToolCalls(client)).toEqual([]);
     });
 
+    it("keeps a structured hand-back report when Claude Code sends no child stream", async () => {
+      scriptTurns(async function* (options) {
+        yield toolUseMessage(options, "toolu_agent-1", "Agent", {
+          description: "Explore the project",
+          prompt: "Look around",
+        });
+        yield taskStarted(options, "agent-1", { prompt: "Look around" });
+        yield taskNotification(options, "agent-1", {});
+        yield {
+          ...toolResultMessage(options, "toolu_agent-1", {
+            content: "The report was delivered as a message.",
+          }),
+          tool_use_result: { status: "completed", handbackReport: { text: "Found it." } },
+        };
+        yield result(options);
+        yield idleState(options);
+      });
+      const client = await promptToIdle(v2Client());
+      const root = client.sessionUpdates.find(
+        ({ update }) => update.sessionUpdate === "user_message",
+      )!.sessionId;
+      expect(sessionMessages(client, root)).toEqual([
+        "root toolu_agent-1 root -> agent-1 Look around",
+        "agent-1 toolu_agent-1 root -> agent-1 Look around",
+        "agent-1 toolu_agent-1:handback agent-1 -> root Found it.",
+        "root toolu_agent-1:handback agent-1 -> root Found it.",
+      ]);
+      expect(shownToolCalls(client)).toEqual([]);
+    });
+
     it("shows a SendMessage call whose message reached no child session as a tool call", async () => {
       scriptTurns(async function* (options) {
         yield toolUseMessage(options, "toolu_send", "SendMessage", {
