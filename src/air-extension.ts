@@ -25,6 +25,8 @@ export const AIR_SESSION_INDEX_CAPABILITY = "sessionIndex";
 /** Metadata lookup of known ids with `_session/batch_get`. Advertised
  *  exactly when {@link AIR_SESSION_INDEX_CAPABILITY} is negotiated. */
 export const AIR_SESSION_BATCH_GET_CAPABILITY = "sessionBatchGet";
+/** Versioned transcript text from the stored transcript through `_session/batch_get`. */
+export const AIR_SESSION_TRANSCRIPT_TEXT_CAPABILITY = "sessionTranscriptText";
 /**
  * The agent supports `_session/archive` and `_session/unarchive`. Advertised
  * exactly when {@link AIR_SESSION_INDEX_CAPABILITY} is; the client does not

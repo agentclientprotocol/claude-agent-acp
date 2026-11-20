@@ -42,7 +42,14 @@ import {
   type ListChanges,
 } from "../../session-index/list-subscriptions.js";
 import { SessionTitles } from "../../session-titles.js";
-import { initializeClient } from "../helpers.js";
+import {
+  initializeClient,
+  transcriptAssistant,
+  transcriptCompactBoundary,
+  transcriptCompactSummary,
+  transcriptUser,
+  writeTranscript as writeLinkedTranscript,
+} from "../helpers.js";
 import {
   mockSessionState,
   successfulResultMessage,
@@ -360,6 +367,156 @@ describe("_session/batch_get", () => {
     } finally {
       connection.close();
       await agent.dispose();
+    }
+  });
+
+  it("projects the selected copy before opening it and detects edits at the same mtime", async () => {
+    const sessionId = randomUUID();
+    const otherCwd = path.join(workspace, "other");
+    const cwd = path.join(workspace, "chosen");
+    const directory = path.join(configDir, "projects", encodeProjectPath(cwd));
+    const transcript = path.join(directory, `${sessionId}.jsonl`);
+    const firstReply = transcriptAssistant("assistant", "joined ");
+    const records = [
+      transcriptUser("prompt", "stable title"),
+      firstReply,
+      {
+        ...transcriptAssistant("assistant-next", "answer"),
+        message: { ...firstReply.message, content: [{ type: "text", text: "answer" }] },
+      },
+      transcriptUser("tool", "", {
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "t", content: "private tool output" }],
+        },
+      }),
+      transcriptCompactBoundary("boundary", "tool"),
+      transcriptCompactSummary(
+        "summary",
+        "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n" +
+          "<system-reminder>\n<tools-used-before-summary>Read</tools-used-before-summary>\n</system-reminder>\n" +
+          "compact marker\n\nIf you need specific details from before compaction, read the full transcript at: /tmp/example.jsonl\n" +
+          "Continue the conversation from where it left off without asking the user any further questions.",
+      ),
+      transcriptUser(
+        "later",
+        "late user marker<system-reminder>private instruction</system-reminder>",
+      ),
+    ];
+    await writeLinkedTranscript(
+      directory,
+      sessionId,
+      records.map((record) => ({ cwd, ...record })),
+    );
+    const mtime = new Date("2026-10-11T01:00:00.000Z");
+    await fs.utimes(transcript, mtime, mtime);
+    await writeTranscript({
+      sessionId,
+      cwd: otherCwd,
+      prompt: "other project",
+      mtimeMs: mtime.getTime() + 5000,
+    });
+
+    let agent!: ClaudeAcpAgent;
+    const connection = acpClient({ name: "search-text-test" }).connect(
+      v1AgentApp({ log: () => {}, error: () => {} }, (created) => {
+        agent = created;
+      }),
+    );
+    const request = async (mode?: "transcriptRevision" | "transcriptTextSnapshot") => {
+      const result = await connection.agent.request<{ sessions: SessionInfo[] }>(
+        "_session/batch_get",
+        {
+          sessionIds: [sessionId],
+          ...(mode && { _meta: { jetbrains: { air: { include: mode, cwd } } } }),
+        },
+      );
+      return {
+        row: result.sessions[0],
+        text: (result.sessions[0]?._meta as any)?.jetbrains.air.transcriptTextSnapshot,
+      };
+    };
+    try {
+      const old = await connection.agent.request<InitializeResponse>("initialize", {
+        protocolVersion: 1,
+        clientCapabilities: air("sessionIndex"),
+      });
+      expect(airCapabilities(old)).not.toContain("sessionTranscriptText");
+      expect((await request()).text).toBeUndefined();
+      await expect(request("transcriptTextSnapshot")).rejects.toMatchObject({ code: -32602 });
+
+      const negotiated = await connection.agent.request<InitializeResponse>("initialize", {
+        protocolVersion: 1,
+        clientCapabilities: air("sessionIndex", "sessionTranscriptText"),
+      });
+      expect(airCapabilities(negotiated)).toContain("sessionTranscriptText");
+      expect((await request()).text).toBeUndefined();
+      for (const include of [["transcriptRevision"], "revision", "projection", {}]) {
+        await expect(
+          connection.agent.request("_session/batch_get", {
+            sessionIds: [sessionId],
+            _meta: { jetbrains: { air: { include, cwd } } },
+          }),
+        ).rejects.toMatchObject({ code: -32602 });
+      }
+      const before = await request("transcriptRevision");
+      expect(before.row?.cwd).toBe(cwd);
+      expect(before.text).toEqual({ revision: expect.any(String) });
+      expect((await request("transcriptTextSnapshot")).text).toEqual({
+        revision: before.text.revision,
+        messages: [
+          { role: "user", text: "stable title" },
+          { role: "assistant", text: "joined answer" },
+          { role: "compact_summary", text: "compact marker" },
+          { role: "user", text: "late user marker" },
+        ],
+        truncated: false,
+      });
+
+      const data = await fs.readFile(transcript, "utf8");
+      await fs.writeFile(transcript, data.replace("late user marker", "next user marker"));
+      await fs.utimes(transcript, mtime, mtime);
+      const after = await request("transcriptTextSnapshot");
+      expect(after.row?.title).toBe(before.row?.title);
+      expect(after.row?.updatedAt).toBe(before.row?.updatedAt);
+      expect(after.text.revision).not.toBe(before.text.revision);
+      expect(after.text.messages.at(-1)).toEqual({ role: "user", text: "next user marker" });
+    } finally {
+      connection.close();
+      await agent.dispose();
+    }
+  });
+
+  it("keeps searchable messages around a malformed transcript record", async () => {
+    const sessionId = randomUUID();
+    const directory = path.join(configDir, "projects", encodeProjectPath(workspace));
+    const transcript = path.join(directory, `${sessionId}.jsonl`);
+    await writeLinkedTranscript(directory, sessionId, [
+      { cwd: workspace, ...transcriptUser("before", "before damaged record") },
+      transcriptAssistant("after", "after damaged record"),
+    ]);
+    const data = await fs.readFile(transcript, "utf8");
+    await fs.writeFile(transcript, data.replace("\n", '\n{"type":"assistant",\n'));
+    const service = new SessionIndexService({ logError: () => {} });
+    try {
+      const read = async (mode: "transcriptRevision" | "transcriptTextSnapshot") => {
+        const result = await service.batchGet(
+          { sessionIds: [sessionId], transcriptText: { mode, cwd: workspace } },
+          () => undefined,
+        );
+        return (result.sessions[0]?._meta as any)?.jetbrains.air.transcriptTextSnapshot;
+      };
+      const { revision } = await read("transcriptRevision");
+      expect(await read("transcriptTextSnapshot")).toEqual({
+        revision,
+        messages: [
+          { role: "user", text: "before damaged record" },
+          { role: "assistant", text: "after damaged record" },
+        ],
+        truncated: true,
+      });
+    } finally {
+      service.dispose();
     }
   });
 

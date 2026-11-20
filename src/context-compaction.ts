@@ -69,6 +69,8 @@ const ANALYSIS_BLOCKS = [
 const CONTINUATION_PREAMBLE = /^\s*This session is being continued from a previous conversation/i;
 const PERSISTED_PREAMBLE =
   /^\s*This session is being continued from a previous conversation[^\n]*\n(?:[\s\S]*?\n)?Summary:[ \t]*\r?\n/;
+const CURRENT_PERSISTED_PREAMBLE =
+  /^\s*This session is being continued from a previous conversation that ran out of context\. The summary below covers the earlier portion of the conversation\.\r?\n\s*(?:<system-reminder>[\s\S]*?<\/system-reminder>\s*)?(?:Summary:[ \t]*\r?\n)?/;
 const PERSISTED_TRAILERS = [
   /\n+If you need specific details from before compaction[\s\S]*$/,
   /\n+(?:Please )?[Cc]ontinue the conversation from where it left (?:it )?off[\s\S]*$/,
@@ -93,9 +95,10 @@ export function compactionSummaryText(raw: string): string | undefined {
   if (tagged !== undefined) {
     text = tagged;
   } else if (CONTINUATION_PREAMBLE.test(text)) {
-    const body = text.replace(PERSISTED_PREAMBLE, "");
-    if (body === text) return undefined;
-    text = body;
+    const preamble =
+      text.match(CURRENT_PERSISTED_PREAMBLE)?.[0] ?? text.match(PERSISTED_PREAMBLE)?.[0];
+    if (!preamble) return undefined;
+    text = text.slice(preamble.length);
     for (const trailer of PERSISTED_TRAILERS) {
       text = text.replace(trailer, "");
     }

@@ -1563,9 +1563,9 @@ sessions and folder members outside the recent list page. Check for
 `sessionBatchGet` in `initialize.result._meta.jetbrains.air.capabilities` before
 calling it.
 
-The params object must contain only `sessionIds`: an array of distinct,
+The params object must contain `sessionIds`: an array of distinct,
 non-blank strings. IDs match exactly, without trimming or case normalization.
-Malformed params, duplicates or extra fields return `Invalid params` (`-32602`).
+An optional `_meta` object carries extensions. Malformed params, duplicates or extra fields return `Invalid params` (`-32602`).
 The agent sets no limit on the number of IDs; the client chooses the batch size
 for the latency it accepts. Archived sessions and sessions in other projects
 or worktrees are eligible.
@@ -1620,6 +1620,44 @@ The agent looks up 100 IDs at a time; the client may request any number of IDs.
 Merge returned rows with the recent page by `sessionId`. A batch read does not
 expand an existing list subscription's scope; refresh retained IDs outside that
 scope explicitly.
+
+#### Transcript text
+
+An ACP 1 client declares `sessionTranscriptText` with `sessionIndex` in
+`initialize.params.clientCapabilities._meta.jetbrains.air.capabilities`.
+The agent returns `sessionTranscriptText` with its index capabilities when it
+supports the extension.
+
+The selector `_meta.jetbrains.air.include` is exactly one string: `transcriptRevision` or `transcriptTextSnapshot`.
+An extended batch read takes one ID from a listed row and the `cwd` of that row.
+
+```json
+{
+  "sessionIds": ["oldA"],
+  "_meta": { "jetbrains": { "air": { "include": "transcriptTextSnapshot", "cwd": "/project" } } }
+}
+```
+
+Each returned row adds an object at `_meta.jetbrains.air.transcriptTextSnapshot`. In
+`transcriptRevision` mode it contains only the opaque string `revision`. In
+`transcriptTextSnapshot` mode it also contains `messages` and the boolean `truncated`.
+
+```json
+{
+  "revision": "7:1234:5643:22:91",
+  "messages": [{ "role": "user", "text": "Find this prior prompt" }],
+  "truncated": false
+}
+```
+
+The agent reads the current saved conversation without opening the session.
+The roles are `user`, `assistant` and `compact_summary`. Message order follows
+the conversation. Tool payloads, reasoning and internal messages are excluded.
+The revision describes the returned snapshot. The agent omits a missing session,
+rejects a read that changed while in progress, and marks a projection partial
+when it reaches a size limit. An empty complete projection means the read
+succeeded and found no searchable text. Ordinary batch and list calls still
+return only metadata.
 
 ### List subscription
 

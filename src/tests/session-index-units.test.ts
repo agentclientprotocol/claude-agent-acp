@@ -245,6 +245,7 @@ describe("change signature", () => {
   it("is the same for an unmarked row as without the agentWorktree field", () => {
     const row: IndexRow = {
       sessionId: SESSION,
+      filePath: `/config/projects/-repo/${SESSION}.jsonl`,
       cwd: "/repo",
       title: "Fix it",
       updatedAtMs: Date.parse("2026-01-01T00:00:00Z"),

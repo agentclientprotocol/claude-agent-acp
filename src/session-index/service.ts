@@ -18,7 +18,7 @@ import {
   type SessionInfo,
 } from "@agentclientprotocol/sdk/unstable";
 import { deleteSession as sdkDeleteSession } from "@anthropic-ai/claude-agent-sdk";
-import { airExtensionMeta } from "../air-extension.js";
+import { airExtensionMeta, withAirMeta } from "../air-extension.js";
 import { sanitizeTitle } from "../session-titles.js";
 import type { OwnSessionState } from "./activity.js";
 import {
@@ -62,6 +62,11 @@ import {
   type ListCursor,
 } from "./session-index.js";
 import { sessionInfoOf } from "./session-info.js";
+import {
+  readTranscriptText,
+  TRANSCRIPT_TEXT_SNAPSHOT_KEY,
+  type TranscriptTextMode,
+} from "./transcript-text.js";
 
 export const SESSION_RENAME_METHOD = "_session/rename";
 export const SESSION_ARCHIVE_METHOD = "_session/archive";
@@ -75,7 +80,10 @@ const CURSOR_VERSION = 5;
 
 export type SessionIdRequest = { sessionId: string };
 export type RenameSessionRequest = { sessionId: string; title: string };
-export type BatchGetSessionsRequest = { sessionIds: string[] };
+export type BatchGetSessionsRequest = {
+  sessionIds: string[];
+  transcriptText?: { mode: TranscriptTextMode; cwd: string };
+};
 export type BatchGetSessionsResponse = {
   sessions: SessionInfo[];
 };
@@ -84,17 +92,32 @@ export function parseBatchGetSessionsRequest(value: unknown): BatchGetSessionsRe
   const record = asRecord(value);
   const ids = record.sessionIds;
   if (
-    Object.keys(record).length !== 1 ||
+    Object.keys(record).some((key) => key !== "sessionIds" && key !== "_meta") ||
     !Array.isArray(ids) ||
     ids.some((id) => typeof id !== "string" || !id.trim()) ||
     new Set(ids).size !== ids.length
   ) {
     throw RequestError.invalidParams(
       undefined,
-      "params require only sessionIds: distinct, non-blank strings",
+      "sessionIds must contain distinct, non-blank strings",
     );
   }
-  return { sessionIds: ids };
+  const air = airExtensionMeta(record._meta);
+  const include = air?.include;
+  if (include === undefined) return { sessionIds: ids };
+  const cwd = air?.cwd;
+  if (
+    (include !== "transcriptRevision" && include !== TRANSCRIPT_TEXT_SNAPSHOT_KEY) ||
+    ids.length !== 1 ||
+    typeof cwd !== "string" ||
+    !path.isAbsolute(cwd)
+  ) {
+    throw RequestError.invalidParams(
+      undefined,
+      "Transcript text requires one session id, an absolute cwd, and a valid mode",
+    );
+  }
+  return { sessionIds: ids, transcriptText: { mode: include, cwd } };
 }
 
 export function sessionNotFound(sessionId: string): RequestError {
@@ -539,18 +562,27 @@ export class SessionIndexService {
 
   /** Metadata for known ids, independent of list pages and project filters. */
   async batchGet(
-    { sessionIds }: BatchGetSessionsRequest,
+    { sessionIds, transcriptText }: BatchGetSessionsRequest,
     own: (sessionId: string) => OwnSessionState | undefined,
+    signal?: AbortSignal,
   ): Promise<BatchGetSessionsResponse> {
     if (sessionIds.length === 0) return { sessions: [] };
+    signal?.throwIfAborted();
     const live = await this.registry.snapshot();
     const now = this.now();
-    const rows = await this.index.getSessions(sessionIds);
-    return {
-      sessions: rows.map((row) =>
-        sessionInfoOf(row, own(row.sessionId), live.get(row.sessionId), now),
-      ),
-    };
+    const rows = await this.index.getSessions(sessionIds, transcriptText?.cwd);
+    signal?.throwIfAborted();
+    const sessions = rows.map((row) =>
+      sessionInfoOf(row, own(row.sessionId), live.get(row.sessionId), now),
+    );
+    const row = rows[0];
+    const session = sessions[0];
+    if (transcriptText && row && session) {
+      const result = await readTranscriptText(row, transcriptText.mode, signal);
+      if (!result) return { sessions: [] };
+      session._meta = withAirMeta(session._meta, TRANSCRIPT_TEXT_SNAPSHOT_KEY, result);
+    }
+    return { sessions };
   }
 
   /** Runs `mutation` after the previous mutation of the session ended, such

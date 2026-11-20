@@ -24,6 +24,7 @@ import type { Logger } from "../logger.js";
 import {
   AIR_SESSION_ARCHIVE_CAPABILITY,
   AIR_SESSION_BATCH_GET_CAPABILITY,
+  AIR_SESSION_TRANSCRIPT_TEXT_CAPABILITY,
   AIR_SESSION_INDEX_CAPABILITY,
   AIR_SESSION_LIST_SUBSCRIBE_CAPABILITY,
   AIR_SESSION_RENAME_CAPABILITY,
@@ -115,6 +116,7 @@ export class SessionIndexConnection {
    * exactly as before.
    */
   service?: SessionIndexService;
+  private clientAdvertisedSessionTranscriptText = false;
   /** The transcript writes of a client without `sessionIndex` (see
    *  {@link transcriptWriter}). */
   private transcripts?: SessionIndexService;
@@ -127,6 +129,10 @@ export class SessionIndexConnection {
   negotiate(request: InitializeRequest): void {
     this.service?.dispose();
     this.service = undefined;
+    this.clientAdvertisedSessionTranscriptText = clientSupportsAirCapability(
+      request.clientCapabilities,
+      AIR_SESSION_TRANSCRIPT_TEXT_CAPABILITY,
+    );
     if (
       this.host.isAirClient() &&
       clientSupportsAirCapability(request.clientCapabilities, AIR_SESSION_INDEX_CAPABILITY)
@@ -156,6 +162,9 @@ export class SessionIndexConnection {
       ? [
           AIR_SESSION_INDEX_CAPABILITY,
           AIR_SESSION_BATCH_GET_CAPABILITY,
+          ...(this.clientAdvertisedSessionTranscriptText
+            ? [AIR_SESSION_TRANSCRIPT_TEXT_CAPABILITY]
+            : []),
           AIR_SESSION_ARCHIVE_CAPABILITY,
           AIR_SESSION_RENAME_CAPABILITY,
           AIR_SESSION_LIST_SUBSCRIBE_CAPABILITY,
@@ -236,10 +245,18 @@ export class SessionIndexConnection {
     return this.service?.list(params, (sessionId) => this.ownSessionState(sessionId));
   }
 
-  batchGet(params: BatchGetSessionsRequest): Promise<BatchGetSessionsResponse> {
-    return this.requireService(SESSION_BATCH_GET_METHOD).batchGet(params, (sessionId) =>
-      this.ownSessionState(sessionId),
-    );
+  batchGet(
+    params: BatchGetSessionsRequest,
+    signal?: AbortSignal,
+  ): Promise<BatchGetSessionsResponse> {
+    const service = this.requireService(SESSION_BATCH_GET_METHOD);
+    if (params.transcriptText && !this.clientAdvertisedSessionTranscriptText) {
+      throw RequestError.invalidParams(
+        undefined,
+        "Declare sessionTranscriptText in initialize first",
+      );
+    }
+    return service.batchGet(params, (sessionId) => this.ownSessionState(sessionId), signal);
   }
 
   /** An AIR client archives with session/delete (see {@link deleteSession}):
@@ -418,7 +435,10 @@ export class SessionIndexConnection {
 
 /** The agent methods behind the session index extension methods. */
 type SessionIndexMethods = {
-  batchGetSessions(params: BatchGetSessionsRequest): Promise<BatchGetSessionsResponse>;
+  batchGetSessions(
+    params: BatchGetSessionsRequest,
+    signal: AbortSignal,
+  ): Promise<BatchGetSessionsResponse>;
   subscribeSessionList(params: ListSubscribeRequest): Promise<ListSubscribeResponse>;
   unsubscribeSessionList(params: ListUnsubscribeRequest): Promise<EmptyResponse>;
   renameSessionTitle(params: RenameSessionRequest): Promise<EmptyResponse>;
@@ -433,7 +453,7 @@ export function onSessionIndexRequests(app: AgentApp, agent: () => SessionIndexM
     .onRequest<BatchGetSessionsRequest, BatchGetSessionsResponse>(
       SESSION_BATCH_GET_METHOD,
       { parse: parseBatchGetSessionsRequest },
-      (ctx) => agent().batchGetSessions(ctx.params),
+      (ctx) => agent().batchGetSessions(ctx.params, ctx.signal),
     )
     .onRequest<ListSubscribeRequest, ListSubscribeResponse>(
       LIST_SUBSCRIBE_METHOD,
