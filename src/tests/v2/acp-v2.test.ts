@@ -259,7 +259,9 @@ function v2Client({
   answerPermission = () => ({ outcome: { outcome: "cancelled" } }),
   answerElicitation = () => ({ action: "accept" }),
 }: {
-  answerPermission?: (request: v2.RequestPermissionRequest) => v2.RequestPermissionResponse;
+  answerPermission?: (
+    request: v2.RequestPermissionRequest,
+  ) => v2.RequestPermissionResponse | Promise<v2.RequestPermissionResponse>;
   answerElicitation?: (
     request: v2.CreateElicitationRequest,
   ) => v2.CreateElicitationResponse | Promise<v2.CreateElicitationResponse>;
@@ -3334,7 +3336,7 @@ describe("ACP v2 prompts", () => {
     });
   });
 
-  it("answers a queued prompt once Claude Code takes it in, after the turn before it", async () => {
+  it("answers a priority prompt once Claude Code takes it in, without ending the foreground work", async () => {
     const firstAnswer = Promise.withResolvers<void>();
     const echoed = scriptTurns(
       async function* (options) {
@@ -3361,7 +3363,7 @@ describe("ACP v2 prompts", () => {
       expect(await queued).toEqual({ messageId: echoed[1] });
       await vi.waitFor(() =>
         expect(turnTrace(client.sessionUpdates).filter((s) => s === "idle end_turn")).toHaveLength(
-          2,
+          1,
         ),
       );
       await client.authUpdate(1);
@@ -3370,9 +3372,7 @@ describe("ACP v2 prompts", () => {
     expect(turnTrace(client.sessionUpdates)).toEqual([
       "user_message",
       "running",
-      "idle end_turn",
       "user_message",
-      "running",
       "idle end_turn",
     ]);
     expect(client.updates("user_message").map((update) => update.messageId)).toEqual(echoed);
@@ -4506,7 +4506,7 @@ describe("ACP v2 prompts", () => {
       await client.authUpdate(1);
     });
 
-    expect(turnTrace(client.sessionUpdates)).toEqual(["user_message", "running", "idle end_turn"]);
+    expect(turnTrace(client.sessionUpdates)).toEqual(["user_message", "running", "idle error"]);
   });
 
   it("gives a messageId to the chunks that the agent builds from a command's output and a result", async () => {
@@ -5928,6 +5928,158 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
     stop_reason: null,
     terminal_reason: "aborted_streaming",
   };
+
+  it.each([
+    { markers: true, streamReply: true },
+    { markers: false, streamReply: true },
+    { markers: true, streamReply: false },
+    { markers: false, streamReply: false },
+  ])(
+    "steers a busy prompt without an idle between the replies (%o)",
+    async ({ markers, streamReply }) => {
+      const reply = Promise.withResolvers<void>();
+      const priorities: unknown[] = [];
+      sdk.run = async function* (prompts, options) {
+        const input = prompts[Symbol.asyncIterator]();
+        const first = (await input.next()).value;
+        const echo = (value: SDKUserMessage) => ({
+          type: "user",
+          message: value.message,
+          uuid: value.uuid,
+          parent_tool_use_id: null,
+          session_id: options.sessionId,
+          isReplay: true,
+        });
+        yield markersInit(options);
+        yield echo(first);
+        yield assistantText(options, "First reply", "msg_first");
+        const second = (await input.next()).value;
+        priorities.push(second.priority);
+        yield result(options, {
+          ...ABORTED,
+          ...(markers ? { user_message_uuids: [first.uuid] } : {}),
+        });
+        yield idleState(options);
+        yield echo(second);
+        if (streamReply) yield assistantText(options, "Stopped", "msg_second");
+        await reply.promise;
+        yield result(options, {
+          result: "Stopped",
+          uuid: "msg_second",
+          ...(markers ? { user_message_uuids: [second.uuid] } : {}),
+        });
+        yield idleState(options);
+        while (!(await input.next()).done);
+      };
+      const client = await promptAndWait(1, async (agent, sessionId, client) => {
+        await vi.waitFor(() =>
+          expect(turnTrace(client.sessionUpdates)).toContain("agent_message_chunk"),
+        );
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("stop") });
+        if (streamReply)
+          await vi.waitFor(() => expect(client.updates("agent_message_chunk")).toHaveLength(2));
+        expect(turnTrace(client.sessionUpdates)).not.toContain("idle end_turn");
+        expect(turnTrace(client.sessionUpdates)).not.toContain("idle error");
+        reply.resolve();
+      });
+      expect(priorities).toEqual(["now"]);
+      expect(turnTrace(client.sessionUpdates)).toEqual([
+        "user_message",
+        "running",
+        "agent_message_chunk",
+        "user_message",
+        "agent_message_chunk",
+        "idle end_turn",
+      ]);
+      expect(client.updates("agent_message_chunk").map((update) => update.messageId)).toEqual([
+        "msg_first",
+        "msg_second",
+      ]);
+    },
+  );
+
+  it.each(["refused", "cancelled"])(
+    "ends the foreground work when a waiting priority prompt is %s",
+    async (state) => {
+      sdk.run = async function* (prompts, options) {
+        const input = prompts[Symbol.asyncIterator]();
+        const first = (await input.next()).value;
+        yield {
+          type: "user",
+          message: first.message,
+          uuid: first.uuid,
+          parent_tool_use_id: null,
+          session_id: options.sessionId,
+          isReplay: true,
+        };
+        yield assistantText(options, "First reply", "msg_first");
+        const second = (await input.next()).value;
+        yield result(options, { user_message_uuids: [first.uuid] });
+        yield { type: "command_lifecycle", command_uuid: second.uuid, state };
+        while (!(await input.next()).done);
+      };
+      await promptAndWait(1, async (agent, sessionId, client) => {
+        await vi.waitFor(() => expect(client.updates("agent_message_chunk")).toHaveLength(1));
+        await expect(
+          agent.request(v2.methods.agent.session.prompt, {
+            sessionId,
+            prompt: text("stop"),
+          }),
+        ).rejects.toMatchObject({ code: state === "cancelled" ? -32800 : -32603 });
+      });
+    },
+  );
+
+  it("keeps an open permission request while a busy prompt waits", async () => {
+    const permission = Promise.withResolvers<v2.RequestPermissionResponse>();
+    const priorities: unknown[] = [];
+    sdk.run = async function* (prompts, options) {
+      const input = prompts[Symbol.asyncIterator]();
+      const echo = (value: SDKUserMessage) => ({
+        type: "user",
+        message: value.message,
+        uuid: value.uuid,
+        parent_tool_use_id: null,
+        session_id: options.sessionId,
+        isReplay: true,
+      });
+      yield echo((await input.next()).value);
+      const decision = options.canUseTool!("Bash", { command: "ls" }, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "toolu_ls",
+        requestId: randomUUID(),
+      } as Parameters<NonNullable<Options["canUseTool"]>>[2]);
+      const second = (await input.next()).value;
+      priorities.push(second.priority);
+      await decision;
+      yield result(options);
+      yield echo(second);
+      yield result(options);
+      while (!(await input.next()).done);
+    };
+    const client = v2Client({ answerPermission: () => permission.promise });
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("go") });
+      await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(1));
+      const queued = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("next"),
+      });
+      await vi.waitFor(() => expect(priorities).toEqual(["later"]));
+      expect(client.cancelledRequests).toEqual([]);
+      permission.resolve({ outcome: { outcome: "selected", optionId: "allow-once" } });
+      await queued;
+      await vi.waitFor(() =>
+        expect(
+          turnTrace(client.sessionUpdates).filter((value) => value === "idle end_turn"),
+        ).toHaveLength(2),
+      );
+      await client.authUpdate(1);
+    });
+  });
 
   it("ends a cancelled turn at its result and reports the follow-up after it as a cycle", async () => {
     const interrupted = Promise.withResolvers<void>();

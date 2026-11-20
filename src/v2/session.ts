@@ -1,9 +1,9 @@
 /**
  * One ACP v2 session, served straight from its Claude Code query.
  *
- * ACP v2 and Claude Code describe a session the same way: prompts go into a
- * queue, Claude Code works through them, and the session reports whether it
- * is working. So this session keeps little of its own:
+ * Prompts go to Claude Code, and its updates report the session's work.
+ * A busy prompt uses priority `now`, unless an input request is open.
+ * The session keeps the foreground work open while Claude Code answers it.
  *
  * - A prompt is pushed to Claude Code at once, with a uuid. Its response is
  *   the prompt's insertion: the `command_lifecycle` frame `started` for that
@@ -51,7 +51,7 @@ import type {
   SDKResultMessage,
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { AUTONOMOUS_RESULT_ORIGINS } from "../result-end.js";
+import { AUTONOMOUS_RESULT_ORIGINS, isAbortedResult } from "../result-end.js";
 import { promptToClaude } from "../prompt-to-claude.js";
 import type { Logger } from "../logger.js";
 import type { McpCommand } from "../mcp-command.js";
@@ -147,6 +147,8 @@ type CommandLifecycleFrame = { type: "command_lifecycle"; command_uuid: string; 
 export class V2Session implements RequestTarget {
   /** The prompts not inserted yet, by uuid. */
   private readonly pending = new Map<string, PendingPrompt>();
+  /** Priority prompts whose reply still belongs to the open foreground work. */
+  private readonly steeredPrompts = new Set<string>();
   /** Whether a turn of Claude Code is open: the session's foreground work. */
   private foreground = false;
   /** The prompt whose `started` frame came last in the open turn. */
@@ -494,7 +496,7 @@ export class V2Session implements RequestTarget {
       // The notice of a mode fallback at the session's start, which sends it at once.
       void this.config.promptSent();
     };
-    const message = { ...promptToClaude(request), uuid };
+    const message: SDKUserMessage = { ...promptToClaude(request), uuid };
     /** What a prompt that is new to the session registers before it goes to Claude Code. */
     const accept = () => {
       if (!guarded) sent();
@@ -565,6 +567,11 @@ export class V2Session implements RequestTarget {
             }
             if (answered()) return;
             this.fileChanges?.requested(uuid, params._meta);
+          }
+          if (this.foreground || [...this.pending.values()].some((prompt) => prompt.pushed)) {
+            // Interrupting an open input callback would withdraw the client's request.
+            message.priority = this.requests.size > 0 ? "later" : "now";
+            if (message.priority === "now") this.steeredPrompts.add(uuid);
           }
           pending.pushed = true;
           this.remoteControl.pushed(uuid);
@@ -708,6 +715,7 @@ export class V2Session implements RequestTarget {
    * {@link closeTurn}).
    */
   private stopForeground(): void {
+    this.steeredPrompts.clear();
     const pushed: string[] = [];
     for (const [uuid, prompt] of [...this.pending]) {
       if (prompt.pushed) pushed.push(uuid);
@@ -1047,8 +1055,7 @@ export class V2Session implements RequestTarget {
    */
   private handle(message: SDKMessage): void | Promise<void> {
     if ((message as { type: string }).type === "command_lifecycle") {
-      this.lifecycle(message as unknown as CommandLifecycleFrame);
-      return;
+      return this.lifecycle(message as unknown as CommandLifecycleFrame);
     }
     // Before the tasks take a subagent's messages: its file edits are the turn's.
     this.fileChanges?.message(message);
@@ -1191,7 +1198,7 @@ export class V2Session implements RequestTarget {
     this.reports.handle(message);
   }
 
-  private lifecycle(frame: CommandLifecycleFrame): void {
+  private lifecycle(frame: CommandLifecycleFrame): void | Promise<void> {
     this.lifecycleFrames = true;
     const uuid = frame.command_uuid;
     switch (frame.state) {
@@ -1199,13 +1206,18 @@ export class V2Session implements RequestTarget {
         this.promptStarted(uuid);
         return;
       case "cancelled":
-        if (this.failPrompt(uuid, RequestError.requestCancelled())) return;
+        this.steeredPrompts.delete(uuid);
+        if (this.failPrompt(uuid, RequestError.requestCancelled())) {
+          if (!this.cycleOpen) return this.endTurn();
+          return;
+        }
         this.stopped.promptEnded(uuid, true);
         // The prompt had started: the interrupt stopped its turn.
         if (uuid === this.turnCommand) this.closeTurn();
         return;
       case "discarded":
       case "refused":
+        this.steeredPrompts.delete(uuid);
         this.failPrompt(
           uuid,
           RequestError.internalError(
@@ -1213,6 +1225,7 @@ export class V2Session implements RequestTarget {
             `Claude Code ${frame.state} the prompt before it ran`,
           ),
         );
+        if (!this.cycleOpen) return this.endTurn();
         return;
       case "completed":
         // Claude Code sends it after the result for the prompt that started
@@ -1221,7 +1234,10 @@ export class V2Session implements RequestTarget {
         // then ends the turn. Nothing but Claude Code's order tells the two
         // apart.
         this.stopped.promptEnded(uuid);
-        if (uuid === this.cycleCommand) this.closeTurn();
+        if (uuid === this.cycleCommand) {
+          this.steeredPrompts.delete(uuid);
+          this.closeTurn();
+        }
         return;
       default:
         // `queued`: the prompt waits in Claude Code's queue.
@@ -1282,6 +1298,16 @@ export class V2Session implements RequestTarget {
     const end = this.usage.record(message);
     if (isPlaceholderResult(message)) return;
     this.idleOwed = true;
+    const served =
+      message.user_message_uuids ?? (message.user_message_uuid ? [message.user_message_uuid] : []);
+    for (const uuid of served) this.steeredPrompts.delete(uuid);
+    // Older CLIs omit the result's prompt list. An accepted priority prompt
+    // is answered by the next result that did not abort the preceding cycle.
+    if (served.length === 0 && !isAbortedResult(message)) {
+      for (const uuid of this.steeredPrompts) {
+        if (!this.pending.has(uuid)) this.steeredPrompts.delete(uuid);
+      }
+    }
     const { dropped, interrupted } = this.stopped.result(message);
     // Also a dropped result: the cancel's interrupt reached no further.
     this.tasks.foregroundCancelEnded();
@@ -1352,6 +1378,10 @@ export class V2Session implements RequestTarget {
    */
   private endTurn(): void | Promise<void> {
     if (!this.foreground || this.clearContext.holdsTurn()) return;
+    if (this.steeredPrompts.size > 0) {
+      this.turnReport.reset();
+      return;
+    }
     const { stopReason } = idleOutcome(this.lastEnd, this.cancelledWork, this.turnReport);
     const reporting = this.fileChanges?.turnEnding(stopReason, this.query);
     if (!reporting) return this.closeTurn();
@@ -1468,12 +1498,12 @@ export class V2Session implements RequestTarget {
     if (!this.cycleOpen) {
       this.cycleOpen = true;
       this.cycleCommand = command;
+      this.output.resetAgentText();
+      this.reports.turnStarted();
     }
     if (this.foreground) return;
     this.foreground = true;
     this.lastEnd = undefined;
-    this.output.resetAgentText();
-    this.reports.turnStarted();
     this.reportState();
   }
 
@@ -1483,7 +1513,7 @@ export class V2Session implements RequestTarget {
    * that prompt's.
    */
   private closeTurn(): void {
-    if (!this.foreground || this.clearContext.holdsTurn()) return;
+    if (!this.foreground || this.clearContext.holdsTurn() || this.steeredPrompts.size > 0) return;
     // A subagent's end that still waited for its messages, before the turn's idle.
     this.tasks.turnClosed();
     // v2 asks for a final status of the turn's tool calls before its idle. A
@@ -1618,6 +1648,7 @@ export class V2Session implements RequestTarget {
   private failPrompt(uuid: string, error: unknown): boolean {
     const prompt = this.takePrompt(uuid);
     if (!prompt) return false;
+    this.steeredPrompts.delete(uuid);
     this.localCommands.delete(uuid);
     this.fileChanges?.promptFailed(uuid, error);
     prompt.reject(error);
