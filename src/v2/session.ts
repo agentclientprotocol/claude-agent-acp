@@ -1447,6 +1447,8 @@ export class V2Session implements RequestTarget {
    */
   private closeTurn(): void {
     if (!this.foreground || this.clearContext.holdsTurn()) return;
+    // A subagent's end that still waited for its messages, before the turn's idle.
+    this.tasks.turnClosed();
     // v2 asks for a final status of the turn's tool calls before its idle. A
     // tool call whose task goes on in the background is not part of the work.
     const cancelled = idleOutcome(this.lastEnd, this.cancelledWork).stopReason === "cancelled";

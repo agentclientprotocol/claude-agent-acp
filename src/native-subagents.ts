@@ -58,6 +58,14 @@ export type NativeSubagent = {
   endedRuns?: Set<string>;
   /** The RFD form: the calls that delegated to the child, whose runs handed back a report. */
   handedBack?: Set<string>;
+  /** Whether a message of it came (see `NativeSubagentRuntime.messageCame`). */
+  heard?: boolean;
+  /**
+   * The RFD form: the call that launched it is no Agent or Task call, such as
+   * the Skill call of a forked skill. The client is shown that call, so the
+   * prompt does not replace it.
+   */
+  launchShown?: boolean;
   announced?: boolean;
   /**
    * The RFD form: the `cwd` that the client holds for the child. Undefined or
@@ -126,6 +134,8 @@ export type TaskEnd = {
    * conversation was reset, and the runtime forgets its children.
    */
   unobservable?: boolean;
+  /** Whether the task ran in the foreground of its parent's work when it ended. */
+  foreground?: boolean;
 };
 
 type TaskStarted = {
@@ -134,7 +144,51 @@ type TaskStarted = {
   subagentType?: unknown;
   description?: unknown;
   prompt?: unknown;
+  /** The name of the tool of the call `toolUseId`, when the session has that call. */
+  launchTool?: string;
+  /** The task of the subagent that started this one. None means the root session. */
+  parentTaskId?: string;
 };
+
+/**
+ * Whether the end of a subagent's run waits for its messages. Claude Code
+ * (2.1.328) holds the messages of a forked skill that the user typed, such as
+ * `/code-review`, and writes them after its next `init` or before its next
+ * result: most or all of them come after the task's end. Nothing but that
+ * order tells such a subagent apart: no tool call launched it, and it ran in
+ * the foreground.
+ */
+export function endWaitsForMessages(run: { launched: boolean; foreground: boolean }): boolean {
+  return !run.launched && run.foreground;
+}
+
+/**
+ * Whether `message` ends the wait of an agent's end (see
+ * {@link endWaitsForMessages}):
+ *
+ * - the turn's result, which Claude Code writes after the agent's messages;
+ * - Claude Code's `idle`, for a turn that ends without a result;
+ * - once a message of the agent came (`heard`), the first message of the main
+ *   conversation (`parent_tool_use_id: null`). Another subagent's message
+ *   ends no wait: Claude Code holds the messages of the subagents that the
+ *   agent launched along with the agent's own.
+ *
+ * Without a message, no more come: the turn or the query ended, or the
+ * conversation was reset.
+ */
+export function endsMessageWait(
+  message:
+    { type: string; subtype?: unknown; state?: unknown; parent_tool_use_id?: unknown } | undefined,
+  heard: boolean,
+): boolean {
+  if (message === undefined || message.type === "result") return true;
+  if (message.type === "system") {
+    return message.subtype === "session_state_changed" && message.state === "idle";
+  }
+  const conversation =
+    message.type === "assistant" || message.type === "user" || message.type === "stream_event";
+  return conversation && heard && message.parent_tool_use_id === null;
+}
 
 export type SubagentIdentity = {
   name?: string;
@@ -204,6 +258,8 @@ export class NativeSubagentRuntime {
    */
   private readonly childByToolCall = new Map<string, NativeSubagent>();
   private readonly taskFinishPromises = new Map<string, Promise<void>>();
+  /** The ends that wait for their tasks' messages (see {@link finishTask}), by task id. */
+  private readonly heldEnds = new Map<string, { status: unknown; end?: TaskEnd }>();
   /** The session that made each SendMessage call. */
   private readonly senderByToolUse = new Map<string, string>();
   /**
@@ -629,6 +685,87 @@ export class NativeSubagentRuntime {
     return notification;
   }
 
+  /**
+   * Takes a message of the query, before its updates are routed.
+   *
+   * A subagent's message names it by `agent_id`. A child that no tool call
+   * launched has no id that its updates could go by: a forked skill that the
+   * user typed sends `forked-command-<skill>` as `parent_tool_use_id`, for
+   * every run of the skill. From this message on, the updates under that id
+   * are the child's, and no longer those of an earlier run's child.
+   *
+   * It also ends the runs whose ends waited for their messages (see
+   * {@link finishTask} and {@link endsMessageWait}). Only then does it return
+   * a promise, for the caller to await: a caller that awaited every message
+   * would let a cancel run between a message and its handling.
+   */
+  messageCame(
+    message: {
+      type: string;
+      subtype?: unknown;
+      state?: unknown;
+      parent_tool_use_id?: unknown;
+      agent_id?: unknown;
+    },
+    deliver: Publish,
+  ): Promise<void> | undefined {
+    if (!this.enabled) return undefined;
+    const { parent_tool_use_id: launchId, agent_id: agentId } = message;
+    const child = typeof agentId === "string" ? this.children.get(agentId) : undefined;
+    if (child && typeof agentId === "string" && typeof launchId === "string") {
+      child.heard = true;
+      if (
+        child.parentToolUseId === undefined &&
+        this.childByParentToolUse.get(launchId) !== child
+      ) {
+        this.taskByToolUse.set(launchId, agentId);
+        this.childByParentToolUse.set(launchId, child);
+      }
+    }
+    return this.releaseHeldEnds(deliver, message);
+  }
+
+  /**
+   * Ends the runs whose wait `message` ends; without a message, all of them.
+   * Undefined when it ends none.
+   */
+  private releaseHeldEnds(
+    deliver: Publish,
+    message?: Parameters<typeof endsMessageWait>[0],
+  ): Promise<void> | undefined {
+    if (this.heldEnds.size === 0) return undefined;
+    const ended = [...this.heldEnds].filter(([taskId]) =>
+      endsMessageWait(message, this.children.get(taskId)?.heard === true),
+    );
+    if (ended.length === 0) return undefined;
+    return (async () => {
+      for (const [taskId, held] of ended) {
+        this.heldEnds.delete(taskId);
+        await this.finishTask(taskId, held.status, deliver, undefined, held.end);
+      }
+    })();
+  }
+
+  /**
+   * The session of the call that launched `task`, when the session has that
+   * call and it is no Agent, Task or SendMessage call, such as the Skill call
+   * of a forked skill: the session of the subagent that made it, once that
+   * one is announced, or the root session.
+   */
+  private shownLaunchParent(task: TaskStarted): string | undefined {
+    if (
+      !task.toolUseId ||
+      task.launchTool === undefined ||
+      task.launchTool === "SendMessage" ||
+      isNativeSubagentControlTool(task.launchTool)
+    ) {
+      return undefined;
+    }
+    if (task.parentTaskId === undefined) return this.rootSessionId;
+    const parent = this.children.get(task.parentTaskId);
+    return parent?.announced ? parent.sessionId : undefined;
+  }
+
   async taskStarted(task: TaskStarted, deliver: Publish): Promise<void> {
     if (!this.enabled) return;
     const known =
@@ -678,9 +815,11 @@ export class NativeSubagentRuntime {
 
     // A SendMessage resume reuses the finished generation's tool id, whose
     // control state is already cleaned up.
+    const shownLaunchParent = this.shownLaunchParent(task);
     const knownParentSessionId =
       (task.toolUseId ? this.parentByToolUse.get(task.toolUseId) : undefined) ??
-      (previous && this.resumedParentSessionId(previous));
+      (previous && this.resumedParentSessionId(previous)) ??
+      shownLaunchParent;
     const identity = task.toolUseId ? this.identityByToolUse.get(task.toolUseId) : undefined;
     // A nested child must wait for the spawning Agent/Task frame to establish
     // its immediate parent. Root children without a tool id can be announced.
@@ -706,6 +845,7 @@ export class NativeSubagentRuntime {
           identity?.subagentType ?? task.subagentType,
           identity?.description ?? task.description,
         ),
+        ...(shownLaunchParent !== undefined ? { launchShown: true } : {}),
       },
       !!knownParentSessionId || !task.toolUseId,
       deliver,
@@ -804,6 +944,8 @@ export class NativeSubagentRuntime {
   /**
    * Reports that the SDK ended the task's work. `end` has what the SDK says
    * about it: its text for a failure, and its reason for an unusual end.
+   * The end of a child whose messages Claude Code holds until after it (see
+   * {@link endWaitsForMessages}) is reported once they came.
    */
   async finishTask(
     taskId: string,
@@ -832,6 +974,23 @@ export class NativeSubagentRuntime {
     }
     if (this.form === "air" ? child.terminalState !== undefined : child.workState === "idle") {
       if (this.form === "rfd") await this.supplyError(child, state, end?.error);
+      return;
+    }
+    const held = this.heldEnds.get(taskId);
+    if (held) {
+      // A second report of an end that waits can give the text of its failure.
+      if (end?.error && !held.end?.error) held.end = { ...held.end, error: end.error };
+      return;
+    }
+    if (
+      child.announced &&
+      endWaitsForMessages({
+        launched: child.parentToolUseId !== undefined,
+        foreground: end?.foreground === true,
+      })
+    ) {
+      // The run ends once its messages came (see `messageCame`).
+      this.heldEnds.set(taskId, { status, end: { ...end, foreground: false } });
       return;
     }
 
@@ -896,6 +1055,12 @@ export class NativeSubagentRuntime {
         : mayStillRun
           ? { unobservable: true }
           : { unexplained: true };
+    try {
+      // An end that waited for its task's messages is that task's end.
+      await this.releaseHeldEnds(deliver);
+    } catch (error) {
+      errors.push(error);
+    }
     try {
       for (const taskId of [...this.children.keys()].reverse()) {
         try {
@@ -1519,7 +1684,9 @@ export class NativeSubagentRuntime {
    * - a SendMessage call that resumed the child, and stays shown because a
    *   permission request showed it;
    * - an Agent/Task call that launched the child, and stays shown for the
-   *   same reason.
+   *   same reason;
+   * - the call that launched a child and is no Agent/Task call, such as the
+   *   Skill call of a forked skill, which always stays shown.
    *
    * The RFD requires the announcement before the reference, so a call whose
    * child is not announced yet gets none.
@@ -1599,6 +1766,7 @@ export class NativeSubagentRuntime {
     this.cwdBySession.clear();
     this.childByParentToolUse.clear();
     this.taskFinishPromises.clear();
+    this.heldEnds.clear();
     this.senderByToolUse.clear();
     this.hiddenLaunches.clear();
     this.hiddenSendMessages.clear();
@@ -1698,6 +1866,7 @@ export class NativeSubagentRuntime {
       | "title"
       | "role"
       | "description"
+      | "launchShown"
     >,
     announce: boolean,
     deliver: Publish,
@@ -1824,7 +1993,8 @@ export async function announceNativeSubagent(
       });
       if (cwd) child.reportedCwd = cwd;
       child.announced = true;
-      // The immediate parent made the Agent/Task call that launched the child.
+      // The immediate parent made the call that launched the child. The
+      // prompt replaces an Agent/Task call, and not a call that stays shown.
       if (child.prompt) {
         await publishPrompt(
           child,
@@ -1832,7 +2002,7 @@ export async function announceNativeSubagent(
           child.parentToolUseId,
           child.parentSessionId,
           publish,
-          { replacesCall: true },
+          { replacesCall: !child.launchShown },
         );
       }
       return;
