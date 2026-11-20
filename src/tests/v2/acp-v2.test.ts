@@ -10937,6 +10937,12 @@ describe("ACP v2 subscription guard (--hide-claude-auth)", () => {
       await expect(agent.request(v2.methods.agent.session.new, { cwd })).rejects.toMatchObject(
         refusal,
       );
+      if (account === SUBSCRIPTION) {
+        await expect(agent.request(v2.methods.agent.auth.status, {})).resolves.toEqual({
+          state: "unauthenticated",
+        });
+        expect(client.acpAuthUpdates.at(-1)).toEqual({ state: "unauthenticated" });
+      }
     });
   });
 

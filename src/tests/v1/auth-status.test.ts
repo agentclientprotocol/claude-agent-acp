@@ -6,9 +6,10 @@ import type { Logger } from "../../logger.js";
 import { ClaudeAcpAgent } from "../../v1/acp-agent.js";
 import type { AuthStatus } from "../../auth-status.js";
 import {
+  cliAuthIdentity,
   fromAccountInfo,
-  fromCliStatus,
   mergeAuthStatus,
+  parseCliAuthStatus,
   sameIdentity,
   toAcpAuthStatus,
 } from "../../auth-status.js";
@@ -155,6 +156,11 @@ function scriptedTurnQuery(args: any, account: Record<string, unknown>) {
   query.interrupt = vi.fn(async () => {});
   query.stopTask = vi.fn(async () => {});
   return query;
+}
+
+function fromCliStatus(stdout: string, apiKeyHelper?: string) {
+  const parsed = parseCliAuthStatus(stdout);
+  return parsed && cliAuthIdentity(parsed, apiKeyHelper);
 }
 
 describe("auth status mappers", () => {
@@ -787,6 +793,30 @@ describe("auth status over ACP", () => {
     expect(authStatusUpdate).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    [CLI_SUBSCRIPTION, "unauthenticated", "account"],
+    [CLI_SUBSCRIPTION.replace('"max"', '"Claude Enterprise"'), "authenticated", "account"],
+    [CLI_KEY_HELPER_AND_SUBSCRIPTION, "authenticated", "api_key"],
+    [CLI_SUBSCRIPTION.replace('"claude.ai"', '"oauth_token"'), "authenticated", "account"],
+  ])(
+    "reports whether the CLI credential is usable under --hide-claude-auth: %s",
+    async (stdout, state, kind) => {
+      const argv = process.argv;
+      process.argv = [...argv, "--hide-claude-auth"];
+      try {
+        statusStdout = stdout;
+        await initialize();
+        const status = await agent.authStatusResponse();
+        expect(status.state).toBe(state);
+        if (state === "unauthenticated") expect(status.accounts).toBeUndefined();
+        expect(authStatusUpdate.mock.calls).toEqual([[status]]);
+        expect(lastPush()?.kind).toBe(kind);
+      } finally {
+        process.argv = argv;
+      }
+    },
+  );
+
   it("answers auth/status from the probe in flight while no identity is known", async () => {
     deferStatus = true;
     const init = agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
@@ -1344,7 +1374,6 @@ describe("auth status over ACP", () => {
         } as unknown as AcpClient,
         logger as Logger,
       );
-      agent.setAuthStatus({ ...KNOWN });
     });
 
     afterEach(() => {
@@ -1353,6 +1382,7 @@ describe("auth status over ACP", () => {
 
     it("bounds the probe at 5 s and keeps the last known state", async () => {
       agent.setAuthStatus({ ...KNOWN });
+      await Promise.resolve();
       const pushesBefore = updates().length;
 
       await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
@@ -1374,7 +1404,6 @@ describe("auth status over ACP", () => {
     });
 
     it("answers auth/status with unknown when the first probe times out", async () => {
-      (agent as any).authStatus.current = undefined;
       const status = agent.authStatusResponse();
       await vi.advanceTimersByTimeAsync(0);
       await vi.advanceTimersByTimeAsync(5000);
