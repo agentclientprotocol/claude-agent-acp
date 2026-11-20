@@ -10,6 +10,7 @@ import path from "node:path";
 import { isCompactSummaryMessage } from "./context-compaction.js";
 import { claudeConfigDir } from "./paths.js";
 import { SessionTiming } from "./session-timing.js";
+import { snapshotFromUsage, totalTokens } from "./session-usage.js";
 
 /** The size of one backward read of a transcript. */
 const TAIL_CHUNK_BYTES = 64 * 1024;
@@ -171,19 +172,23 @@ export type ResumedTail = {
   model?: string;
   /** The last permission mode of the main thread. See {@link TailScan}. */
   permissionMode?: string;
+  /** The tokens in the main thread's context after its last request. See
+   *  {@link TailScan}. */
+  contextUsed?: number;
 };
 
 /**
- * Read the resume model and the permission mode of a session from the end
- * of its local transcript.
+ * Read the resume model, the permission mode and the context usage of a
+ * session from the end of its local transcript.
  *
- * A resume needs only these two values, not the messages. The transcript file
- * is read backwards until both are known, so the cost does not grow with the
+ * A resume needs only these values, not the messages. The transcript file
+ * is read backwards until all are known, so the cost does not grow with the
  * length of the session. A session without a local transcript file falls back
  * to {@link readResumedSession} for the model.
  *
  * A caller that already has the model passes `withModel: false`. The read then
- * looks for the permission mode only and has no fallback.
+ * looks for the permission mode and the context usage only, and has no
+ * fallback.
  */
 export async function readResumedTail(
   sessionId: string,
@@ -259,11 +264,13 @@ async function lastTailRecords(filePath: string, withModel: boolean): Promise<Re
 
 type TranscriptRecord = {
   type?: unknown;
+  subtype?: unknown;
   isSidechain?: unknown;
-  message?: { model?: unknown };
+  message?: { model?: unknown; usage?: unknown };
   permissionMode?: unknown;
   origin?: { kind?: unknown };
   attachment?: { type?: unknown };
+  compactMetadata?: { postTokens?: unknown };
 };
 
 /**
@@ -281,11 +288,18 @@ type TranscriptRecord = {
  * Each human prompt of a current Claude Code has the mode, so a prompt without
  * it means that the transcript does not record modes. A compaction does not
  * stop the search: the mode of the prompt before it is still current.
+ *
+ * The context usage follows the rules of the live `usage_update`: the total
+ * usage of the last real assistant record, or the tokens that a later
+ * compaction kept (its `postTokens`). The usage search stops at the first of
+ * the two. An assistant record without usage, or a compaction without
+ * `postTokens` (written by an older Claude Code), gives no usage.
  */
 class TailScan {
   readonly tail: ResumedTail = {};
   private modeDone = false;
   private planExited = false;
+  private usageDone = false;
 
   constructor(private readonly withModel: boolean) {}
 
@@ -303,7 +317,26 @@ class TailScan {
       if (entry?.type === "assistant") this.tail.model = concreteModel(entry.message?.model);
     }
     if (!this.modeDone) this.visitForMode(record);
-    return (!this.withModel || this.tail.model !== undefined) && this.modeDone;
+    if (!this.usageDone) this.visitForUsage(record);
+    return (!this.withModel || this.tail.model !== undefined) && this.modeDone && this.usageDone;
+  }
+
+  private visitForUsage(record: (marker: string) => TranscriptRecord | undefined): void {
+    const assistant = record('"assistant"');
+    if (assistant?.type === "assistant" && concreteModel(assistant.message?.model)) {
+      this.usageDone = true;
+      const usage = assistant.message?.usage;
+      if (!usage || typeof usage !== "object") return;
+      const used = totalTokens(snapshotFromUsage(usage));
+      if (Number.isFinite(used)) this.tail.contextUsed = used;
+      return;
+    }
+    const boundary = record('"compact_boundary"');
+    if (boundary?.type === "system" && boundary.subtype === "compact_boundary") {
+      this.usageDone = true;
+      const kept = boundary.compactMetadata?.postTokens;
+      if (typeof kept === "number" && Number.isFinite(kept)) this.tail.contextUsed = kept;
+    }
   }
 
   private visitForMode(record: (marker: string) => TranscriptRecord | undefined): void {

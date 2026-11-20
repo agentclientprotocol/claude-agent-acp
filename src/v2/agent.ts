@@ -967,6 +967,7 @@ class V2Agent implements AgentHandle, SessionConnection {
       mcpOAuth: this.elicitation.url && supportsMcpOAuth(q),
       query: q,
       model: { id: models.models.currentModelId, info: models.allowlistedModelInfo },
+      contextUsed: opened.contextUsed,
     });
     let keys = this.promptKeys.get(sessionId);
     if (!keys) {
@@ -1273,6 +1274,7 @@ class V2Agent implements AgentHandle, SessionConnection {
       mcpServers,
       unservedMcpServers: served.unserved,
       routeGeneration,
+      contextUsed: resumed?.contextUsed,
     };
   }
 }
