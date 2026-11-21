@@ -2654,7 +2654,7 @@ export class ClaudeAcpAgent {
     // Background work alone leaves the prompt in the foreground.
     const behind =
       session.turnQueue.some((queued) => !queued.settled) ||
-      session.asyncTaskRuntime?.autonomousTurnOpen === true;
+      this.runsAutonomousCycle(params.sessionId);
     session.turnQueue.push(turn);
     (session.sentUserUuids ??= new Set()).add(promptUuid);
     session.input.push(userMessage);
@@ -3136,10 +3136,17 @@ export class ClaudeAcpAgent {
     try {
       withdrawn = await query.cancelAsyncMessage(promptUuid);
     } catch (error) {
-      // An older Claude Code that refuses the request: the caller cancels as it
-      // did before withdrawal existed.
       this.logger.error(`Session ${sessionId}: failed to withdraw a queued prompt:`, error);
-      return "unsupported";
+      // Only a Claude Code that does not know the request gets the session
+      // cancel the prompt had before withdrawal existed, and only while the
+      // prompt still waits: by now it may have run, and another turn started.
+      const unknown = String(error).includes("Unsupported control request subtype");
+      return unknown &&
+        !turn.settled &&
+        session.turnQueue?.includes(turn) &&
+        session.activeTurn !== turn
+        ? "unsupported"
+        : "taken";
     }
     if (!withdrawn) return "taken";
     // Claude Code will never run it, so no echo or result comes: settle it here.

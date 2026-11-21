@@ -191,7 +191,7 @@ describe("$/cancel_request on a queued session/prompt", () => {
   it("cancels the session when Claude Code refuses to withdraw", async () => {
     const t = setup(true);
     t.query.cancelAsyncMessage = vi.fn(async () => {
-      throw new Error("Unknown control request subtype: cancel_async_message");
+      throw new Error("Unsupported control request subtype: cancel_async_message");
     });
     const a = runPromptWithCancellation(t.agent, text("A"), new AbortController().signal);
     await untilDone(t.echoed.promise);
@@ -200,6 +200,25 @@ describe("$/cancel_request on a queued session/prompt", () => {
     await vi.waitFor(() => expect(t.session.turnQueue).toHaveLength(2));
     bCancel.abort();
     await vi.waitFor(() => expect(t.cancel).toHaveBeenCalledWith({ sessionId: "test-session" }));
+    t.release.resolve();
+    await untilDone(a);
+    t.finish.resolve();
+  });
+
+  it("leaves the session alone when withdrawal fails for another reason", async () => {
+    const t = setup(true);
+    t.query.cancelAsyncMessage = vi.fn(async () => {
+      throw new Error("Query closed before response received");
+    });
+    const a = runPromptWithCancellation(t.agent, text("A"), new AbortController().signal);
+    await untilDone(t.echoed.promise);
+    const bCancel = new AbortController();
+    void runPromptWithCancellation(t.agent, text("B"), bCancel.signal);
+    await vi.waitFor(() => expect(t.session.turnQueue).toHaveLength(2));
+    bCancel.abort();
+    await vi.waitFor(() => expect(t.query.cancelAsyncMessage).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 20));
+    expect(t.cancel).not.toHaveBeenCalled();
     t.release.resolve();
     await untilDone(a);
     t.finish.resolve();
