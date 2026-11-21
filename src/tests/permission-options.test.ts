@@ -662,7 +662,7 @@ describe("Claude permission options and response mapping", () => {
       })._meta,
     ).toEqual({
       jetbrains: {
-        air: { version: 1, permission: { version: 1, title: "mcp__computer-use__screenshot" } },
+        air: { version: 1, permission: { version: 1, title: "computer-use: screenshot" } },
       },
     });
   });

@@ -228,7 +228,9 @@ The adapter keeps them where they are.
 
 ## Auth source display
 
-The connection-scoped `_auth/status_update` continues to report agent-owned authentication, not client-owned `providers/set` routing. The adapter also reports the same identity through the ACP `auth/status` method and `auth/status_update` notification (advertised as `auth.status`), with `kind`, `detail` and `plan` under the account's `_meta.claudeCode`. The account's `description` carries the `detail` too, e.g. `label: "Anthropic API key"` with `description: "ANTHROPIC_API_KEY"`. Each notification is sent when its own payload changed. `auth/status` answers with the identity last reported and starts a new read, whose change arrives as a notification. When the active key source is `apiKeyHelper`, the adapter reads the effective helper command through SDK `resolveSettings` / the session's `SettingsManager`, including programmatic settings overrides.
+The connection-scoped `_auth/status_update` reports agent-owned authentication, not client-owned `providers/set` routing. The adapter also reports that login through the ACP `auth/status` method and `auth/status_update` notification (advertised as `auth.status`). Under `--hide-claude-auth`, a subscription the integration cannot use is `unauthenticated`, with no active account; the legacy notification still describes the stored login. Enterprise subscriptions, API keys, and setup tokens remain usable.
+
+For a reported account, `_meta.claudeCode` carries `kind`, `detail` and `plan`. The account's `description` carries the `detail` too, e.g. `label: "Anthropic API key"` with `description: "ANTHROPIC_API_KEY"`. Each notification is sent when its own payload changed. `auth/status` answers with the identity last reported and starts a new read, whose change arrives as a notification. When the active key source is `apiKeyHelper`, the adapter reads the effective helper command through SDK `resolveSettings` / the session's `SettingsManager`, including programmatic settings overrides.
 
 A command containing the whole word `central` and the word sequence `proxy start` is displayed as:
 
@@ -344,11 +346,11 @@ For every tool, a client that is not AIR also gets these upstream fields:
 | `Skill`                                                        | `kind: other`, `title: "Load skill: <name>"`.                                                                                 | `_meta.jetbrains.air.skill`.                                                                                                                                                                   | none                                                                                             |
 | `TodoWrite`, `TaskCreate`, `TaskUpdate`, `TaskList`, `TaskGet` | The stream reports them as a standard `plan` with entries. Only a permission request shows them as a tool call.               | A plan that repeats the previous plan is not sent.                                                                                                                                             | Every plan goes out.                                                                             |
 | `ReportFindings`                                               | `kind: think`, `title: "Report <n> findings"`.                                                                                | With `rawInputRendering`, no copy of the findings in `content`.                                                                                                                                | none                                                                                             |
-| MCP tools (`mcp__*`) and other tools                           | `kind: other`, `title` is the tool name. The result text goes to `content`.                                                   | `_meta.is_mcp_tool_call` for MCP, and `_meta.jetbrains.air.mcp = {server, tool}`.                                                                                                              | none                                                                                             |
+| MCP tools (`mcp__*`) and other tools                           | `kind: other`, `title` is `server: tool` for a complete MCP name, otherwise the tool name. Result text goes to `content`.     | `_meta.is_mcp_tool_call` for MCP, and `_meta.jetbrains.air.mcp = {server, tool}`.                                                                                                              | none                                                                                             |
 | Context compaction                                             | `compaction_update` when the client declares `session.compaction`. Otherwise a synthetic tool call.                           | Both forms carry `_meta.jetbrains.air.contextCompaction`.                                                                                                                                      | See [Context compaction](#context-compaction).                                                   |
 | Background work that is not a subagent                         | none                                                                                                                          | With `asyncTasks`, async task updates.                                                                                                                                                         | none                                                                                             |
 
-`_meta.jetbrains.air.mcp` comes from the tool name `mcp__<server>__<tool>`, on `tool_call` and on a `tool_call_update` that changes it.
+The standard `name` stays `mcp__<server>__<tool>`. AIR also gets those parts in `_meta.jetbrains.air.mcp` on `tool_call` and on a `tool_call_update` that changes it.
 `server` is the part up to the next `__`. `tool` is the whole rest and can contain `__`, as in Claude Code.
 A name that does not split (`mcp__x`) gets no `mcp` key, and `_meta.is_mcp_tool_call` still marks it.
 
@@ -859,8 +861,9 @@ A failed command restores the previous state.
 
 After a turn, the Claude Code CLI can predict the prompt the user is likely to send next.
 The adapter asks for it with the SDK option `promptSuggestions: true` and forwards the one prediction of the turn.
+It asks only in a session of AIR or of a client that advertises `session.promptSuggestions`, on v1 and v2: a prediction costs a request per turn, and no other client would get it.
 
-ACP has no field for a composer prefill, so the prediction travels outside the AIR namespace:
+AIR reads the prediction from a `_meta` key outside the AIR namespace, which the adapter used before ACP had an update for it:
 
 ```json
 {
@@ -869,8 +872,19 @@ ACP has no field for a composer prefill, so the prediction travels outside the A
 }
 ```
 
-The key names no vendor, so another client can read it.
+The key names no vendor.
 The adapter sends it only to an AIR client; see the [compatibility rule](#compatibility-rule).
+
+Any client that advertises `session.promptSuggestions` gets the same prediction as ACP's unstable `prompt_suggestions_update`, on v1 and v2:
+
+```json
+{
+  "sessionUpdate": "prompt_suggestions_update",
+  "suggestions": [{ "prompt": [{ "type": "text", "text": "Run the tests" }] }]
+}
+```
+
+An AIR client that advertises the capability gets both.
 
 AIR shows the first non-blank `suggestions[].text` as gray text in an empty composer.
 Tab fills the composer with it and sends nothing.
@@ -881,6 +895,11 @@ Tab fills the composer with it and sends nothing.
 - on a `conversation_reset`, because the prediction was drawn from the transcript the reset dropped.
 
 A prediction the next prompt outran — the user sent it before the adapter read the prediction off the SDK stream — is dropped instead of published.
+
+`prompt_suggestions_update` follows two more rules of ACP, which the `_meta` form does not:
+
+- a prediction that arrives while Claude works, such as on a prompt that was queued before the turn's result, is dropped;
+- on v2, the list is withdrawn when foreground work starts without a prompt, such as a cycle that Claude Code starts after a background task ends.
 
 The CLI predicts nothing on the first turn of a session, after an API error, in plan mode, and at the account's usage limit, so many turns end with no prediction.
 A client must treat a turn without one as normal.
@@ -1281,7 +1300,7 @@ A client without the capability gets the original transcript and no typed record
 
 ## Native subagent sessions
 
-The adapter implements the draft [ACP subagent RFD](https://github.com/agentclientprotocol/agent-client-protocol/pull/1992).
+The adapter implements ACP's [subagents](https://agentclientprotocol.com/protocol/v1/subagents).
 This section covers only the AIR bridge.
 
 - The canonical client field is `clientCapabilities.subagents: {}`.
@@ -1296,6 +1315,10 @@ This section covers only the AIR bridge.
   The source is the `task_started` prompt, else the Agent or Task input `prompt`.
   A resumed generation gets the SendMessage `message` text.
   The field is absent when the adapter has no prompt. The adapter does not truncate it.
+- A forked skill (`context: fork`, such as `/code-review`) is a child session too, without an Agent or Task call.
+  The parent of one that Claude runs with the Skill tool is the session that made the Skill call, which stays a tool call.
+  The parent of one that the user types is the root session.
+  Claude Code sends the output of a typed one only when the command ends: its `subagent_state_update` follows that output.
 - Without either signal, Agent and Task stay ordinary tool calls. AIR gets `_meta.jetbrains.air.subagent: true` on them.
   Child interactions stay on the root session.
 - A client that uses the older `_meta["subagent-transcript"]` capability or the `forwardSubagentText` session option keeps the flat child transcript.
@@ -1645,7 +1668,7 @@ Claude Code sends the result of the turn when the main agent stops, also while s
 
 ### Hold without the capability
 
-A client that does not declare `backgroundSubagents` gets the hold of issues #864 and #866.
+A client that does not declare `backgroundSubagents` gets the hold of issues #864 and #866, unless it gets the RFD form of [subagent sessions](subagent-sessions.md).
 The adapter keeps the `session/prompt` request open while a subagent that the turn started or resumed runs.
 The subagent output, its permission requests and the followup summary of the model then go out inside the turn.
 The turn ends at the followup result, at an `idle` with no live subagent, at `session/cancel`, or when the next prompt starts.

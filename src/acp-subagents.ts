@@ -1,7 +1,8 @@
-import type {
-  ClientCapabilities,
-  SessionCapabilities,
-  SessionNotification,
+import {
+  RequestError,
+  type ClientCapabilities,
+  type SessionCapabilities,
+  type SessionNotification,
 } from "@agentclientprotocol/sdk/unstable";
 import {
   AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
@@ -23,6 +24,71 @@ export { AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY } from "./air-extension.js";
  *   whichever capability it declares (`docs/air-extensions.md`).
  */
 export type SubagentForm = "rfd" | "air";
+
+/**
+ * The error of a client's request that names a child session, other than
+ * `session/cancel`: invalid params (-32602), as the RFD asks, not the -32002
+ * of an unknown session. `method` completes "the client cannot … it".
+ */
+export function restrictedChild(sessionId: string, method: string): RequestError {
+  return RequestError.invalidParams(
+    { sessionId },
+    `${sessionId} is a subagent session: the client cannot ${method} it. Its parent session runs it.`,
+  );
+}
+
+/**
+ * The child sessions that the sessions of one connection announced with
+ * `subagent_update`, while they run or in the replay of a `session/load` or
+ * `session/resume`. The client knows such a session, so a request that names
+ * it fails as {@link restrictedChild} says, and not as a request of an unknown
+ * session.
+ *
+ * A child is known from its announcement until the client ends its root
+ * session ({@link rootClosed}): with `session/close`, or a request that closes
+ * the session too, such as `session/delete`. Nothing else removes it: after a
+ * conversation reset (`/clear`), a restart of the root's query or the end of
+ * the root's Claude Code process, the client still holds the child.
+ *
+ * AIR's draft announces a child with `subagent_spawned` and keeps its own
+ * rules, so its children are never known here.
+ */
+export class AnnouncedChildren {
+  /** The root session of each announced child session, by the child's id. */
+  private readonly rootByChild = new Map<string, string>();
+
+  /**
+   * Takes a session update that goes to the client. A `subagent_update`
+   * announces the child session it names, or reports on one that is known
+   * already. The update's own session is the child's parent, which can be a
+   * child itself: its root is the child's too.
+   */
+  sending(notification: {
+    sessionId: string;
+    update: { sessionUpdate: string; sessionId?: unknown };
+  }): void {
+    const { sessionId: parent, update } = notification;
+    if (update.sessionUpdate !== "subagent_update" || typeof update.sessionId !== "string") return;
+    this.rootByChild.set(update.sessionId, this.rootByChild.get(parent) ?? parent);
+  }
+
+  /** Whether `sessionId` is a child session that the client knows. */
+  has(sessionId: string): boolean {
+    return this.rootByChild.has(sessionId);
+  }
+
+  /** The root session of the child session `sessionId`, when the client knows it. */
+  rootOf(sessionId: string): string | undefined {
+    return this.rootByChild.get(sessionId);
+  }
+
+  /** The client ended the session `rootSessionId`, and can no longer name its children. */
+  rootClosed(rootSessionId: string): void {
+    for (const [child, root] of this.rootByChild) {
+      if (root === rootSessionId) this.rootByChild.delete(child);
+    }
+  }
+}
 
 /** The form of native subagent sessions that the client gets, or none. */
 export function subagentForm(capabilities?: ClientCapabilities | null): SubagentForm | undefined {

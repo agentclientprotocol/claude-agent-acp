@@ -19,6 +19,7 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 - Client MCP servers, including the ones that the client serves over the ACP connection ([MCP-over-ACP](https://agentclientprotocol.com/rfds/mcp-over-acp), `"type": "acp"`)
 - An Ultracode session config option, which turns on Claude Code's dynamic workflows for every task. It appears when dynamic workflows are enabled and the model supports ultracode (any model with `xhigh` effort)
 - `/mcp` in the chat: the MCP server status as a list. The adapter runs `/mcp reconnect`, `/mcp enable`, and `/mcp disable` through the SDK control API, because Claude Code refuses them in SDK mode. A reconnect of an ACP server that needs authentication starts MCP OAuth through URL elicitation
+- Prompt suggestions: the prompt that Claude Code predicts the user sends next, as ACP's unstable `prompt_suggestions_update`, for a client that advertises `session.promptSuggestions`
 - Session-scoped long-running goals for AIR through the [goal extension](docs/air-extensions.md#goal) under `_meta.jetbrains.air.goal`
 - Structured errors, recovery, and warnings through the opt-in [session failure extension](docs/air-extensions.md#session-failure)
 - Concrete model and effort defaults through the opt-in [recommended config value extension](docs/air-extensions.md#recommended-config-values)
@@ -57,11 +58,11 @@ npm run build:binary
 npm run smoke:binary            # add `-- --full` to drive a real session; needs a Claude login
 ```
 
-### Experimental ACP v2
+### ACP v2 (Preview)
 
-The adapter also serves the [draft ACP v2](https://agentclientprotocol.com/protocol/v2/overview):
-a client that asks for protocol version 2 or later in `initialize` gets v2, and every other client
-gets v1. The draft can still change, and this surface changes with it.
+The adapter also serves [ACP v2](https://agentclientprotocol.com/protocol/v2/overview), which is in
+Preview: a client that asks for protocol version 2 or later in `initialize` gets v2, and every other
+client gets v1. v2 is not frozen yet, and this surface changes with it.
 
 `CLAUDE_AGENT_ACP_PROTOCOL` limits the adapter to one version. With `v1`, a client that asks
 for v2 is negotiated down to v1. With `v2`, the adapter rejects the `initialize` of a v1 client.
@@ -73,6 +74,20 @@ with replay, which `replay_complete` ends, `session/close`, `session/prompt`, `s
 `session/resume` and `session/fork`), `session/set_title`, additional directories, config options (the mode is one), plans, notices,
 compaction, display terminals for commands, permission requests, elicitation, providers, auth, and
 [subagents](docs/subagent-sessions.md). Steering is v1 only for now.
+
+On v2, the `command` of a stdio MCP server must be an absolute path, such as `/usr/local/bin/npx`.
+`session/new`, `session/resume` and `session/fork` fail with `-32602` for a relative one, such as
+`npx`. A v1 client can still send one.
+
+`session/prompt` takes an `idempotencyKey`: a prompt that a client sends again with the same key
+is inserted once, and the retry gets the first `messageId`. The key is known for as long as Claude
+Code stores the message, also after a restart. A prompt that Claude Code does not store, such as a
+local command, keeps its key until `session/close` or the end of the connection.
+
+The adapter announces a session cursor (`cursor_update`) before each user message that follows
+another entry of the conversation, live and in a replay. `session/fork` with its `cursorId` copies
+the history before that message, and fails with `-32602` for any other `cursorId`. A v1 client gets
+no cursors yet.
 
 v2 is served by the v2 agent in `src/v2/`, which runs straight on Claude
 Code instead of translating to v1. A v2 client that declares JetBrains AIR

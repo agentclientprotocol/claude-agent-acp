@@ -18,6 +18,14 @@
  *   wait for it. A child that ends before it is announced stays unexposed.
  *   Each run of it is the child's foreground work: `running` from its start
  *   to its end, on its stream and mirrored on the parent's `subagent_update`.
+ * - A forked skill (`context: fork`, such as `/code-review`) runs as a
+ *   subagent that no Agent or Task call launched. One that Claude called
+ *   with the Skill tool is announced on the session that made the call, which
+ *   stays shown. One that the user typed has no call: it is announced on the
+ *   root, and its messages name it by `agent_id` only, under an id that no
+ *   call has (`forked-command-code-review`). Claude Code (2.1.328) holds
+ *   those until after the task's end, so the child's end waits for them (see
+ *   {@link SessionTasks.taskEnded}).
  * - The parent is not shown the Agent call of an announced child: the call's
  *   prompt is the parent's outgoing `session_message` and the child's
  *   incoming one, and a foreground child's answer is its reply to the parent.
@@ -66,6 +74,8 @@ import {
 } from "../background-output.js";
 import {
   childModelOption,
+  endsMessageWait,
+  endWaitsForMessages,
   HANDBACK_TOOL,
   handbackMessage,
   isNativeSubagentControlTool,
@@ -98,6 +108,7 @@ import type { V2UpdateTranslator } from "./update-translator.js";
 import { type WorkflowCardProgress, workflowCard, workflowSnapshot } from "../workflow-progress.js";
 import { ChildConfigurations } from "./child-config.js";
 import { SessionOutput } from "./stream.js";
+import { REPLAY_COMPLETE } from "./setup.js";
 import { SubagentReplay } from "./subagent-replay.js";
 
 /** What the tasks need of their root session. */
@@ -193,6 +204,8 @@ type Child = {
   awaitedParent: string | undefined;
   /** Its messages that came before its announcement. */
   pending: SDKMessage[];
+  /** Whether a message of it came. */
+  heard: boolean;
   title: string | undefined;
   description: string | undefined;
   /** Whether a run of it is going on: its foreground work. */
@@ -264,6 +277,11 @@ export class SessionTasks {
   private readonly pendingByLaunch = new Map<string, SDKMessage[]>();
   /** The live subagent tasks, by agent id, announced or not. */
   private readonly agents = new Map<string, AgentTask>();
+  /**
+   * The ends of the runs that wait for their messages (see {@link taskEnded}),
+   * by agent id.
+   */
+  private readonly heldEnds = new Map<string, IdleOutcome>();
   /** The open permission requests of each subagent, by agent id. */
   private readonly agentRequests = new Map<string, Set<AbortController>>();
   /** The subagents whose runs a cancel stops, by agent id, until their runs end. */
@@ -378,6 +396,7 @@ export class SessionTasks {
    * was a child's, which then goes to the child's stream only.
    */
   handle(message: SDKMessage): boolean {
+    this.releaseHeldEnds(message);
     switch (message.type) {
       case "system":
         switch (message.subtype) {
@@ -564,7 +583,7 @@ export class SessionTasks {
   /** Reads the subagents that the history `messages` launched, for its replay. */
   loadReplay(messages: SessionMessage[]): Promise<SubagentReplay | undefined> {
     return SubagentReplay.load(this.host, messages, {
-      tracks: (sessionId) => this.children.has(sessionId),
+      working: (sessionId) => this.children.get(sessionId)?.working === true,
       configuration: (sessionId) =>
         this.hasChild(sessionId) ? this.configs.published(sessionId) : undefined,
     });
@@ -575,8 +594,13 @@ export class SessionTasks {
     return this.agents.size > 0;
   }
 
-  /** Whether `sessionId` is an announced child session of this root. */
-  hasChild(sessionId: string): boolean {
+  /**
+   * Whether `sessionId` is a child session that this root announced in its
+   * current conversation. A child that only a replay announced, or one from
+   * before a conversation reset, is not: the client still knows those (see
+   * `AnnouncedChildren`).
+   */
+  private hasChild(sessionId: string): boolean {
     return this.children.get(sessionId)?.announced === true;
   }
 
@@ -790,6 +814,50 @@ export class SessionTasks {
   }
 
   /**
+   * For a resume of the active session that replays: the announcement and
+   * the `replay_complete` of each current child that the replay did not
+   * announce (`replayed`), parents first. The stored history has no launch of
+   * such a child: a forked skill's, whose metadata names no call, or a
+   * subagent that Claude launched after the history was written. Its replay
+   * is empty, so its `replay_complete` follows its announcement at once.
+   *
+   * A child is current when it works, when its parent lists it, or when the
+   * replay holds something its session sent (`held`), such as the end of a
+   * run that ended while the history was read. v2 asks for a child's
+   * announcement again on every resume, before any other update of its
+   * session, and for a `replay_complete` on every child that is announced
+   * before the response. The caller sends these after the root's
+   * `replay_complete`, where an announcement is current, and before what the
+   * replay held.
+   */
+  unreplayedChildren(
+    replayed: (sessionId: string) => boolean,
+    held: ReadonlySet<string>,
+  ): v2.UpdateSessionNotification[] {
+    const lists = this.lists();
+    return this.parentsFirst()
+      .filter(
+        (child) =>
+          !replayed(child.sessionId) &&
+          (held.has(child.sessionId) || this.worksOrListed(child, lists)),
+      )
+      .flatMap((child) => [
+        { sessionId: child.parentSessionId, update: this.announcement(child) },
+        { sessionId: child.sessionId, update: REPLAY_COMPLETE },
+      ]);
+  }
+
+  /** Whether `child` works, or its parent's `background` list (of `lists`) names it. */
+  private worksOrListed(child: Child, lists: Map<string, BackgroundItem[]>): boolean {
+    return (
+      child.working ||
+      (lists.get(child.parentSessionId) ?? []).some(
+        (item) => item.type === "subagent" && item.sessionId === child.sessionId,
+      )
+    );
+  }
+
+  /**
    * The current state of the session's work, for a resume of the active
    * session: each subagent that a session lists, or that works in its
    * foreground, with its labels and state (also on its own stream), and the
@@ -804,10 +872,7 @@ export class SessionTasks {
     const visit = (sessionId: string) => {
       const listed = lists.get(sessionId) ?? [];
       const children = this.parentsFirst().filter(
-        (child) =>
-          child.parentSessionId === sessionId &&
-          (child.working ||
-            listed.some((item) => item.type === "subagent" && item.sessionId === child.sessionId)),
+        (child) => child.parentSessionId === sessionId && this.worksOrListed(child, lists),
       );
       for (const child of children) {
         const state = stateObject(this.childState(child), undefined);
@@ -871,12 +936,22 @@ export class SessionTasks {
   }
 
   /**
+   * The root's turn ends: a run whose end still waited for its messages ends
+   * before the root's idle, since the turn waited on it. Such a turn ended
+   * without a result, as one that a cancel stopped can.
+   */
+  turnClosed(): void {
+    this.releaseHeldEnds();
+  }
+
+  /**
    * Claude Code's query ended: its tasks ended with its process. Terminals
    * exit and background tool calls are cancelled; a child that worked ends
    * `error`, as the root's work does.
    */
   queryEnded(error: { code: number; message: string } | undefined): void {
     this.stopForeground();
+    this.releaseHeldEnds();
     for (const [taskId, terminal] of this.terminals) {
       terminal.tail?.stop();
       if (error) this.exitTerminal(taskId);
@@ -904,6 +979,7 @@ export class SessionTasks {
    * its state.
    */
   conversationReset(): void {
+    this.releaseHeldEnds();
     for (const child of [...this.parentsFirst()].reverse()) {
       if (!child.working) continue;
       child.working = false;
@@ -1007,9 +1083,11 @@ export class SessionTasks {
       if (toolUseId !== undefined) {
         this.pendingByLaunch.delete(toolUseId);
         this.childByToolUse.set(toolUseId, child);
-        // The launch call names the parent. Without one, it is the parent task.
-        const launch = this.launches.get(toolUseId);
-        if (launch) this.announce(child, launch.output.sessionId);
+        // The call that launched it names the parent: an Agent or Task call,
+        // else a call that a session's stream mapped, such as the Skill call
+        // of a forked skill. Without a call, it is the parent task.
+        const parent = this.launches.get(toolUseId)?.output.sessionId ?? this.callerOf(toolUseId);
+        if (parent !== undefined) this.announce(child, parent);
       } else {
         // No session update may carry a session id before its announcement.
         const parent = message.parent_task_id ?? this.host.sessionId;
@@ -1118,12 +1196,12 @@ export class SessionTasks {
     error?: string,
   ): void {
     const child = this.children.get(taskId);
+    const foreground = this.agents.get(taskId)?.background === false;
     if (this.agents.delete(taskId)) this.host.foregroundRequestsChanged();
     if (child && !child.announced) {
       this.withdrawChild(child);
     } else if (child) {
-      this.endRun(
-        child,
+      const outcome: IdleOutcome =
         status === "completed"
           ? { stopReason: "end_turn" }
           : status === "stopped"
@@ -1133,8 +1211,28 @@ export class SessionTasks {
                 ...(error
                   ? { error: { code: RequestError.internalError().code, message: error } }
                   : {}),
-              },
-      );
+              };
+      const held = this.heldEnds.get(taskId);
+      if (held) {
+        // A second report of an end that waits can give the text of its failure.
+        if (
+          held.stopReason === "error" &&
+          !held.error &&
+          outcome.stopReason === "error" &&
+          outcome.error
+        ) {
+          this.heldEnds.set(taskId, outcome);
+        }
+      } else if (
+        child.working &&
+        endWaitsForMessages({ launched: child.launchToolUseId !== undefined, foreground })
+      ) {
+        // The run of a child whose messages Claude Code holds until after
+        // its end ends once they came (see `releaseHeldEnds`).
+        this.heldEnds.set(taskId, outcome);
+      } else {
+        this.endRun(child, outcome);
+      }
     }
     // A foreground command's output is read no more: a tool call that gets no
     // result, such as one of a reply that Claude Code took back, would
@@ -1198,6 +1296,8 @@ export class SessionTasks {
     launchToolUseId: string | undefined,
     task: Child["task"],
   ): Child {
+    const pending =
+      launchToolUseId !== undefined ? (this.pendingByLaunch.get(launchToolUseId) ?? []) : [];
     const child: Child = {
       sessionId,
       parentSessionId: this.host.sessionId,
@@ -1205,8 +1305,8 @@ export class SessionTasks {
       task,
       announced: false,
       awaitedParent: undefined,
-      pending:
-        launchToolUseId !== undefined ? (this.pendingByLaunch.get(launchToolUseId) ?? []) : [],
+      pending,
+      heard: pending.length > 0,
       title: undefined,
       description: undefined,
       working: true,
@@ -1287,15 +1387,49 @@ export class SessionTasks {
     this.host.foregroundRequestsChanged();
   }
 
+  /** The session whose stream mapped the tool call `toolCallId`, if one did. */
+  private callerOf(toolCallId: string): string | undefined {
+    if (this.rootOutput.holds(toolCallId)) return this.host.sessionId;
+    for (const child of this.children.values()) {
+      if (child.output?.holds(toolCallId)) return child.sessionId;
+    }
+    return undefined;
+  }
+
+  /**
+   * Ends the runs whose ends waited for their messages (see {@link taskEnded}),
+   * when `message` ends their wait (see `endsMessageWait`). Without a
+   * message, all of them: the root's turn or the query ended, or the
+   * conversation was reset.
+   */
+  private releaseHeldEnds(message?: SDKMessage): void {
+    if (this.heldEnds.size === 0) return;
+    for (const [agentId, outcome] of [...this.heldEnds]) {
+      const child = this.children.get(agentId);
+      if (!endsMessageWait(message, child?.heard === true)) continue;
+      this.heldEnds.delete(agentId);
+      if (child) this.endRun(child, outcome);
+      this.publish();
+    }
+  }
+
   /**
    * A message of a subagent, by its `parent_tool_use_id`: it goes to the
-   * child's stream, or waits for the child's announcement. A message of an
-   * agent that no known call launched is the root's.
+   * child's stream, or waits for the child's announcement. One whose
+   * `parent_tool_use_id` is no Agent or Task call goes by its `agent_id`: a
+   * forked skill that the user typed sends `forked-command-<skill>` for every
+   * run of the skill. A message of an agent that neither names is the root's.
    */
   private childMessage(message: SDKMessage & { parent_tool_use_id: string | null }): boolean {
     const launchId = message.parent_tool_use_id;
     if (launchId === null) return false;
-    const child = this.childByToolUse.get(launchId);
+    const agentId = (message as { agent_id?: unknown }).agent_id;
+    const child =
+      this.childByToolUse.get(launchId) ??
+      (typeof agentId === "string" && !this.launches.has(launchId)
+        ? this.children.get(agentId)
+        : undefined);
+    if (child) child.heard = true;
     if (child?.announced) {
       this.deliver(child, message);
       return true;
@@ -1358,7 +1492,14 @@ export class SessionTasks {
       update: { sessionUpdate: "state_update", ...state } as v2.SessionUpdate,
     });
     const prompt = child.task.prompt ?? identity?.prompt;
-    if (prompt) this.sendPrompt(child, prompt, child.launchToolUseId, parentSessionId, true);
+    // The prompt replaces an Agent or Task call in the parent's transcript.
+    // Another call that launched the child, such as a Skill call, stays
+    // shown there, so the prompt is the child's incoming message only.
+    const replacesCall =
+      child.launchToolUseId !== undefined && this.launches.has(child.launchToolUseId);
+    if (prompt) {
+      this.sendPrompt(child, prompt, child.launchToolUseId, parentSessionId, replacesCall);
+    }
     // What its hooks reported before, after the prompt.
     this.publishConfiguration(child, undefined);
     const pending = child.pending;
@@ -1464,9 +1605,11 @@ export class SessionTasks {
   /**
    * `notification`, an update that the client is shown on the session
    * `shownOn`, with a `session` reference when it is of a TaskStop or
-   * SendMessage call that names an announced child by its agent id, or of a
+   * SendMessage call that names an announced child by its agent id, of a
    * SendMessage call that resumed one and stays shown (see
-   * {@link requestShows}), as on v1 (`NativeSubagentRuntime.withTarget`).
+   * {@link requestShows}), or of the call that launched one and is no Agent
+   * or Task call, such as the Skill call of a forked skill, as on v1
+   * (`NativeSubagentRuntime.withTarget`).
    */
   private withTarget(
     notification: AcpSessionNotification,
@@ -2222,12 +2365,4 @@ function terminalOutput(
       _meta: output.replaces ? { terminal_output: data } : { terminal_output_delta: data },
     },
   };
-}
-
-/** The error of a request on a child session: the client can only watch a child. */
-export function restrictedChild(sessionId: string, method: string): RequestError {
-  return RequestError.invalidParams(
-    { sessionId },
-    `${sessionId} is a subagent session: the client cannot ${method} it. Its parent session runs it.`,
-  );
 }

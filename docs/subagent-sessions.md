@@ -1,7 +1,7 @@
 # Subagent sessions
 
 A client that declares `clientCapabilities.subagents`, other than JetBrains AIR, gets each Agent or
-Task subagent as its own child session, following the [subagents RFD](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/rfds/subagents.mdx):
+Task subagent as its own child session, following ACP's [subagents](https://agentclientprotocol.com/protocol/v1/subagents):
 
 - `subagent_update` on the parent announces the child before any of its traffic, with the
   parent's `title` and `description` for it, and reports its work state: `running`,
@@ -20,8 +20,8 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
   first model request. It sends `cwd: null` when the child is back in its parent's directory. A
   child in its parent's directory gets no `cwd`, and no child gets `additionalDirectories`: Claude
   Code gives a subagent the session's additional directories, so it inherits them. A replay
-  announces a child with the `cwd` that its transcript recorded, and clears it after the response
-  when that directory no longer exists.
+  announces a child with the `cwd` that its transcript recorded, and clears it with the child's
+  current state (see below) when that directory no longer exists.
 - Session messages replace the Agent or Task call that launches the child, which its parent is
   not shown:
   - The launch's prompt is a `session_message` in both transcripts: the parent's outgoing view and
@@ -32,6 +32,30 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
     message to the parent instead, in both transcripts and linked the same way.
   - A launch whose child is never exposed is shown as a tool call after all, with its final
     status.
+- A forked skill (a skill with `context: fork`, such as `/code-review`) is a child session too.
+  Claude Code runs it as a subagent that no Agent or Task call launched:
+  - When Claude runs it with the Skill tool, the child is announced on the session that made the
+    Skill call, once Claude Code reports its task. The Skill call stays a tool call of that session,
+    with the skill's result. The skill's prompt is a `session_message` in the child's transcript
+    only, with the Skill call's tool use id.
+  - When the user types it, there is no call: the child is announced on the root session, and the
+    command's output is the root's message. Claude Code (2.1.328) sends such a child's messages
+    only when the command ends, after it reports the task's end. The adapter keeps the child
+    `running` until they came, so its `idle` follows its tool calls and text. They all arrive at
+    once: the child's transcript is not live.
+  - A subagent that a typed skill launches gets no session: Claude Code reports the end of its
+    task before the Agent call that launched it. That call is a tool call of the skill's child,
+    with its final status.
+  - After a `session/cancel` of the root session, a typed skill's messages are the output of
+    stopped work, which the adapter drops: the child reports `idle` with `cancelled` and no more.
+    After a `session/cancel` of the child itself, they still go to the child, before its `idle`
+    with `cancelled`.
+  - A replay shows no child for a forked skill. The Skill call stays a tool call.
+- On v1, the parent's prompt turn ends at its result, also while a background child that it
+  launched or resumed still runs. The child's updates and requests follow the prompt response: the
+  RFD has a client keep receiving child events after it. The parent's summary when the child ends
+  comes from a followup cycle out of a turn. Its result ends no turn, and a plan approval it asks
+  for has no clear-context option.
 - A SendMessage call that resumes the child is not shown either. Its message is a
   `session_message` in both transcripts, the sender's outgoing view and the child's incoming one,
   linked like a launch's prompt. A SendMessage call whose message resumes no announced child,
@@ -43,10 +67,11 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
   carries the RFD's `session` content, `{ "type": "session", "sessionId": "<child>" }`, after its
   other content: a TaskStop call whose `task_id`, or a SendMessage call whose `to`, is the child's
   agent id; a SendMessage call that resumed the child and stays shown because a permission request
-  showed it first; and, on v1, an Agent or Task call that stays shown for the same reason. A
-  `tool_call_update` without content carries none, since it would replace the content the client
-  holds. A call that names the child by its name gets no reference: Claude Code resolves the
-  name, and the adapter cannot tell which agent it picked.
+  showed it first; on v1, an Agent or Task call that stays shown for the same reason; and the
+  Skill call that launched a forked skill's child. A `tool_call_update` without content carries
+  none, since it would replace the content the client holds. A call that names the child by its
+  name gets no reference: Claude Code resolves the name, and the adapter cannot tell which agent it
+  picked.
 - `session/cancel` on the parent interrupts Claude Code, which stops the foreground children that
   the turn waits on. Background children keep running, as the RFD prefers; a client stops one with
   its own `cancel`. Each stopped child reports `idle` with `cancelled` from Claude Code's own
@@ -65,9 +90,22 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
   guessing its parent.
 - A replay restores each child under its live session id, from its own transcript, with the same
   session messages and `session` references as live, and its end is an `idle` before the response.
-  Each replayed child's current state follows the response.
+  Each replayed child's current state follows the response: on v1, the response is what separates
+  a replayed child state from a current one.
+  A replay sends no `config_option_update` of a child, since one that arrives before the response
+  is a past value to the client. Each replayed child's configuration follows its current state:
+  the configuration of a child that still runs, else its `model` option with the model of the
+  latest response in its transcript, as the session's `model` option names it. A child that
+  neither runs nor has a response gets none.
   A launch without Claude Code's metadata file for the child stays an ordinary tool call of the
   parent, and a notice, for a client that takes notices, says that subagent history is missing.
+- A session that is loaded or resumed with the same settings while it runs keeps its children's
+  runs. After the response, each child that works and that no replay announced is announced
+  again on its parent, with its labels, the `cancel` capability and its state, and then gets the
+  configuration that the client last had for it: every working child after a `session/resume`,
+  which replays nothing, and after a `session/load` a child whose launch the history does not
+  have, such as a forked skill's. A child that no longer works but has a working child of its own
+  is named first, with its labels only.
 - After a load or resume, with or without replay, a SendMessage that resumes an agent from before
   it runs that agent in its session from before. Before the agent's traffic, each of its ancestors
   that the client was not told about in this connection is announced, parent before child and
@@ -78,13 +116,27 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
   parent's: Claude Code also stops the foreground children it waits on, and the parent's turn goes
   on. Each stopped child reports `idle` with `cancelled` from Claude Code's own events, and its
   requests that the stop withdraws report no `running` first. A replayed child, which no longer
-  runs, gets no capabilities. A client cannot prompt or otherwise change a child.
+  runs, gets no capabilities, and a `session/cancel` of it does nothing. A client cannot prompt or
+  otherwise change a child: any other request that names a child fails with `-32602` (Invalid
+  params), `session/close` and `session/delete` too. That holds for every child that a
+  `subagent_update` announced, while it ran or in a replay, until the client closes the child's
+  root session: also after `/clear` and after a restart of the root's Claude Code process.
 
-An [ACP v2](../README.md#experimental-acp-v2) client gets the same without declaring anything, since subagents
+An [ACP v2](../README.md#acp-v2-preview) client gets the same without declaring anything, since subagents
 are part of v2's baseline. Each child also reports its work state as its own `state_update`, right
 after the parent's copy. A replay ends each child's history with a `replay_complete` on the child's
-session, before the child's `idle`. The notice that subagent history is missing follows the
-parent's `replay_complete`.
+session. On v2, the parent's `replay_complete` is what separates a replayed child state from a
+current one, so each replayed child's current state follows the root session's `replay_complete`
+and comes before the response: on its parent, with the cleared `cwd`, and then as the child's own
+`idle`. The child's configuration follows it there, since v2 asks an agent not to replay a past
+`config_option_update`. The notice that subagent history is missing follows the root's
+`replay_complete` too.
+
+On v2, a resume of the active session that replays can meet a child that the stored history does
+not launch: a forked skill's child, or a subagent that Claude launched after the history was written.
+Such a child is announced again right after the root's `replay_complete`, when it works, when its
+parent lists it, or when the replay held one of its updates. Its own `replay_complete` follows at
+once, since its replay is empty, and then come the updates that the replay held.
 
 JetBrains AIR keeps the earlier draft of the RFD (`subagent_spawned`, `subagent_state_update`),
 which it enables with `nativeSubagentSessions` in `_meta.jetbrains.air.capabilities`. See

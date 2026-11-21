@@ -15,7 +15,7 @@ import {
 import { foregroundBashTerminal } from "../../v1/background-work.js";
 import { ChangedMetaFilter } from "../../v1/tool-calls/changed-meta-filter.js";
 import { ToolCallFieldTracker } from "../../tool-calls/field-tracker.js";
-import { AcpToolCallRenderer, mcpToolName } from "../../tool-calls/renderer.js";
+import { AcpToolCallRenderer } from "../../tool-calls/renderer.js";
 import { changedTaskPlanEntries, createTaskHook, type TaskState } from "../../tools.js";
 
 const logger = { log: () => {}, error: () => {} };
@@ -680,22 +680,20 @@ describe("tool call reports outside the tool_use stream", () => {
   });
 });
 
-describe("mcpToolName", () => {
-  /** Splits at the first separator after the prefix; the tool keeps any later separator. */
+describe("MCP tool names", () => {
   it.each([
-    ["mcp__docs__search", { server: "docs", tool: "search" }],
     [
-      "mcp__plugin_documents_docs__doc_export",
-      { server: "plugin_documents_docs", tool: "doc_export" },
+      "mcp__plugin_documents_docs__doc_export__v2",
+      { server: "plugin_documents_docs", tool: "doc_export__v2" },
     ],
-    ["mcp__srv__a__b", { server: "srv", tool: "a__b" }],
-  ])("parses %s", (name, expected) => {
-    expect(mcpToolName(name)).toEqual(expected);
-  });
-
-  /** Names that are not a complete mcp__server__tool name give no result. */
-  it.each(["mcp__x", "mcp____tool", "mcp__srv__", "Bash"])("rejects %s", (name) => {
-    expect(mcpToolName(name)).toBeUndefined();
+    ["mcp__x", undefined],
+    ["mcp____tool", undefined],
+    ["mcp__srv__", undefined],
+    ["custom__tool", undefined],
+  ] as const)("formats only complete MCP names: %s", (name, mcp) => {
+    const { call } = report(terminalAir, name, {});
+    expect(call.title).toBe(mcp ? `${mcp.server}: ${mcp.tool}` : name);
+    expect(call._meta.jetbrains?.air?.mcp).toEqual(mcp);
   });
 });
 

@@ -22,6 +22,7 @@ import type {
   CreateElicitationRequest,
   CreateElicitationResponse,
 } from "@agentclientprotocol/sdk/unstable";
+import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { CanUseTool, Options, Query } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "../logger.js";
 import {
@@ -35,6 +36,38 @@ import {
 } from "../elicitation.js";
 import { startMcpServerAuthentication } from "../mcp-oauth.js";
 import type { RequestTarget } from "./tasks.js";
+
+/**
+ * The v2 form of an elicitation that the shared module built in v1 types.
+ *
+ * A form's string properties go without `pattern`: v1 has the keyword, and v2
+ * removed it. Only an MCP server's schema can carry one, since it is relayed
+ * as the server sent it. The server still gets the answer as the client sent
+ * it, and checks it against its own schema.
+ *
+ * Nothing else changes, and the cast does not check the rest: the v1 types
+ * accept a property schema with any `type`, and the v2 types accept an
+ * unknown one only in a received value.
+ */
+export function v2ElicitationRequest(
+  request: CreateElicitationRequest,
+): v2.CreateElicitationRequest {
+  if (request.mode !== "form") return request as v2.CreateElicitationRequest;
+  // The custom modes of the union keep `mode` a string, so it does not narrow.
+  const { requestedSchema } = request as Extract<CreateElicitationRequest, { mode: "form" }>;
+  const properties = Object.fromEntries(
+    Object.entries(requestedSchema.properties ?? {}).map(([name, property]) => {
+      if (property.type !== "string" || !("pattern" in property)) return [name, property];
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { pattern, ...rest } = property;
+      return [name, rest];
+    }),
+  );
+  return {
+    ...request,
+    requestedSchema: { ...requestedSchema, properties },
+  } as v2.CreateElicitationRequest;
+}
 
 /** What the elicitations need of the connection and the session. */
 export interface ElicitationHost {

@@ -43,23 +43,27 @@ export function v2SessionUpdate(
     case "tool_call_update":
       return v2ToolCallUpdate(update);
     case "plan": {
-      // Every v2 client has the `plan` capability, so the agent sends the
+      // v2 has plan operations without a capability, so the agent sends the
       // checklist as `plan_update`; a legacy plan converts the same way.
       const converted = checklistPlanOperation(update.entries);
       return update._meta != null ? { ...converted, _meta: update._meta } : converted;
     }
     case "plan_update":
     case "plan_removed":
-      // v1's draft plan operations have v2's shape.
+      // v1's plan operations have v2's shape.
       return update;
     case "subagent_update": {
-      // The subagents RFD gives it the same shape in v1 and v2.
+      // It has the same shape in v1 and v2.
       const { state, ...association } = update;
       return { ...association, ...(state != null ? { state: v2SubagentState(state) } : {}) };
     }
     case "session_message":
     case "session_message_chunk":
       // The subagents RFD gives these the same shape in v1 and v2.
+      return update;
+    case "prompt_suggestions_update":
+      // The prompt suggestions RFD gives it the same shape in v1 and v2, and
+      // v2 content blocks are a superset of the v1 blocks.
       return update;
     case "current_mode_update":
       // v2 has no modes: the mode is the `mode` config option. Every mode

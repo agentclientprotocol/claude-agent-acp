@@ -438,7 +438,7 @@ describe("Claude permission ACP v1 presentation", () => {
     ]);
   });
 
-  it("reuses the standard title for an unknown tool", () => {
+  it("reuses the MCP tool title for the permission request", () => {
     const presentation = buildClaudePermissionPresentation({
       capabilities: airCapabilities(),
       toolName: "mcp__demo__deploy",
@@ -447,11 +447,11 @@ describe("Claude permission ACP v1 presentation", () => {
     });
     expect(presentation.toolCall).toEqual({
       toolCallId: "tool-5",
-      title: "mcp__demo__deploy",
+      title: "demo: deploy",
       rawInput: { target: "staging" },
     });
     expect(presentation._meta).toEqual({
-      jetbrains: { air: { version: 1, permission: { version: 1, title: "mcp__demo__deploy" } } },
+      jetbrains: { air: { version: 1, permission: { version: 1, title: "demo: deploy" } } },
     });
   });
 });

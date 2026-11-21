@@ -74,8 +74,33 @@ export function v2ToolCallPatch(toolCall: ToolCall | ToolCallUpdate): v2.ToolCal
   ) as Omit<v2.ToolCallUpdate, "content">;
   return {
     ...patch,
-    ...(toolCall.content != null ? { content: toolCall.content.map(v2ToolCallContent) } : {}),
+    ...(toolCall.content != null
+      ? { content: separateParagraphs(toolCall.content).map(v2ToolCallContent) }
+      : {}),
   };
+}
+
+/**
+ * v2 reads adjacent text items as one continuous text, which a client joins
+ * without a separator. The agent's text items are separate paragraphs, such
+ * as one per question of an AskUserQuestion or one per block of a tool
+ * result, so each one that another text item follows ends with a blank line.
+ * Without it, two fenced error blocks would join into "```\nA\n``````\nB\n```".
+ */
+function separateParagraphs(content: ToolCallContent[]): ToolCallContent[] {
+  return content.map((item, index) => {
+    const next = content[index + 1];
+    if (!isText(item) || !next || !isText(next)) return item;
+    const { text } = item.content;
+    const separator = text.endsWith("\n\n") ? "" : text.endsWith("\n") ? "\n" : "\n\n";
+    return { ...item, content: { ...item.content, text: text + separator } };
+  });
+}
+
+function isText(
+  item: ToolCallContent,
+): item is ToolCallContent & { type: "content"; content: { type: "text"; text: string } } {
+  return item.type === "content" && item.content.type === "text";
 }
 
 function v2ToolCallContent(item: ToolCallContent): v2.ToolCallContent {

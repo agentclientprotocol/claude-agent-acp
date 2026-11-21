@@ -56,24 +56,49 @@ describe("claudeCliPath", () => {
   });
 });
 
-describe("mcpServersDelivery", () => {
+describe("cliDelivery", () => {
   afterEach(() => vi.unstubAllEnvs());
 
-  it.each([
+  it.each<{
+    name: string;
+    cli: string;
+    extraArgs?: Record<string, string>;
+    mcpServers: string;
+    settings: string;
+  }>([
     {
-      name: "is initialize for the CLI that it ships",
+      name: "is stdin for the CLI that it ships",
       cli: "",
-      delivery: "initialize",
+      mcpServers: "initialize",
+      settings: "initialize",
     },
     {
-      name: "is argv for a CLAUDE_CODE_EXECUTABLE CLI",
+      name: "is a flag for a CLAUDE_CODE_EXECUTABLE",
       cli: "/opt/claude",
-      delivery: "argv",
+      mcpServers: "argv",
+      settings: "argv",
     },
-  ])("$name", async ({ cli, delivery }) => {
+    {
+      name: "keeps settings a flag beside a client's",
+      cli: "",
+      extraArgs: { settings: "{}" },
+      mcpServers: "initialize",
+      settings: "argv",
+    },
+    {
+      name: "keeps settings a flag with sdk-url",
+      cli: "",
+      extraArgs: { "sdk-url": "wss://example.com/session" },
+      mcpServers: "initialize",
+      settings: "argv",
+    },
+  ])("$name", async ({ cli, extraArgs, mcpServers, settings }) => {
     vi.stubEnv("CLAUDE_CODE_EXECUTABLE", cli);
-    const { mcpServersDelivery } = await load();
+    const { cliDelivery } = await load();
 
-    expect(mcpServersDelivery()).toBe(delivery);
+    expect(cliDelivery(extraArgs)).toEqual({
+      mcpServersDelivery: mcpServers,
+      settingsDelivery: settings,
+    });
   });
 });

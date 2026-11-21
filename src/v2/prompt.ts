@@ -21,8 +21,16 @@ import { isSupportedBlobMimeType } from "../blob-resources.js";
  * Claude cannot read, e.g. an `application/zip` resource: `promptToClaude`
  * would drop it. An empty `prompt` fails the same way: v2 requires at least
  * one content block.
+ *
+ * Without the `idempotencyKey`, which v1 does not have and which the session
+ * handles (see `prompt-keys.ts`).
  */
-export function v1PromptRequest({ prompt, ...request }: v2.PromptRequest): PromptRequest {
+export function v1PromptRequest({
+  prompt,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  idempotencyKey,
+  ...request
+}: v2.PromptRequest): PromptRequest {
   if (prompt.length === 0) {
     throw RequestError.invalidParams({ prompt }, "`prompt` must hold at least one content block");
   }

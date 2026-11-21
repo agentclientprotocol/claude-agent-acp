@@ -382,9 +382,10 @@ export class ContextCompactionLifecycle {
         status: terminalStatus,
         ...(summary !== undefined ? { summary: [{ type: "text", text: summary }] } : {}),
         ...(terminalStatus === "failed" && metadata.error ? { error: metadata.error } : {}),
-        // `_meta` is a replace-patch: seed it with the first terminal, then
-        // only re-send it when the boundary adds facts, so a status-only
-        // duplicate can't wipe the token counts.
+        // A `_meta` that is sent replaces the facts a client holds (the
+        // whole `_meta` on v1, its `jetbrains` key on v2): seed it with the
+        // first terminal, then only re-send it when the boundary adds facts,
+        // so a status-only duplicate can't wipe the token counts.
         // The standard `error` field carries the error, so `_meta` does not.
         // Only AIR gets the compaction facts.
         ...(this.airClient && (firstTerminal || hasMetadata)
