@@ -437,18 +437,19 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("v2 core with Claude Code", 
     const sessionId = await newSession("bypassPermissions");
     await prompt(
       sessionId,
-      "Use the Bash tool in the foreground (not run_in_background) to run exactly: ping -c 30 127.0.0.1 > /dev/null . Then reply with just: woke",
+      `Use the Bash tool in the foreground (not run_in_background) to run exactly: printf "cancel-ready\\n"; sleep 30. Then reply with just: woke`,
     );
+    // Wait for actual stdout so the foreground command is running when we queue the prompt.
     await until(() =>
       updates.some(
-        ({ update }) =>
-          update.sessionUpdate === "terminal_update" &&
-          /ping/.test((update as v2.TerminalUpdate).command ?? ""),
+        ({ sessionId: id, update }) =>
+          id === sessionId &&
+          update.sessionUpdate === "terminal_output_chunk" &&
+          Buffer.from((update as v2.TerminalOutputChunk).data, "base64")
+            .toString()
+            .includes("cancel-ready"),
       ),
     );
-    // Claude Code takes in a prompt sent while it works only at its next
-    // step, so this one is still queued at the cancel.
-    // It answers when Claude Code starts it, so the cancel fails it instead.
     const queued = prompt(sessionId, "Reply with just: queued");
     await new Promise((resolve) => setTimeout(resolve, 500));
     await agent.notify(v2.methods.agent.session.cancel, { sessionId });
