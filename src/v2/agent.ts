@@ -259,7 +259,7 @@ class V2Agent implements AgentHandle, SessionConnection {
     };
     const held = this.heldBy(notification.sessionId);
     if (held === undefined) send();
-    else this.replays.defer(held, send);
+    else this.replays.defer(held, send, notification.sessionId);
   }
 
   /**
@@ -285,12 +285,16 @@ class V2Agent implements AgentHandle, SessionConnection {
     send: () => Promise<T>,
   ): Promise<T> {
     const held = sessionId === undefined ? undefined : this.heldBy(sessionId);
-    if (held === undefined) return send();
+    if (sessionId === undefined || held === undefined) return send();
     return new Promise((resolve, reject) =>
-      this.replays.defer(held, () => {
-        if (signal.aborted) reject(new Error("The request was withdrawn"));
-        else send().then(resolve, reject);
-      }),
+      this.replays.defer(
+        held,
+        () => {
+          if (signal.aborted) reject(new Error("The request was withdrawn"));
+          else send().then(resolve, reject);
+        },
+        sessionId,
+      ),
     );
   }
 
@@ -581,7 +585,10 @@ class V2Agent implements AgentHandle, SessionConnection {
    * subagents (`subagents`), and ends the replay: each replayed child's
    * `replay_complete` (see `SubagentReplay.finish`), then the session's. An
    * AIR client that declared `loadReplayEnd` gets AIR's own mark after it.
-   * All in one synchronous step, as `ReplayHolds.replay` requires.
+   * Then each live child that the history did not have is announced again and
+   * gets its `replay_complete` (see `SessionTasks.unreplayedChildren`), ahead
+   * of what the replay held of it. All in one synchronous step, as
+   * `ReplayHolds.replay` requires.
    */
   private replay(
     session: V2Session,
@@ -600,6 +607,11 @@ class V2Agent implements AgentHandle, SessionConnection {
       this.send({ sessionId, update: REPLAY_COMPLETE });
       const end = replayEndUpdate(this.clientCapabilities);
       if (end) this.send({ sessionId, update: end });
+      const unreplayed = session.tasks.unreplayedChildren(
+        (child) => subagents?.announced(child) === true,
+        this.replays.senders(sessionId),
+      );
+      for (const notification of unreplayed) this.send(notification);
     });
   }
 

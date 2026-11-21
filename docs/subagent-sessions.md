@@ -125,6 +125,12 @@ and comes before the response: on its parent, with the cleared `cwd`, and then a
 `config_option_update`. The notice that subagent history is missing follows the root's
 `replay_complete` too.
 
+A resume of the active session that replays can meet a child that the stored history does not
+launch: a forked skill's child, or a subagent that Claude launched after the history was written.
+Such a child is announced again right after the root's `replay_complete`, when it works, when its
+parent lists it, or when the replay held one of its updates. Its own `replay_complete` follows at
+once, since its replay is empty, and then come the updates that the replay held.
+
 JetBrains AIR keeps the earlier draft of the RFD (`subagent_spawned`, `subagent_state_update`),
 which it enables with `nativeSubagentSessions` in `_meta.jetbrains.air.capabilities`. See
 [AIR extensions](air-extensions.md#native-subagent-sessions).
