@@ -6,13 +6,12 @@
  * metadata file names the Agent or Task call that launched it (see
  * `subagentHistory`). The replay announces each child right after that call,
  * under its live session id (the agent id), with no capabilities: it cannot
- * run again in this process. Then it sends the child's `model` (of its first
- * response) and its history to the child session; a later response with
- * another model sends it again. As live, the parent is not shown the launch
- * call: its prompt is the parent's outgoing message, and a foreground child's
- * answer its reply. A child's successful SubagentHandback call is its message
- * to the parent instead. Unlike live, the replay does not tell runs apart, so
- * a child that handed back any report gets no reply from its launch's result.
+ * run again in this process. Then it sends the child's history to the child
+ * session. As live, the parent is not shown the launch call: its prompt is
+ * the parent's outgoing message, and a foreground child's answer its reply. A
+ * child's successful SubagentHandback call is its message to the parent
+ * instead. Unlike live, the replay does not tell runs apart, so a child that
+ * handed back any report gets no reply from its launch's result.
  *
  * A SendMessage call whose message the replay delivered to a child before it
  * reached the call is that message too: the sender's outgoing view, at the
@@ -32,9 +31,12 @@
  * ({@link currentStates}): on its parent and on its own stream. A child that
  * works in the live session, on a resume of the active session, gets its
  * current state from the resume snapshot instead
- * (`SessionTasks.currentState`). A child whose configuration is not the
- * `model` that the replay sent, such as a live child whose hooks reported its
- * mode, gets it again then too.
+ * (`SessionTasks.currentState`).
+ *
+ * The replay sends no `config_option_update` of a child: v2 asks an agent not
+ * to replay a past one. Each child's configuration goes out after the root's
+ * `replay_complete` too, following the child's current state (see
+ * `currentChildConfiguration`).
  *
  * A launch without metadata has no known id, so it is not announced: the RFD
  * forbids inventing one. Its Agent call stays an ordinary tool call of the
@@ -47,11 +49,9 @@ import type { SessionMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "../logger.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import {
-  childModelOption,
   launchReply,
   linkedSessionMessages,
   nativeSubagentState,
-  responseModelEntry,
   rfdLabels,
   type SubagentModels,
 } from "../native-subagents.js";
@@ -62,14 +62,15 @@ import {
   type SubagentHistory,
 } from "../subagent-history.js";
 import {
+  currentChildConfiguration,
   deliveredCall,
-  firstResponseModel,
   isDelivery,
   isDirectory,
   missingHistoryNotice,
   ReplayTranscript,
   replayEndState,
   textOf,
+  trackResponseModel,
   type ReplayChild as SharedReplayChild,
 } from "../subagent-replay.js";
 import { taskNotificationsOf } from "../task-notifications.js";
@@ -150,6 +151,11 @@ export class SubagentReplay {
     return this.ownerHooks(output, undefined);
   }
 
+  /** Whether the replay announced the child session `sessionId`. */
+  announced(sessionId: string): boolean {
+    return this.transcript.byAgentId.get(sessionId)?.announced === true;
+  }
+
   /**
    * Ends the replay of the children. Every child's end goes out on its
    * parent, whose history it is. Then each announced child gets its
@@ -195,9 +201,8 @@ export class SubagentReplay {
    * session: its work ended, or its process is gone, so its replayed end, on
    * its parent and on its own stream. A `cwd` that is gone, such as a
    * worktree that Claude Code removed, is cleared. Then each replayed child's
-   * configuration, when it is not the `model` that the replay sent: the live
-   * child's, else the model of its latest response, by the session's model
-   * list.
+   * configuration (see `currentChildConfiguration`): the live child's, else
+   * the model of its latest response, by the session's model list.
    *
    * The v1 core sends the same after the response (`currentStates`): on v1
    * the response is what separates a replayed child state from a current one.
@@ -211,15 +216,16 @@ export class SubagentReplay {
   }
 
   private sendConfiguration(child: ReplayChild): void {
-    const entry = responseModelEntry(child.responseModel, this.host.models());
-    const current =
-      this.live.configuration(child.sessionId) ?? (entry ? [childModelOption(entry)] : undefined);
-    const replayed = child.model ? JSON.stringify([childModelOption(child.model)]) : undefined;
-    if (!current || JSON.stringify(current) === replayed) return;
+    const configOptions = currentChildConfiguration(
+      child,
+      this.live.configuration(child.sessionId),
+      this.host.models(),
+    );
+    if (!configOptions) return;
     child.output!.emitV1([
       {
         sessionId: child.sessionId,
-        update: { sessionUpdate: "config_option_update", configOptions: current },
+        update: { sessionUpdate: "config_option_update", configOptions },
       },
     ]);
   }
@@ -322,14 +328,15 @@ export class SubagentReplay {
   }
 
   /**
-   * Before a message of `owner`'s history (the root's when undefined): a
-   * child's response with another model sends its `model` again, and a
-   * persisted task notification of a child is the state its work ended in.
+   * Before a message of `owner`'s history (the root's when undefined): the
+   * model of a child's response is its latest one (see `trackResponseModel`),
+   * and a persisted task notification of a child is the state its work ended
+   * in.
    */
   private replaying(message: SessionMessage, owner: ReplayChild | undefined): void {
     const inner = message.message as { model?: unknown; content?: unknown } | undefined;
     if (message.type === "assistant") {
-      if (owner) this.sendModel(owner, typeof inner?.model === "string" ? inner.model : undefined);
+      if (owner) trackResponseModel(owner, inner?.model);
       return;
     }
     for (const notification of taskNotificationsOf(inner?.content)) {
@@ -349,7 +356,6 @@ export class SubagentReplay {
       const messages = this.transcripts.get(child.sessionId) ?? [];
       if (messages.length === 0) this.withoutHistory++;
       this.announce(child);
-      this.sendModel(child, firstResponseModel(messages));
       this.transcript.scan(messages, child.sessionId);
       child.output!.replay(messages, this.ownerHooks(child.output!, child));
       if (!child.promptSent && typeof child.input.prompt === "string") {
@@ -389,21 +395,6 @@ export class SubagentReplay {
       this.host.logger,
       true,
     );
-  }
-
-  /** The `model` of a response of `child`, when it is not the one the client holds. */
-  private sendModel(child: ReplayChild, model: string | undefined): void {
-    const entry = responseModelEntry(model, this.host.models());
-    if (!entry || !child.output) return;
-    child.responseModel = model;
-    if (child.model?.value === entry.value && child.model.name === entry.name) return;
-    child.model = entry;
-    child.output.emitV1([
-      {
-        sessionId: child.sessionId,
-        update: { sessionUpdate: "config_option_update", configOptions: [childModelOption(entry)] },
-      },
-    ]);
   }
 
   /**

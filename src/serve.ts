@@ -51,7 +51,7 @@ export function serveAcp(
 /**
  * Routes a connection to the protocol version that the client negotiates in
  * `initialize`. With `auto`, a client that requests version 2 or later gets
- * the draft ACP v2, and every other client gets ACP v1. With `v1`, a v2
+ * ACP v2, and every other client gets ACP v1. With `v1`, a v2
  * client is negotiated down to v1. With `v2`, the router rejects the
  * `initialize` of a v1 client as an unsupported protocol version. `onAgent`
  * receives the agent of a v1 connection (`ClaudeAcpAgent`) once the router

@@ -25,11 +25,12 @@
  * replayed child by its agent id carries the RFD's `session` reference to it
  * (`ReplayTranscript.withTarget`).
  *
- * Right after its announcement, each child gets its `model` option: the model
- * of its first response, in its transcript. A later response with another
- * model sends it again. A child without responses gets none. After the load
- * response, a model goes again only when the session's model list, which the
- * replay can lack, maps it to another entry.
+ * The replay sends no `config_option_update` of a child: one that arrives
+ * before the load response is a past value to the client. Each child's
+ * configuration goes out after the response, with its current state
+ * (`currentStates`): the configuration of a child that still runs in this
+ * process, else the `model` option with the model of the latest response in
+ * its transcript. A child that neither runs nor has a response gets none.
  *
  * A launch without metadata has no known id, so it is not announced: the RFD
  * forbids inventing one. Its Agent call stays an ordinary tool call of the
@@ -46,7 +47,6 @@ import {
   isNativeSubagentControlTool,
   launchReply,
   linkedSessionMessages,
-  type ModelEntry,
   nativeSubagentState,
   responseModelEntry,
   rfdEndState,
@@ -83,8 +83,6 @@ export type ReplayChild = {
   promptSent: boolean;
   /** Whether it handed a report to its parent with a SubagentHandback call. */
   handedBack?: boolean;
-  /** The `model` option entry that the replay sent. */
-  model?: ModelEntry;
   /** The model id of the latest response in its transcript. */
   responseModel?: string;
 };
@@ -219,13 +217,12 @@ export class RfdSubagentReplay {
   constructor(
     private readonly history: SubagentHistory,
     private readonly publish: Publish,
-    private readonly models?: SubagentModels,
     /**
-     * Whether the replay maps a model to the session's model list as it goes.
-     * A load lacks the list until the CLI started, so it maps only in
-     * {@link currentStates}, after the load response.
+     * The session's model list, which {@link currentStates} maps each child's
+     * model to. A load can lack the list until the CLI started, so it is read
+     * after the load response.
      */
-    private readonly mapsDuringReplay = true,
+    private readonly models?: SubagentModels,
     /** The working directory of the root session, which a child inherits unless it reports its own. */
     private readonly rootCwd?: string,
   ) {
@@ -253,10 +250,8 @@ export class RfdSubagentReplay {
   /**
    * Announces `child` on its parent, as live: running, with the parent's
    * labels, and with its recorded `cwd` when that differs from its parent's.
-   * Then it sends `firstModel`, the model of the child's first response, when
-   * the transcript has one.
    */
-  async announce(child: ReplayChild, firstModel?: string): Promise<void> {
+  async announce(child: ReplayChild): Promise<void> {
     if (child.announced) return;
     const labels = rfdLabels(
       child.record.name ?? child.input.name,
@@ -282,7 +277,6 @@ export class RfdSubagentReplay {
     });
     child.cwd = cwd;
     child.announced = true;
-    await this.responseModel(child, firstModel);
   }
 
   /**
@@ -300,27 +294,9 @@ export class RfdSubagentReplay {
     return this.rootCwd;
   }
 
-  /**
-   * Takes the model of a replayed response of the child `owner`. A child
-   * whose model changes gets its `model` option again.
-   */
-  async responseModel(owner: ReplayChild, model: string | undefined): Promise<void> {
-    const entry = responseModelEntry(model, this.mapsDuringReplay ? this.models : undefined);
-    if (!entry || !owner.announced) return;
-    owner.responseModel = model;
-    await this.sendModel(owner, entry);
-  }
-
-  private async sendModel(child: ReplayChild, model: ModelEntry): Promise<void> {
-    if (child.model?.value === model.value && child.model.name === model.name) return;
-    child.model = model;
-    await this.publish({
-      sessionId: child.sessionId,
-      update: {
-        sessionUpdate: "config_option_update",
-        configOptions: [childModelOption(model)],
-      },
-    });
+  /** Takes the model of a replayed response of the child `owner` (see {@link trackResponseModel}). */
+  responseModel(owner: ReplayChild, model: string | undefined): void {
+    trackResponseModel(owner, model);
   }
 
   /**
@@ -462,11 +438,16 @@ export class RfdSubagentReplay {
     }
   }
 
+  /** Whether the replay announced the child session `sessionId`. */
+  announced(sessionId: string): boolean {
+    return this.transcript.byAgentId.get(sessionId)?.announced === true;
+  }
+
   /**
-   * The current state of each announced child, to send after the load
-   * response. The RFD makes that response the freshness boundary: a client
-   * treats the replayed states before it as history, so they show no current
-   * activity and allow no cancel.
+   * The current state and configuration of each announced child, to send
+   * after the load response. The RFD makes that response the freshness
+   * boundary: a client treats the replayed states before it as history, so
+   * they show no current activity and allow no cancel.
    *
    * `live` gives the work state of a child that still runs in this process, as
    * when a live session is loaded again. Such a child reports that state and
@@ -476,6 +457,10 @@ export class RfdSubagentReplay {
    * A replayed `cwd` whose directory is gone, such as a worktree that Claude
    * Code removed when the child finished, is cleared with `cwd: null`, as the
    * RFD requires after a reconnection.
+   *
+   * Each child's configuration follows its state (see
+   * {@link currentChildConfiguration}). `liveConfiguration` gives the one
+   * that the client last got for a child that still runs in this process.
    */
   currentStates(
     live: (sessionId: string) => WorkState["state"] | undefined,
@@ -489,13 +474,11 @@ export class RfdSubagentReplay {
           liveState === undefined || liveState === "idle"
             ? replayEndState(child)
             : { state: liveState };
-        // The session's model list may be known only now, after the load response.
-        const entry = responseModelEntry(child.responseModel, this.models);
-        const replayed = child.model ? JSON.stringify([childModelOption(child.model)]) : undefined;
-        const current =
-          liveConfiguration?.(child.sessionId) ?? (entry ? [childModelOption(entry)] : undefined);
-        // A configuration that the replay already sent does not go again.
-        const configOptions = current && JSON.stringify(current) !== replayed ? current : undefined;
+        const configOptions = currentChildConfiguration(
+          child,
+          liveConfiguration?.(child.sessionId),
+          this.models,
+        );
         return [
           {
             sessionId: child.parentSessionId,
@@ -584,14 +567,38 @@ export class RfdSubagentReplay {
   }
 }
 
-/** The model of the first response in `messages`, a subagent's transcript. */
-export function firstResponseModel(messages: readonly SessionMessage[]): string | undefined {
-  for (const message of messages) {
-    if (message.type !== "assistant") continue;
-    const model = (message.message as { model?: unknown } | undefined)?.model;
-    if (typeof model === "string" && model && model !== "<synthetic>") return model;
+/**
+ * Takes `model`, the model id of a replayed response of `child`. The latest
+ * one is the child's model after the replay (see
+ * {@link currentChildConfiguration}). A response without a model id, or with
+ * `<synthetic>`, which marks a message that no model wrote, changes nothing.
+ */
+export function trackResponseModel(child: ReplayChild, model: unknown): void {
+  if (typeof model === "string" && responseModelEntry(model, undefined)) {
+    child.responseModel = model;
   }
-  return undefined;
+}
+
+/**
+ * The configuration of the replayed `child` to send once the replay is over:
+ * after the load response on v1, after the root's `replay_complete` on v2. A
+ * child's `config_option_update` inside a replay is a past value to the
+ * client, so the replay sends none, and this one goes also when the client
+ * held the same configuration before.
+ *
+ * `live` is the configuration that the client last got for a child that still
+ * runs in this process. Any other child gets its `model` option, with the
+ * model of the latest response in its transcript, as the session's model list
+ * `models` names it. Undefined for such a child without responses.
+ */
+export function currentChildConfiguration(
+  child: ReplayChild,
+  live: SessionConfigOption[] | undefined,
+  models: SubagentModels | undefined,
+): SessionConfigOption[] | undefined {
+  if (live) return live;
+  const entry = responseModelEntry(child.responseModel, models);
+  return entry ? [childModelOption(entry)] : undefined;
 }
 
 /**

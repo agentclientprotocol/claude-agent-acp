@@ -404,6 +404,58 @@ export class NativeSubagentRuntime {
   }
 
   /**
+   * The RFD form: what is current of the children that work now, for the
+   * time after a `session/load` or `session/resume` of the session that runs
+   * them. The client discarded the state and the capabilities it held for
+   * them, and need not keep their place in the session tree, so each one is
+   * announced again on its parent: with its labels, its `cwd`, the `cancel`
+   * capability and its state, then the configuration that the client last
+   * got for it. `covered` names the children that the load's replay reports
+   * instead (see `RfdSubagentReplay.currentStates`).
+   *
+   * An announced child that no longer works but has one that does, such as a
+   * background child of its own, is announced first, with its labels and
+   * `cwd` only: nothing of it is current, but its child's updates name it.
+   * Parents come before their children.
+   */
+  currentChildren(covered: (sessionId: string) => boolean): AcpSessionNotification[] {
+    if (this.form !== "rfd") return [];
+    const bySession = new Map<string, NativeSubagent>();
+    for (const child of this.children.values()) {
+      if (child.announced && !covered(child.sessionId)) bySession.set(child.sessionId, child);
+    }
+    const ordered: NativeSubagent[] = [];
+    const add = (child: NativeSubagent) => {
+      if (ordered.includes(child)) return;
+      const parent = bySession.get(child.parentSessionId);
+      if (parent) add(parent);
+      ordered.push(child);
+    };
+    for (const child of bySession.values()) if (isWorking(child)) add(child);
+    return ordered.flatMap((child): AcpSessionNotification[] => {
+      const announcement = rfdAnnouncement(child, child.reportedCwd);
+      if (!isWorking(child)) return [{ sessionId: child.parentSessionId, update: announcement }];
+      const configOptions = this.configurationOf(child.sessionId);
+      const state: WorkState =
+        child.workState === "requires_action" ? { state: "requires_action" } : { state: "running" };
+      return [
+        {
+          sessionId: child.parentSessionId,
+          update: { ...announcement, capabilities: { cancel: {} }, state },
+        },
+        ...(configOptions
+          ? [
+              {
+                sessionId: child.sessionId,
+                update: { sessionUpdate: "config_option_update" as const, configOptions },
+              },
+            ]
+          : []),
+      ];
+    });
+  }
+
+  /**
    * Takes configuration options of the child `agentId`: an SDK agent id, as a
    * hook names it, or a child session id. Hook observations can precede the
    * task event that establishes a child's parent.
@@ -1116,15 +1168,6 @@ export class NativeSubagentRuntime {
     child.cancels = (child.cancels ?? 0) + 1;
     await stop(taskId);
     return true;
-  }
-
-  /**
-   * The RFD form: whether `sessionId` is a child session that this runtime
-   * announced. The client can cancel such a session and nothing else (see
-   * `restrictedChild`). False in AIR's draft, which keeps its own rules.
-   */
-  hasChild(sessionId: string): boolean {
-    return this.announcedChild(sessionId) !== undefined;
   }
 
   /** The RFD form: the announced child session `sessionId`, with its task id. */
@@ -1961,6 +2004,24 @@ export function responseModelEntry(
 }
 
 /**
+ * The RFD form: the `subagent_update` that names `child` on its parent, with
+ * the parent's labels for it and `cwd`, its working directory when that is
+ * not its parent's.
+ */
+function rfdAnnouncement(
+  child: NativeSubagent,
+  cwd: string | null | undefined,
+): Extract<AcpSessionNotification["update"], { sessionUpdate: "subagent_update" }> {
+  return {
+    sessionUpdate: "subagent_update",
+    sessionId: child.sessionId,
+    ...(child.title ? { title: child.title } : {}),
+    ...(child.description ? { description: child.description } : {}),
+    ...(cwd ? { cwd } : {}),
+  };
+}
+
+/**
  * Announces the child on its parent, once, before any update of the child.
  * The RFD form announces it as running and then sends the prompt as the
  * first message of the child. It grants the child `cancel`: the client may
@@ -1982,11 +2043,7 @@ export async function announceNativeSubagent(
       await publish({
         sessionId: child.parentSessionId,
         update: {
-          sessionUpdate: "subagent_update",
-          sessionId: child.sessionId,
-          ...(child.title ? { title: child.title } : {}),
-          ...(child.description ? { description: child.description } : {}),
-          ...(cwd ? { cwd } : {}),
+          ...rfdAnnouncement(child, cwd),
           capabilities: { cancel: {} },
           state: { state: "running" },
         },

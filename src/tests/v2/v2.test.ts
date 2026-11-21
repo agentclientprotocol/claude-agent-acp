@@ -75,6 +75,8 @@ const sdk = vi.hoisted(() => ({
   startFailure: undefined as Error | undefined,
   /** When set, the SDK refuses the query's options with it: `query()` throws. */
   optionsRefusal: undefined as Error | undefined,
+  /** When set, Claude Code refuses flag settings with it: `applyFlagSettings` rejects. */
+  flagRefusal: undefined as Error | undefined,
   /** When set, Claude Code's start waits for it. */
   startGate: undefined as Promise<void> | undefined,
   /** When set, the query serves Remote Control with it (`enableRemoteControl`). */
@@ -119,7 +121,9 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         setModel: vi.fn(async () => {}),
         stopTask: vi.fn(async () => {}),
         close: vi.fn(() => push({ value: undefined, done: true })),
-        applyFlagSettings: vi.fn(async () => {}),
+        applyFlagSettings: vi.fn(async () => {
+          if (sdk.flagRefusal) throw sdk.flagRefusal;
+        }),
         rewindFiles: vi.fn(async () => ({ canRewind: true, filesChanged: [] })),
       };
       sdk.processes.push(fake);
@@ -223,6 +227,7 @@ beforeEach(async () => {
   sdk.previewGate = undefined;
   sdk.startFailure = undefined;
   sdk.optionsRefusal = undefined;
+  sdk.flagRefusal = undefined;
   sdk.startGate = undefined;
   sdk.enableRemoteControl = undefined;
   vi.mocked(forkSession).mockClear();
@@ -650,6 +655,43 @@ describe("ACP v2 core", () => {
     });
     // In the settings tier too, so a settings.json env cannot restore another route.
     expect(settings).toMatchObject({ apiKeyHelper: "", env: { ANTHROPIC_BASE_URL: baseUrl } });
+    // And applied to the running session, which does not depend on the `settings` option.
+    expect(sdk.processes[0].applyFlagSettings.mock.calls[0]).toEqual([
+      { apiKeyHelper: "", env: expect.objectContaining({ ANTHROPIC_BASE_URL: baseUrl }) },
+    ]);
+  });
+
+  it("starts no session when Claude Code refuses the route of a gateway login", async () => {
+    // The text of Claude Code 2.1.328 for a refused `applyFlagSettings`.
+    sdk.flagRefusal = new Error(
+      "apply_flag_settings: nothing in this request was applied and earlier settings stay in force. " +
+        "Fix or remove these invalid settings and send it again: env",
+    );
+    const initialized = vi.spyOn(SettingsManager.prototype, "initialize");
+    const disposed = vi.spyOn(SettingsManager.prototype, "dispose");
+    const client = v2Client();
+    const error = await client.connect(async (agent) => {
+      await agent.request(v2.methods.agent.initialize, {
+        protocolVersion: v2.PROTOCOL_VERSION,
+        info: { name: "v2-test-client", version: "1.0.0" },
+        capabilities: { auth: { _meta: { gateway: true } } },
+      });
+      await agent.request(v2.methods.agent.auth.login, {
+        methodId: "gateway",
+        _meta: { gateway: { baseUrl: "https://gateway.example.com" } },
+      });
+      return agent.request(v2.methods.agent.session.new, { cwd }).catch((error: unknown) => error);
+    });
+
+    expect(error).toMatchObject({
+      code: -32603,
+      message: expect.stringContaining("Claude Code did not take its provider or gateway route"),
+      data: { details: sdk.flagRefusal.message },
+    });
+    expect(sdk.processes[0].close).toHaveBeenCalledOnce();
+    expect(disposed).toHaveBeenCalledTimes(initialized.mock.calls.length);
+    initialized.mockRestore();
+    disposed.mockRestore();
   });
 
   it("rejects an incompatible provider listing before a prompt and recovers", async () => {
@@ -752,6 +794,30 @@ describe("ACP v2 core", () => {
         // The stored history that the test's SDK returns is empty: the record answers.
         expect(await agent.request(v2.methods.agent.session.prompt, keyed)).toEqual({ messageId });
         expect(sdk.processes[1].prompts).toHaveLength(0);
+      });
+    });
+
+    it("rejects a request on a subagent's session across the restart of its root's query", async () => {
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        void agent.request(v2.methods.agent.session.prompt, {
+          sessionId: response.sessionId,
+          prompt: PROMPT,
+        });
+        claude.send(lifecycle(await claude.prompt(0), "started"));
+        const helper = subagent("agent-1", "toolu_agent");
+        claude.send(helper.launch());
+        claude.send(helper.started());
+        claude.send(helper.ended());
+        claude.send(result());
+        await vi.waitFor(() => expect(client.states().at(-1)).toBe("idle"));
+
+        await setProvider(agent);
+        expect(sdk.processes).toHaveLength(2);
+        await expect(
+          agent.request(v2.methods.agent.session.close, { sessionId: "agent-1" }),
+        ).rejects.toMatchObject({ code: -32602 });
       });
     });
 
@@ -1389,7 +1455,7 @@ describe("ACP v2 core", () => {
       const { claude } = await openSession(agent);
       claude.send(cycleStart());
       await vi.waitFor(() => expect(client.states()).toEqual(["running"]));
-      return claude.options.canUseTool!(
+      const decision = await claude.options.canUseTool!(
         "Bash",
         { command: "ls" },
         {
@@ -1399,10 +1465,15 @@ describe("ACP v2 core", () => {
           suggestions: [],
         },
       );
+      // The client reads one message per event-loop task, so it gets the
+      // `running` update after Claude Code has its decision.
+      await vi.waitFor(() =>
+        expect(client.states()).toEqual(["running", "requires_action", "running"]),
+      );
+      return decision;
     });
 
     expect(decision?.behavior).toBe("allow");
-    expect(client.states()).toEqual(["running", "requires_action", "running"]);
     expect(client.permissionRequests[0].subject).toMatchObject({
       type: "tool_call",
       toolCall: { toolCallId: "toolu_1" },
@@ -2015,7 +2086,9 @@ describe("ACP v2 core", () => {
       // The turn goes on: the session sends `/clear` for the fresh context.
       const clear = await claude.prompt(1);
       expect(clear.message.content).toEqual([{ type: "text", text: "/clear" }]);
-      expect(client.states()).toEqual(["running", "requires_action", "running"]);
+      await vi.waitFor(() =>
+        expect(client.states()).toEqual(["running", "requires_action", "running"]),
+      );
       await agent.notify(v2.methods.agent.session.cancel, { sessionId });
       await vi.waitFor(() =>
         expect(client.states()).toEqual(["running", "requires_action", "running", "idle"]),
@@ -2140,6 +2213,27 @@ describe("ACP v2 core", () => {
         expect(client.states()).toEqual(["running", "idle", "running", "idle"]),
       );
     });
+  });
+
+  it("removes the origin of a usage update when the next result has none", async () => {
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      const { claude } = await openSession(agent);
+      for (const origin of [{ kind: "task-notification" }, undefined]) {
+        for (const event of textDelta(`msg_${randomUUID()}`, "Done")) claude.send(event);
+        claude.send(result(origin ? { origin } : {}));
+        claude.send(sessionState("idle"));
+      }
+      await vi.waitFor(() =>
+        expect(client.states()).toEqual(["running", "idle", "running", "idle"]),
+      );
+    });
+
+    // A v2 client keeps a `_meta` key of a `usage_update` until `null` removes it.
+    const origins = client.sessionUpdates
+      .filter((update) => update.sessionUpdate === "usage_update" && update.cost != null)
+      .map((update) => (update._meta as Record<string, unknown>)["_claude/origin"]);
+    expect(origins).toEqual([{ kind: "task-notification" }, null]);
   });
 
   it.each([
@@ -4771,10 +4865,111 @@ describe("ACP v2 core", () => {
       expect(received.indexOf("live report")).toBeGreaterThan(received.indexOf("replay_complete"));
     });
 
+    describe("a live child that the replayed history does not launch", () => {
+      type LiveChild = ReturnType<typeof subagent> | ReturnType<typeof forkedSkill>;
+      /** A subagent that Claude launched after the stored history was written. */
+      const launched = (claude: FakeClaudeCode): LiveChild => {
+        const child = subagent("a5966d", "toolu_agent");
+        claude.send(cycleStart());
+        claude.send(child.launch());
+        claude.send(child.started());
+        return child;
+      };
+      // What the resume's snapshot sends of a child that works: its state, on its parent and its own stream.
+      const works = ["root subagent_update running", "child state_update running"];
+
+      it.each<{
+        name: string;
+        start: (claude: FakeClaudeCode) => LiveChild;
+        /** What Claude Code sends of the child while the transcript is read. */
+        during: (child: LiveChild) => Record<string, unknown>[];
+        /** What the client gets after the child's `replay_complete`, before the root's state. */
+        current: string[];
+      }>([
+        {
+          // Claude Code's metadata of a forked skill's agent names no call, so no replay has it.
+          name: "a forked skill's child that reports meanwhile",
+          start: (claude) => {
+            const fork = forkedSkill("a5966d");
+            claude.send(fork.started());
+            return fork;
+          },
+          during: (child) => [child.says("Live report")],
+          current: ["child agent_message_chunk", ...works],
+        },
+        {
+          name: "a subagent that sends nothing meanwhile",
+          start: launched,
+          during: () => [],
+          current: works,
+        },
+        {
+          name: "a subagent whose run ends meanwhile",
+          start: launched,
+          during: (child) => [child.ended()],
+          // The end that the replay held. The snapshot has nothing of a child that no longer works.
+          current: ["root subagent_update idle", "child state_update idle"],
+        },
+      ])(
+        "is announced again after the root's replay_complete and gets its own, before its other updates: $name",
+        async ({ start, during, current }) => {
+          const client = v2Client();
+          const read = Promise.withResolvers<Awaited<ReturnType<typeof getSessionMessages>>>();
+          let resumedAt = 0;
+          const sessionId = await client.connect(async (agent) => {
+            const { response, claude } = await openSession(agent);
+            const child = start(claude);
+            await vi.waitFor(() =>
+              expect(updatesOf(client.notifications, "a5966d")).toContainEqual(
+                expect.objectContaining({ sessionUpdate: "state_update", state: "running" }),
+              ),
+            );
+            vi.mocked(getSessionMessages).mockReturnValueOnce(read.promise);
+            resumedAt = client.notifications.length;
+            const resume = agent.request(v2.methods.agent.session.resume, {
+              sessionId: response.sessionId,
+              cwd,
+              replayFrom: { type: "start" },
+            });
+            await vi.waitFor(() => expect(getSessionMessages).toHaveBeenCalled());
+            for (const message of during(child)) claude.send(message);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            // The replay holds what the child sends.
+            expect(client.notifications.slice(resumedAt)).toEqual([]);
+            read.resolve([]);
+            await resume;
+            return response.sessionId;
+          });
+
+          const received = client.notifications
+            .slice(resumedAt)
+            .map(({ sessionId: of, update }) => {
+              const state = (update as { state?: unknown }).state;
+              const name =
+                typeof state === "object" ? (state as { state?: unknown } | null)?.state : state;
+              return `${of === sessionId ? "root" : "child"} ${update.sessionUpdate}${
+                typeof name === "string" ? ` ${name}` : ""
+              }`;
+            });
+          expect(received).toEqual([
+            "root replay_complete",
+            // Current, as it follows its parent's `replay_complete`: the child's labels, with no state.
+            "root subagent_update",
+            // The child's replay is empty.
+            "child replay_complete",
+            ...current,
+            expect.stringMatching(/^root state_update /),
+          ]);
+        },
+      );
+    });
+
     it.each([
-      ["session/prompt", v2.methods.agent.session.prompt, { prompt: PROMPT }],
-      ["session/close", v2.methods.agent.session.close, {}],
-    ])("rejects %s on a subagent's session", async (_, method, params) => {
+      ["session/prompt", v2.methods.agent.session.prompt, { prompt: PROMPT }, false],
+      ["session/close", v2.methods.agent.session.close, {}, false],
+      // The adapter no longer follows the child, and the client still holds it.
+      ["session/close after a conversation reset", v2.methods.agent.session.close, {}, true],
+    ])("rejects %s on a subagent's session", async (_, method, params, reset) => {
       const client = v2Client();
       const error = await client.connect(async (agent) => {
         const { claude } = await openSession(agent);
@@ -4784,6 +4979,22 @@ describe("ACP v2 core", () => {
         await vi.waitFor(() =>
           expect(client.notifications.some((n) => n.sessionId === "child")).toBe(true),
         );
+        if (reset) {
+          claude.send({
+            type: "conversation_reset",
+            new_conversation_id: randomUUID(),
+            uuid: randomUUID(),
+            trigger: "clear",
+            timestamp: new Date().toISOString(),
+            session_id: "session",
+          });
+          await vi.waitFor(() =>
+            expect(updatesOf(client.notifications, "child").at(-1)).toMatchObject({
+              sessionUpdate: "state_update",
+              state: "unknown",
+            }),
+          );
+        }
         return agent
           .request(
             method as typeof v2.methods.agent.session.close,
@@ -4796,6 +5007,74 @@ describe("ACP v2 core", () => {
       });
 
       expect(error).toMatchObject({ code: -32602 });
+    });
+
+    it("rejects a request on a subagent's session that only a replay announced, until its root closes", async () => {
+      sdk.subagents = new Map([
+        [
+          "toolu_launch",
+          {
+            agentId: "child",
+            background: false,
+            stoppedByUser: false,
+            agentType: "general-purpose",
+          },
+        ],
+      ]);
+      const client = v2Client();
+      const errors = await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const sessionId = response.sessionId;
+        vi.mocked(getSessionMessages).mockResolvedValueOnce([
+          {
+            type: "assistant",
+            uuid: "a1",
+            session_id: sessionId,
+            parent_tool_use_id: null,
+            parent_agent_id: null,
+            message: subagent("child", "toolu_launch").launch().message,
+          },
+        ] as never);
+        await agent.request(v2.methods.agent.session.resume, {
+          sessionId,
+          cwd,
+          replayFrom: { type: "start" },
+        });
+        // The child does not run, so a cancel of it has nothing to stop.
+        await agent.notify(v2.methods.agent.session.cancel, { sessionId: "child" });
+        const refusal = (request: Promise<unknown>) => request.catch((error: unknown) => error);
+        const close = await refusal(
+          agent.request(v2.methods.agent.session.close, { sessionId: "child" }),
+        );
+        // The child lists no tool call: it does not run.
+        const cancelItem = () =>
+          refusal(
+            agent.request(v2.methods.agent.toolCall.cancel, {
+              sessionId: "child",
+              toolCallId: "toolu_read",
+            }),
+          );
+        const whileRootRuns = await cancelItem();
+        expect(claude.stopTask).not.toHaveBeenCalled();
+        expect(claude.interrupt).not.toHaveBeenCalled();
+        // The root's query ends: the root is still active, and the child still known.
+        claude.end();
+        const afterQueryEnd = await cancelItem();
+        await agent.request(v2.methods.agent.session.close, { sessionId });
+        const afterClose = await refusal(
+          agent.request(v2.methods.agent.session.prompt, { sessionId: "child", prompt: PROMPT }),
+        );
+        return [close, whileRootRuns, afterQueryEnd, afterClose];
+      });
+
+      const notListed = { code: -32602, data: { sessionId: "child", toolCallId: "toolu_read" } };
+      expect(errors).toMatchObject([
+        { code: -32602, message: expect.stringContaining("child is a subagent session") },
+        notListed,
+        notListed,
+        // The client closed the child's root, so it can no longer name the child.
+        { code: -32002 },
+      ]);
     });
 
     it("keeps a background command's terminal running and listed until its task ends", async () => {

@@ -4,7 +4,9 @@
  * `providers/disable`, and the legacy gateway logins (`authenticate` or
  * `auth/login` with `gateway` or `gateway-bedrock`). Each core holds its own
  * {@link ProviderConfig} and gateway login, and builds the query env of its
- * sessions with {@link createEnvForProvider}.
+ * sessions with {@link createEnvForProvider}. It holds that route above the
+ * user's and the project's settings with {@link providerRouteSettings} and
+ * {@link applyProviderRoute}.
  */
 import { isDeepStrictEqual } from "node:util";
 import {
@@ -16,6 +18,7 @@ import {
   type ProviderInfo,
   type SetProviderRequest,
 } from "@agentclientprotocol/sdk/unstable";
+import type { Query } from "@anthropic-ai/claude-agent-sdk";
 import {
   GatewayListingError,
   listBedrockModels,
@@ -186,6 +189,50 @@ export function createEnvForProvider(config: ProviderConfig | null): Record<stri
     ANTHROPIC_CUSTOM_HEADERS: customHeaders,
     ANTHROPIC_AUTH_TOKEN: PROVIDER_AUTH_TOKEN_PLACEHOLDER, // Bypass local Claude login checks
   };
+}
+
+/** A provider's route as settings of Claude Code (see {@link providerRouteSettings}). */
+export type ProviderRouteSettings = { apiKeyHelper: ""; env: Record<string, string> };
+
+/**
+ * The route of a provider as settings of Claude Code, for the tier of the
+ * `settings` option. `env` is the result of {@link createEnvForProvider}.
+ *
+ * Claude Code applies the `env` of settings files after the process env, so
+ * without this tier the user's or the project's settings could restore another
+ * `ANTHROPIC_BASE_URL`. The empty `apiKeyHelper` turns off a helper of theirs.
+ */
+export function providerRouteSettings(env: Record<string, string>): ProviderRouteSettings {
+  return { apiKeyHelper: "", env };
+}
+
+/**
+ * Sends `route` to the running session, into the tier of the `settings`
+ * option (`applyFlagSettings`). Call it right after the query's initialize
+ * response, before a request of the session reaches the provider:
+ * `getContextUsage()` sends one (`count_tokens`).
+ *
+ * The `settings` option holds the route too, in one object with the client's
+ * settings and the model configuration. Claude Code loads that object as a
+ * whole or not at all: one value that fails validation, e.g.
+ * `permissions.allow: "Bash"`, leaves all of it out. This call does not depend
+ * on that object. When the object did load, the call changes nothing: Claude
+ * Code merges `env` key by key.
+ *
+ * Throws when Claude Code refuses the route. The caller must close the query.
+ */
+export async function applyProviderRoute(
+  query: Pick<Query, "applyFlagSettings">,
+  route: ProviderRouteSettings,
+): Promise<void> {
+  try {
+    await query.applyFlagSettings(route);
+  } catch (error) {
+    throw RequestError.internalError(
+      { details: error instanceof Error ? error.message : String(error) },
+      "The session was not started, because Claude Code did not take its provider or gateway route. Try again, or set the provider or the gateway login again.",
+    );
+  }
 }
 
 function sameHeaders(a: Record<string, string>, b: Record<string, string>): boolean {
