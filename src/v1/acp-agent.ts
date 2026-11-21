@@ -9496,22 +9496,30 @@ export class ClaudeAcpAgent {
   }
 
   /**
-   * Sends the current state and configuration of each subagent that the last
-   * load of `sessionId` replayed (see {@link RfdSubagentReplay.currentStates}).
-   * Run it only after the load response: before it, the client treats a
-   * subagent's state and configuration as history.
+   * Sends what is current of the subagents of `sessionId` after a session
+   * setup response: the state and configuration of each one that the last
+   * load replayed (see {@link RfdSubagentReplay.currentStates}), then each
+   * one that works in the session and that no replay announced, with its
+   * announcement again (see `NativeSubagentRuntime.currentChildren`). The
+   * second kind is a child of a session that was resumed, which replays
+   * nothing, or one whose launch the loaded history does not have, such as a
+   * forked skill's. Run it only after the response: before a load's response,
+   * the client treats a subagent's state and configuration as history.
    */
   async publishCurrentSubagentStates(sessionId: string): Promise<void> {
     await this.publishReplayedChildModels(sessionId);
     const replay = this.replayedSubagents.get(sessionId);
-    if (!replay) return;
     this.replayedSubagents.delete(sessionId);
     const runtime = this.sessions[sessionId]?.nativeSubagentRuntime;
     try {
-      for (const notification of replay.currentStates(
-        (child) => runtime?.liveWorkState(child),
-        (child) => runtime?.configurationOf?.(child),
-      )) {
+      const current = [
+        ...(replay?.currentStates(
+          (child) => runtime?.liveWorkState(child),
+          (child) => runtime?.configurationOf?.(child),
+        ) ?? []),
+        ...(runtime?.currentChildren((child) => replay?.announced(child) === true) ?? []),
+      ];
+      for (const notification of current) {
         await this.client.sessionUpdate(asSdkSessionNotification(notification));
       }
     } catch (error) {

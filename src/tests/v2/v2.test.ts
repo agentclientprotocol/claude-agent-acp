@@ -4823,6 +4823,105 @@ describe("ACP v2 core", () => {
       expect(received.indexOf("live report")).toBeGreaterThan(received.indexOf("replay_complete"));
     });
 
+    describe("a live child that the replayed history does not launch", () => {
+      type LiveChild = ReturnType<typeof subagent> | ReturnType<typeof forkedSkill>;
+      /** A subagent that Claude launched after the stored history was written. */
+      const launched = (claude: FakeClaudeCode): LiveChild => {
+        const child = subagent("a5966d", "toolu_agent");
+        claude.send(cycleStart());
+        claude.send(child.launch());
+        claude.send(child.started());
+        return child;
+      };
+      // What the resume's snapshot sends of a child that works: its state, on its parent and its own stream.
+      const works = ["root subagent_update running", "child state_update running"];
+
+      it.each<{
+        name: string;
+        start: (claude: FakeClaudeCode) => LiveChild;
+        /** What Claude Code sends of the child while the transcript is read. */
+        during: (child: LiveChild) => Record<string, unknown>[];
+        /** What the client gets after the child's `replay_complete`, before the root's state. */
+        current: string[];
+      }>([
+        {
+          // Claude Code's metadata of a forked skill's agent names no call, so no replay has it.
+          name: "a forked skill's child that reports meanwhile",
+          start: (claude) => {
+            const fork = forkedSkill("a5966d");
+            claude.send(fork.started());
+            return fork;
+          },
+          during: (child) => [child.says("Live report")],
+          current: ["child agent_message_chunk", ...works],
+        },
+        {
+          name: "a subagent that sends nothing meanwhile",
+          start: launched,
+          during: () => [],
+          current: works,
+        },
+        {
+          name: "a subagent whose run ends meanwhile",
+          start: launched,
+          during: (child) => [child.ended()],
+          // The end that the replay held. The snapshot has nothing of a child that no longer works.
+          current: ["root subagent_update idle", "child state_update idle"],
+        },
+      ])(
+        "is announced again after the root's replay_complete and gets its own, before its other updates: $name",
+        async ({ start, during, current }) => {
+          const client = v2Client();
+          const read = Promise.withResolvers<Awaited<ReturnType<typeof getSessionMessages>>>();
+          let resumedAt = 0;
+          const sessionId = await client.connect(async (agent) => {
+            const { response, claude } = await openSession(agent);
+            const child = start(claude);
+            await vi.waitFor(() =>
+              expect(updatesOf(client.notifications, "a5966d")).toContainEqual(
+                expect.objectContaining({ sessionUpdate: "state_update", state: "running" }),
+              ),
+            );
+            vi.mocked(getSessionMessages).mockReturnValueOnce(read.promise);
+            resumedAt = client.notifications.length;
+            const resume = agent.request(v2.methods.agent.session.resume, {
+              sessionId: response.sessionId,
+              cwd,
+              replayFrom: { type: "start" },
+            });
+            await vi.waitFor(() => expect(getSessionMessages).toHaveBeenCalled());
+            for (const message of during(child)) claude.send(message);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            // The replay holds what the child sends.
+            expect(client.notifications.slice(resumedAt)).toEqual([]);
+            read.resolve([]);
+            await resume;
+            return response.sessionId;
+          });
+
+          const received = client.notifications
+            .slice(resumedAt)
+            .map(({ sessionId: of, update }) => {
+              const state = (update as { state?: unknown }).state;
+              const name =
+                typeof state === "object" ? (state as { state?: unknown } | null)?.state : state;
+              return `${of === sessionId ? "root" : "child"} ${update.sessionUpdate}${
+                typeof name === "string" ? ` ${name}` : ""
+              }`;
+            });
+          expect(received).toEqual([
+            "root replay_complete",
+            // Current, as it follows its parent's `replay_complete`: the child's labels, with no state.
+            "root subagent_update",
+            // The child's replay is empty.
+            "child replay_complete",
+            ...current,
+            expect.stringMatching(/^root state_update /),
+          ]);
+        },
+      );
+    });
+
     it.each([
       ["session/prompt", v2.methods.agent.session.prompt, { prompt: PROMPT }, false],
       ["session/close", v2.methods.agent.session.close, {}, false],

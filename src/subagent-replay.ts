@@ -438,6 +438,11 @@ export class RfdSubagentReplay {
     }
   }
 
+  /** Whether the replay announced the child session `sessionId`. */
+  announced(sessionId: string): boolean {
+    return this.transcript.byAgentId.get(sessionId)?.announced === true;
+  }
+
   /**
    * The current state and configuration of each announced child, to send
    * after the load response. The RFD makes that response the freshness

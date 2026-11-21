@@ -4106,6 +4106,8 @@ describe("subagent transcript replay", () => {
         live: (childSessionId: string) => string | undefined;
         /** The configuration that the client last got for a child that still runs. */
         configuration?: (childSessionId: string) => SessionConfigOption[] | undefined;
+        /** The children that work in the live session, of which the replay can lack some. */
+        working?: string[];
         /** The session's config options and model list, known after the response. */
         models?: { configOptions: SessionConfigOption[]; modelInfos: ModelInfo[] };
       },
@@ -4180,6 +4182,18 @@ describe("subagent transcript replay", () => {
             nativeSubagentRuntime: {
               liveWorkState: afterResponse.live,
               configurationOf: afterResponse.configuration,
+              currentChildren: (covered: (childSessionId: string) => boolean) =>
+                (afterResponse.working ?? [])
+                  .filter((child) => !covered(child))
+                  .map((child) => ({
+                    sessionId,
+                    update: {
+                      sessionUpdate: "subagent_update",
+                      sessionId: child,
+                      capabilities: { cancel: {} },
+                      state: { state: "running" },
+                    },
+                  })),
             },
             configOptions: afterResponse.models?.configOptions ?? [],
             modelInfos: afterResponse.models?.modelInfos ?? [],
@@ -4505,8 +4519,12 @@ describe("subagent transcript replay", () => {
         ],
         { aaa111: child("live", "toolu_live"), bbb222: child("gone", "toolu_gone") },
         undefined,
-        // The session is loaded again in the process that still runs `aaa111`.
-        { live: (childSessionId) => (childSessionId === "aaa111" ? "running" : undefined) },
+        // The session is loaded again in the process that still runs `aaa111`,
+        // and `ccc333`, whose launch the history does not have.
+        {
+          live: (childSessionId) => (childSessionId === "aaa111" ? "running" : undefined),
+          working: ["aaa111", "ccc333"],
+        },
       );
 
       expect(trace.slice(trace.indexOf("-- response --"))).toEqual([
@@ -4516,6 +4534,9 @@ describe("subagent transcript replay", () => {
         // Any other child's process is gone: its replayed end is its current
         // state, and nothing can cancel it.
         'root subagent_update bbb222 {"state":"idle","stopReason":"end_turn"}',
+        // The live session reports the child that the replay did not announce,
+        // and not `aaa111` a second time.
+        'root subagent_update ccc333 {"state":"running"} capabilities={"cancel":{}}',
       ]);
     });
 

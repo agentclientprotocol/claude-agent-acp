@@ -151,6 +151,11 @@ export class SubagentReplay {
     return this.ownerHooks(output, undefined);
   }
 
+  /** Whether the replay announced the child session `sessionId`. */
+  announced(sessionId: string): boolean {
+    return this.transcript.byAgentId.get(sessionId)?.announced === true;
+  }
+
   /**
    * Ends the replay of the children. Every child's end goes out on its
    * parent, whose history it is. Then each announced child gets its

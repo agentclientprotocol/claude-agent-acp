@@ -7,12 +7,20 @@
  * permission request or an elicitation.
  *
  * The replay itself runs in one synchronous step ({@link ReplayHolds.replay}),
- * so what a session sends during that step is its replayed history. Nothing
- * else tells the two apart.
+ * so what a session sends during that step is not held: its replayed history
+ * and the `replay_complete` updates that end it. Nothing else tells that from
+ * what waits.
  */
 export class ReplayHolds {
-  /** What each session with a replay in flight holds, in send order, with the count of its replays. */
-  private readonly sessions = new Map<string, { resumes: number; sends: Array<() => void> }>();
+  /**
+   * What each session with a replay in flight holds, in send order, with the
+   * count of its replays and the sessions that sent what it holds: itself and
+   * its subagent sessions.
+   */
+  private readonly sessions = new Map<
+    string,
+    { resumes: number; sends: Array<() => void>; senders: Set<string> }
+  >();
   /** Whether {@link replay} runs. */
   private replaying = false;
 
@@ -34,7 +42,7 @@ export class ReplayHolds {
    * Calling it again does nothing.
    */
   begin(sessionId: string): () => void {
-    const hold = this.sessions.get(sessionId) ?? { resumes: 0, sends: [] };
+    const hold = this.sessions.get(sessionId) ?? { resumes: 0, sends: [], senders: new Set() };
     hold.resumes++;
     this.sessions.set(sessionId, hold);
     let released = false;
@@ -47,9 +55,19 @@ export class ReplayHolds {
     };
   }
 
-  /** Runs `send` once the session `sessionId` no longer holds its sends (see {@link holds}). */
-  defer(sessionId: string, send: () => void): void {
-    this.sessions.get(sessionId)!.sends.push(send);
+  /**
+   * Runs `send`, an update or a request of the session `sender`, once the
+   * session `sessionId` no longer holds its sends (see {@link holds}).
+   */
+  defer(sessionId: string, send: () => void, sender: string): void {
+    const hold = this.sessions.get(sessionId)!;
+    hold.sends.push(send);
+    hold.senders.add(sender);
+  }
+
+  /** The sessions whose updates or requests the session `sessionId` holds now. */
+  senders(sessionId: string): ReadonlySet<string> {
+    return this.sessions.get(sessionId)?.senders ?? new Set();
   }
 
   /** Runs `replay`, which must send the history and its `replay_complete` before it returns. */
