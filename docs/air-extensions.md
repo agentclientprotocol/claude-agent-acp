@@ -1300,7 +1300,7 @@ A client without the capability gets the original transcript and no typed record
 
 ## Native subagent sessions
 
-The adapter implements the draft [ACP subagent RFD](https://github.com/agentclientprotocol/agent-client-protocol/pull/1992).
+The adapter implements ACP's [subagents](https://agentclientprotocol.com/protocol/v1/subagents).
 This section covers only the AIR bridge.
 
 - The canonical client field is `clientCapabilities.subagents: {}`.

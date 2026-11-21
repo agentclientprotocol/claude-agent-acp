@@ -1389,7 +1389,7 @@ describe("ACP v2 core", () => {
       const { claude } = await openSession(agent);
       claude.send(cycleStart());
       await vi.waitFor(() => expect(client.states()).toEqual(["running"]));
-      return claude.options.canUseTool!(
+      const decision = await claude.options.canUseTool!(
         "Bash",
         { command: "ls" },
         {
@@ -1399,10 +1399,15 @@ describe("ACP v2 core", () => {
           suggestions: [],
         },
       );
+      // The client reads one message per event-loop task, so it gets the
+      // `running` update after Claude Code has its decision.
+      await vi.waitFor(() =>
+        expect(client.states()).toEqual(["running", "requires_action", "running"]),
+      );
+      return decision;
     });
 
     expect(decision?.behavior).toBe("allow");
-    expect(client.states()).toEqual(["running", "requires_action", "running"]);
     expect(client.permissionRequests[0].subject).toMatchObject({
       type: "tool_call",
       toolCall: { toolCallId: "toolu_1" },
@@ -2015,7 +2020,9 @@ describe("ACP v2 core", () => {
       // The turn goes on: the session sends `/clear` for the fresh context.
       const clear = await claude.prompt(1);
       expect(clear.message.content).toEqual([{ type: "text", text: "/clear" }]);
-      expect(client.states()).toEqual(["running", "requires_action", "running"]);
+      await vi.waitFor(() =>
+        expect(client.states()).toEqual(["running", "requires_action", "running"]),
+      );
       await agent.notify(v2.methods.agent.session.cancel, { sessionId });
       await vi.waitFor(() =>
         expect(client.states()).toEqual(["running", "requires_action", "running", "idle"]),
@@ -2140,6 +2147,27 @@ describe("ACP v2 core", () => {
         expect(client.states()).toEqual(["running", "idle", "running", "idle"]),
       );
     });
+  });
+
+  it("removes the origin of a usage update when the next result has none", async () => {
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      const { claude } = await openSession(agent);
+      for (const origin of [{ kind: "task-notification" }, undefined]) {
+        for (const event of textDelta(`msg_${randomUUID()}`, "Done")) claude.send(event);
+        claude.send(result(origin ? { origin } : {}));
+        claude.send(sessionState("idle"));
+      }
+      await vi.waitFor(() =>
+        expect(client.states()).toEqual(["running", "idle", "running", "idle"]),
+      );
+    });
+
+    // A v2 client keeps a `_meta` key of a `usage_update` until `null` removes it.
+    const origins = client.sessionUpdates
+      .filter((update) => update.sessionUpdate === "usage_update" && update.cost != null)
+      .map((update) => (update._meta as Record<string, unknown>)["_claude/origin"]);
+    expect(origins).toEqual([{ kind: "task-notification" }, null]);
   });
 
   it.each([

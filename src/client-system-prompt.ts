@@ -1,5 +1,5 @@
 /**
- * The client-provided system prompt of the unstable `systemPrompt` field on
+ * The client-provided system prompt of the `systemPrompt` field on
  * `session/new`, `session/load`, `session/resume`, and `session/fork`.
  *
  * - `append` keeps the Claude Code preset and adds the text after it, the
@@ -10,7 +10,7 @@
  *
  * The CLI records the system prompt of a conversation on its first request
  * and reuses it on resume, so a different `systemPrompt` on a later
- * `session/resume` takes effect at the next compaction. The RFD allows this
+ * `session/resume` takes effect at the next compaction. ACP allows this
  * deferral.
  */
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
@@ -30,8 +30,10 @@ export type ClientSystemPrompt = { mode: "append" | "override"; text: string };
 /**
  * The mode and text of a `systemPrompt`, or `undefined` when the request has
  * none. Throws `invalid_params` for a mode other than `append` and `override`
- * and for a content block other than text: the RFD requires an error, and no
- * session, for a prompt the agent cannot apply.
+ * and for a content block other than text: ACP requires an error, and no
+ * session, for a prompt the agent cannot apply. Also for an empty `content`
+ * list, which a client must not send: the v2 schema rejects it before this
+ * runs, and a v1 client gets the same answer.
  */
 export function clientSystemPrompt(
   systemPrompt: SystemPrompt | null | undefined,
@@ -42,6 +44,12 @@ export function clientSystemPrompt(
     throw RequestError.invalidParams(
       { systemPrompt: { mode } },
       `Unsupported systemPrompt mode: ${mode}`,
+    );
+  }
+  if (content.length === 0) {
+    throw RequestError.invalidParams(
+      { systemPrompt: { content } },
+      "systemPrompt content is empty. Send at least one text block, or leave systemPrompt out.",
     );
   }
   const text: string[] = [];

@@ -4,7 +4,7 @@ import {
   RequestError,
   SessionNotification,
 } from "@agentclientprotocol/sdk/unstable";
-import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
+import type { ClientCapabilities, SystemPrompt } from "@agentclientprotocol/sdk/unstable";
 import { forkSession, getSessionMessages, type Options } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../../v1/acp-agent.js";
 import type { AcpClient } from "../../acp-client.js";
@@ -1061,29 +1061,20 @@ describe("createSession options merging", () => {
       });
     });
 
-    it("rejects an unsupported mode without creating a session", async () => {
+    it.each<{ name: string; systemPrompt: SystemPrompt }>([
+      { name: "an unsupported mode", systemPrompt: { mode: "_vendor", content: [text("x")] } },
+      {
+        name: "content other than text",
+        systemPrompt: {
+          mode: "append",
+          content: [{ type: "image", data: "", mimeType: "image/png" }],
+        },
+      },
+      { name: "no content", systemPrompt: { mode: "override", content: [] } },
+    ])("rejects $name without creating a session", async ({ systemPrompt }) => {
       capturedOptions = undefined;
       await expect(
-        agent.newSession({
-          cwd: process.cwd(),
-          mcpServers: [],
-          systemPrompt: { mode: "_vendor", content: [text("x")] },
-        }),
-      ).rejects.toMatchObject({ code: RequestError.invalidParams().code });
-      expect(capturedOptions).toBeUndefined();
-    });
-
-    it("rejects content other than text without creating a session", async () => {
-      capturedOptions = undefined;
-      await expect(
-        agent.newSession({
-          cwd: process.cwd(),
-          mcpServers: [],
-          systemPrompt: {
-            mode: "append",
-            content: [{ type: "image", data: "", mimeType: "image/png" }],
-          },
-        }),
+        agent.newSession({ cwd: process.cwd(), mcpServers: [], systemPrompt }),
       ).rejects.toMatchObject({ code: RequestError.invalidParams().code });
       expect(capturedOptions).toBeUndefined();
     });

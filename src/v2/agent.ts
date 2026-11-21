@@ -676,7 +676,7 @@ class V2Agent implements AgentHandle, SessionConnection {
     }
     const fields = (config: SessionConfig, commands: v2.AvailableCommand[]) => ({
       configOptions: config.options(),
-      // The draft leaves out an empty list.
+      // An omitted list means none, like an empty one.
       ...(commands.length > 0 ? { availableCommands: commands } : {}),
     });
     const listed = (commands: SessionCommands) =>
@@ -884,7 +884,7 @@ class V2Agent implements AgentHandle, SessionConnection {
     });
     return {
       configOptions: session.config.options(),
-      // The draft leaves out an empty list.
+      // An omitted list means none, like an empty one.
       ...(commands.length > 0 ? { availableCommands: commands } : {}),
     };
   }

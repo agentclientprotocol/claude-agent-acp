@@ -58,11 +58,11 @@ npm run build:binary
 npm run smoke:binary            # add `-- --full` to drive a real session; needs a Claude login
 ```
 
-### Experimental ACP v2
+### ACP v2 (Preview)
 
-The adapter also serves the [draft ACP v2](https://agentclientprotocol.com/protocol/v2/overview):
-a client that asks for protocol version 2 or later in `initialize` gets v2, and every other client
-gets v1. The draft can still change, and this surface changes with it.
+The adapter also serves [ACP v2](https://agentclientprotocol.com/protocol/v2/overview), which is in
+Preview: a client that asks for protocol version 2 or later in `initialize` gets v2, and every other
+client gets v1. v2 is not frozen yet, and this surface changes with it.
 
 `CLAUDE_AGENT_ACP_PROTOCOL` limits the adapter to one version. With `v1`, a client that asks
 for v2 is negotiated down to v1. With `v2`, the adapter rejects the `initialize` of a v1 client.
@@ -77,7 +77,8 @@ compaction, display terminals for commands, permission requests, elicitation, pr
 
 `session/prompt` takes an `idempotencyKey`: a prompt that a client sends again with the same key
 is inserted once, and the retry gets the first `messageId`. The key is known for as long as Claude
-Code stores the message, also after a restart.
+Code stores the message, also after a restart. A prompt that Claude Code does not store, such as a
+local command, keeps its key until `session/close` or the end of the connection.
 
 The adapter announces a session cursor (`cursor_update`) before each user message that follows
 another entry of the conversation, live and in a replay. `session/fork` with its `cursorId` copies
