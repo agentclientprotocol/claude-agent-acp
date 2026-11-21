@@ -18,6 +18,7 @@ const mockQuery = vi.hoisted(() =>
       applyFlagSettings: vi.fn().mockResolvedValue(undefined),
       supportedCommands: vi.fn().mockResolvedValue([]),
       close: vi.fn(() => closed.resolve()),
+      [Symbol.asyncDispose]: vi.fn(async () => {}),
       interrupt: vi.fn().mockResolvedValue(undefined),
       getContextUsage: vi.fn().mockResolvedValue({ totalTokens: 0, rawMaxTokens: 200000 }),
       next: async () => {
@@ -281,19 +282,33 @@ describe("providers", () => {
     expect(Object.keys(agent.sessions)).toEqual([]);
   });
 
-  it("recreates loaded sessions with the new provider between turns", async () => {
+  it("recreates loaded sessions with the new provider after the old query exits", async () => {
     const [agent, mockQuery] = await createAgentMock();
     await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
     const first = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
     const originalQuery = mockQuery.mock.results[0].value;
 
-    await agent.unstable_setProvider({
+    const disposing = Promise.withResolvers<void>();
+    const exited = Promise.withResolvers<void>();
+    originalQuery[Symbol.asyncDispose].mockImplementationOnce(() => {
+      disposing.resolve();
+      return exited.promise;
+    });
+    const changing = agent.unstable_setProvider({
       providerId: "main",
       apiType: "anthropic",
       baseUrl: "https://gateway.example",
     });
+    try {
+      await Promise.race([disposing.promise, changing]);
+      expect(originalQuery.close).toHaveBeenCalledOnce();
+      expect(mockQuery).toHaveBeenCalledOnce();
+    } finally {
+      exited.resolve();
+      await changing;
+    }
 
-    expect(originalQuery.close).toHaveBeenCalledOnce();
+    expect(originalQuery[Symbol.asyncDispose]).toHaveBeenCalledOnce();
     expect(mockQuery).toHaveBeenCalledTimes(2);
     expect(mockQuery.mock.calls[1][0]).toEqual(
       expect.objectContaining({
@@ -323,6 +338,32 @@ describe("providers", () => {
     expect(mockQuery.mock.calls[2][0].options.env.ANTHROPIC_BASE_URL).toBe(
       process.env.ANTHROPIC_BASE_URL,
     );
+  });
+
+  it("does not start a replacement for a session closed while the old query exits", async () => {
+    const [agent, mockQuery] = await createAgentMock();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    const disposing = Promise.withResolvers<void>();
+    const exited = Promise.withResolvers<void>();
+    mockQuery.mock.results[0].value[Symbol.asyncDispose].mockImplementationOnce(() => {
+      disposing.resolve();
+      return exited.promise;
+    });
+
+    const changing = agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: "https://gateway.example",
+    });
+    try {
+      await Promise.race([disposing.promise, changing]);
+      await agent.closeSession({ sessionId });
+    } finally {
+      exited.resolve();
+      await changing;
+    }
+    expect(mockQuery).toHaveBeenCalledOnce();
   });
 
   it("switches every loaded session through proxy replacements and back to native routing", async () => {
