@@ -1866,6 +1866,10 @@ export class ClaudeAcpAgent {
         _meta: {
           claudeCode: {
             promptQueueing: true,
+            // `$/cancel_request` on a `session/prompt` that waits behind
+            // another turn withdraws that prompt alone, and the running turn
+            // goes on (see `runPromptWithCancellation`).
+            queuedPromptCancel: true,
           },
           // Capability marker for the `authStatus` extension: presence means
           // "this agent pushes its identity" and the object stays empty — it is
@@ -2424,7 +2428,12 @@ export class ClaudeAcpAgent {
    * the request with invalid params (-32602) before anything is queued:
    * `promptToClaude` would drop it.
    */
-  async prompt(params: PromptRequest, origin: TurnOrigin = "client"): Promise<PromptResponse> {
+  async prompt(
+    params: PromptRequest,
+    origin: TurnOrigin = "client",
+    onQueued?: (promptUuid: string, behind: boolean) => void,
+    withdrawn?: () => boolean,
+  ): Promise<PromptResponse> {
     for (const block of params.prompt) {
       if (!SUPPORTED_PROMPT_CONTENT_TYPES.includes(block.type)) {
         throw RequestError.invalidParams(
@@ -2435,7 +2444,7 @@ export class ClaudeAcpAgent {
     }
     let events!: TurnEvents;
     const outcome = new Promise<TurnOutcome>((resolve, reject) => {
-      events = { inserted() {}, ended: resolve, failed: reject };
+      events = { queued: onQueued, withdrawn, inserted() {}, ended: resolve, failed: reject };
     });
     await this.startTurn(params, events, origin);
     return outcome;
@@ -2595,7 +2604,13 @@ export class ClaudeAcpAgent {
     // that ended meanwhile fails the prompt as the check above does.
     // A `session/cancel` that arrived after this prompt, during the awaits
     // above, ends it the same way.
-    if (session.tornDown || received <= (this.cancelledThrough.get(params.sessionId) ?? 0)) {
+    // A `$/cancel_request` for this prompt itself ends it the same way, and
+    // only it (see `runPromptWithCancellation`).
+    if (
+      session.tornDown ||
+      received <= (this.cancelledThrough.get(params.sessionId) ?? 0) ||
+      events.withdrawn?.()
+    ) {
       session.fileChangeReporter?.finish(fileChangeReport, "cancelled");
       events.ended({ stopReason: "cancelled" });
       return;
@@ -2634,9 +2649,16 @@ export class ClaudeAcpAgent {
     };
 
     session.turnQueue ??= [];
+    // Behind a turn of ours, or a turn Claude Code started on its own (a task
+    // notification's), which takes the prompt in at its next tool step too.
+    // Background work alone leaves the prompt in the foreground.
+    const behind =
+      session.turnQueue.some((queued) => !queued.settled) ||
+      this.runsAutonomousCycle(params.sessionId);
     session.turnQueue.push(turn);
     (session.sentUserUuids ??= new Set()).add(promptUuid);
     session.input.push(userMessage);
+    events.queued?.(promptUuid, behind);
     this.ensureConsumer(session, params.sessionId);
     if (origin === "client") session.titles.onPromptQueued(session, params.prompt);
     // The prompt is queued, so its turn goes ahead even if the client misses
@@ -3086,6 +3108,49 @@ export class ClaudeAcpAgent {
     const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
     await this.publishGoalFromPrompt(sessionId, firstText, steeredUuid);
     return { outcome: "injected" };
+  }
+
+  /**
+   * Withdraws the prompt queued as `promptUuid` while it still waits behind
+   * another turn, which goes on: Claude Code drops the message from its queue
+   * (`cancel_async_message`) and the prompt answers `cancelled`. `taken` when
+   * it is no longer waiting: Claude Code took it in, folded into the running
+   * turn or as its own, or it has settled; it then goes on as it is.
+   * `unsupported` when this Claude Code cannot withdraw a message.
+   */
+  async withdrawQueuedPrompt(
+    sessionId: string,
+    promptUuid: string,
+  ): Promise<"withdrawn" | "taken" | "unsupported"> {
+    const session = this.sessions[sessionId];
+    const turn = session?.turnQueue?.find((t) => t.promptUuid === promptUuid);
+    if (!session || !turn || turn.settled || session.activeTurn === turn) return "taken";
+    if (turn.insertedReported || turn.commandStarted || turn.isLocalOnlyCommand) return "taken";
+    // Not in the SDK's declared Query type, though every CLI with
+    // msg_lifecycle_v1 serves it.
+    const query = session.query as Query & {
+      cancelAsyncMessage?: (messageUuid: string) => Promise<boolean>;
+    };
+    if (typeof query.cancelAsyncMessage !== "function") return "unsupported";
+    let withdrawn: boolean;
+    try {
+      withdrawn = await query.cancelAsyncMessage(promptUuid);
+    } catch (error) {
+      this.logger.error(`Session ${sessionId}: failed to withdraw a queued prompt:`, error);
+      return String(error).includes("Unsupported control request subtype")
+        ? "unsupported"
+        : "taken";
+    }
+    if (!withdrawn) return "taken";
+    // Claude Code will never run it, so no echo or result comes: settle it here.
+    if (!turn.settled) {
+      turn.settled = true;
+      session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
+      session.sentUserUuids?.delete(promptUuid);
+      session.fileChangeReporter?.finish(turn.fileChangeReport, "cancelled");
+      turn.resolve({ stopReason: "cancelled" });
+    }
+    return "withdrawn";
   }
 
   async stopAsyncTask(params: AsyncTaskStopRequest): Promise<AsyncTaskStopResponse> {
@@ -11345,21 +11410,56 @@ function rememberResolvedToolNames(
  *  subsequent turn. `signal` also aborts on connection close, in which case
  *  cancelling the in-flight turn is the desired behavior anyway. */
 export async function runPromptWithCancellation(
-  agent: Pick<ClaudeAcpAgent, "prompt" | "cancel" | "logger">,
+  agent: Pick<ClaudeAcpAgent, "prompt" | "cancel" | "withdrawQueuedPrompt" | "logger">,
   params: PromptRequest,
   signal: AbortSignal,
 ): Promise<PromptResponse> {
+  // Cancelling this request:
+  // - before its prompt is queued: it never is, and ends cancelled;
+  // - after: while Claude Code still holds the prompt in its queue, it is
+  //   withdrawn alone (cancel_async_message) and answers cancelled, and any
+  //   running work goes on (InitializeResponse
+  //   `_meta.claudeCode.queuedPromptCancel`). A `/goal` is never withdrawn:
+  //   queueing it already published its goal;
+  // - once Claude Code has taken it in, or cannot withdraw: a prompt queued
+  //   behind other work is left to run (the client asked to take back a
+  //   waiting message, and cancelling would stop that work too), and the
+  //   foreground prompt cancels the session.
+  // Fire-and-forget: nothing awaits these, so log any rejection rather than
+  // surfacing it as an unhandled rejection.
+  let queued: { uuid: string; behind: boolean } | undefined;
+  let answered = false; // a late withdrawal result must not cancel whatever runs next
+  const fail = (error: unknown) =>
+    agent.logger.error(`Failed to cancel prompt via $/cancel_request: ${error}`);
+  const cancelSession = () => agent.cancel({ sessionId: params.sessionId }).catch(fail);
+  const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
+  const publishesGoal = goalUpdateFromPrompt(firstText) !== undefined;
   const onAbort = () => {
-    // Fire-and-forget: nothing awaits this listener, so swallow (and log) any
-    // rejection rather than surfacing it as an unhandled rejection.
-    agent.cancel({ sessionId: params.sessionId }).catch((error) => {
-      agent.logger.error(`Failed to cancel prompt via $/cancel_request: ${error}`);
-    });
+    if (!queued) return; // startTurn reads signal.aborted before queueing it
+    const { uuid, behind } = queued;
+    if (publishesGoal) {
+      if (!behind) void cancelSession();
+      return;
+    }
+    agent
+      .withdrawQueuedPrompt(params.sessionId, uuid)
+      .then((outcome) =>
+        outcome !== "withdrawn" && !behind && !answered ? cancelSession() : undefined,
+      )
+      .catch(fail);
   };
   signal.addEventListener("abort", onAbort, { once: true });
   try {
-    return await agent.prompt(params);
+    return await agent.prompt(
+      params,
+      "client",
+      (uuid, behind) => {
+        queued = { uuid, behind };
+      },
+      () => signal.aborted,
+    );
   } finally {
+    answered = true;
     signal.removeEventListener("abort", onAbort);
   }
 }
