@@ -75,6 +75,10 @@ with replay, which `replay_complete` ends, `session/close`, `session/prompt`, `s
 compaction, display terminals for commands, permission requests, elicitation, providers, auth, and
 [subagents](docs/subagent-sessions.md). Steering is v1 only for now.
 
+On v2, the `command` of a stdio MCP server must be an absolute path, such as `/usr/local/bin/npx`.
+`session/new`, `session/resume` and `session/fork` fail with `-32602` for a relative one, such as
+`npx`. A v1 client can still send one.
+
 `session/prompt` takes an `idempotencyKey`: a prompt that a client sends again with the same key
 is inserted once, and the retry gets the first `messageId`. The key is known for as long as Claude
 Code stores the message, also after a restart. A prompt that Claude Code does not store, such as a

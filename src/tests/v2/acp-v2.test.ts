@@ -615,22 +615,32 @@ describe("ACP v2 sessions", () => {
     expect(sdk.queryOptions).toHaveLength(0);
   });
 
-  it("rejects two MCP servers with the same name in new, resume, and fork", async () => {
+  it.each<{ name: string; mcpServers: v2.McpServer[]; data: Record<string, string> }>([
+    {
+      name: "two MCP servers with the same name",
+      mcpServers: [
+        { type: "stdio", name: "files", command: "/usr/local/bin/mcp-files" },
+        { type: "http", name: "files", url: "https://mcp.example.com/mcp" },
+      ],
+      data: { name: "files" },
+    },
+    {
+      name: "a stdio MCP server whose command is not an absolute path",
+      mcpServers: [{ type: "stdio", name: "files", command: "npx", args: ["mcp-files"] }],
+      data: { name: "files", command: "npx" },
+    },
+  ])("rejects $name in new, resume, and fork", async ({ mcpServers, data }) => {
     const { app, authUpdate } = v2Client();
-    const mcpServers: v2.McpServer[] = [
-      { type: "stdio", name: "files", command: "/usr/local/bin/mcp-files" },
-      { type: "http", name: "files", url: "https://mcp.example.com/mcp" },
-    ];
-    const duplicate = { code: -32602, data: { name: "files" } };
+    const invalid = { code: -32602, data };
     await app.connectWith(connectRouter(), async (agent) => {
       await initializeV2(agent);
       await expect(
         agent.request(v2.methods.agent.session.new, { cwd, mcpServers }),
-      ).rejects.toMatchObject(duplicate);
+      ).rejects.toMatchObject(invalid);
       const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
       await expect(
         agent.request(v2.methods.agent.session.resume, { sessionId, cwd, mcpServers }),
-      ).rejects.toMatchObject(duplicate);
+      ).rejects.toMatchObject(invalid);
       await expect(
         agent.request(v2.methods.agent.session.resume, {
           sessionId,
@@ -638,10 +648,10 @@ describe("ACP v2 sessions", () => {
           mcpServers,
           replayFrom: { type: "start" },
         }),
-      ).rejects.toMatchObject(duplicate);
+      ).rejects.toMatchObject(invalid);
       await expect(
         agent.request(v2.methods.agent.session.fork, { sessionId, cwd, mcpServers }),
-      ).rejects.toMatchObject(duplicate);
+      ).rejects.toMatchObject(invalid);
       await authUpdate(1);
     });
     // Only the session without MCP servers started.

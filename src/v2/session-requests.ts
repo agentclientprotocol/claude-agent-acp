@@ -135,7 +135,9 @@ export function v2AvailableCommands(commands: AvailableCommand[]): v2.AvailableC
  * list. A request with two servers of the same `name`, or with a transport
  * that the agent does not advertise in `session.mcp` (such as a custom `_`
  * type), fails with invalid params (-32602): `sdkMcpServers` would otherwise
- * drop the server without telling the client.
+ * drop the server without telling the client. So does a stdio server whose
+ * `command` is not an absolute path, such as `npx`, which v2 requires. The
+ * SDK's `assertSupportedMcpServers` checks all three.
  */
 function v1McpServers(servers: v2.McpServer[] | null | undefined): McpServer[] | undefined {
   if (servers == null) return undefined;
