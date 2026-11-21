@@ -5499,9 +5499,7 @@ describe("ACP v2 core", () => {
       [
         "an AIR client the AIR capabilities that v2 does not cover",
         air("loadReplayEnd"),
-        airMeta({
-          capabilities: ["agentFileChangeReport", "recommendedValue", "modelReasoningEfforts"],
-        }),
+        airMeta({ capabilities: ["agentFileChangeReport", "recommendedValue"] }),
       ],
       ["any other client no AIR key", {}, undefined],
     ])("advertises to %s", async (_, capabilities, expected) => {

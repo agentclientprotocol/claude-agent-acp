@@ -10,6 +10,7 @@ export const AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY = "recommendedValue";
 /**
  * Each entry of the `model` config option names the effort levels of its
  * model in `_meta.jetbrains.air` (see {@link AIR_REASONING_EFFORTS_KEY}).
+ * The client declares it; the agent does not advertise it.
  */
 export const AIR_MODEL_REASONING_EFFORTS_CAPABILITY = "modelReasoningEfforts";
 export const AIR_CUSTOM_INSTRUCTIONS_CAPABILITY = "customInstructions";

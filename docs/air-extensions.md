@@ -126,7 +126,6 @@ The `initialize` response of an AIR client carries the agent side of the extensi
           "nativeSubagentSessions",
           "asyncTasks",
           "recommendedValue",
-          "modelReasoningEfforts",
           "diffPatch",
           "planFile",
           "backgroundSubagents"
@@ -150,7 +149,7 @@ The response to a client that is not AIR has no `_meta.jetbrains` key.
 ### ACP v2
 
 The v2 core (`src/v2/`) serves an AIR client only the extensions that ACP v2 does not cover.
-Its `initialize` response lists `agentFileChangeReport`, `recommendedValue` and `modelReasoningEfforts`.
+Its `initialize` response lists `agentFileChangeReport` and `recommendedValue`.
 It also serves the [permission presentation](#permission-presentation), the [question custom answers](#question-custom-answers), the [predicted follow-up prompt](#predicted-follow-up-prompt), and [load replay end](#load-replay-end).
 The [agent file-change report](#agent-file-change-report) goes out at the end of the turn that serves the prompt, before the turn's idle `state_update`, because a v2 `session/prompt` is answered when Claude Code takes the prompt in.
 ACP v2 covers subagents, background work, plans, patches, compaction, the system prompt, and turn failures itself, so the v2 core serves no `nativeSubagentSessions`, `backgroundSubagents`, `asyncTasks`, `planFile`, `diffPatch`, `contextCompaction`, `customInstructions`, or `sessionFailure`.
@@ -163,7 +162,7 @@ It does not serve the [tool call contract](#tool-call-contract) yet.
 | `diffPatch`              | yes                 | Sends an exact Git patch in the diff block of an Edit or a Write.                                               | [Diff patch](#diff-patch)                               |
 | `sessionFailure`         | yes                 | Sends warnings and errors as typed transcript records.                                                          | [Session failure](#session-failure)                     |
 | `recommendedValue`       | yes                 | Replaces the `default` model and effort rows with concrete values and a recommendation.                         | [Recommended config values](#recommended-config-values) |
-| `modelReasoningEfforts`  | yes                 | Names the effort levels of each model in its `model` option entry.                                              | [Model reasoning efforts](#model-reasoning-efforts)     |
+| `modelReasoningEfforts`  | no                  | Names the effort levels of each model in its `model` option entry.                                              | [Model reasoning efforts](#model-reasoning-efforts)     |
 | `asyncTasks`             | yes                 | Publishes background work that is not a subagent as async tasks.                                                | [Async tasks](#async-tasks)                             |
 | `agentFileChangeReport`  | yes                 | Accepts a report request on `session/prompt` and sends the changed file list.                                   | [Agent file-change report](#agent-file-change-report)   |
 | `nativeSubagentSessions` | yes                 | Reports an Agent or Task subagent as a native ACP child session.                                                | [Native subagent sessions](#native-subagent-sessions)   |
@@ -996,6 +995,7 @@ The effort option shows only the levels of the current model.
 ### Activation
 
 The adapter enables the extension only when the client declares `modelReasoningEfforts`.
+The client declares the capability. The agent does not list it in its `initialize` response.
 Otherwise the entries of the `model` option have no `_meta`.
 The extension does not depend on `recommendedValue`.
 
