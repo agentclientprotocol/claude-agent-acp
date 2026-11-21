@@ -4104,6 +4104,8 @@ describe("subagent transcript replay", () => {
       capabilities: ClientCapabilities = { subagents: {}, session: { notices: {} } },
       afterResponse?: {
         live: (childSessionId: string) => string | undefined;
+        /** The configuration that the client last got for a child that still runs. */
+        configuration?: (childSessionId: string) => SessionConfigOption[] | undefined;
         /** The session's config options and model list, known after the response. */
         models?: { configOptions: SessionConfigOption[]; modelInfos: ModelInfo[] };
       },
@@ -4171,7 +4173,10 @@ describe("subagent transcript replay", () => {
         if (afterResponse) {
           // Stands in for the live session's runtime, which knows its running children.
           (agent.sessions as Record<string, unknown>)[sessionId] = {
-            nativeSubagentRuntime: { liveWorkState: afterResponse.live },
+            nativeSubagentRuntime: {
+              liveWorkState: afterResponse.live,
+              configurationOf: afterResponse.configuration,
+            },
             configOptions: afterResponse.models?.configOptions ?? [],
             modelInfos: afterResponse.models?.modelInfos ?? [],
           };
@@ -4510,7 +4515,7 @@ describe("subagent transcript replay", () => {
       ]);
     });
 
-    it("sends the model of each child's responses, and after the load response only a changed entry", async () => {
+    it("sends no child configuration in the replay, and each child's current one after the load response", async () => {
       const launch = (id: string, name: string, input: object = {}) =>
         toolUse(id, "Agent", {
           name,
@@ -4533,6 +4538,14 @@ describe("subagent transcript replay", () => {
         toolUseId: launchId,
         requestShape: "foreground",
       });
+      const haikuOption: SessionConfigOption = {
+        id: "model",
+        name: "Model",
+        category: "model",
+        type: "select",
+        currentValue: "haiku",
+        options: [{ value: "haiku", name: "Haiku 4.5" }],
+      };
       const trace = await replayRfd(
         [
           user("u1", "Go"),
@@ -4540,11 +4553,13 @@ describe("subagent transcript replay", () => {
             launch("toolu_answered", "answered"),
             launch("toolu_unlisted", "unlisted", { model: "haiku" }),
             launch("toolu_silent", "silent"),
+            launch("toolu_live", "live"),
           ]),
           user("u2", [
             toolResult("toolu_answered", "Done."),
             toolResult("toolu_unlisted", "Done."),
             toolResult("toolu_silent", "Done."),
+            toolResult("toolu_live", "Done."),
           ]),
         ],
         {
@@ -4553,8 +4568,9 @@ describe("subagent transcript replay", () => {
             records: [
               user("x1", "Run answered"),
               answer("x2", "claude-haiku-4-5", "First."),
-              answer("x3", "claude-haiku-4-5", "Same model."),
-              answer("x4", "claude-opus-5", "Fallback."),
+              answer("x3", "claude-opus-5", "Fallback."),
+              // No model wrote this message, so it is not the child's model.
+              answer("x4", "<synthetic>", "API Error"),
             ],
           },
           // A model that the session's list does not have.
@@ -4564,10 +4580,17 @@ describe("subagent transcript replay", () => {
           },
           // No response: the replay does not guess the launch input's or the parent's model.
           ccc333: { meta: meta("silent", "toolu_silent"), records: [user("z1", "Run silent")] },
+          // Still runs in this process, on another model than its stored response.
+          ddd444: {
+            meta: meta("live", "toolu_live"),
+            records: [user("w1", "Run live"), answer("w2", "claude-opus-5", "Working.")],
+          },
         },
         undefined,
         {
-          live: () => undefined,
+          live: (childSessionId) => (childSessionId === "ddd444" ? "running" : undefined),
+          configuration: (childSessionId) =>
+            childSessionId === "ddd444" ? [haikuOption] : undefined,
           models: {
             configOptions: [
               {
@@ -4602,25 +4625,35 @@ describe("subagent transcript replay", () => {
       );
 
       const opus = JSON.stringify([{ value: "opus", name: "Opus 5" }]);
+      const haiku = JSON.stringify([{ value: "haiku", name: "Haiku 4.5" }]);
       const raw = (model: string) => JSON.stringify([{ value: model, name: model }]);
-      expect(trace.filter((line) => / (model|subagent_update) /.test(line))).toEqual([
-        // During the replay the session has no model list yet, so the model is the id.
+      const idle = '{"state":"idle","stopReason":"end_turn"}';
+      expect(
+        trace.filter((line) => / (model|subagent_update) /.test(line) || line.startsWith("--")),
+      ).toEqual([
+        // A configuration before the response is a past value to the client:
+        // the replay sends none.
         'root subagent_update aaa111 {"state":"running"}',
-        `aaa111 model claude-haiku-4-5 ${raw("claude-haiku-4-5")}`,
-        // A response on another model sends the model again; the same model does not.
-        `aaa111 model claude-opus-5 ${raw("claude-opus-5")}`,
         'root subagent_update bbb222 {"state":"running"}',
-        `bbb222 model claude-fable-9 ${raw("claude-fable-9")}`,
         'root subagent_update ccc333 {"state":"running"}',
-        'root subagent_update ccc333 {"state":"idle","stopReason":"end_turn"}',
-        'root subagent_update bbb222 {"state":"idle","stopReason":"end_turn"}',
-        'root subagent_update aaa111 {"state":"idle","stopReason":"end_turn"}',
-        // After the response, a model goes again only when the root session's
-        // `model` option maps it to another entry.
-        'root subagent_update aaa111 {"state":"idle","stopReason":"end_turn"}',
+        'root subagent_update ddd444 {"state":"running"}',
+        `root subagent_update ddd444 ${idle}`,
+        `root subagent_update ccc333 ${idle}`,
+        `root subagent_update bbb222 ${idle}`,
+        `root subagent_update aaa111 ${idle}`,
+        "-- response --",
+        // The model of the latest response, as the root session's `model`
+        // option names it.
+        `root subagent_update aaa111 ${idle}`,
         `aaa111 model opus ${opus}`,
-        'root subagent_update bbb222 {"state":"idle","stopReason":"end_turn"}',
-        'root subagent_update ccc333 {"state":"idle","stopReason":"end_turn"}',
+        // A model that the option does not list is its id.
+        `root subagent_update bbb222 ${idle}`,
+        `bbb222 model claude-fable-9 ${raw("claude-fable-9")}`,
+        `root subagent_update ccc333 ${idle}`,
+        // A child that still runs gets the configuration that the live session
+        // last sent for it, not its stored response's model.
+        'root subagent_update ddd444 {"state":"running"} capabilities={"cancel":{}}',
+        `ddd444 model haiku ${haiku}`,
       ]);
     });
 

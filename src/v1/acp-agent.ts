@@ -228,7 +228,6 @@ import {
 import {
   type ReplayChild,
   RfdSubagentReplay,
-  firstResponseModel,
   replaySubagentTerminalState,
 } from "../subagent-replay.js";
 import {
@@ -1676,7 +1675,8 @@ export class ClaudeAcpAgent {
   toolUseWaitMs: number = TOOL_USE_WAIT_MS;
   /**
    * The subagent replay of each session's last load, until
-   * {@link publishCurrentSubagentStates} sends its children's current states.
+   * {@link publishCurrentSubagentStates} sends its children's current states
+   * and configurations.
    */
   private readonly replayedSubagents = new Map<string, RfdSubagentReplay>();
   /**
@@ -8221,7 +8221,6 @@ export class ClaudeAcpAgent {
             rfdHistory,
             (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
             this.subagentModels(sessionId),
-            !pending,
             session?.cwd,
           )
         : undefined;
@@ -8348,7 +8347,7 @@ export class ClaudeAcpAgent {
       if (message.type === "assistant") {
         const model = (message.message as { model?: string }).model;
         if (rfdReplay && child) {
-          await rfdReplay.responseModel(child, model);
+          rfdReplay.responseModel(child, model);
         } else if (nativeReplayEnabled && parentToolUseId) {
           // AIR's draft: the entry of the model list that is known now. A load
           // can lack the list until the CLI started, so the entry goes again
@@ -8494,7 +8493,7 @@ export class ClaudeAcpAgent {
             rfdHistory,
             this.logger,
           );
-          await rfdReplay.announce(launched, firstResponseModel(childMessages));
+          await rfdReplay.announce(launched);
           rfdReplay.scan(childMessages, launched.sessionId);
           for (const childMessage of childMessages) await replayMessage(childMessage, launched);
           await rfdReplay.childReplayed(launched, childMessages);
@@ -9479,10 +9478,10 @@ export class ClaudeAcpAgent {
   }
 
   /**
-   * Sends the current state of each subagent that the last load of
-   * `sessionId` replayed (see {@link RfdSubagentReplay.currentStates}). Run it
-   * only after the load response: before it, the client treats subagent states
-   * as history.
+   * Sends the current state and configuration of each subagent that the last
+   * load of `sessionId` replayed (see {@link RfdSubagentReplay.currentStates}).
+   * Run it only after the load response: before it, the client treats a
+   * subagent's state and configuration as history.
    */
   async publishCurrentSubagentStates(sessionId: string): Promise<void> {
     await this.publishReplayedChildModels(sessionId);
