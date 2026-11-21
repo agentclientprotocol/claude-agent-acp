@@ -92,6 +92,11 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
   session messages and `session` references as live, and its end is an `idle` before the response.
   Each replayed child's current state follows the response: on v1, the response is what separates
   a replayed child state from a current one.
+  A replay sends no `config_option_update` of a child, since one that arrives before the response
+  is a past value to the client. Each replayed child's configuration follows its current state:
+  the configuration of a child that still runs, else its `model` option with the model of the
+  latest response in its transcript, as the session's `model` option names it. A child that
+  neither runs nor has a response gets none.
   A launch without Claude Code's metadata file for the child stays an ordinary tool call of the
   parent, and a notice, for a client that takes notices, says that subagent history is missing.
 - After a load or resume, with or without replay, a SendMessage that resumes an agent from before
@@ -114,7 +119,9 @@ after the parent's copy. A replay ends each child's history with a `replay_compl
 session. On v2, the parent's `replay_complete` is what separates a replayed child state from a
 current one, so each replayed child's current state follows the root session's `replay_complete`
 and comes before the response: on its parent, with the cleared `cwd`, and then as the child's own
-`idle`. The notice that subagent history is missing follows the root's `replay_complete` too.
+`idle`. The child's configuration follows it there, since v2 asks an agent not to replay a past
+`config_option_update`. The notice that subagent history is missing follows the root's
+`replay_complete` too.
 
 JetBrains AIR keeps the earlier draft of the RFD (`subagent_spawned`, `subagent_state_update`),
 which it enables with `nativeSubagentSessions` in `_meta.jetbrains.air.capabilities`. See
