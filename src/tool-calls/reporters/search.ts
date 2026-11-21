@@ -1,15 +1,20 @@
 import type { GlobInput, GrepInput } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import { inputString } from "../content.js";
-import type { ToolReporter, ToolUseFacts } from "../facts.js";
+import type { ToolReporter, ToolUseContext, ToolUseFacts } from "../facts.js";
 
-/** Glob: the file list is the result to show. */
+/**
+ * Glob: the file list is the result to show. A v1 client gets the path and
+ * the pattern as Markdown code spans, like upstream. A v2 tool call title is
+ * plain text, so a v2 client gets them as they are.
+ */
 export class GlobReporter implements ToolReporter {
-  toolUse(input: unknown): ToolUseFacts {
+  toolUse(input: unknown, { capabilities }: ToolUseContext): ToolUseFacts {
     const glob = input as GlobInput | undefined;
     const searchPath = inputString(input, "path");
+    const code = (text: string) => (capabilities.v2 ? text : `\`${text}\``);
     let label = "Find";
-    if (searchPath) label += ` \`${searchPath}\``;
-    if (glob?.pattern) label += ` \`${glob.pattern}\``;
+    if (searchPath) label += ` ${code(searchPath)}`;
+    if (glob?.pattern) label += ` ${code(glob.pattern)}`;
     return {
       title: label,
       kind: "search",
