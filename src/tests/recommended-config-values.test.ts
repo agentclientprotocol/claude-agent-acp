@@ -287,7 +287,8 @@ describe("buildConfigOptions recommended values presentation", () => {
 });
 
 describe("model reasoning efforts", () => {
-  const EFFORTS_PRESENTATION = undefined;
+  const AIR_RECOMMENDED = { useRecommendedValue: true, airClient: true };
+  const EFFORTS_PRESENTATION = { useRecommendedValue: false, airClient: true };
 
   function effortsMeta(values: string[], recommended: string) {
     return { jetbrains: { air: { version: 1, reasoningEfforts: { values, recommended } } } };
@@ -434,7 +435,7 @@ describe("model reasoning efforts", () => {
         [],
         "default",
         undefined,
-        RECOMMENDED_PRESENTATION,
+        AIR_RECOMMENDED,
       );
       const recommended = (
         entry(options, currentModelId)?._meta as {
@@ -454,7 +455,7 @@ describe("model reasoning efforts", () => {
       [],
       "default",
       undefined,
-      RECOMMENDED_PRESENTATION,
+      AIR_RECOMMENDED,
     );
     const model = selectOption(options, "model");
     expect(model._meta).toEqual(recommendedMeta("sonnet"));
@@ -469,9 +470,10 @@ describe("model reasoning efforts", () => {
   });
 
   it.each([
-    ["without AIR metadata", undefined],
-    ["with recommendedValue", RECOMMENDED_PRESENTATION],
-  ])("names the efforts for every client, %s", (_name, presentation) => {
+    ["with recommendedValue", AIR_RECOMMENDED, true],
+    ["for a client that is not AIR", undefined, false],
+    ["for a client that is not AIR, with recommendedValue", RECOMMENDED_PRESENTATION, false],
+  ])("names the efforts only for an AIR client, %s", (_name, presentation, airClient) => {
     const options = buildConfigOptions(
       MODES,
       MODELS,
@@ -482,7 +484,13 @@ describe("model reasoning efforts", () => {
       undefined,
       presentation,
     );
-    expect(entry(options, "opus")?._meta).toEqual(effortsMeta(["low", "medium", "high"], "medium"));
+    if (airClient) {
+      expect(entry(options, "opus")?._meta).toEqual(
+        effortsMeta(["low", "medium", "high"], "medium"),
+      );
+    } else {
+      for (const candidate of entries(options)) expect(candidate).not.toHaveProperty("_meta");
+    }
     expect(entry(options, "haiku")).not.toHaveProperty("_meta");
   });
 });

@@ -872,6 +872,10 @@ describe("session config options", () => {
     });
 
     it("keeps each model's efforts in config_option_update after an external switch", async () => {
+      const { ClientCapabilities } = await import("../../tool-calls/client-capabilities.js");
+      (agent as any).toolCallCapabilities = ClientCapabilities.from({
+        _meta: { jetbrains: { air: { version: 1, capabilities: [] } } },
+      });
       const session = agent.sessions[SESSION_ID];
       session.modelInfos[1].supportsEffort = false;
 

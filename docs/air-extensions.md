@@ -186,7 +186,7 @@ The agent advertises the `goal` object, and the client uses the control method w
 
 Every payload goes into `_meta.jetbrains.air`, next to `version: 1`.
 The adapter merges a payload into an existing `_meta` and keeps the other namespaces.
-The adapter sends these keys only to an AIR client, except a key whose Gate column says "every client". "AIR" in the Gate column means an AIR client without a further capability.
+The adapter sends these keys only to an AIR client. "AIR" in the Gate column means an AIR client without a further capability.
 
 | Key                            | Message and field path                                                                | Shape                                                                  | Gate                                                                                   |
 | ------------------------------ | ------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
@@ -196,7 +196,7 @@ The adapter sends these keys only to an AIR client, except a key whose Gate colu
 | `diffPatch`                    | tool call and permission request `content[]` of type `diff`, `_meta.jetbrains.air`    | `{version: 1, format: "git_patch", text}`                              | `diffPatch`                                                                            |
 | `permission`                   | `session/request_permission` request `_meta.jetbrains.air`                            | `{version: 1, title, description?, defaultToNo?}`                      | AIR                                                                                    |
 | `recommendedValue`             | `model` and effort config options, `_meta.jetbrains.air`                              | option value string                                                    | `recommendedValue`                                                                     |
-| `reasoningEfforts`             | entry of the `model` config option, `_meta.jetbrains.air`                             | `{values: string[], recommended: string}`                              | every client                                                                           |
+| `reasoningEfforts`             | entry of the `model` config option, `_meta.jetbrains.air`                             | `{values: string[], recommended: string}`                              | AIR                                                                                    |
 | `asyncTasks`                   | Bash `tool_call_update._meta.jetbrains.air`                                           | `{backgrounded: true}`                                                 | `asyncTasks`                                                                           |
 | `agentFileChangeReportRequest` | `session/prompt` request `_meta.jetbrains.air` (client to agent)                      | `{version: 1, requestId}`                                              | `agentFileChangeReport`                                                                |
 | `agentFileChangeReport`        | `session_info_update._meta.jetbrains.air`                                             | report object                                                          | `agentFileChangeReport`                                                                |
@@ -993,9 +993,9 @@ The effort option shows only the levels of the current model.
 
 ### Activation
 
-The adapter always sends the key, to every client.
+The adapter sends the key to every AIR client.
 The key has no capability, because it only adds data.
-A client that does not know the key ignores it.
+A client that is not AIR gets no `reasoningEfforts`.
 The key does not depend on `recommendedValue`.
 
 ### Entry metadata

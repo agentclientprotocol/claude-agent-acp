@@ -117,6 +117,9 @@ export type ConfigOptionPresentation = {
   /** Replace ambiguous `default` rows with concrete values and advertise the
    *  SDK/adapter recommendation as `_meta.jetbrains.air.recommendedValue`. */
   useRecommendedValue: boolean;
+  /** The client is AIR: each `model` option entry names its model's effort
+   *  levels at `_meta.jetbrains.air.reasoningEfforts`. */
+  airClient?: boolean;
 };
 
 /**
@@ -165,7 +168,12 @@ export function buildConfigOptions(
   // there is no model option at all.
   if (models.availableModels.length > 0) {
     options.push(
-      buildModelConfigOption(models, modelInfos, presentation?.useRecommendedValue === true),
+      buildModelConfigOption(
+        models,
+        modelInfos,
+        presentation?.useRecommendedValue === true,
+        presentation?.airClient === true,
+      ),
     );
   }
   const effort = buildEffortConfigOption(

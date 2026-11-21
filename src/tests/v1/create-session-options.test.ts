@@ -1787,6 +1787,9 @@ describe("createSession options merging", () => {
     );
 
     describe("model reasoning efforts", () => {
+      const AIR_CLIENT = {
+        _meta: { jetbrains: { air: { version: 1, capabilities: [] } } },
+      } as ClientCapabilities;
       const efforts = (values: string[], recommended: string) => ({
         jetbrains: { air: { version: 1, reasoningEfforts: { values, recommended } } },
       });
@@ -1803,8 +1806,8 @@ describe("createSession options merging", () => {
         "claude-haiku-4-5": efforts(["low", "medium"], "medium"),
       };
 
-      it("names each model's efforts in every answer, without a capability", async () => {
-        await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      it("names each model's efforts in every answer to an AIR client, without a capability", async () => {
+        await agent.initialize({ protocolVersion: 1, clientCapabilities: AIR_CLIENT });
         const created = await agent.newSession({ cwd, mcpServers: [] });
         expect(entryMetas(created)).toEqual(expected);
 
@@ -1841,6 +1844,15 @@ describe("createSession options merging", () => {
             ),
           ).toBe(true),
         );
+      });
+
+      it("names no efforts to a client that is not AIR", async () => {
+        await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+        const created = await agent.newSession({ cwd, mcpServers: [] });
+        expect(entryMetas(created)).toEqual({
+          "claude-sonnet-4-6": undefined,
+          "claude-haiku-4-5": undefined,
+        });
       });
     });
 
