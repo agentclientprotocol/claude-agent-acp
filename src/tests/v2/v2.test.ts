@@ -1,7 +1,7 @@
 /**
  * The ACP v2 core (`src/v2/`), driven through the protocol
- * router with the SDK's v2 client app, which validates every response and
- * session update against the v2 schema.
+ * router with the SDK's v2 client app. Raw notifications are checked against
+ * the v2 schema before the SDK handles them.
  *
  * Claude Code is a double that the test drives message by message (see
  * {@link FakeClaudeCode}), shaped like what the bundled CLI sends: prompt
@@ -24,6 +24,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { McpOverAcp } from "../../mcp-servers.js";
 import { acpProtocolRouter } from "../../serve.js";
+import { validateV2Notification } from "../acp-scenarios/schema.js";
 import { SettingsManager } from "../../settings.js";
 import type { AgentHandle } from "../../v2/agent.js";
 import { v2ElicitationRequest } from "../../v2/elicitation.js";
@@ -216,10 +217,12 @@ vi.mock("node:child_process", async () => ({
 }));
 
 const agents: AgentHandle[] = [];
+const notificationErrors: string[] = [];
 let tempDir: string;
 let cwd: string;
 
 beforeEach(async () => {
+  notificationErrors.length = 0;
   tempDir = await mkdtemp(path.join(os.tmpdir(), "acp-v2-"));
   cwd = await mkdtemp(path.join(tempDir, "project-"));
   vi.stubEnv("CLAUDE_CONFIG_DIR", path.join(tempDir, "claude"));
@@ -240,6 +243,7 @@ afterEach(async () => {
   await Promise.all(agents.splice(0).map((agent) => agent.dispose()));
   vi.unstubAllEnvs();
   await rm(tempDir, { recursive: true, force: true, maxRetries: 10 });
+  expect(notificationErrors).toEqual([]);
 });
 
 /** A v2 client of the v2 core that records the session updates it receives. */
@@ -280,7 +284,12 @@ function v2Client({
       completedElicitations.push(params.elicitationId);
     });
   const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
-  const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
+  const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>({
+    transform(message, controller) {
+      notificationErrors.push(...validateV2Notification(message));
+      controller.enqueue(message);
+    },
+  });
   acpProtocolRouter(undefined, () => {}, "v2", {
     onV2Agent: (agent) => agents.push(agent),
   }).connect({ readable: toAgent.readable, writable: toClient.writable });
@@ -6283,6 +6292,7 @@ describe("v2ElicitationRequest", () => {
       mode: "form" as const,
       sessionId: "s1",
       message: "Which release?",
+      _meta: { jetbrains: { air: { version: 1, existing: true } } },
       requestedSchema: {
         type: "object" as const,
         required: ["tag"],
@@ -6291,6 +6301,13 @@ describe("v2ElicitationRequest", () => {
           // A property that is named `pattern` is no keyword.
           pattern: { type: "string" as const, enum: ["a", "b"] },
           count: { type: "integer" as const, minimum: 1 },
+          note: {
+            type: "string" as const,
+            _meta: {
+              _askUserQuestionCustomAnswer: { questionId: "pattern", isCustomAnswer: true },
+              jetbrains: { air: { customAnswer: true } },
+            },
+          },
         },
       },
     };

@@ -1,8 +1,7 @@
 /**
  * The experimental draft ACP v2 surface, driven through the protocol router
- * with the SDK's own v1 and v2 client apps. The v2 client app validates every
- * response, session update, and elicitation it receives against the v2
- * schema, so a malformed v2 message fails the test.
+ * with the SDK's own v1 and v2 client apps. Raw v2 notifications are checked
+ * against the v2 schema before the SDK handles them.
  */
 import { randomUUID } from "node:crypto";
 import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -20,6 +19,7 @@ import {
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { AuthStatusUpdateNotification } from "../../auth-status.js";
+import { validateV2Notification } from "../acp-scenarios/schema.js";
 import { clearContextWindowCache } from "../../context-window.js";
 import { v2DiffContent } from "../../diff.js";
 import { type AcpProtocols, acpProtocolRouter, acpProtocolsFromEnv } from "../../serve.js";
@@ -192,11 +192,13 @@ const CLI_SUBSCRIPTION = JSON.stringify({
 const V2_CLIENT_INFO = { name: "v2-test-client", version: "1.0.0" };
 
 const agents: AgentHandle[] = [];
+const notificationErrors: string[] = [];
 /** An empty Claude config directory and a session cwd, so no test reads the real ones. */
 let tempDir: string;
 let cwd: string;
 
 beforeEach(async () => {
+  notificationErrors.length = 0;
   // `claude auth status --json` reports a subscription, `claude auth logout` succeeds.
   execFileSpy.mockImplementation((...invocation: unknown[]) => {
     const args = invocation[1] as string[];
@@ -215,12 +217,27 @@ afterEach(async () => {
   vi.mocked(getSessionInfo).mockReset();
   vi.unstubAllEnvs();
   await rm(tempDir, { recursive: true, force: true, maxRetries: 10 });
+  expect(notificationErrors).toEqual([]);
 });
 
 /** Connects a fresh router to a client, and returns the client end of the stream. */
 function connectRouter(protocols?: AcpProtocols): v2.Stream {
-  const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
-  const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
+  let v2Connection = false;
+  const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>({
+    transform(message, controller) {
+      if ("method" in message && message.method === v2.methods.agent.initialize) {
+        const params = message.params as { protocolVersion?: unknown } | undefined;
+        v2Connection = params?.protocolVersion === v2.PROTOCOL_VERSION;
+      }
+      controller.enqueue(message);
+    },
+  });
+  const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>({
+    transform(message, controller) {
+      if (v2Connection) notificationErrors.push(...validateV2Notification(message));
+      controller.enqueue(message);
+    },
+  });
   acpProtocolRouter(undefined, (agent) => agents.push(agent), protocols, {
     onV2Agent: (agent) => agents.push(agent),
   }).connect({
