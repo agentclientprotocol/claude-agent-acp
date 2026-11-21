@@ -83,7 +83,8 @@ export class ClientConnection implements AcpClient {
 }
 
 /**
- * The client that the agent talks to. For an AIR client, every session update
+ * The client that the agent talks to. `sending` takes every session update
+ * first, before it goes to the client. For an AIR client, every session update
  * passes the {@link ChangedMetaFilter} last, after the native subagent routing,
  * so a `tool_call_update` carries only the `_meta` keys that changed. ACP
  * merges only the top-level tool call fields, not the `_meta` keys. So another
@@ -95,9 +96,11 @@ export class ChangedMetaClient implements AcpClient {
   constructor(
     private readonly inner: AcpClient,
     private readonly airClient: () => boolean,
+    private readonly sending: (update: AcpSessionNotification) => void = () => {},
   ) {}
 
   async sessionUpdate(params: AcpSessionNotification): Promise<void> {
+    this.sending(params);
     if (!this.airClient()) return this.inner.sessionUpdate(params);
     const update = this.filter.apply(params.update as SessionNotification["update"]);
     if (update) await this.inner.sessionUpdate({ ...params, update } as AcpSessionNotification);

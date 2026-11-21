@@ -113,6 +113,7 @@ import { sanitizeTitle, SessionTitles } from "../session-titles.js";
 import {
   AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
   AcpSessionNotification,
+  AnnouncedChildren,
   asSdkSessionNotification,
   clientSupportsSubagents,
   restrictedChild,
@@ -228,7 +229,6 @@ import {
 import {
   type ReplayChild,
   RfdSubagentReplay,
-  firstResponseModel,
   replaySubagentTerminalState,
 } from "../subagent-replay.js";
 import {
@@ -379,6 +379,7 @@ import {
   withCurrentModelInfo,
 } from "../session-model.js";
 import {
+  applyProviderRoute,
   createEnvForProvider,
   defaultProviderConfig,
   gatewayRequestToProviderConfig,
@@ -389,6 +390,7 @@ import {
   PROVIDER_ID,
   type ProviderConfig,
   providerConfigFromSetRequest,
+  providerRouteSettings,
   validatedGatewayAuthRequest,
   withListedModels,
 } from "../providers.js";
@@ -1676,9 +1678,16 @@ export class ClaudeAcpAgent {
   toolUseWaitMs: number = TOOL_USE_WAIT_MS;
   /**
    * The subagent replay of each session's last load, until
-   * {@link publishCurrentSubagentStates} sends its children's current states.
+   * {@link publishCurrentSubagentStates} sends its children's current states
+   * and configurations.
    */
   private readonly replayedSubagents = new Map<string, RfdSubagentReplay>();
+  /**
+   * The subagents RFD form: the child sessions that the sessions announced,
+   * from each one's `subagent_update` until the client ends its root session
+   * (see {@link endSession}) or the connection ends (see `AnnouncedChildren`).
+   */
+  private readonly announcedChildren = new AnnouncedChildren();
   /**
    * AIR's draft: the model that the last load of each session replayed to each
    * child session, as the model id and the entry that went out. See
@@ -1707,7 +1716,7 @@ export class ClaudeAcpAgent {
     agent: this,
     isAirClient: () => this.toolCallCapabilities.air.client,
     interruptSession: (sessionId) => this.cancelTurns({ sessionId }, { awaitInterrupt: false }),
-    teardownSession: (sessionId) => this.teardownSession(sessionId),
+    teardownSession: (sessionId) => this.endSession(sessionId),
   });
 
   /**
@@ -1727,7 +1736,12 @@ export class ClaudeAcpAgent {
 
   constructor(client: AcpClient, logger?: Logger) {
     this.sessions = {};
-    this.client = new ChangedMetaClient(client, () => this.toolCallCapabilities.air.client);
+    this.client = new ChangedMetaClient(
+      client,
+      () => this.toolCallCapabilities.air.client,
+      // Before the client can name the child that a `subagent_update` announces.
+      (update) => this.announcedChildren.sending(update),
+    );
     this.logger = logger ?? console;
     this.exitPlan = new ExitPlanCoordinator<Session, Turn>({
       currentSession: (id) => this.sessions[id],
@@ -7344,16 +7358,13 @@ export class ClaudeAcpAgent {
 
   /**
    * Throws invalid params (-32602) when `sessionId` is a child session that a
-   * session of this connection announced on the subagents RFD form (see
-   * `NativeSubagentRuntime.hasChild`): the client can cancel a child, and
-   * nothing else. `method` completes "the client cannot … it".
+   * session of this connection announced on the subagents RFD form, while it
+   * ran or in a load's replay, and that session is not closed (see
+   * `AnnouncedChildren`): the client can cancel a child, and nothing else.
+   * `method` completes "the client cannot … it".
    */
   assertNoChildSession(sessionId: string, method: string): void {
-    for (const session of Object.values(this.sessions)) {
-      if (session.nativeSubagentRuntime?.hasChild(sessionId)) {
-        throw restrictedChild(sessionId, method);
-      }
-    }
+    if (this.announcedChildren.has(sessionId)) throw restrictedChild(sessionId, method);
   }
 
   /**
@@ -7892,12 +7903,21 @@ export class ClaudeAcpAgent {
     await Promise.all(Object.keys(this.sessions).map((id) => this.teardownSession(id)));
   }
 
+  /**
+   * {@link teardownSession}, for a session that the client ends: with
+   * `session/close`, `session/delete`, or an archive. The client can no
+   * longer name the session's children then (see `AnnouncedChildren`). A load
+   * or resume that replaces the session's query keeps them.
+   */
+  private async endSession(sessionId: string): Promise<void> {
+    await this.teardownSession(sessionId);
+    // After the teardown's last updates, which name the children.
+    this.announcedChildren.rootClosed(sessionId);
+  }
+
   /** Idempotent: a session that is not loaded here is already closed. */
   async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
-    if (!this.sessions[params.sessionId]) {
-      return {};
-    }
-    await this.teardownSession(params.sessionId);
+    await this.endSession(params.sessionId);
     return {};
   }
 
@@ -8221,7 +8241,6 @@ export class ClaudeAcpAgent {
             rfdHistory,
             (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
             this.subagentModels(sessionId),
-            !pending,
             session?.cwd,
           )
         : undefined;
@@ -8348,7 +8367,7 @@ export class ClaudeAcpAgent {
       if (message.type === "assistant") {
         const model = (message.message as { model?: string }).model;
         if (rfdReplay && child) {
-          await rfdReplay.responseModel(child, model);
+          rfdReplay.responseModel(child, model);
         } else if (nativeReplayEnabled && parentToolUseId) {
           // AIR's draft: the entry of the model list that is known now. A load
           // can lack the list until the CLI started, so the entry goes again
@@ -8494,7 +8513,7 @@ export class ClaudeAcpAgent {
             rfdHistory,
             this.logger,
           );
-          await rfdReplay.announce(launched, firstResponseModel(childMessages));
+          await rfdReplay.announce(launched);
           rfdReplay.scan(childMessages, launched.sessionId);
           for (const childMessage of childMessages) await replayMessage(childMessage, launched);
           await rfdReplay.childReplayed(launched, childMessages);
@@ -9453,7 +9472,7 @@ export class ClaudeAcpAgent {
    *
    * Call it in the same synchronous step as the handler's `return`: an
    * `await` between them would let the timer run before the response. The ACP
-   * SDK (2.8.0) gives a request handler no responder and no after-response
+   * SDK (2.9.1) gives a request handler no responder and no after-response
    * hook, so the order rests on two things that its source shows and its API
    * does not promise. `registerAppRequest` queues the response in the
    * microtask that follows the handler's return, with no macrotask in
@@ -9479,22 +9498,30 @@ export class ClaudeAcpAgent {
   }
 
   /**
-   * Sends the current state of each subagent that the last load of
-   * `sessionId` replayed (see {@link RfdSubagentReplay.currentStates}). Run it
-   * only after the load response: before it, the client treats subagent states
-   * as history.
+   * Sends what is current of the subagents of `sessionId` after a session
+   * setup response: the state and configuration of each one that the last
+   * load replayed (see {@link RfdSubagentReplay.currentStates}), then each
+   * one that works in the session and that no replay announced, with its
+   * announcement again (see `NativeSubagentRuntime.currentChildren`). The
+   * second kind is a child of a session that was resumed, which replays
+   * nothing, or one whose launch the loaded history does not have, such as a
+   * forked skill's. Run it only after the response: before a load's response,
+   * the client treats a subagent's state and configuration as history.
    */
   async publishCurrentSubagentStates(sessionId: string): Promise<void> {
     await this.publishReplayedChildModels(sessionId);
     const replay = this.replayedSubagents.get(sessionId);
-    if (!replay) return;
     this.replayedSubagents.delete(sessionId);
     const runtime = this.sessions[sessionId]?.nativeSubagentRuntime;
     try {
-      for (const notification of replay.currentStates(
-        (child) => runtime?.liveWorkState(child),
-        (child) => runtime?.configurationOf?.(child),
-      )) {
+      const current = [
+        ...(replay?.currentStates(
+          (child) => runtime?.liveWorkState(child),
+          (child) => runtime?.configurationOf?.(child),
+        ) ?? []),
+        ...(runtime?.currentChildren((child) => replay?.announced(child) === true) ?? []),
+      ];
+      for (const notification of current) {
         await this.client.sessionUpdate(asSdkSessionNotification(notification));
       }
     } catch (error) {
@@ -10191,14 +10218,14 @@ export class ClaudeAcpAgent {
       userProvidedOptions?.settings,
       params.cwd,
     );
-    // Claude Code applies env from settings.json after the subprocess env. Put
-    // an active ACP route in the programmatic settings tier too so user/project
-    // settings cannot silently restore a different ANTHROPIC_BASE_URL.
-    const settings = resolvedProvider
+    // An active ACP route goes into the programmatic settings tier too (see
+    // `providerRouteSettings`).
+    const route = resolvedProvider ? providerRouteSettings(providerEnv) : undefined;
+    const settings = route
       ? {
           ...configuredSettingsObject,
-          apiKeyHelper: "",
-          env: { ...configuredSettingsObject?.env, ...providerEnv },
+          ...route,
+          env: { ...configuredSettingsObject?.env, ...route.env },
         }
       : configuredSettingsObject;
     const env = {
@@ -10495,6 +10522,8 @@ export class ClaudeAcpAgent {
         }
         throw startupFailureError(error) ?? error;
       }
+      // Before a request of the session reaches the provider.
+      if (route) await applyProviderRoute(q, route);
       timing.phase("sdk-initialize");
 
       // Publish the identity BEFORE the guard can refuse this session. A

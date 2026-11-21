@@ -615,22 +615,32 @@ describe("ACP v2 sessions", () => {
     expect(sdk.queryOptions).toHaveLength(0);
   });
 
-  it("rejects two MCP servers with the same name in new, resume, and fork", async () => {
+  it.each<{ name: string; mcpServers: v2.McpServer[]; data: Record<string, string> }>([
+    {
+      name: "two MCP servers with the same name",
+      mcpServers: [
+        { type: "stdio", name: "files", command: "/usr/local/bin/mcp-files" },
+        { type: "http", name: "files", url: "https://mcp.example.com/mcp" },
+      ],
+      data: { name: "files" },
+    },
+    {
+      name: "a stdio MCP server whose command is not an absolute path",
+      mcpServers: [{ type: "stdio", name: "files", command: "npx", args: ["mcp-files"] }],
+      data: { name: "files", command: "npx" },
+    },
+  ])("rejects $name in new, resume, and fork", async ({ mcpServers, data }) => {
     const { app, authUpdate } = v2Client();
-    const mcpServers: v2.McpServer[] = [
-      { type: "stdio", name: "files", command: "/usr/local/bin/mcp-files" },
-      { type: "http", name: "files", url: "https://mcp.example.com/mcp" },
-    ];
-    const duplicate = { code: -32602, data: { name: "files" } };
+    const invalid = { code: -32602, data };
     await app.connectWith(connectRouter(), async (agent) => {
       await initializeV2(agent);
       await expect(
         agent.request(v2.methods.agent.session.new, { cwd, mcpServers }),
-      ).rejects.toMatchObject(duplicate);
+      ).rejects.toMatchObject(invalid);
       const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
       await expect(
         agent.request(v2.methods.agent.session.resume, { sessionId, cwd, mcpServers }),
-      ).rejects.toMatchObject(duplicate);
+      ).rejects.toMatchObject(invalid);
       await expect(
         agent.request(v2.methods.agent.session.resume, {
           sessionId,
@@ -638,10 +648,10 @@ describe("ACP v2 sessions", () => {
           mcpServers,
           replayFrom: { type: "start" },
         }),
-      ).rejects.toMatchObject(duplicate);
+      ).rejects.toMatchObject(invalid);
       await expect(
         agent.request(v2.methods.agent.session.fork, { sessionId, cwd, mcpServers }),
-      ).rejects.toMatchObject(duplicate);
+      ).rejects.toMatchObject(invalid);
       await authUpdate(1);
     });
     // Only the session without MCP servers started.
@@ -1548,6 +1558,11 @@ describe("ACP v2 sessions", () => {
       expect(sdk.queryOptions).toHaveLength(2);
       expect(sdk.queryOptions[1].effort).toBeUndefined();
       expect(sdk.flagSettings).toEqual([
+        // The provider's route, before the session's own choices.
+        {
+          apiKeyHelper: "",
+          env: expect.objectContaining({ ANTHROPIC_BASE_URL: "https://gateway.example.com" }),
+        },
         { ultracode: true },
         { fastMode: false },
         { fastMode: true },
@@ -2633,16 +2648,9 @@ describe("ACP v2 prompts", () => {
     // The child's past `running` does not replay. Its current state goes
     // once, after its own `replay_complete` and before the response: its
     // process is gone, so it is idle.
-    // The child's model, from its transcript, goes right after its
-    // announcement. It does not go again after the replay: it is unchanged.
-    const model = expect.objectContaining({
-      sessionUpdate: "config_option_update",
-      configOptions: [
-        expect.objectContaining({ configId: "model", currentValue: "claude-haiku-4-5" }),
-      ],
-    });
+    // Its configuration is no history either: v2 asks an agent not to replay
+    // a past `config_option_update`, so it follows the current state.
     expect(child).toEqual([
-      model,
       expect.objectContaining({ sessionUpdate: "session_message", content: text("Look around") }),
       // The client may still hold the child's message, so the replay clears it.
       { sessionUpdate: "agent_message", messageId: "msg_child", content: [] },
@@ -2653,6 +2661,7 @@ describe("ACP v2 prompts", () => {
       }),
       { sessionUpdate: "replay_complete" },
       { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn", background: [] },
+      expect.objectContaining({ sessionUpdate: "config_option_update" }),
       { sessionUpdate: "response" },
     ]);
     // On the parent, the child's states before the parent's `replay_complete`
@@ -2681,7 +2690,7 @@ describe("ACP v2 prompts", () => {
     ).toEqual([]);
   });
 
-  it("replays a SendMessage call's delivery, a hand-back and a child's model change as live", async () => {
+  it("replays a SendMessage call's delivery and a hand-back as live", async () => {
     scriptTurns();
     const client = v2Client();
     let root = "";
@@ -2795,17 +2804,6 @@ describe("ACP v2 prompts", () => {
       "root toolu_send root -> abc123",
     ]);
     expect(client.updates("tool_call_update")).toEqual([]);
-    // The child's model goes again when a response changes it.
-    expect(
-      client.sessionUpdates.flatMap(({ sessionId, update }) =>
-        sessionId === "abc123" && update.sessionUpdate === "config_option_update"
-          ? [(update as { configOptions: Array<{ currentValue: unknown }> }).configOptions[0]!]
-          : [],
-      ),
-    ).toEqual([
-      expect.objectContaining({ currentValue: "claude-haiku-4-5" }),
-      expect.objectContaining({ currentValue: "claude-sonnet-4-6" }),
-    ]);
     // The client cannot fork a child, so the messages a child received get no cursor.
     expect(client.updates("cursor_update")).toEqual([]);
   });
@@ -6622,7 +6620,7 @@ describe("ACP v2 requests that subagents make", () => {
       });
     });
 
-    it("sends a live child's configuration again after a replay, when the replay sent another", async () => {
+    it("sends a live child's configuration after a replay, not the model of its stored response", async () => {
       scriptTurns(async function* (options) {
         yield toolUseMessage(options, "toolu_agent-1", "Agent", {
           description: "Explore the project",
@@ -6708,11 +6706,10 @@ describe("ACP v2 requests that subagents make", () => {
             .join(" "),
         ];
       });
-      // The replay sends the model of the child's response. The live child's
-      // configuration has its mode too, so it goes again after the replay,
-      // before the response.
+      // The live session's configuration of the child has its mode and agent
+      // too. It goes once, after the replay and before the response: the
+      // client may not show what it held before the resume.
       expect(configurations).toEqual([
-        "model=claude-sonnet-4-6",
         "model=claude-sonnet-4-6 mode=acceptEdits agent=Explore",
         "response",
       ]);
@@ -6727,73 +6724,87 @@ describe("ACP v2 requests that subagents make", () => {
       expect(states).toEqual(["idle", "response"]);
     });
 
-    it("names a replayed child's model by the session's model list, on a resume of a closed session", async () => {
-      scriptTurns();
-      const client = v2Client();
-      await client.app.connectWith(connectRouter(), async (agent) => {
-        await initializeV2(agent);
-        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
-        await agent.request(v2.methods.agent.session.close, { sessionId });
-        await writeSubagentHistory(
-          sessionId,
-          [transcriptRecord(sessionId, "r1", null, { role: "user", content: "hi" })],
-          "agent-1",
-          { agentType: "Explore", toolUseId: "toolu_agent-1" },
-          [
-            transcriptRecord(sessionId, "c1", null, { role: "user", content: "Look around" }),
-            transcriptRecord(sessionId, "c2", "c1", {
-              id: "msg_child",
-              role: "assistant",
-              model: "claude-sonnet-4-6",
-              content: [{ type: "text", text: "Done." }],
-            }),
-          ],
-        );
-        vi.mocked(getSessionMessages).mockResolvedValueOnce([
-          transcriptEntry("assistant", randomUUID(), {
-            id: "msg_agent",
-            role: "assistant",
-            content: [
-              {
-                type: "tool_use",
-                id: "toolu_agent-1",
-                name: "Agent",
-                input: { subagent_type: "Explore", prompt: "Look around" },
-              },
+    it.each([
+      {
+        // The latest response's model, as the session's model list names it.
+        name: "its latest response's model",
+        responses: ["claude-haiku-4-5", "claude-sonnet-4-6"],
+        expected: ["claude-sonnet-4-6 Claude Sonnet 4.6", "response"],
+      },
+      // The replay does not guess the launch input's or the parent's model.
+      { name: "none without a response", responses: [], expected: ["response"] },
+    ])(
+      "sends a replayed child's configuration on a resume of a closed session: $name",
+      async ({ responses, expected }) => {
+        scriptTurns();
+        const client = v2Client();
+        await client.app.connectWith(connectRouter(), async (agent) => {
+          await initializeV2(agent);
+          const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+          await agent.request(v2.methods.agent.session.close, { sessionId });
+          await writeSubagentHistory(
+            sessionId,
+            [transcriptRecord(sessionId, "r1", null, { role: "user", content: "hi" })],
+            "agent-1",
+            { agentType: "Explore", toolUseId: "toolu_agent-1" },
+            [
+              transcriptRecord(sessionId, "c1", null, { role: "user", content: "Look around" }),
+              ...responses.map((model, index) =>
+                transcriptRecord(sessionId, `a${index}`, index === 0 ? "c1" : `a${index - 1}`, {
+                  id: `msg_child_${index}`,
+                  role: "assistant",
+                  model,
+                  content: [{ type: "text", text: "Done." }],
+                }),
+              ),
             ],
-          }),
-          transcriptEntry("user", randomUUID(), {
-            role: "user",
-            content: [{ type: "tool_result", tool_use_id: "toolu_agent-1", content: "Done." }],
-          }),
-        ] as unknown as Awaited<ReturnType<typeof getSessionMessages>>);
-        await agent.request(v2.methods.agent.session.resume, {
-          sessionId,
-          cwd,
-          replayFrom: { type: "start" },
+          );
+          vi.mocked(getSessionMessages).mockResolvedValueOnce([
+            transcriptEntry("assistant", randomUUID(), {
+              id: "msg_agent",
+              role: "assistant",
+              content: [
+                {
+                  type: "tool_use",
+                  id: "toolu_agent-1",
+                  name: "Agent",
+                  input: { subagent_type: "Explore", prompt: "Look around" },
+                },
+              ],
+            }),
+            transcriptEntry("user", randomUUID(), {
+              role: "user",
+              content: [{ type: "tool_result", tool_use_id: "toolu_agent-1", content: "Done." }],
+            }),
+          ] as unknown as Awaited<ReturnType<typeof getSessionMessages>>);
+          await agent.request(v2.methods.agent.session.resume, {
+            sessionId,
+            cwd,
+            replayFrom: { type: "start" },
+          });
+          client.sessionUpdates.push({
+            sessionId: "agent-1",
+            update: { sessionUpdate: "response" },
+          } as never);
+          await client.authUpdate(1);
         });
-        client.sessionUpdates.push({
-          sessionId: "agent-1",
-          update: { sessionUpdate: "response" },
-        } as never);
-        await client.authUpdate(1);
-      });
 
-      const models = client.sessionUpdates.flatMap(({ sessionId, update }) => {
-        if (sessionId !== "agent-1") return [];
-        if (update.sessionUpdate === "response") return ["response"];
-        if (update.sessionUpdate !== "config_option_update") return [];
-        const [option] = (
-          update as {
-            configOptions: Array<{ currentValue: unknown; options: Array<{ name: string }> }>;
-          }
-        ).configOptions;
-        return [`${option!.currentValue} ${option!.options[0]!.name}`];
-      });
-      // The core replays after Claude Code started, so the model goes as the
-      // model list's entry at once.
-      expect(models).toEqual(["claude-sonnet-4-6 Claude Sonnet 4.6", "response"]);
-    });
+        const models = client.sessionUpdates.flatMap(({ sessionId, update }) => {
+          if (sessionId !== "agent-1") return [];
+          if (update.sessionUpdate === "response") return ["response"];
+          if (update.sessionUpdate !== "config_option_update") return [];
+          const [option] = (
+            update as {
+              configOptions: Array<{ currentValue: unknown; options: Array<{ name: string }> }>;
+            }
+          ).configOptions;
+          return [`${option!.currentValue} ${option!.options[0]!.name}`];
+        });
+        // After the replay, when Claude Code has started: the session's model
+        // list is known.
+        expect(models).toEqual(expected);
+      },
+    );
 
     it("references a replayed child from a TaskStop call that names it by its agent id", async () => {
       scriptTurns();
@@ -10485,6 +10496,36 @@ describe("ACP v2 session translation", () => {
     );
     expect(update({ type: "terminal", terminalId: "term" })).toMatchObject({
       content: [{ type: "terminal", terminalId: "term" }],
+    });
+  });
+
+  it("ends a tool call's text item with a blank line when another text item follows", () => {
+    const text = (text: string): v1.ToolCallContent => ({
+      type: "content",
+      content: { type: "text", text },
+    });
+    const terminal: v1.ToolCallContent = { type: "terminal", terminalId: "term" };
+    // A v2 client joins adjacent text items without a separator.
+    expect(
+      v2SessionUpdate({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "t",
+        content: [
+          text("```\nfirst\n```"),
+          text("ends a line\n"),
+          text("before a terminal"),
+          terminal,
+          text("last"),
+        ],
+      }),
+    ).toMatchObject({
+      content: [
+        text("```\nfirst\n```\n\n"),
+        text("ends a line\n\n"),
+        text("before a terminal"),
+        terminal,
+        text("last"),
+      ],
     });
   });
 

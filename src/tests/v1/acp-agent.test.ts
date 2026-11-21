@@ -4104,16 +4104,23 @@ describe("subagent transcript replay", () => {
       capabilities: ClientCapabilities = { subagents: {}, session: { notices: {} } },
       afterResponse?: {
         live: (childSessionId: string) => string | undefined;
+        /** The configuration that the client last got for a child that still runs. */
+        configuration?: (childSessionId: string) => SessionConfigOption[] | undefined;
+        /** The children that work in the live session, of which the replay can lack some. */
+        working?: string[];
         /** The session's config options and model list, known after the response. */
         models?: { configOptions: SessionConfigOption[]; modelInfos: ModelInfo[] };
       },
       {
         traceModels = false,
         load = false,
+        replayed,
       }: {
         traceModels?: boolean;
         /** Replay as a load does, while the CLI starts: without the session record. */
         load?: boolean;
+        /** Runs after the replay, with the agent that replayed. */
+        replayed?: (agent: ClaudeAcpAgent) => Promise<void>;
       } = {},
     ): Promise<string[]> {
       const configDir = await mkdtemp(path.join(os.tmpdir(), "claude-acp-rfd-replay-"));
@@ -4167,11 +4174,27 @@ describe("subagent transcript replay", () => {
             ): Promise<void>;
           }
         ).replaySessionHistory(sessionId, undefined, pending);
+        await replayed?.(agent);
         const responseAt = updates.length;
         if (afterResponse) {
           // Stands in for the live session's runtime, which knows its running children.
           (agent.sessions as Record<string, unknown>)[sessionId] = {
-            nativeSubagentRuntime: { liveWorkState: afterResponse.live },
+            nativeSubagentRuntime: {
+              liveWorkState: afterResponse.live,
+              configurationOf: afterResponse.configuration,
+              currentChildren: (covered: (childSessionId: string) => boolean) =>
+                (afterResponse.working ?? [])
+                  .filter((child) => !covered(child))
+                  .map((child) => ({
+                    sessionId,
+                    update: {
+                      sessionUpdate: "subagent_update",
+                      sessionId: child,
+                      capabilities: { cancel: {} },
+                      state: { state: "running" },
+                    },
+                  })),
+            },
             configOptions: afterResponse.models?.configOptions ?? [],
             modelInfos: afterResponse.models?.modelInfos ?? [],
           };
@@ -4496,8 +4519,12 @@ describe("subagent transcript replay", () => {
         ],
         { aaa111: child("live", "toolu_live"), bbb222: child("gone", "toolu_gone") },
         undefined,
-        // The session is loaded again in the process that still runs `aaa111`.
-        { live: (childSessionId) => (childSessionId === "aaa111" ? "running" : undefined) },
+        // The session is loaded again in the process that still runs `aaa111`,
+        // and `ccc333`, whose launch the history does not have.
+        {
+          live: (childSessionId) => (childSessionId === "aaa111" ? "running" : undefined),
+          working: ["aaa111", "ccc333"],
+        },
       );
 
       expect(trace.slice(trace.indexOf("-- response --"))).toEqual([
@@ -4507,10 +4534,13 @@ describe("subagent transcript replay", () => {
         // Any other child's process is gone: its replayed end is its current
         // state, and nothing can cancel it.
         'root subagent_update bbb222 {"state":"idle","stopReason":"end_turn"}',
+        // The live session reports the child that the replay did not announce,
+        // and not `aaa111` a second time.
+        'root subagent_update ccc333 {"state":"running"} capabilities={"cancel":{}}',
       ]);
     });
 
-    it("sends the model of each child's responses, and after the load response only a changed entry", async () => {
+    it("sends no child configuration in the replay, and each child's current one after the load response", async () => {
       const launch = (id: string, name: string, input: object = {}) =>
         toolUse(id, "Agent", {
           name,
@@ -4533,6 +4563,14 @@ describe("subagent transcript replay", () => {
         toolUseId: launchId,
         requestShape: "foreground",
       });
+      const haikuOption: SessionConfigOption = {
+        id: "model",
+        name: "Model",
+        category: "model",
+        type: "select",
+        currentValue: "haiku",
+        options: [{ value: "haiku", name: "Haiku 4.5" }],
+      };
       const trace = await replayRfd(
         [
           user("u1", "Go"),
@@ -4540,11 +4578,13 @@ describe("subagent transcript replay", () => {
             launch("toolu_answered", "answered"),
             launch("toolu_unlisted", "unlisted", { model: "haiku" }),
             launch("toolu_silent", "silent"),
+            launch("toolu_live", "live"),
           ]),
           user("u2", [
             toolResult("toolu_answered", "Done."),
             toolResult("toolu_unlisted", "Done."),
             toolResult("toolu_silent", "Done."),
+            toolResult("toolu_live", "Done."),
           ]),
         ],
         {
@@ -4553,8 +4593,9 @@ describe("subagent transcript replay", () => {
             records: [
               user("x1", "Run answered"),
               answer("x2", "claude-haiku-4-5", "First."),
-              answer("x3", "claude-haiku-4-5", "Same model."),
-              answer("x4", "claude-opus-5", "Fallback."),
+              answer("x3", "claude-opus-5", "Fallback."),
+              // No model wrote this message, so it is not the child's model.
+              answer("x4", "<synthetic>", "API Error"),
             ],
           },
           // A model that the session's list does not have.
@@ -4564,10 +4605,17 @@ describe("subagent transcript replay", () => {
           },
           // No response: the replay does not guess the launch input's or the parent's model.
           ccc333: { meta: meta("silent", "toolu_silent"), records: [user("z1", "Run silent")] },
+          // Still runs in this process, on another model than its stored response.
+          ddd444: {
+            meta: meta("live", "toolu_live"),
+            records: [user("w1", "Run live"), answer("w2", "claude-opus-5", "Working.")],
+          },
         },
         undefined,
         {
-          live: () => undefined,
+          live: (childSessionId) => (childSessionId === "ddd444" ? "running" : undefined),
+          configuration: (childSessionId) =>
+            childSessionId === "ddd444" ? [haikuOption] : undefined,
           models: {
             configOptions: [
               {
@@ -4602,25 +4650,35 @@ describe("subagent transcript replay", () => {
       );
 
       const opus = JSON.stringify([{ value: "opus", name: "Opus 5" }]);
+      const haiku = JSON.stringify([{ value: "haiku", name: "Haiku 4.5" }]);
       const raw = (model: string) => JSON.stringify([{ value: model, name: model }]);
-      expect(trace.filter((line) => / (model|subagent_update) /.test(line))).toEqual([
-        // During the replay the session has no model list yet, so the model is the id.
+      const idle = '{"state":"idle","stopReason":"end_turn"}';
+      expect(
+        trace.filter((line) => / (model|subagent_update) /.test(line) || line.startsWith("--")),
+      ).toEqual([
+        // A configuration before the response is a past value to the client:
+        // the replay sends none.
         'root subagent_update aaa111 {"state":"running"}',
-        `aaa111 model claude-haiku-4-5 ${raw("claude-haiku-4-5")}`,
-        // A response on another model sends the model again; the same model does not.
-        `aaa111 model claude-opus-5 ${raw("claude-opus-5")}`,
         'root subagent_update bbb222 {"state":"running"}',
-        `bbb222 model claude-fable-9 ${raw("claude-fable-9")}`,
         'root subagent_update ccc333 {"state":"running"}',
-        'root subagent_update ccc333 {"state":"idle","stopReason":"end_turn"}',
-        'root subagent_update bbb222 {"state":"idle","stopReason":"end_turn"}',
-        'root subagent_update aaa111 {"state":"idle","stopReason":"end_turn"}',
-        // After the response, a model goes again only when the root session's
-        // `model` option maps it to another entry.
-        'root subagent_update aaa111 {"state":"idle","stopReason":"end_turn"}',
+        'root subagent_update ddd444 {"state":"running"}',
+        `root subagent_update ddd444 ${idle}`,
+        `root subagent_update ccc333 ${idle}`,
+        `root subagent_update bbb222 ${idle}`,
+        `root subagent_update aaa111 ${idle}`,
+        "-- response --",
+        // The model of the latest response, as the root session's `model`
+        // option names it.
+        `root subagent_update aaa111 ${idle}`,
         `aaa111 model opus ${opus}`,
-        'root subagent_update bbb222 {"state":"idle","stopReason":"end_turn"}',
-        'root subagent_update ccc333 {"state":"idle","stopReason":"end_turn"}',
+        // A model that the option does not list is its id.
+        `root subagent_update bbb222 ${idle}`,
+        `bbb222 model claude-fable-9 ${raw("claude-fable-9")}`,
+        `root subagent_update ccc333 ${idle}`,
+        // A child that still runs gets the configuration that the live session
+        // last sent for it, not its stored response's model.
+        'root subagent_update ddd444 {"state":"running"} capabilities={"cancel":{}}',
+        `ddd444 model haiku ${haiku}`,
       ]);
     });
 
@@ -4740,6 +4798,47 @@ describe("subagent transcript replay", () => {
         "abc123 tool_call toolu_lost",
         "root agent_message_chunk It said PONG.",
         'root subagent_update abc123 {"state":"idle","stopReason":"end_turn"}',
+      ]);
+    });
+
+    it("refuses a request that names a child that the replay announced, until the session closes", async () => {
+      const refusals: unknown[] = [];
+      const refusal = (agent: ClaudeAcpAgent) => {
+        try {
+          agent.assertNoChildSession("aaa111", "prompt");
+          return undefined;
+        } catch (error) {
+          return error;
+        }
+      };
+      await replayRfd(
+        [
+          user("u1", "Go"),
+          assistant("a1", [toolUse("toolu_agent", "Agent", { prompt: "Run" })]),
+          user("u2", [toolResult("toolu_agent", "Done.")]),
+        ],
+        {
+          aaa111: {
+            meta: { toolUseId: "toolu_agent", requestShape: "foreground" },
+            records: [user("c1", "Run")],
+          },
+        },
+        undefined,
+        undefined,
+        {
+          // No session record and no subagent runtime exist yet.
+          load: true,
+          replayed: async (agent) => {
+            refusals.push(refusal(agent));
+            await agent.closeSession({ sessionId });
+            refusals.push(refusal(agent));
+          },
+        },
+      );
+
+      expect(refusals).toEqual([
+        expect.objectContaining({ code: -32602, data: { sessionId: "aaa111" } }),
+        undefined,
       ]);
     });
 
@@ -8450,70 +8549,70 @@ describe("subagent permission attribution (issue #851)", () => {
       );
     });
 
-    describe("session/cancel on a child session", () => {
-      /**
-       * Runs a turn whose child agent-42 runs until `stopped`, then ends as
-       * Claude Code ends a child that `stopTask` stopped, for a client with
-       * `capabilities`. Returns the agent, its updates, and the prompt.
-       */
-      async function childRuns(capabilities: ClientCapabilities = { subagents: {} }) {
-        const updates: AcpSessionNotification[] = [];
-        const agent = new ClaudeAcpAgent(
-          {
-            sessionUpdate: async (update: AcpSessionNotification) => {
-              updates.push(update);
-            },
-          } as unknown as AcpClient,
-          { log: () => {}, error: () => {} },
-        );
-        await agent.initialize({ protocolVersion: 1, clientCapabilities: capabilities });
-        const stopped = Promise.withResolvers<void>();
-        injectGeneratorSession(agent, async function* (input: Pushable<any>) {
-          const { value } = await input[Symbol.asyncIterator]().next();
-          yield userEcho(value);
-          yield rootToolUse("toolu_parent", "Agent");
-          yield {
-            ...taskStarted("agent-42", "toolu_parent"),
-            subagent_type: "Explore",
-            prompt: "Go",
-          };
-          await stopped.promise;
-          // As seen live: the child's end, then the Agent call's interrupted
-          // result, and the parent's turn goes on.
-          yield taskUpdated({ status: "killed" });
-          yield taskNotification("toolu_parent", "stopped");
-          yield {
-            type: "user",
-            parent_tool_use_id: null,
-            uuid: randomUUID(),
-            session_id: "test-session",
-            message: {
-              role: "user",
-              content: [
-                {
-                  type: "tool_result",
-                  tool_use_id: "toolu_parent",
-                  is_error: true,
-                  content: "[Request interrupted by user for tool use]",
-                },
-              ],
-            },
-          };
-          yield successResult();
-          yield { type: "system", subtype: "session_state_changed", state: "idle" };
-        } as never);
-        const prompt = agent.prompt({
-          sessionId: "test-session",
-          prompt: [{ type: "text", text: "go" }],
-        });
-        await vi.waitFor(() =>
-          expect(
-            agent.sessions["test-session"]?.nativeSubagentsByTaskId?.get("agent-42")?.announced,
-          ).toBe(true),
-        );
-        return { agent, updates, prompt, stop: () => stopped.resolve() };
-      }
+    /**
+     * Runs a turn whose child agent-42 runs until `stopped`, then ends as
+     * Claude Code ends a child that `stopTask` stopped, for a client with
+     * `capabilities`. Returns the agent, its updates, and the prompt.
+     */
+    async function childRuns(capabilities: ClientCapabilities = { subagents: {} }) {
+      const updates: AcpSessionNotification[] = [];
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (update: AcpSessionNotification) => {
+            updates.push(update);
+          },
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: capabilities });
+      const stopped = Promise.withResolvers<void>();
+      injectGeneratorSession(agent, async function* (input: Pushable<any>) {
+        const { value } = await input[Symbol.asyncIterator]().next();
+        yield userEcho(value);
+        yield rootToolUse("toolu_parent", "Agent");
+        yield {
+          ...taskStarted("agent-42", "toolu_parent"),
+          subagent_type: "Explore",
+          prompt: "Go",
+        };
+        await stopped.promise;
+        // As seen live: the child's end, then the Agent call's interrupted
+        // result, and the parent's turn goes on.
+        yield taskUpdated({ status: "killed" });
+        yield taskNotification("toolu_parent", "stopped");
+        yield {
+          type: "user",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_parent",
+                is_error: true,
+                content: "[Request interrupted by user for tool use]",
+              },
+            ],
+          },
+        };
+        yield successResult();
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      } as never);
+      const prompt = agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "go" }],
+      });
+      await vi.waitFor(() =>
+        expect(
+          agent.sessions["test-session"]?.nativeSubagentsByTaskId?.get("agent-42")?.announced,
+        ).toBe(true),
+      );
+      return { agent, updates, prompt, stop: () => stopped.resolve() };
+    }
 
+    describe("session/cancel on a child session", () => {
       it("stops the child's task, and not its parent's work, then reports the child idle cancelled", async () => {
         const { agent, updates, prompt, stop } = await childRuns();
 
@@ -8612,27 +8711,11 @@ describe("subagent permission attribution (issue #851)", () => {
               protocolVersion: 1,
               clientCapabilities: { subagents: {} },
             });
-            injectGeneratorSession(agent, async function* () {} as never);
-            const session = agent.sessions["test-session"]!;
-            session.nativeSubagentsByTaskId = new Map([
-              [
-                sessionId,
-                {
-                  sessionId,
-                  parentSessionId: "test-session",
-                  name: "Explore",
-                  task: "Go",
-                  announced: true,
-                },
-              ],
-            ]);
-            session.nativeSubagentRuntime = new NativeSubagentRuntime(
-              "rfd",
-              "test-session",
-              session,
-              async () => {},
-              logger,
-            );
+            // The session test-session announces its child.
+            await agent.client.sessionUpdate({
+              sessionId: "test-session",
+              update: { sessionUpdate: "subagent_update", sessionId },
+            });
 
             await expect(client.request(method as never, params as never)).rejects.toMatchObject({
               code: -32602,
@@ -8641,6 +8724,16 @@ describe("subagent permission attribution (issue #851)", () => {
             });
           },
         );
+      });
+
+      it("knows a child from the announcement of its run", async () => {
+        const { agent, prompt, stop } = await childRuns();
+
+        expect(() => agent.assertNoChildSession(sessionId, "prompt")).toThrow(
+          "agent-42 is a subagent session",
+        );
+        stop();
+        await prompt;
       });
     });
 

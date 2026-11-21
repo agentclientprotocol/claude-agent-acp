@@ -1,7 +1,7 @@
 # Subagent sessions
 
 A client that declares `clientCapabilities.subagents`, other than JetBrains AIR, gets each Agent or
-Task subagent as its own child session, following the [subagents RFD](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/rfds/subagents.mdx):
+Task subagent as its own child session, following ACP's [subagents](https://agentclientprotocol.com/protocol/v1/subagents):
 
 - `subagent_update` on the parent announces the child before any of its traffic, with the
   parent's `title` and `description` for it, and reports its work state: `running`,
@@ -92,8 +92,20 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
   session messages and `session` references as live, and its end is an `idle` before the response.
   Each replayed child's current state follows the response: on v1, the response is what separates
   a replayed child state from a current one.
+  A replay sends no `config_option_update` of a child, since one that arrives before the response
+  is a past value to the client. Each replayed child's configuration follows its current state:
+  the configuration of a child that still runs, else its `model` option with the model of the
+  latest response in its transcript, as the session's `model` option names it. A child that
+  neither runs nor has a response gets none.
   A launch without Claude Code's metadata file for the child stays an ordinary tool call of the
   parent, and a notice, for a client that takes notices, says that subagent history is missing.
+- A session that is loaded or resumed with the same settings while it runs keeps its children's
+  runs. After the response, each child that works and that no replay announced is announced
+  again on its parent, with its labels, the `cancel` capability and its state, and then gets the
+  configuration that the client last had for it: every working child after a `session/resume`,
+  which replays nothing, and after a `session/load` a child whose launch the history does not
+  have, such as a forked skill's. A child that no longer works but has a working child of its own
+  is named first, with its labels only.
 - After a load or resume, with or without replay, a SendMessage that resumes an agent from before
   it runs that agent in its session from before. Before the agent's traffic, each of its ancestors
   that the client was not told about in this connection is announced, parent before child and
@@ -104,17 +116,27 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
   parent's: Claude Code also stops the foreground children it waits on, and the parent's turn goes
   on. Each stopped child reports `idle` with `cancelled` from Claude Code's own events, and its
   requests that the stop withdraws report no `running` first. A replayed child, which no longer
-  runs, gets no capabilities. A client cannot prompt or otherwise change a child: any other request
-  that names an announced child of a running session fails with `-32602` (Invalid params),
-  `session/close` and `session/delete` too.
+  runs, gets no capabilities, and a `session/cancel` of it does nothing. A client cannot prompt or
+  otherwise change a child: any other request that names a child fails with `-32602` (Invalid
+  params), `session/close` and `session/delete` too. That holds for every child that a
+  `subagent_update` announced, while it ran or in a replay, until the client closes the child's
+  root session: also after `/clear` and after a restart of the root's Claude Code process.
 
-An [ACP v2](../README.md#experimental-acp-v2) client gets the same without declaring anything, since subagents
+An [ACP v2](../README.md#acp-v2-preview) client gets the same without declaring anything, since subagents
 are part of v2's baseline. Each child also reports its work state as its own `state_update`, right
 after the parent's copy. A replay ends each child's history with a `replay_complete` on the child's
 session. On v2, the parent's `replay_complete` is what separates a replayed child state from a
 current one, so each replayed child's current state follows the root session's `replay_complete`
 and comes before the response: on its parent, with the cleared `cwd`, and then as the child's own
-`idle`. The notice that subagent history is missing follows the root's `replay_complete` too.
+`idle`. The child's configuration follows it there, since v2 asks an agent not to replay a past
+`config_option_update`. The notice that subagent history is missing follows the root's
+`replay_complete` too.
+
+On v2, a resume of the active session that replays can meet a child that the stored history does
+not launch: a forked skill's child, or a subagent that Claude launched after the history was written.
+Such a child is announced again right after the root's `replay_complete`, when it works, when its
+parent lists it, or when the replay held one of its updates. Its own `replay_complete` follows at
+once, since its replay is empty, and then come the updates that the replay held.
 
 JetBrains AIR keeps the earlier draft of the RFD (`subagent_spawned`, `subagent_state_update`),
 which it enables with `nativeSubagentSessions` in `_meta.jetbrains.air.capabilities`. See

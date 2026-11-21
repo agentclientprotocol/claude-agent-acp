@@ -108,6 +108,7 @@ import type { V2UpdateTranslator } from "./update-translator.js";
 import { type WorkflowCardProgress, workflowCard, workflowSnapshot } from "../workflow-progress.js";
 import { ChildConfigurations } from "./child-config.js";
 import { SessionOutput } from "./stream.js";
+import { REPLAY_COMPLETE } from "./setup.js";
 import { SubagentReplay } from "./subagent-replay.js";
 
 /** What the tasks need of their root session. */
@@ -593,8 +594,13 @@ export class SessionTasks {
     return this.agents.size > 0;
   }
 
-  /** Whether `sessionId` is an announced child session of this root. */
-  hasChild(sessionId: string): boolean {
+  /**
+   * Whether `sessionId` is a child session that this root announced in its
+   * current conversation. A child that only a replay announced, or one from
+   * before a conversation reset, is not: the client still knows those (see
+   * `AnnouncedChildren`).
+   */
+  private hasChild(sessionId: string): boolean {
     return this.children.get(sessionId)?.announced === true;
   }
 
@@ -808,6 +814,50 @@ export class SessionTasks {
   }
 
   /**
+   * For a resume of the active session that replays: the announcement and
+   * the `replay_complete` of each current child that the replay did not
+   * announce (`replayed`), parents first. The stored history has no launch of
+   * such a child: a forked skill's, whose metadata names no call, or a
+   * subagent that Claude launched after the history was written. Its replay
+   * is empty, so its `replay_complete` follows its announcement at once.
+   *
+   * A child is current when it works, when its parent lists it, or when the
+   * replay holds something its session sent (`held`), such as the end of a
+   * run that ended while the history was read. v2 asks for a child's
+   * announcement again on every resume, before any other update of its
+   * session, and for a `replay_complete` on every child that is announced
+   * before the response. The caller sends these after the root's
+   * `replay_complete`, where an announcement is current, and before what the
+   * replay held.
+   */
+  unreplayedChildren(
+    replayed: (sessionId: string) => boolean,
+    held: ReadonlySet<string>,
+  ): v2.UpdateSessionNotification[] {
+    const lists = this.lists();
+    return this.parentsFirst()
+      .filter(
+        (child) =>
+          !replayed(child.sessionId) &&
+          (held.has(child.sessionId) || this.worksOrListed(child, lists)),
+      )
+      .flatMap((child) => [
+        { sessionId: child.parentSessionId, update: this.announcement(child) },
+        { sessionId: child.sessionId, update: REPLAY_COMPLETE },
+      ]);
+  }
+
+  /** Whether `child` works, or its parent's `background` list (of `lists`) names it. */
+  private worksOrListed(child: Child, lists: Map<string, BackgroundItem[]>): boolean {
+    return (
+      child.working ||
+      (lists.get(child.parentSessionId) ?? []).some(
+        (item) => item.type === "subagent" && item.sessionId === child.sessionId,
+      )
+    );
+  }
+
+  /**
    * The current state of the session's work, for a resume of the active
    * session: each subagent that a session lists, or that works in its
    * foreground, with its labels and state (also on its own stream), and the
@@ -822,10 +872,7 @@ export class SessionTasks {
     const visit = (sessionId: string) => {
       const listed = lists.get(sessionId) ?? [];
       const children = this.parentsFirst().filter(
-        (child) =>
-          child.parentSessionId === sessionId &&
-          (child.working ||
-            listed.some((item) => item.type === "subagent" && item.sessionId === child.sessionId)),
+        (child) => child.parentSessionId === sessionId && this.worksOrListed(child, lists),
       );
       for (const child of children) {
         const state = stateObject(this.childState(child), undefined);

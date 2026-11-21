@@ -15,6 +15,7 @@ const mockQuery = vi.hoisted(() =>
       }),
       setModel: vi.fn(),
       setPermissionMode: vi.fn(),
+      applyFlagSettings: vi.fn().mockResolvedValue(undefined),
       supportedCommands: vi.fn().mockResolvedValue([]),
       close: vi.fn(() => closed.resolve()),
       [Symbol.asyncDispose]: vi.fn(async () => {}),
@@ -222,7 +223,63 @@ describe("providers", () => {
 
     expect(mockQuery).toHaveBeenCalledOnce();
     expect(mockQuery.mock.calls[0][0].options.resume).toBeUndefined();
+    expect(mockQuery.mock.results[0].value.applyFlagSettings).not.toHaveBeenCalled();
     expect(mockQuery.mock.results[0].value.close).not.toHaveBeenCalled();
+  });
+
+  it("applies the route to the running session before its first context read", async () => {
+    const [agent, mockQuery] = await createAgentMock();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    await agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: "https://gateway.example",
+      headers: { "x-api-key": "test" },
+    });
+
+    await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+    const query = mockQuery.mock.results[0].value;
+    // The route of the `settings` option, without the client's settings.
+    expect(query.applyFlagSettings.mock.calls[0]).toEqual([
+      {
+        apiKeyHelper: "",
+        env: expect.objectContaining({
+          ANTHROPIC_AUTH_TOKEN: "acp-proxy",
+          ANTHROPIC_BASE_URL: "https://gateway.example",
+          ANTHROPIC_CUSTOM_HEADERS: "x-api-key: test",
+        }),
+      },
+    ]);
+    expect(query.applyFlagSettings.mock.invocationCallOrder[0]).toBeLessThan(
+      query.getContextUsage.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("starts no session when Claude Code refuses the route", async () => {
+    const [agent, mockQuery] = await createAgentMock();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    await agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: "https://gateway.example",
+    });
+    // The text of Claude Code 2.1.328 for a refused `applyFlagSettings`.
+    const refusal =
+      "apply_flag_settings: nothing in this request was applied and earlier settings stay in force. Fix or remove these invalid settings and send it again: env";
+    const query = mockQuery.getMockImplementation()!();
+    query.applyFlagSettings.mockRejectedValue(new Error(refusal));
+    mockQuery.mockReturnValueOnce(query);
+
+    await expect(agent.newSession({ cwd: process.cwd(), mcpServers: [] })).rejects.toMatchObject({
+      code: -32603,
+      message: expect.stringContaining("Claude Code did not take its provider or gateway route"),
+      data: { details: refusal },
+    });
+
+    expect(query.getContextUsage).not.toHaveBeenCalled();
+    expect(query.close).toHaveBeenCalledOnce();
+    expect(Object.keys(agent.sessions)).toEqual([]);
   });
 
   it("recreates loaded sessions with the new provider after the old query exits", async () => {
@@ -656,6 +713,7 @@ describe("providers", () => {
         initializationResult: vi.fn().mockResolvedValue({ models }),
         setModel,
         setPermissionMode: vi.fn(),
+        applyFlagSettings: vi.fn().mockResolvedValue(undefined),
         supportedCommands: vi.fn().mockResolvedValue([]),
         close: vi.fn(),
         interrupt: vi.fn().mockResolvedValue(undefined),
