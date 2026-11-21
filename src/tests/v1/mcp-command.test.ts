@@ -10,6 +10,8 @@ import {
   formatMcpStatus,
   MCP_AVAILABLE_COMMAND,
   parseMcpCommand,
+  runMcpCommand,
+  type McpChooser,
 } from "../../mcp-command.js";
 import { Pushable } from "../../utils.js";
 import { initializeClient } from "../helpers.js";
@@ -863,5 +865,227 @@ describe("/mcp replay", () => {
         "<command-name>/mcp</command-name><command-args>reconnect db</command-args>",
       ),
     ).toBeNull();
+  });
+});
+
+describe("runMcpCommand with a chooser", () => {
+  function fakeQuery() {
+    const calls: string[] = [];
+    const query = {
+      mcpServerStatus: vi.fn(async () => SERVERS),
+      reconnectMcpServer: vi.fn(async (name: string) => {
+        calls.push(`reconnect ${name}`);
+      }),
+      toggleMcpServer: vi.fn(async (name: string, enabled: boolean) => {
+        calls.push(`${enabled ? "enable" : "disable"} ${name}`);
+      }),
+    };
+    return { query, calls };
+  }
+  const run = (
+    command: Parameters<typeof runMcpCommand>[1],
+    choose?: McpChooser,
+    originalOutput = "",
+  ) => {
+    const { query, calls } = fakeQuery();
+    const promise = runMcpCommand(
+      query,
+      command,
+      originalOutput,
+      new AbortController().signal,
+      () => {},
+      choose,
+    );
+    return { promise, calls, query };
+  };
+
+  it("asks after a bare /mcp and runs the chosen command on every chosen server", async () => {
+    const choose = vi.fn<McpChooser>(async () => ({
+      action: "reconnect",
+      all: false,
+      servers: ["linear", "db"],
+    }));
+    const { promise, calls } = run({ action: "status" }, choose);
+    const outcome = await promise;
+    expect(choose).toHaveBeenCalledWith(SERVERS, undefined);
+    expect(calls).toEqual(["reconnect linear", "reconnect db"]);
+    expect(outcome.reconnected).toEqual(["linear", "db"]);
+    expect(outcome.markdown).toContain("- Reconnected `linear`");
+    expect(outcome.markdown).toContain("- Reconnected `db`");
+    expect(outcome.markdown).toContain("**MCP servers:**");
+  });
+
+  it("shows only the list when the user dismisses the form", async () => {
+    const { promise, calls } = run({ action: "status" }, async () => null);
+    const outcome = await promise;
+    expect(calls).toEqual([]);
+    expect(outcome.markdown).toBe(formatMcpStatus(SERVERS));
+  });
+
+  it("does not ask when a prompt names the servers", async () => {
+    const choose = vi.fn<McpChooser>(async () => null);
+    const { promise, calls } = run({ action: "disable", all: false, server: "github" }, choose);
+    await promise;
+    expect(choose).not.toHaveBeenCalled();
+    expect(calls).toEqual(["disable github"]);
+    const all = run({ action: "reconnect", all: true }, choose);
+    await all.promise;
+    expect(choose).not.toHaveBeenCalled();
+  });
+
+  it("asks with the named action for an enable or a disable without a server", async () => {
+    const choose = vi.fn<McpChooser>(async () => ({
+      action: "enable",
+      all: false,
+      servers: ["old"],
+    }));
+    const { promise, calls } = run({ action: "enable", all: false }, choose, "Name a server.");
+    const outcome = await promise;
+    expect(choose).toHaveBeenCalledWith(SERVERS, "enable");
+    expect(calls).toEqual(["enable old"]);
+    expect(outcome.markdown).toContain("- Enabled `old`");
+    expect(outcome.markdown).not.toContain("Name a server");
+  });
+
+  it("does not ask for an empty server list", async () => {
+    const choose = vi.fn<McpChooser>(async () => null);
+    const { query } = fakeQuery();
+    query.mcpServerStatus.mockResolvedValue([]);
+    const outcome = await runMcpCommand(
+      query,
+      { action: "status" },
+      "",
+      new AbortController().signal,
+      () => {},
+      choose,
+    );
+    expect(choose).not.toHaveBeenCalled();
+    expect(outcome.markdown).toBe("No MCP servers are configured.");
+  });
+
+  it("keeps the Claude Code text when the turn is cancelled during the form", async () => {
+    const controller = new AbortController();
+    const { query } = fakeQuery();
+    const outcome = await runMcpCommand(
+      query,
+      { action: "status" },
+      "",
+      controller.signal,
+      () => {},
+      async () => {
+        controller.abort();
+        return { action: "reconnect", all: false, servers: ["db"] };
+      },
+    );
+    expect(outcome.markdown).toBeNull();
+    expect(query.reconnectMcpServer).not.toHaveBeenCalled();
+  });
+
+  it("behaves as before without a chooser", async () => {
+    const { promise } = run({ action: "status" });
+    expect((await promise).markdown).toBe(formatMcpStatus(SERVERS));
+  });
+});
+
+describe("the /mcp form in the agent", () => {
+  async function formSetup(
+    answer: Record<string, unknown>,
+    options: Parameters<typeof setup>[0] = {},
+    capabilities: Record<string, unknown> = { elicitation: { form: {} } },
+  ) {
+    const createElicitation = vi.fn(async (_request: unknown) => answer);
+    const harness = setup({ ...options, client: { createElicitation, ...options.client } });
+    await initializeClient(harness.agent, capabilities as any);
+    return { ...harness, createElicitation };
+  }
+
+  it("asks after /mcp and runs the servers that the user picked", async () => {
+    const { sdkQuery, events, text, prompt, createElicitation } = await formSetup({
+      action: "accept",
+      content: { action: "reconnect", servers: ["db", "docs"] },
+    });
+
+    const response = await prompt("/mcp");
+
+    expect(response.stopReason).toBe("end_turn");
+    expect(createElicitation).toHaveBeenCalledOnce();
+    const request = createElicitation.mock.calls[0]![0] as any;
+    expect(request).toMatchObject({ mode: "form", sessionId: "test-session" });
+    expect(request.requestedSchema.properties.action.default).toBe("reconnect");
+    expect(sdkQuery.reconnectMcpServer.mock.calls).toEqual([["db"], ["docs"]]);
+    expect(events).toEqual([
+      "run /mcp",
+      "status",
+      "reconnect db",
+      "reconnect docs",
+      "status",
+      "answer",
+    ]);
+    expect(text()).toBe(
+      "- Reconnected `db`\n- Reconnected `docs`\n\n" +
+        listAfter({ db: "connected", docs: "connected" }),
+    );
+  });
+
+  it("shows the plain list when the user dismisses the form", async () => {
+    const { sdkQuery, text, prompt, createElicitation } = await formSetup({ action: "cancel" });
+
+    await prompt("/mcp");
+
+    expect(createElicitation).toHaveBeenCalledOnce();
+    expect(sdkQuery.reconnectMcpServer).not.toHaveBeenCalled();
+    expect(sdkQuery.toggleMcpServer).not.toHaveBeenCalled();
+    expect(text()).toBe(formatMcpStatus(SERVERS));
+  });
+
+  it("shows the plain list when the client rejects the form", async () => {
+    const createElicitation = vi.fn(async () => {
+      throw new Error("-32602");
+    });
+    const { agent, text, prompt } = setup({ client: { createElicitation } });
+    await initializeClient(agent, { elicitation: { form: {} } } as any);
+
+    await prompt("/mcp");
+
+    expect(text()).toBe(formatMcpStatus(SERVERS));
+  });
+
+  it("asks with the named action after /mcp disable without a server", async () => {
+    const { sdkQuery, text, prompt, createElicitation } = await formSetup({
+      action: "accept",
+      content: { action: "disable", servers: ["github"] },
+    });
+
+    await prompt("/mcp disable");
+
+    const request = createElicitation.mock.calls[0]![0] as any;
+    expect(request.requestedSchema.properties.action.default).toBe("disable");
+    expect(sdkQuery.toggleMcpServer).toHaveBeenCalledExactlyOnceWith("github", false);
+    expect(text()).toBe(`- Disabled \`github\`\n\n${listAfter({ github: "disabled" })}`);
+  });
+
+  it("never asks when the prompt names the servers", async () => {
+    const { createElicitation, prompt } = await formSetup({ action: "cancel" });
+
+    await prompt("/mcp reconnect db");
+    await prompt("/mcp reconnect all");
+
+    expect(createElicitation).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["no elicitation at all", {}],
+    ["URL elicitation only", { elicitation: { url: {} } }],
+  ])("never asks a client with %s", async (_name, capabilities) => {
+    const { createElicitation, text, prompt } = await formSetup(
+      { action: "cancel" },
+      {},
+      capabilities,
+    );
+
+    await prompt("/mcp");
+
+    expect(createElicitation).not.toHaveBeenCalled();
+    expect(text()).toBe(formatMcpStatus(SERVERS));
   });
 });

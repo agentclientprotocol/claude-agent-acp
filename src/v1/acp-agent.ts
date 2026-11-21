@@ -202,6 +202,7 @@ import * as path from "node:path";
 import packageJson from "../../package.json" with { type: "json" };
 import {
   answerAskUserQuestion,
+  answerMcpManage,
   answerMcpElicitation,
   answerUserDialog,
   ElicitationSupport,
@@ -359,7 +360,7 @@ import { AGENT_CONFIG_ID, DEFAULT_AGENT_ID } from "../session-config-ids.js";
 import { type PersistedTaskNotification, taskNotificationsOf } from "../task-notifications.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "../usage-markdown.js";
 
-import { parseMcpCommand, runMcpCommand } from "../mcp-command.js";
+import { parseMcpCommand, runMcpCommand, type McpChooser } from "../mcp-command.js";
 import { configuredSettings, resolveThinkingConfig } from "../session-env.js";
 import {
   MODE_CONFIG_ID,
@@ -2373,6 +2374,26 @@ export class ClaudeAcpAgent {
     }
   }
 
+  /** The form that lets the user pick the servers of a `/mcp` command, or
+   *  undefined when the client advertised no form elicitation. The form
+   *  holds the session's steering like any other open user input. */
+  private mcpChooser(sessionId: string, turnSignal: AbortSignal): McpChooser | undefined {
+    if (!this.clientCapabilities?.elicitation?.form) return undefined;
+    const signal = this.untilSessionClosed(sessionId, turnSignal);
+    return (statuses, action) =>
+      answerMcpManage(statuses, {
+        sessionId,
+        action,
+        logger: this.logger,
+        elicit: (createRequest) =>
+          elicitUnlessWithdrawn(signal, (signal) =>
+            this.withPendingUserInput(sessionId, () =>
+              this.elicitFromClient(createRequest, signal),
+            ),
+          ),
+      });
+  }
+
   /** The structured replacement for a prompt that is exactly `/usage` or a
    *  `/mcp` command. Claude Code runs the command, and the replacement takes
    *  the place of its text. Claude Code refuses a `/mcp` reconnect, enable,
@@ -2396,8 +2417,13 @@ export class ClaudeAcpAgent {
     return {
       startsAtActivation: false,
       produce: async (query, signal, originalOutput) => {
-        const outcome = await runMcpCommand(query, command, originalOutput, signal, (message) =>
-          this.logger.error(message),
+        const outcome = await runMcpCommand(
+          query,
+          command,
+          originalOutput,
+          signal,
+          (message) => this.logger.error(message),
+          this.mcpChooser(params.sessionId, signal),
         );
         reconnected = outcome.reconnected;
         return outcome.markdown;
