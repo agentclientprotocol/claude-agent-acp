@@ -2649,10 +2649,12 @@ export class ClaudeAcpAgent {
     };
 
     session.turnQueue ??= [];
-    // Behind a turn of ours, or a cycle Claude Code runs on its own (a task
+    // Behind a turn of ours, or a turn Claude Code started on its own (a task
     // notification's), which takes the prompt in at its next tool step too.
+    // Background work alone leaves the prompt in the foreground.
     const behind =
-      session.turnQueue.some((queued) => !queued.settled) || session.lastSessionState === "running";
+      session.turnQueue.some((queued) => !queued.settled) ||
+      session.asyncTaskRuntime?.autonomousTurnOpen === true;
     session.turnQueue.push(turn);
     (session.sentUserUuids ??= new Set()).add(promptUuid);
     session.input.push(userMessage);
@@ -3134,8 +3136,10 @@ export class ClaudeAcpAgent {
     try {
       withdrawn = await query.cancelAsyncMessage(promptUuid);
     } catch (error) {
+      // An older Claude Code that refuses the request: the caller cancels as it
+      // did before withdrawal existed.
       this.logger.error(`Session ${sessionId}: failed to withdraw a queued prompt:`, error);
-      return "taken";
+      return "unsupported";
     }
     if (!withdrawn) return "taken";
     // Claude Code will never run it, so no echo or result comes: settle it here.

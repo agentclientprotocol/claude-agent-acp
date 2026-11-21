@@ -188,6 +188,23 @@ describe("$/cancel_request on a queued session/prompt", () => {
     t.finish.resolve();
   });
 
+  it("cancels the session when Claude Code refuses to withdraw", async () => {
+    const t = setup(true);
+    t.query.cancelAsyncMessage = vi.fn(async () => {
+      throw new Error("Unknown control request subtype: cancel_async_message");
+    });
+    const a = runPromptWithCancellation(t.agent, text("A"), new AbortController().signal);
+    await untilDone(t.echoed.promise);
+    const bCancel = new AbortController();
+    void runPromptWithCancellation(t.agent, text("B"), bCancel.signal);
+    await vi.waitFor(() => expect(t.session.turnQueue).toHaveLength(2));
+    bCancel.abort();
+    await vi.waitFor(() => expect(t.cancel).toHaveBeenCalledWith({ sessionId: "test-session" }));
+    t.release.resolve();
+    await untilDone(a);
+    t.finish.resolve();
+  });
+
   it("cancels the session when the request is the running prompt", async () => {
     const t = setup(true);
     const aCancel = new AbortController();
