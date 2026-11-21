@@ -12,10 +12,10 @@ import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { V2Terminals } from "./terminal.js";
 
 /** An item of a `background` list. */
-export type BackgroundItem =
-  | { type: "terminal"; terminalId: string }
-  | { type: "tool_call"; toolCallId: string }
-  | { type: "subagent"; sessionId: string };
+export type BackgroundItem = Extract<
+  v2.BackgroundWork,
+  { type: "terminal" | "tool_call" | "subagent" }
+>;
 
 /** The work state of a session, as its `state_update` names it. */
 export type WorkStateName = "idle" | "running" | "requires_action" | "unknown";
@@ -45,7 +45,7 @@ export function stateUpdate(state: WorkStateName): v2.SessionUpdate {
 
 /** `state` with the list `background`. */
 function withBackground(state: v2.StateUpdate, background: BackgroundItem[]): v2.StateUpdate {
-  return { ...state, background } as v2.StateUpdate;
+  return { ...state, background };
 }
 
 /** The final tool call statuses. */

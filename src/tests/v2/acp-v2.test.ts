@@ -1,8 +1,7 @@
 /**
  * The experimental draft ACP v2 surface, driven through the protocol router
- * with the SDK's own v1 and v2 client apps. The v2 client app validates every
- * response, session update, and elicitation it receives against the v2
- * schema, so a malformed v2 message fails the test.
+ * with the SDK's own v1 and v2 client apps. Raw v2 notifications are checked
+ * against the v2 schema before the SDK handles them.
  */
 import { randomUUID } from "node:crypto";
 import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -20,6 +19,7 @@ import {
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { AuthStatusUpdateNotification } from "../../auth-status.js";
+import { validateV2Notification } from "../acp-scenarios/schema.js";
 import { clearContextWindowCache } from "../../context-window.js";
 import { v2DiffContent } from "../../diff.js";
 import { type AcpProtocols, acpProtocolRouter, acpProtocolsFromEnv } from "../../serve.js";
@@ -32,6 +32,7 @@ import { v2SessionUpdate } from "../../v2/session-update.js";
 import type { AgentHandle } from "../../v2/agent.js";
 import {
   v1ForkSessionRequest,
+  initialConfigRequests,
   v1NewSessionRequest,
   v1SetSessionConfigOptionRequest,
   v2ConfigOptions,
@@ -191,11 +192,13 @@ const CLI_SUBSCRIPTION = JSON.stringify({
 const V2_CLIENT_INFO = { name: "v2-test-client", version: "1.0.0" };
 
 const agents: AgentHandle[] = [];
+const notificationErrors: string[] = [];
 /** An empty Claude config directory and a session cwd, so no test reads the real ones. */
 let tempDir: string;
 let cwd: string;
 
 beforeEach(async () => {
+  notificationErrors.length = 0;
   // `claude auth status --json` reports a subscription, `claude auth logout` succeeds.
   execFileSpy.mockImplementation((...invocation: unknown[]) => {
     const args = invocation[1] as string[];
@@ -214,12 +217,27 @@ afterEach(async () => {
   vi.mocked(getSessionInfo).mockReset();
   vi.unstubAllEnvs();
   await rm(tempDir, { recursive: true, force: true, maxRetries: 10 });
+  expect(notificationErrors).toEqual([]);
 });
 
 /** Connects a fresh router to a client, and returns the client end of the stream. */
 function connectRouter(protocols?: AcpProtocols): v2.Stream {
-  const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
-  const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
+  let v2Connection = false;
+  const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>({
+    transform(message, controller) {
+      if ("method" in message && message.method === v2.methods.agent.initialize) {
+        const params = message.params as { protocolVersion?: unknown } | undefined;
+        v2Connection = params?.protocolVersion === v2.PROTOCOL_VERSION;
+      }
+      controller.enqueue(message);
+    },
+  });
+  const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>({
+    transform(message, controller) {
+      if (v2Connection) notificationErrors.push(...validateV2Notification(message));
+      controller.enqueue(message);
+    },
+  });
   acpProtocolRouter(undefined, (agent) => agents.push(agent), protocols, {
     onV2Agent: (agent) => agents.push(agent),
   }).connect({
@@ -258,7 +276,9 @@ function v2Client({
   answerPermission = () => ({ outcome: { outcome: "cancelled" } }),
   answerElicitation = () => ({ action: "accept" }),
 }: {
-  answerPermission?: (request: v2.RequestPermissionRequest) => v2.RequestPermissionResponse;
+  answerPermission?: (
+    request: v2.RequestPermissionRequest,
+  ) => v2.RequestPermissionResponse | Promise<v2.RequestPermissionResponse>;
   answerElicitation?: (
     request: v2.CreateElicitationRequest,
   ) => v2.CreateElicitationResponse | Promise<v2.CreateElicitationResponse>;
@@ -1034,6 +1054,86 @@ describe("ACP v2 sessions", () => {
       options: [{ value: "default" }, { value: "fable", name: "Fable 5.2" }],
     });
     expect(setModel).not.toHaveBeenCalled();
+  });
+
+  it("preserves a pending request when changed-root resume is refused, and accepts an MCP update", async () => {
+    const answer = Promise.withResolvers<v2.RequestPermissionResponse>();
+    const client = v2Client({
+      answerPermission: () => answer.promise as unknown as v2.RequestPermissionResponse,
+    });
+    scriptTurns(
+      async function* (options) {
+        yield toolUseMessage(options, "toolu_wait", "Bash", { command: "ls" });
+        await options.canUseTool!(
+          "Bash",
+          { command: "ls" },
+          {
+            signal: new AbortController().signal,
+            suggestions: [],
+            toolUseID: "toolu_wait",
+            requestId: randomUUID(),
+          },
+        );
+        yield toolResultMessage(options, "toolu_wait", {});
+        yield result(options);
+      },
+      async function* (options) {
+        yield result(options);
+      },
+    );
+    sdk.setMcpServers = vi.fn(sdkDefaults.setMcpServers);
+    const extra = await mkdtemp(path.join(tempDir, "extra-"));
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("work") });
+      await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(1));
+      const session = v2Session(sessionId);
+      const request = client.permissionRequests[0];
+      await expect(
+        agent.request(v2.methods.agent.session.resume, {
+          sessionId,
+          cwd,
+          additionalDirectories: [extra],
+        }),
+      ).rejects.toMatchObject({ code: -32602 });
+      expect(v2Session(sessionId)).toBe(session);
+      expect(sdk.queryOptions).toHaveLength(1);
+      expect(client.cancelledRequests).toEqual([]);
+      const before = client.sessionUpdates.length;
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+        mcpServers: [{ type: "http", name: "github", url: "https://github.dev/mcp" }],
+      });
+      expect(client.sessionUpdates.slice(before).at(-1)).toMatchObject({
+        sessionId,
+        update: { sessionUpdate: "state_update", state: "requires_action", background: [] },
+      });
+      expect(sdk.setMcpServers).toHaveBeenCalledExactlyOnceWith({
+        github: expect.objectContaining({ type: "http" }),
+      });
+      expect(client.permissionRequests).toEqual([request]);
+      answer.resolve({
+        outcome: {
+          outcome: "selected",
+          optionId: request!.options.find((option) => option.kind === "allow_once")!.optionId,
+        },
+      });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates).at(-1)).toBe("idle end_turn"));
+      const states = client.updates("state_update").length;
+      await agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("follow up"),
+      });
+      await vi.waitFor(() =>
+        expect(client.updates("state_update").slice(states).at(-1)).toMatchObject({
+          state: "idle",
+          stopReason: "end_turn",
+        }),
+      );
+    });
   });
 
   it("keeps the running turn of the active session that a resume gives other MCP servers", async () => {
@@ -2231,6 +2331,69 @@ describe("ACP v2 prompts", () => {
     });
   });
 
+  it.each([true, false])("keeps custom answers beside their questions for AIR=%s", async (air) => {
+    let answer: unknown;
+    scriptTurns(async function* (options) {
+      const input = {
+        questions: [false, true].map((multiSelect) => ({
+          question: multiSelect ? "Which features?" : "Which package?",
+          header: multiSelect ? "Features" : "Package",
+          options: [
+            { label: "core", description: "Core" },
+            { label: "cli", description: "CLI" },
+          ],
+          multiSelect,
+        })),
+      };
+      yield toolUseMessage(options, "toolu_question", "AskUserQuestion", input);
+      answer = await options.canUseTool!("AskUserQuestion", input, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "toolu_question",
+        requestId: randomUUID(),
+      } as Parameters<NonNullable<Options["canUseTool"]>>[2]);
+      yield toolResultMessage(options, "toolu_question", {});
+      yield result(options);
+    });
+    const client = v2Client({
+      answerElicitation: () => ({
+        action: "accept",
+        content: {
+          question_0: "core",
+          question_0_custom: "A note",
+          question_1_custom: "My feature",
+        },
+      }),
+    });
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent, {
+        elicitation: { form: {} },
+        ...(air ? { _meta: { jetbrains: { air: { version: 1, capabilities: [] } } } } : {}),
+      });
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("Ask me") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+    });
+
+    expect(client.elicitations).toHaveLength(1);
+    expect(client.elicitations[0]._meta).toEqual(
+      air
+        ? {
+            jetbrains: {
+              air: { version: 1, customAnswerFields: ["question_0_custom", "question_1_custom"] },
+            },
+          }
+        : undefined,
+    );
+    expect(answer).toMatchObject({
+      behavior: "allow",
+      updatedInput: {
+        answers: { "Which package?": "core", "Which features?": "My feature" },
+        annotations: { "Which package?": { notes: "A note" } },
+      },
+    });
+  });
+
   it("reports waiting on a question as requires_action", async () => {
     scriptTurns(async function* (options) {
       await options.onElicitation!(
@@ -3205,7 +3368,7 @@ describe("ACP v2 prompts", () => {
     });
   });
 
-  it("answers a queued prompt once Claude Code takes it in, after the turn before it", async () => {
+  it("answers a priority prompt once Claude Code takes it in, without ending the foreground work", async () => {
     const firstAnswer = Promise.withResolvers<void>();
     const echoed = scriptTurns(
       async function* (options) {
@@ -3232,7 +3395,7 @@ describe("ACP v2 prompts", () => {
       expect(await queued).toEqual({ messageId: echoed[1] });
       await vi.waitFor(() =>
         expect(turnTrace(client.sessionUpdates).filter((s) => s === "idle end_turn")).toHaveLength(
-          2,
+          1,
         ),
       );
       await client.authUpdate(1);
@@ -3241,9 +3404,7 @@ describe("ACP v2 prompts", () => {
     expect(turnTrace(client.sessionUpdates)).toEqual([
       "user_message",
       "running",
-      "idle end_turn",
       "user_message",
-      "running",
       "idle end_turn",
     ]);
     expect(client.updates("user_message").map((update) => update.messageId)).toEqual(echoed);
@@ -4377,7 +4538,7 @@ describe("ACP v2 prompts", () => {
       await client.authUpdate(1);
     });
 
-    expect(turnTrace(client.sessionUpdates)).toEqual(["user_message", "running", "idle end_turn"]);
+    expect(turnTrace(client.sessionUpdates)).toEqual(["user_message", "running", "idle error"]);
   });
 
   it("gives a messageId to the chunks that the agent builds from a command's output and a result", async () => {
@@ -5800,6 +5961,158 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
     terminal_reason: "aborted_streaming",
   };
 
+  it.each([
+    { markers: true, streamReply: true },
+    { markers: false, streamReply: true },
+    { markers: true, streamReply: false },
+    { markers: false, streamReply: false },
+  ])(
+    "steers a busy prompt without an idle between the replies (%o)",
+    async ({ markers, streamReply }) => {
+      const reply = Promise.withResolvers<void>();
+      const priorities: unknown[] = [];
+      sdk.run = async function* (prompts, options) {
+        const input = prompts[Symbol.asyncIterator]();
+        const first = (await input.next()).value;
+        const echo = (value: SDKUserMessage) => ({
+          type: "user",
+          message: value.message,
+          uuid: value.uuid,
+          parent_tool_use_id: null,
+          session_id: options.sessionId,
+          isReplay: true,
+        });
+        yield markersInit(options);
+        yield echo(first);
+        yield assistantText(options, "First reply", "msg_first");
+        const second = (await input.next()).value;
+        priorities.push(second.priority);
+        yield result(options, {
+          ...ABORTED,
+          ...(markers ? { user_message_uuids: [first.uuid] } : {}),
+        });
+        yield idleState(options);
+        yield echo(second);
+        if (streamReply) yield assistantText(options, "Stopped", "msg_second");
+        await reply.promise;
+        yield result(options, {
+          result: "Stopped",
+          uuid: "msg_second",
+          ...(markers ? { user_message_uuids: [second.uuid] } : {}),
+        });
+        yield idleState(options);
+        while (!(await input.next()).done);
+      };
+      const client = await promptAndWait(1, async (agent, sessionId, client) => {
+        await vi.waitFor(() =>
+          expect(turnTrace(client.sessionUpdates)).toContain("agent_message_chunk"),
+        );
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("stop") });
+        if (streamReply)
+          await vi.waitFor(() => expect(client.updates("agent_message_chunk")).toHaveLength(2));
+        expect(turnTrace(client.sessionUpdates)).not.toContain("idle end_turn");
+        expect(turnTrace(client.sessionUpdates)).not.toContain("idle error");
+        reply.resolve();
+      });
+      expect(priorities).toEqual(["now"]);
+      expect(turnTrace(client.sessionUpdates)).toEqual([
+        "user_message",
+        "running",
+        "agent_message_chunk",
+        "user_message",
+        "agent_message_chunk",
+        "idle end_turn",
+      ]);
+      expect(client.updates("agent_message_chunk").map((update) => update.messageId)).toEqual([
+        "msg_first",
+        "msg_second",
+      ]);
+    },
+  );
+
+  it.each(["refused", "cancelled"])(
+    "ends the foreground work when a waiting priority prompt is %s",
+    async (state) => {
+      sdk.run = async function* (prompts, options) {
+        const input = prompts[Symbol.asyncIterator]();
+        const first = (await input.next()).value;
+        yield {
+          type: "user",
+          message: first.message,
+          uuid: first.uuid,
+          parent_tool_use_id: null,
+          session_id: options.sessionId,
+          isReplay: true,
+        };
+        yield assistantText(options, "First reply", "msg_first");
+        const second = (await input.next()).value;
+        yield result(options, { user_message_uuids: [first.uuid] });
+        yield { type: "command_lifecycle", command_uuid: second.uuid, state };
+        while (!(await input.next()).done);
+      };
+      await promptAndWait(1, async (agent, sessionId, client) => {
+        await vi.waitFor(() => expect(client.updates("agent_message_chunk")).toHaveLength(1));
+        await expect(
+          agent.request(v2.methods.agent.session.prompt, {
+            sessionId,
+            prompt: text("stop"),
+          }),
+        ).rejects.toMatchObject({ code: state === "cancelled" ? -32800 : -32603 });
+      });
+    },
+  );
+
+  it("keeps an open permission request while a busy prompt waits", async () => {
+    const permission = Promise.withResolvers<v2.RequestPermissionResponse>();
+    const priorities: unknown[] = [];
+    sdk.run = async function* (prompts, options) {
+      const input = prompts[Symbol.asyncIterator]();
+      const echo = (value: SDKUserMessage) => ({
+        type: "user",
+        message: value.message,
+        uuid: value.uuid,
+        parent_tool_use_id: null,
+        session_id: options.sessionId,
+        isReplay: true,
+      });
+      yield echo((await input.next()).value);
+      const decision = options.canUseTool!("Bash", { command: "ls" }, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "toolu_ls",
+        requestId: randomUUID(),
+      } as Parameters<NonNullable<Options["canUseTool"]>>[2]);
+      const second = (await input.next()).value;
+      priorities.push(second.priority);
+      await decision;
+      yield result(options);
+      yield echo(second);
+      yield result(options);
+      while (!(await input.next()).done);
+    };
+    const client = v2Client({ answerPermission: () => permission.promise });
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("go") });
+      await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(1));
+      const queued = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("next"),
+      });
+      await vi.waitFor(() => expect(priorities).toEqual(["later"]));
+      expect(client.cancelledRequests).toEqual([]);
+      permission.resolve({ outcome: { outcome: "selected", optionId: "allow-once" } });
+      await queued;
+      await vi.waitFor(() =>
+        expect(
+          turnTrace(client.sessionUpdates).filter((value) => value === "idle end_turn"),
+        ).toHaveLength(2),
+      );
+      await client.authUpdate(1);
+    });
+  });
+
   it("ends a cancelled turn at its result and reports the follow-up after it as a cycle", async () => {
     const interrupted = Promise.withResolvers<void>();
     sdk.interrupt = async () => interrupted.resolve();
@@ -7123,6 +7436,36 @@ describe("ACP v2 requests that subagents make", () => {
       expect(shownToolCalls(client)).toEqual([]);
     });
 
+    it("keeps a structured hand-back report when Claude Code sends no child stream", async () => {
+      scriptTurns(async function* (options) {
+        yield toolUseMessage(options, "toolu_agent-1", "Agent", {
+          description: "Explore the project",
+          prompt: "Look around",
+        });
+        yield taskStarted(options, "agent-1", { prompt: "Look around" });
+        yield taskNotification(options, "agent-1", {});
+        yield {
+          ...toolResultMessage(options, "toolu_agent-1", {
+            content: "The report was delivered as a message.",
+          }),
+          tool_use_result: { status: "completed", handbackReport: { text: "Found it." } },
+        };
+        yield result(options);
+        yield idleState(options);
+      });
+      const client = await promptToIdle(v2Client());
+      const root = client.sessionUpdates.find(
+        ({ update }) => update.sessionUpdate === "user_message",
+      )!.sessionId;
+      expect(sessionMessages(client, root)).toEqual([
+        "root toolu_agent-1 root -> agent-1 Look around",
+        "agent-1 toolu_agent-1 root -> agent-1 Look around",
+        "agent-1 toolu_agent-1:handback agent-1 -> root Found it.",
+        "root toolu_agent-1:handback agent-1 -> root Found it.",
+      ]);
+      expect(shownToolCalls(client)).toEqual([]);
+    });
+
     it("shows a SendMessage call whose message reached no child session as a tool call", async () => {
       scriptTurns(async function* (options) {
         yield toolUseMessage(options, "toolu_send", "SendMessage", {
@@ -7926,6 +8269,49 @@ describe("ACP v2 requests that subagents make", () => {
     ]);
   });
 
+  it.each(["root", "child"])(
+    "keeps running while a tool can progress beside a blocked %s request",
+    async (owner) => {
+      const answer = Promise.withResolvers<v2.RequestPermissionResponse>();
+      const client = v2Client({
+        answerPermission: () => answer.promise as unknown as v2.RequestPermissionResponse,
+      });
+      let whileRunning: string | undefined;
+      scriptTurns(async function* (options) {
+        yield toolUseMessage(options, "toolu_running", "Bash", { command: "sleep 10" });
+        if (owner === "child") {
+          yield taskStarted(options, "agent-1", { is_backgrounded: false });
+        } else {
+          yield toolUseMessage(options, "toolu_wait", "Bash", { command: "ls" });
+        }
+        const asking =
+          owner === "child"
+            ? askFor(options, "agent-1")
+            : options.canUseTool!(
+                "Bash",
+                { command: "ls" },
+                {
+                  signal: new AbortController().signal,
+                  suggestions: [],
+                  toolUseID: "toolu_wait",
+                  requestId: randomUUID(),
+                },
+              );
+        await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(1));
+        whileRunning = turnTrace(client.sessionUpdates).at(-1);
+        yield toolResultMessage(options, "toolu_running", {});
+        await vi.waitFor(() =>
+          expect(turnTrace(client.sessionUpdates).at(-1)).toBe("requires_action"),
+        );
+        answer.resolve({ outcome: { outcome: "cancelled" } });
+        await asking;
+        yield result(options);
+      });
+      await promptToIdle(client);
+      expect(whileRunning).toBe("running");
+    },
+  );
+
   it("reports requires_action while a foreground subagent's request is open", async () => {
     turnWithRequest([["agent-1", { is_backgrounded: false }]], "agent-1");
     const client = await promptToIdle(v2Client());
@@ -7986,6 +8372,73 @@ describe("ACP v2 requests that subagents make", () => {
 
     expect(beforeTaskStarted).toEqual(["user_message", "running", "agent_message_chunk"]);
     expect(atAnswer).toEqual(["user_message", "running", "agent_message_chunk", "requires_action"]);
+  });
+
+  it("preserves an ended child's pending request when changed-root resume is refused", async () => {
+    const answer = Promise.withResolvers<v2.RequestPermissionResponse>();
+    const client = v2Client({
+      answerPermission: () => answer.promise as unknown as v2.RequestPermissionResponse,
+    });
+    let answered: unknown;
+    scriptTurns(async function* (options) {
+      yield toolUseMessage(options, "toolu_agent-1", "Agent", {
+        description: "Explore the project",
+        prompt: "Look around",
+        run_in_background: true,
+      });
+      yield taskStarted(options, "agent-1", { is_backgrounded: true });
+      const asking = askFor(options, "agent-1").then((result) => {
+        answered = result;
+      });
+      await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(1));
+      yield {
+        type: "system",
+        subtype: "task_updated",
+        task_id: "agent-1",
+        patch: { status: "completed" },
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield result(options);
+      await asking;
+    });
+    const extra = await mkdtemp(path.join(tempDir, "extra-"));
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("work") });
+      await vi.waitFor(() =>
+        expect(
+          turnTrace(client.sessionUpdates.filter((update) => update.sessionId === sessionId)).at(
+            -1,
+          ),
+        ).toBe("idle end_turn"),
+      );
+      const session = v2Session(sessionId);
+      expect(session.atTurnBoundary(true)).toBe(false);
+      await expect(
+        agent.request(v2.methods.agent.session.resume, {
+          sessionId,
+          cwd,
+          additionalDirectories: [extra],
+        }),
+      ).rejects.toMatchObject({ code: -32602 });
+      await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+      expect(v2Session(sessionId)).toBe(session);
+      expect(sdk.queryOptions).toHaveLength(1);
+      expect(client.cancelledRequests).toEqual([]);
+      expect(client.permissionRequests[0]?.sessionId).toBe("agent-1");
+      answer.resolve({
+        outcome: {
+          outcome: "selected",
+          optionId: client.permissionRequests[0]!.options.find(
+            (option) => option.kind === "allow_once",
+          )!.optionId,
+        },
+      });
+      await vi.waitFor(() => expect(answered).toMatchObject({ behavior: "allow" }));
+      await vi.waitFor(() => expect(session.atTurnBoundary(true)).toBe(true));
+    });
   });
 
   it("stops waiting for a request once its foreground subagent settles", async () => {
@@ -9673,6 +10126,89 @@ describe("ACP v2 terminal of a command in the background", () => {
       expect(rejected).toMatchObject({ code: -32602 });
     });
 
+    it.each(["terminal", "tool_call"])(
+      "preserves an idle %s when a resume changes roots, then activates roots after completion",
+      async (kind) => {
+        const finish = Promise.withResolvers<void>();
+        const workflow = { task_id: "wf1", task_type: "local_workflow", description: "Review" };
+        const item =
+          kind === "terminal"
+            ? { type: "terminal", terminalId: "toolu_bg" }
+            : { type: "tool_call", toolCallId: "task_wf1" };
+        scriptTurns(async function* (options) {
+          if (kind === "terminal") {
+            yield level(options, [{}]);
+            yield taskStarted(options);
+            yield bashUse(options);
+            yield backgrounded(options);
+          } else {
+            yield level(options, [workflow]);
+            yield taskEvent(options, "task_started", workflow);
+          }
+          yield result(options);
+          yield idleState(options);
+          await finish.promise;
+          if (kind === "terminal") yield* taskEnded(options);
+          else
+            yield taskEvent(options, "task_updated", {
+              task_id: "wf1",
+              patch: { status: "completed" },
+            });
+          yield level(options, []);
+        });
+        const extra = await mkdtemp(path.join(tempDir, "extra-"));
+        sdk.setMcpServers = vi.fn(sdkDefaults.setMcpServers);
+        sdk.close = vi.fn();
+        await promptUntil(
+          `idle end_turn [${kind === "terminal" ? "toolu_bg" : "task_wf1"}]`,
+          async (agent, sessionId, client) => {
+            const original = v2Session(sessionId);
+            await expect(
+              agent.request(v2.methods.agent.session.resume, {
+                sessionId,
+                cwd,
+                additionalDirectories: [extra],
+                mcpServers: [{ type: "http", name: "github", url: "https://github.dev/mcp" }],
+              }),
+            ).rejects.toMatchObject({ code: -32602 });
+            expect(sdk.queryOptions).toHaveLength(1);
+            expect(sdk.close).not.toHaveBeenCalled();
+            expect(sdk.setMcpServers).not.toHaveBeenCalled();
+            expect(v2Session(sessionId)).toBe(original);
+            expect(original.atTurnBoundary(true)).toBe(false);
+            await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+            expect(client.updates("state_update").at(-1)).toMatchObject({
+              state: "idle",
+              background: [item],
+            });
+            finish.resolve();
+            await vi.waitFor(() => expect(backgroundTrace(client)).toContain("idle []"));
+            scriptTurns(async function* (options) {
+              yield result(options);
+            });
+            await agent.request(v2.methods.agent.session.resume, {
+              sessionId,
+              cwd,
+              additionalDirectories: [extra],
+            });
+            expect(sdk.queryOptions).toHaveLength(2);
+            expect(v2Session(sessionId).additionalDirectories).toEqual([extra]);
+            const before = client.updates("state_update").length;
+            await agent.request(v2.methods.agent.session.prompt, {
+              sessionId,
+              prompt: text("follow up"),
+            });
+            await vi.waitFor(() =>
+              expect(client.updates("state_update").slice(before).at(-1)).toMatchObject({
+                state: "idle",
+                stopReason: "end_turn",
+              }),
+            );
+          },
+        );
+      },
+    );
+
     it("sends each listed terminal's current state before the state snapshot of session/resume", async () => {
       scriptTurns(async function* (options) {
         yield level(options, [{}]);
@@ -9979,6 +10515,39 @@ describe("ACP v2 session translation", () => {
     expect(v1ForkSessionRequest({ sessionId: "s", cwd, systemPrompt }).systemPrompt).toEqual(
       v1SystemPrompt,
     );
+  });
+
+  it.each([
+    {
+      option: {
+        configId: "model",
+        type: "id" as const,
+        value: "sonnet",
+        _meta: { source: "client" },
+      },
+      expected: { configId: "model", value: "sonnet", _meta: { source: "client" } },
+    },
+    {
+      option: { configId: "fast", type: "boolean" as const, value: true },
+      expected: { configId: "fast", type: "boolean", value: true },
+    },
+  ])(
+    "applies an initial $option.type config value after the session starts",
+    ({ option, expected }) => {
+      expect(
+        v1NewSessionRequest({ cwd: "/workspace", configOptions: [option] }).configOptions,
+      ).toBeUndefined();
+      const requests = initialConfigRequests("s", [option]);
+      expect(requests.map(v1SetSessionConfigOptionRequest)).toEqual([
+        { sessionId: "s", ...expected },
+      ]);
+    },
+  );
+
+  it("rejects an initial config value that the shared setup cannot express", () => {
+    expect(() =>
+      initialConfigRequests("s", [{ configId: "range", type: "_range", value: 3 }]),
+    ).toThrow("Config option values of type _range are not supported");
   });
 
   it("rejects a config option value type that v1 cannot express", () => {

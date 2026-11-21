@@ -1,9 +1,9 @@
 /**
  * One ACP v2 session, served straight from its Claude Code query.
  *
- * ACP v2 and Claude Code describe a session the same way: prompts go into a
- * queue, Claude Code works through them, and the session reports whether it
- * is working. So this session keeps little of its own:
+ * Prompts go to Claude Code, and its updates report the session's work.
+ * A busy prompt uses priority `now`, unless an input request is open.
+ * The session keeps the foreground work open while Claude Code answers it.
  *
  * - A prompt is pushed to Claude Code at once, with a uuid. Its response is
  *   the prompt's insertion: the `command_lifecycle` frame `started` for that
@@ -18,9 +18,8 @@
  *   `session_state_changed` stays `running` while background subagents work,
  *   which v2 lists as background work instead (`background`), so its `idle`
  *   only ends a turn that ended without a result.
- * - `requires_action` is this session's own: a turn is open, and a
- *   permission request or elicitation of this session is open, or, while
- *   the turn waits on subagents, each of them waits on one.
+ * - `requires_action` means that the open turn cannot progress without user
+ *   input. Another running foreground tool or subagent keeps it `running`.
  * - Subagents are child sessions, and background work is listed on every
  *   state (see {@link SessionTasks}).
  * - `session/cancel` answers the prompts that are not inserted yet with
@@ -41,7 +40,7 @@ import {
   type PromptRequest,
   type ToolCallUpdate,
 } from "@agentclientprotocol/sdk/unstable";
-import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
+import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type {
   FastModeDisabledReason,
   FastModeState,
@@ -52,7 +51,7 @@ import type {
   SDKResultMessage,
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { AUTONOMOUS_RESULT_ORIGINS } from "../result-end.js";
+import { AUTONOMOUS_RESULT_ORIGINS, isAbortedResult } from "../result-end.js";
 import { promptToClaude } from "../prompt-to-claude.js";
 import type { Logger } from "../logger.js";
 import type { McpCommand } from "../mcp-command.js";
@@ -90,7 +89,7 @@ import { SessionReports } from "./reports.js";
 import { SessionElicitations } from "./elicitation.js";
 import { SessionOutput } from "./stream.js";
 import { SessionRemoteControl } from "./remote-control.js";
-import { SessionTasks, type RequestTarget } from "./tasks.js";
+import { SessionTasks, type RequestTarget, type RequestContext } from "./tasks.js";
 
 /** What a session needs of its connection. */
 export interface SessionConnection {
@@ -123,6 +122,8 @@ type PendingPrompt = {
   prompt: v2.ContentBlock[];
   /** Whether the prompt went to Claude Code (see {@link V2Session.prompt}). */
   pushed: boolean;
+  signal: AbortSignal;
+  withdraw: () => void;
   resolve: (response: v2.PromptResponse) => void;
   reject: (error: unknown) => void;
 };
@@ -135,6 +136,7 @@ type OpenRequest = {
   abort: AbortController;
   /** Whether a cancel came while it was open: its work is being stopped. */
   coveredByCancel: boolean;
+  context: RequestContext;
 };
 
 type McpServers = Parameters<Query["setMcpServers"]>[0];
@@ -145,6 +147,8 @@ type CommandLifecycleFrame = { type: "command_lifecycle"; command_uuid: string; 
 export class V2Session implements RequestTarget {
   /** The prompts not inserted yet, by uuid. */
   private readonly pending = new Map<string, PendingPrompt>();
+  /** Priority prompts whose reply still belongs to the open foreground work. */
+  private readonly steeredPrompts = new Set<string>();
   /** Whether a turn of Claude Code is open: the session's foreground work. */
   private foreground = false;
   /** The prompt whose `started` frame came last in the open turn. */
@@ -314,7 +318,10 @@ export class V2Session implements RequestTarget {
         send: (notification) => this.sendNotification(notification),
         rootState: () => this.foregroundState(),
         // A cancel withdraws the requests of the subagents that the work waits on.
-        foregroundRequestsChanged: () => this.reportState(this.cancelledWork),
+        foregroundRequestsChanged: () => {
+          this.reportState(this.cancelledWork);
+          this.checkBoundary();
+        },
         models: () => this.config.subagentModels(),
         modes: () => this.config.availableModes(),
         stopTask: async (taskId) => {
@@ -448,16 +455,18 @@ export class V2Session implements RequestTarget {
    */
   prompt(
     params: v2.PromptRequest,
+    signal: AbortSignal,
     guard?: (query: Query) => Promise<void> | undefined,
   ): Promise<v2.PromptResponse> {
     if (this.closed) {
       return Promise.reject(RequestError.sessionNotFound(this.sessionId));
     }
+    if (signal.aborted) return Promise.reject(RequestError.requestCancelled());
     // Throws invalid params for content that Claude cannot take.
     const request: PromptRequest = v1PromptRequest(params);
     const key = params.idempotencyKey;
-    if (key == null) return this.submit(params, request, guard, { uuid: randomUUID() });
-    return this.keys.once(key, (attempt) => this.submit(params, request, guard, attempt));
+    if (key == null) return this.submit(params, request, guard, { uuid: randomUUID() }, signal);
+    return this.keys.once(key, (attempt) => this.submit(params, request, guard, attempt, signal));
   }
 
   /**
@@ -477,6 +486,7 @@ export class V2Session implements RequestTarget {
     request: PromptRequest,
     guard: ((query: Query) => Promise<void> | undefined) | undefined,
     { uuid, stored }: KeyedAttempt,
+    signal: AbortSignal,
   ): Promise<v2.PromptResponse> {
     const remoteControl = this.remoteControl.mayRun(request.prompt);
     const guarded = guard && !remoteControl ? guard : undefined;
@@ -486,7 +496,7 @@ export class V2Session implements RequestTarget {
       // The notice of a mode fallback at the session's start, which sends it at once.
       void this.config.promptSent();
     };
-    const message = { ...promptToClaude(request), uuid };
+    const message: SDKUserMessage = { ...promptToClaude(request), uuid };
     /** What a prompt that is new to the session registers before it goes to Claude Code. */
     const accept = () => {
       if (!guarded) sent();
@@ -500,8 +510,25 @@ export class V2Session implements RequestTarget {
     // A prompt whose key the stored history may hold is new only once the lookup says so.
     if (!stored) accept();
     return new Promise((resolve, reject) => {
-      const pending: PendingPrompt = { prompt: params.prompt, pushed: false, resolve, reject };
+      const withdraw = () => {
+        void this.withdrawPrompt(uuid).catch((error: unknown) => {
+          this.connection.logger.error(
+            `Session ${this.sessionId}: could not withdraw prompt ${uuid}`,
+            error,
+          );
+        });
+      };
+      const pending: PendingPrompt = {
+        prompt: params.prompt,
+        pushed: false,
+        signal,
+        withdraw,
+        resolve,
+        reject,
+      };
       this.pending.set(uuid, pending);
+      signal.addEventListener("abort", withdraw, { once: true });
+      if (signal.aborted) withdraw();
       // A cancel or close answered it before it went out.
       const answered = () => this.pending.get(uuid) !== pending || this.closed;
       this.pushes = this.pushes
@@ -541,6 +568,11 @@ export class V2Session implements RequestTarget {
             if (answered()) return;
             this.fileChanges?.requested(uuid, params._meta);
           }
+          if (this.foreground || [...this.pending.values()].some((prompt) => prompt.pushed)) {
+            // Interrupting an open input callback would withdraw the client's request.
+            message.priority = this.requests.size > 0 ? "later" : "now";
+            if (message.priority === "now") this.steeredPrompts.add(uuid);
+          }
           pending.pushed = true;
           this.remoteControl.pushed(uuid);
           this.input.push(message);
@@ -553,15 +585,15 @@ export class V2Session implements RequestTarget {
    * Whether no turn is open and no prompt waits in Claude Code's queue. With
    * `restart`, for a restart of the query (see `restarts.ts`), also no
    * prompt of the session waits to go to Claude Code, which the restart would
-   * answer with -32800, and no subagent runs. Without it, for the adapter's
-   * `/remote-control`, whose own prompt waits for the boundary.
+   * answer with -32800. No task or input request remains. Without it, for
+   * the adapter's `/remote-control`, whose own prompt waits for the boundary.
    */
   atTurnBoundary(restart: boolean): boolean {
     return (
       !this.closed &&
       !this.foreground &&
       ![...this.pending.values()].some((prompt) => restart || prompt.pushed) &&
-      !(restart && this.tasks.hasLiveSubagents())
+      !(restart && (this.tasks.hasLiveWork() || this.requests.size > 0))
     );
   }
 
@@ -683,6 +715,7 @@ export class V2Session implements RequestTarget {
    * {@link closeTurn}).
    */
   private stopForeground(): void {
+    this.steeredPrompts.clear();
     const pushed: string[] = [];
     for (const [uuid, prompt] of [...this.pending]) {
       if (prompt.pushed) pushed.push(uuid);
@@ -808,26 +841,35 @@ export class V2Session implements RequestTarget {
     request: v2.RequestPermissionRequest,
     toolSignal: AbortSignal,
   ): Promise<v2.RequestPermissionResponse> {
-    return this.openRequest(toolSignal, async (signal) => {
-      try {
-        // The subject is an upsert of the tool call: the client may see the
-        // request before the tool use streams.
-        return await unlessWithdrawn(signal, () =>
-          this.connection.requestPermission(request, signal),
-        );
-      } catch (error) {
-        if (signal.aborted) return { outcome: { outcome: "cancelled" } };
-        throw error;
-      }
-    });
+    const context: RequestContext =
+      request.subject != null && v2.RequestPermissionSubject.isToolCall(request.subject)
+        ? { type: "tool_call", toolCallId: request.subject.toolCall.toolCallId }
+        : { type: "session" };
+    return this.openRequest(
+      toolSignal,
+      async (signal) => {
+        try {
+          // The subject is an upsert of the tool call: the client may see the
+          // request before the tool use streams.
+          return await unlessWithdrawn(signal, () =>
+            this.connection.requestPermission(request, signal),
+          );
+        } catch (error) {
+          if (signal.aborted) return { outcome: { outcome: "cancelled" } };
+          throw error;
+        }
+      },
+      context,
+    );
   }
 
   /** Runs `send` as an open request of this session (see {@link RequestTarget.openRequest}). */
   async openRequest<T>(
     toolSignal: AbortSignal,
     send: (signal: AbortSignal) => Promise<T>,
+    context: RequestContext = { type: "session" },
   ): Promise<T> {
-    const open: OpenRequest = { abort: new AbortController(), coveredByCancel: false };
+    const open: OpenRequest = { abort: new AbortController(), coveredByCancel: false, context };
     // After `session/close` nothing of the session goes out: the request is
     // withdrawn before it is sent.
     if (this.closed) open.abort.abort();
@@ -843,6 +885,7 @@ export class V2Session implements RequestTarget {
       // `running` comes first. One that the user answers, or that Claude Code
       // withdraws without a cancel (a hook answered it), lets the work go on.
       this.reportState(open.coveredByCancel && signal.aborted);
+      this.checkBoundary();
     }
   }
 
@@ -964,6 +1007,7 @@ export class V2Session implements RequestTarget {
         if (this.closed) break;
         try {
           await this.handle(message);
+          this.reportState(this.cancelledWork);
         } catch (error) {
           this.connection.logger.error(
             `Session ${this.sessionId}: failed to handle a ${message.type} message`,
@@ -1011,8 +1055,7 @@ export class V2Session implements RequestTarget {
    */
   private handle(message: SDKMessage): void | Promise<void> {
     if ((message as { type: string }).type === "command_lifecycle") {
-      this.lifecycle(message as unknown as CommandLifecycleFrame);
-      return;
+      return this.lifecycle(message as unknown as CommandLifecycleFrame);
     }
     // Before the tasks take a subagent's messages: its file edits are the turn's.
     this.fileChanges?.message(message);
@@ -1155,7 +1198,7 @@ export class V2Session implements RequestTarget {
     this.reports.handle(message);
   }
 
-  private lifecycle(frame: CommandLifecycleFrame): void {
+  private lifecycle(frame: CommandLifecycleFrame): void | Promise<void> {
     this.lifecycleFrames = true;
     const uuid = frame.command_uuid;
     switch (frame.state) {
@@ -1163,13 +1206,18 @@ export class V2Session implements RequestTarget {
         this.promptStarted(uuid);
         return;
       case "cancelled":
-        if (this.failPrompt(uuid, RequestError.requestCancelled())) return;
+        this.steeredPrompts.delete(uuid);
+        if (this.failPrompt(uuid, RequestError.requestCancelled())) {
+          if (!this.cycleOpen) return this.endTurn();
+          return;
+        }
         this.stopped.promptEnded(uuid, true);
         // The prompt had started: the interrupt stopped its turn.
         if (uuid === this.turnCommand) this.closeTurn();
         return;
       case "discarded":
       case "refused":
+        this.steeredPrompts.delete(uuid);
         this.failPrompt(
           uuid,
           RequestError.internalError(
@@ -1177,6 +1225,7 @@ export class V2Session implements RequestTarget {
             `Claude Code ${frame.state} the prompt before it ran`,
           ),
         );
+        if (!this.cycleOpen) return this.endTurn();
         return;
       case "completed":
         // Claude Code sends it after the result for the prompt that started
@@ -1185,7 +1234,10 @@ export class V2Session implements RequestTarget {
         // then ends the turn. Nothing but Claude Code's order tells the two
         // apart.
         this.stopped.promptEnded(uuid);
-        if (uuid === this.cycleCommand) this.closeTurn();
+        if (uuid === this.cycleCommand) {
+          this.steeredPrompts.delete(uuid);
+          this.closeTurn();
+        }
         return;
       default:
         // `queued`: the prompt waits in Claude Code's queue.
@@ -1218,9 +1270,8 @@ export class V2Session implements RequestTarget {
    * command gets none.
    */
   private inserted(uuid: string): void {
-    const prompt = this.pending.get(uuid);
+    const prompt = this.takePrompt(uuid);
     if (!prompt) return;
-    this.pending.delete(uuid);
     this.fileChanges?.promptStarted(uuid);
     this.send({ sessionUpdate: "user_message", messageId: uuid, content: prompt.prompt });
     if (this.hasHistory && promptGetsCursor(prompt.prompt)) this.send(forkCursorUpdate(uuid));
@@ -1247,6 +1298,16 @@ export class V2Session implements RequestTarget {
     const end = this.usage.record(message);
     if (isPlaceholderResult(message)) return;
     this.idleOwed = true;
+    const served =
+      message.user_message_uuids ?? (message.user_message_uuid ? [message.user_message_uuid] : []);
+    for (const uuid of served) this.steeredPrompts.delete(uuid);
+    // Older CLIs omit the result's prompt list. An accepted priority prompt
+    // is answered by the next result that did not abort the preceding cycle.
+    if (served.length === 0 && !isAbortedResult(message)) {
+      for (const uuid of this.steeredPrompts) {
+        if (!this.pending.has(uuid)) this.steeredPrompts.delete(uuid);
+      }
+    }
     const { dropped, interrupted } = this.stopped.result(message);
     // Also a dropped result: the cancel's interrupt reached no further.
     this.tasks.foregroundCancelEnded();
@@ -1271,10 +1332,12 @@ export class V2Session implements RequestTarget {
     // Before the result's text below, which can repeat the failed request's.
     this.reportApiError(end);
     // The turn goes on in a fresh context (see `ClearContext`).
-    if (this.clearContext.holdsResult(message, end)) {
+    const disposition = this.clearContext.resultDisposition(message, end);
+    if (disposition === "held") {
       this.turnReport.reset();
       return;
     }
+    if (disposition === "rejected") this.cancelledWork = true;
     this.lastEnd = this.clearContext.turnEnd(end);
     const local = this.turnLocalCommand;
     if (message.stop_reason === "refusal") {
@@ -1315,6 +1378,10 @@ export class V2Session implements RequestTarget {
    */
   private endTurn(): void | Promise<void> {
     if (!this.foreground || this.clearContext.holdsTurn()) return;
+    if (this.steeredPrompts.size > 0) {
+      this.turnReport.reset();
+      return;
+    }
     const { stopReason } = idleOutcome(this.lastEnd, this.cancelledWork, this.turnReport);
     const reporting = this.fileChanges?.turnEnding(stopReason, this.query);
     if (!reporting) return this.closeTurn();
@@ -1431,12 +1498,12 @@ export class V2Session implements RequestTarget {
     if (!this.cycleOpen) {
       this.cycleOpen = true;
       this.cycleCommand = command;
+      this.output.resetAgentText();
+      this.reports.turnStarted();
     }
     if (this.foreground) return;
     this.foreground = true;
     this.lastEnd = undefined;
-    this.output.resetAgentText();
-    this.reports.turnStarted();
     this.reportState();
   }
 
@@ -1446,7 +1513,7 @@ export class V2Session implements RequestTarget {
    * that prompt's.
    */
   private closeTurn(): void {
-    if (!this.foreground || this.clearContext.holdsTurn()) return;
+    if (!this.foreground || this.clearContext.holdsTurn() || this.steeredPrompts.size > 0) return;
     // A subagent's end that still waited for its messages, before the turn's idle.
     this.tasks.turnClosed();
     // v2 asks for a final status of the turn's tool calls before its idle. A
@@ -1481,15 +1548,21 @@ export class V2Session implements RequestTarget {
     this.checkBoundary();
   }
 
-  /**
-   * While the turn waits on subagents, it is blocked when each of them is
-   * (see `SessionTasks.foregroundBlocked`). Otherwise by the session's own
-   * open requests.
-   */
+  /** Reports waiting only when no foreground tool or subagent can progress. */
   private foregroundState(): ForegroundState {
     if (!this.foreground) return "idle";
-    const blocked = this.tasks.foregroundBlocked() ?? this.requests.size > 0;
-    return blocked ? "requires_action" : "running";
+    const subagentsBlocked = this.tasks.foregroundBlocked();
+    if (subagentsBlocked === false || this.foregroundToolsCanProgress()) return "running";
+    return subagentsBlocked === true || this.requests.size > 0 ? "requires_action" : "running";
+  }
+
+  private foregroundToolsCanProgress(): boolean {
+    const waiting = new Set<string>();
+    for (const { context } of this.requests) {
+      if (context.type === "session") return false;
+      waiting.add(context.toolCallId);
+    }
+    return this.tasks.foregroundToolsCanProgress(waiting);
   }
 
   /**
@@ -1543,11 +1616,39 @@ export class V2Session implements RequestTarget {
     this.connection.send(this.background.stamp(notification));
   }
 
+  /** Withdraws one pending prompt without interrupting the running work. */
+  private async withdrawPrompt(uuid: string): Promise<void> {
+    const prompt = this.pending.get(uuid);
+    if (!prompt) return;
+    if (!prompt.pushed) {
+      this.failPrompt(uuid, RequestError.requestCancelled());
+      return;
+    }
+    // The SDK exposes per-message cancellation without a Query declaration.
+    const query = this.query as Query & { cancelAsyncMessage?: (uuid: string) => Promise<boolean> };
+    if (!query.cancelAsyncMessage) {
+      this.connection.logger.error(
+        `Session ${this.sessionId}: Claude Code cannot withdraw queued prompt ${uuid}`,
+      );
+      return;
+    }
+    if (await query.cancelAsyncMessage(uuid))
+      this.failPrompt(uuid, RequestError.requestCancelled());
+  }
+
+  private takePrompt(uuid: string): PendingPrompt | undefined {
+    const prompt = this.pending.get(uuid);
+    if (!prompt) return undefined;
+    this.pending.delete(uuid);
+    prompt.signal.removeEventListener("abort", prompt.withdraw);
+    return prompt;
+  }
+
   /** Fails the prompt `uuid` if it is not answered yet. Returns whether it was pending. */
   private failPrompt(uuid: string, error: unknown): boolean {
-    const prompt = this.pending.get(uuid);
+    const prompt = this.takePrompt(uuid);
     if (!prompt) return false;
-    this.pending.delete(uuid);
+    this.steeredPrompts.delete(uuid);
     this.localCommands.delete(uuid);
     this.fileChanges?.promptFailed(uuid, error);
     prompt.reject(error);

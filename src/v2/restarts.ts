@@ -10,8 +10,8 @@
  * - The route: `providers/set`, `providers/disable`, and an `auth/logout`
  *   that drops a provider or a gateway login. Each live session restarts at
  *   its next turn boundary: no turn is open, no prompt of the session waits
- *   to go to Claude Code or in its queue, and no subagent runs, background
- *   ones included. A session at a turn boundary restarts right away, and the
+ *   to go to Claude Code or in its queue, and no task or input request remains.
+ *   A session at a turn boundary restarts right away, and the
  *   request that changed the route answers once it did. A busy session's
  *   restart is due at its next turn boundary, which the request does not
  *   wait for: until then the session keeps its query, and its prompts go to
@@ -22,10 +22,9 @@
  *   setup response went out.
  *   A session that cannot start again stops: its requests then fail with
  *   what happened, until a resume starts it again.
- * - The additional directories: a resume of the active session with other
- *   ones restarts it as for a new route, and does not wait for it. Claude
- *   Code reads them once, when its process starts, and the SDK has no call
- *   that changes them on a running query.
+ * - The additional directories: a resume can replace them only at a work
+ *   boundary. It waits for the restart before reporting success. Claude Code
+ *   reads workspace roots at process start; flag settings cannot replace them.
  * - The account, under `--hide-claude-auth` (see `subscription-guard.ts`):
  *   the next prompt that finds the session at a turn boundary restarts it
  *   first, so the guard judges the new account. If the restart fails, such
@@ -35,8 +34,8 @@
  * The new query starts before the old one ends, so a failed start leaves the
  * session as it was. The old one ends at its next turn boundary after that,
  * so work that started on it during the start, such as a turn that Claude
- * Code started on its own, is not cut. Its background commands end with it
- * (their terminals exit), as when a query ends. The new query starts without
+ * Code started on its own, is not cut. Detached tasks also end before retirement.
+ * The new query starts without
  * the effort of the setup's `_meta`, and the client's choices are set again
  * on it (`SessionConfig.restoreFrom`), which then reports its options in a
  * `config_option_update`. Ending the old query withdraws its MCP OAuth
@@ -131,12 +130,12 @@ export class SessionRestarts {
 
   /**
    * A resume of the active session brought other additional directories:
-   * the session restarts with `params`, as for a new route (see the module
-   * doc). Does not wait for it.
+   * the session restarts with `params` at a work boundary. The caller waits
+   * for the restart before reporting the new roots.
    */
-  rootsChanged(sessionId: string, params: SetupParams): void {
+  async rootsChanged(sessionId: string, params: SetupParams): Promise<void> {
     this.track(sessionId, params);
-    void this.rerouteSession(sessionId);
+    await this.rerouteSession(sessionId);
   }
 
   /**

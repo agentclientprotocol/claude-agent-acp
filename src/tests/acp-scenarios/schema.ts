@@ -12,6 +12,7 @@
  * This file defines the unsigned integer formats of the ACP schema.
  */
 import { createRequire } from "node:module";
+import type { AnyMessage } from "@agentclientprotocol/sdk/experimental/v2/unstable";
 // The named exports load under the ESM build of TypeScript. The default
 // exports of these CommonJS modules are not constructable or callable there.
 import { Ajv2020, type ValidateFunction } from "ajv/dist/2020.js";
@@ -147,7 +148,7 @@ function v2Definition(message: WireRecorded): string {
     .filter(
       ([name, definition]) =>
         definition["x-method"] === message.method &&
-        definition["x-side"] === side &&
+        (definition["x-side"] === side || definition["x-side"] === "protocol") &&
         name.endsWith(suffix),
     )
     .map(([name]) => name);
@@ -186,4 +187,18 @@ export function validateV2Message(message: WireRecorded): string[] {
   return (validate.errors ?? []).map(
     (error) => `${label} ${error.instancePath || "/"} ${error.message ?? "is invalid"}`,
   );
+}
+
+/** Validates a raw notification before the SDK can discard an invalid payload. */
+export function validateV2Notification(message: AnyMessage): string[] {
+  if (!("method" in message) || "id" in message) return [];
+  try {
+    return validateV2Message({
+      kind: "notification",
+      method: message.method,
+      payload: message.params,
+    });
+  } catch (error) {
+    return [`notification ${message.method}: ${String(error)}`];
+  }
 }

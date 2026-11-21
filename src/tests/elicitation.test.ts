@@ -291,12 +291,13 @@ describe("askUserQuestionsToCreateRequest", () => {
       mkQuestion("Which?", [{ label: "A" }, { label: "B" }]),
       mkQuestion("What else?", [{ label: "C" }, { label: "D" }]),
     ];
-    const schema = (
-      askUserQuestionsToCreateRequest(questions, SESSION_ID, undefined, true) as Extract<
-        CreateElicitationRequest,
-        { mode: "form" }
-      >
-    ).requestedSchema;
+    const request = askUserQuestionsToCreateRequest(questions, SESSION_ID, undefined, true);
+    const schema = (request as Extract<CreateElicitationRequest, { mode: "form" }>).requestedSchema;
+    expect(request._meta).toEqual({
+      jetbrains: {
+        air: { version: 1, customAnswerFields: ["question_0_custom", "question_1_custom"] },
+      },
+    });
 
     // Each question gets its own "Other" box, not one shared form-level field.
     expect(schema.properties?.["question_0_custom"]).toMatchObject({
@@ -321,13 +322,11 @@ describe("askUserQuestionsToCreateRequest", () => {
     });
 
     // A client that is not AIR gets the field without the AIR marker.
-    const plain = (
-      askUserQuestionsToCreateRequest(questions, SESSION_ID, undefined) as Extract<
-        CreateElicitationRequest,
-        { mode: "form" }
-      >
-    ).requestedSchema;
-    expect(plain.properties?.["question_0_custom"]).not.toHaveProperty("_meta");
+    const plain = askUserQuestionsToCreateRequest(questions, SESSION_ID, undefined);
+    expect(plain).not.toHaveProperty("_meta");
+    const plainSchema = (plain as Extract<CreateElicitationRequest, { mode: "form" }>)
+      .requestedSchema;
+    expect(plainSchema.properties?.["question_0_custom"]).not.toHaveProperty("_meta");
   });
 
   it("builds an array property for multi-select questions and includes per-field question text", () => {

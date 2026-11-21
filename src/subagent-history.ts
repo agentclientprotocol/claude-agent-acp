@@ -7,7 +7,12 @@ import { createReadStream } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
-import { isNativeSubagentControlTool, type HistoricalSubagent } from "./native-subagents.js";
+import {
+  HANDBACK_TOOL,
+  handbackMessage,
+  isNativeSubagentControlTool,
+  type HistoricalSubagent,
+} from "./native-subagents.js";
 import { findTranscript } from "./resumed-session.js";
 
 /** What the metadata file of a subagent says about it. */
@@ -303,6 +308,51 @@ export async function readSubagentMessages(
     logger.error(`Failed to read the history of subagent ${agentId}:`, error);
     return [];
   }
+}
+
+/** AIR's draft has no session messages. A successful hand-back is the child's answer. */
+export function airSubagentMessages(messages: SessionMessage[]): SessionMessage[] {
+  const completed = successfulToolResults(messages);
+  const reports = new Set<string>();
+  const replay: SessionMessage[] = [];
+  for (const message of messages) {
+    const inner = message.message as { content?: unknown };
+    if (!Array.isArray(inner.content)) {
+      replay.push(message);
+      continue;
+    }
+    let reportId: string | undefined;
+    const content = inner.content.flatMap((block) => {
+      if (block.type === "tool_use" && block.name === HANDBACK_TOOL && completed.has(block.id)) {
+        const text = handbackMessage(block.input);
+        if (text !== undefined) {
+          reports.add(block.id);
+          reportId = block.id;
+          return [{ type: "text", text }];
+        }
+      }
+      if (block.type === "tool_result" && reports.has(block.tool_use_id)) return [];
+      return [block];
+    });
+    if (content.length > 0)
+      replay.push({
+        ...message,
+        message: { ...inner, ...(reportId ? { id: reportId } : {}), content },
+      });
+  }
+  return replay;
+}
+
+function successfulToolResults(messages: SessionMessage[]): Set<string> {
+  const completed = new Set<string>();
+  for (const message of messages) {
+    const content = (message.message as { content?: unknown }).content;
+    if (message.type !== "user" || !Array.isArray(content)) continue;
+    for (const block of content) {
+      if (block.type === "tool_result" && !block.is_error) completed.add(block.tool_use_id);
+    }
+  }
+  return completed;
 }
 
 /** How Claude Code opens the directive message of a `subagent_type: "fork"` child. */

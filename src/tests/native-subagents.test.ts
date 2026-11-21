@@ -62,6 +62,55 @@ function control(
 }
 
 describe("NativeSubagentRuntime lifecycle", () => {
+  it.each(["air", "rfd"] as const)(
+    "keeps a structured hand-back report without a child stream (%s)",
+    async (form) => {
+      const published: AcpSessionNotification[] = [];
+      const runtime = new NativeSubagentRuntime(
+        form,
+        "root",
+        sessionWith(child({ announced: true })),
+        async (update) => {
+          published.push(update);
+        },
+        { log: () => {} },
+      );
+      const message = {
+        type: "user",
+        uuid: "00000000-0000-0000-0000-000000000001",
+        session_id: "root",
+        parent_tool_use_id: null,
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "agent-tool",
+              content: "The report was delivered as a message.",
+            },
+          ],
+        },
+        tool_use_result: { status: "completed", handbackReport: { text: "The build passed." } },
+      } as Parameters<NativeSubagentRuntime["toolResult"]>[0];
+      await runtime.toolResult(message);
+      await runtime.toolResult(message);
+      const reports = published.filter(({ sessionId }) => sessionId === "child-1");
+      expect(reports).toHaveLength(1);
+      expect(reports[0]?.update).toMatchObject(
+        form === "air"
+          ? {
+              sessionUpdate: "agent_message_chunk",
+              messageId: "agent-tool:handback",
+              content: { type: "text", text: "The build passed." },
+            }
+          : {
+              sessionUpdate: "session_message",
+              content: [{ type: "text", text: "The build passed." }],
+            },
+      );
+    },
+  );
+
   it("publishes a raced spawn exactly once", async () => {
     const release = deferred();
     const published: AcpSessionNotification[] = [];
