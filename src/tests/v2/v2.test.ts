@@ -79,6 +79,8 @@ const sdk = vi.hoisted(() => ({
   startGate: undefined as Promise<void> | undefined,
   /** When set, the query serves Remote Control with it (`enableRemoteControl`). */
   enableRemoteControl: undefined as ((...args: unknown[]) => Promise<unknown>) | undefined,
+  /** Whether Claude Code asks at `initialize` for Remote Control to start with the query. */
+  remoteControlAtStartup: false,
 }));
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
@@ -145,7 +147,10 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         initializationResult: async () => {
           await sdk.startGate;
           if (sdk.startFailure) throw sdk.startFailure;
-          return { models: sdk.models };
+          return {
+            models: sdk.models,
+            ...(sdk.remoteControlAtStartup ? { remote_control_auto_enable: true } : {}),
+          };
         },
         supportedCommands: async () => [
           { name: "review", description: "Review a change", argumentHint: "<pull request>" },
@@ -225,6 +230,7 @@ beforeEach(async () => {
   sdk.optionsRefusal = undefined;
   sdk.startGate = undefined;
   sdk.enableRemoteControl = undefined;
+  sdk.remoteControlAtStartup = false;
   vi.mocked(forkSession).mockClear();
 });
 
@@ -956,6 +962,51 @@ describe("ACP v2 core", () => {
           expect(withdrawn).toEqual([]);
         });
       });
+    });
+
+    it("starts Remote Control again on the new query of a restart, as the old one's ended", async () => {
+      sdk.remoteControlAtStartup = true;
+      const enableRemoteControl = vi.fn(async () => ({
+        session_url: "https://claude.ai/code/session_123",
+      }));
+      sdk.enableRemoteControl = enableRemoteControl;
+      const client = v2Client();
+      const notices = () =>
+        client.sessionUpdates.filter((update) => update.sessionUpdate === "notice");
+      await client.connect(async (agent) => {
+        await openSession(agent);
+        await vi.waitFor(() => expect(notices()).toHaveLength(1));
+        await setProvider(agent);
+        await vi.waitFor(() => expect(notices()).toHaveLength(2));
+      });
+
+      expect(sdk.processes).toHaveLength(2);
+      expect(enableRemoteControl).toHaveBeenCalledTimes(2);
+      expect(enableRemoteControl).toHaveBeenLastCalledWith(true);
+      expect(notices()[1]).toMatchObject({ title: "Remote Control connected" });
+    });
+
+    it("keeps Remote Control off on the new query of a restart after /remote-control off", async () => {
+      sdk.remoteControlAtStartup = true;
+      const enableRemoteControl = vi.fn(async () => ({
+        session_url: "https://claude.ai/code/session_123",
+      }));
+      sdk.enableRemoteControl = enableRemoteControl;
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { response } = await openSession(agent);
+        await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalledOnce());
+        await agent.request(v2.methods.agent.session.prompt, {
+          sessionId: response.sessionId,
+          prompt: [{ type: "text", text: "/remote-control off" }],
+        });
+        await setProvider(agent);
+        // Past the timer of the restart's setup work.
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+
+      expect(sdk.processes).toHaveLength(2);
+      expect(enableRemoteControl.mock.calls).toEqual([[true], [false]]);
     });
 
     it("preserves an incompatible provider restart error and resumes after recovery", async () => {
@@ -2035,6 +2086,57 @@ describe("ACP v2 core", () => {
     expect(client.states()).toEqual(["running", "requires_action", "running", "idle"]);
     // No plan's prompt went out after the cancel.
     expect(sdk.processes[0].prompts).toHaveLength(2);
+  });
+
+  it("starts no Remote Control with a query that Claude Code is already working in", async () => {
+    sdk.remoteControlAtStartup = true;
+    const enableRemoteControl = vi.fn(async () => ({
+      session_url: "https://claude.ai/code/session_123",
+    }));
+    sdk.enableRemoteControl = enableRemoteControl;
+    const started = Promise.withResolvers<void>();
+    sdk.startGate = started.promise;
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      await agent.request(v2.methods.agent.initialize, {
+        protocolVersion: v2.PROTOCOL_VERSION,
+        info: { name: "v2-test-client", version: "1.0.0" },
+        capabilities: {},
+      });
+      const created = agent.request(v2.methods.agent.session.new, { cwd });
+      await vi.waitFor(() => expect(sdk.processes).toHaveLength(1));
+      // Claude Code starts a cycle of its own before the setup answers.
+      sdk.processes[0].send(cycleStart());
+      started.resolve();
+      await created;
+      await vi.waitFor(() => expect(client.states()).toEqual(["running"]));
+      // Past the timer of the setup response, which runs the connect.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      sdk.processes[0].send(result());
+      await vi.waitFor(() => expect(client.states().at(-1)).toBe("idle"));
+    });
+
+    expect(enableRemoteControl).not.toHaveBeenCalled();
+    expect(client.sessionUpdates.filter((update) => update.sessionUpdate === "notice")).toEqual([]);
+  });
+
+  it("starts Remote Control once per query, so a resume of the live session starts nothing", async () => {
+    sdk.remoteControlAtStartup = true;
+    const enableRemoteControl = vi.fn(async () => ({
+      session_url: "https://claude.ai/code/session_123",
+    }));
+    sdk.enableRemoteControl = enableRemoteControl;
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      const { response } = await openSession(agent);
+      await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalledOnce());
+      await agent.request(v2.methods.agent.session.resume, { sessionId: response.sessionId, cwd });
+      // Past the timer of the resume's setup response.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+
+    expect(sdk.processes).toHaveLength(1);
+    expect(enableRemoteControl).toHaveBeenCalledExactlyOnceWith(true);
   });
 
   it("continues an approved plan in its fresh context while a /remote-control waits for the turn", async () => {

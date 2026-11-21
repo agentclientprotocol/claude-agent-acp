@@ -10,6 +10,11 @@
  * and the turn ends `idle` with `end_turn`. It waits until no turn is open
  * and no prompt waits in Claude Code's queue, and the prompts after it wait
  * for it: v2 asks to hold a prompt rather than reject it while Claude works.
+ *
+ * Remote Control also starts with a query that Claude Code asked to start
+ * with it (`remoteControlAtStartup` in the settings, else the policy default or
+ * a rollout; see `startsWithRemoteControl`). That is no turn: it reports in a
+ * notice, as v1 does.
  */
 import { randomUUID } from "node:crypto";
 import type { Query, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
@@ -18,12 +23,15 @@ import {
   adapterRemoteControlCommand,
   isRemoteHumanMessage,
   parseRemoteControlCommand,
+  RemoteControlAtStartup,
   runRemoteControlCommand,
 } from "../remote-control.js";
+import type { SessionNotice } from "../session-notices.js";
 
 /** What the command needs of its session. */
 export interface RemoteControlHost {
   readonly logger: Logger;
+  readonly sessionId: string;
   query(): Query | undefined;
   /** Claude Code's terminal-bound commands, which it does not offer. */
   terminalCommands(): readonly string[] | undefined;
@@ -33,13 +41,46 @@ export interface RemoteControlHost {
   begin(uuid: string): void;
   /** Sends the reply `text`, as agent text of the message `messageId`, and ends the turn. */
   end(text: string, messageId: string): void;
+  /** Whether a turn is open or a prompt waits in Claude Code's queue. */
+  working(): boolean;
+  /** Sends `notice` to the client. */
+  notice(notice: SessionNotice): void;
 }
 
 export class SessionRemoteControl {
   /** The uuids of the prompts that this session sent, until Claude Code echoes them. */
   private readonly sent = new Set<string>();
 
+  /**
+   * Remote Control at the start of this query, which Claude Code can ask for
+   * at `initialize` (see `V2Session.setRemoteControlAtStartup`).
+   */
+  atStartup = new RemoteControlAtStartup(false);
+
   constructor(private readonly host: RemoteControlHost) {}
+
+  /**
+   * Starts Remote Control after the setup response of a query that Claude
+   * Code asked to start with it, and reports how it went in a notice (see
+   * `RemoteControlAtStartup`). It runs once per query, so a later resume of
+   * the live session starts nothing, while a restart of the query (see
+   * `restarts.ts`), whose new query asks again, starts it again, unless the
+   * user turned it off before (see {@link restartedFrom}). The session holds
+   * its prompts back until the notice is sent.
+   */
+  async connectAtStartup(): Promise<void> {
+    const notice = this.atStartup.connect(this.host);
+    if (notice) this.host.notice(await notice);
+  }
+
+  /**
+   * A restart replaced the query of `previous` with this one: Remote Control
+   * that the user turned off there stays off (see
+   * `RemoteControlAtStartup.restartedFrom`).
+   */
+  restartedFrom(previous: SessionRemoteControl): void {
+    this.atStartup.restartedFrom(previous.atStartup);
+  }
 
   /** Whether `prompt` may be the adapter's command, which {@link run} then decides. */
   mayRun(prompt: Parameters<typeof parseRemoteControlCommand>[0]): boolean {
@@ -64,6 +105,8 @@ export class SessionRemoteControl {
     if (!command) return false;
     if (!(await this.host.idle()) || !stillPending()) return true;
     this.host.begin(uuid);
+    // A restart of the query keeps what the user chose last.
+    this.atStartup.commandRan(command.command);
     // The turn is open across the network call, so the session reads as busy.
     const text = await runRemoteControlCommand(command.query, command.command, (message) =>
       this.host.logger.error(message),

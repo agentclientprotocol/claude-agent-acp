@@ -322,6 +322,8 @@ export class SessionRestarts {
       // The new query read the account in force.
       this.accountChanged.delete(sessionId);
       session.reports.restartedFrom(previous.reports);
+      // Before its connect below: Remote Control that the user turned off stays off.
+      session.remoteControlRestartedFrom(previous);
       // Work that started on the old query while the new one started, such
       // as a turn that Claude Code started on its own, ends first. New
       // prompts wait for this restart meanwhile (`beforePrompt`).
@@ -334,6 +336,11 @@ export class SessionRestarts {
         sessionId,
         update: { sessionUpdate: "config_option_update", configOptions: session.config.options() },
       });
+      // Closing the old query ended its Remote Control. Connect before the
+      // prompts that wait for this restart: the timer in `afterSetupResponse`
+      // runs after they push theirs and would find the session busy. Its own
+      // call then finds the request used up.
+      session.connectRemoteControlAtStartup();
       // Closing the old query withdrew its MCP OAuth runs. The servers of a
       // resume that came during the restart are tracked by now.
       afterSetupResponse(session, this.setups.get(sessionId) ?? params);
