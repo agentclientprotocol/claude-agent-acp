@@ -4,7 +4,11 @@ import {
   RequestError,
   SessionNotification,
 } from "@agentclientprotocol/sdk/unstable";
-import type { ClientCapabilities, SystemPrompt } from "@agentclientprotocol/sdk/unstable";
+import type {
+  ClientCapabilities,
+  SessionConfigOption,
+  SystemPrompt,
+} from "@agentclientprotocol/sdk/unstable";
 import { forkSession, getSessionMessages, type Options } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../../v1/acp-agent.js";
 import type { AcpClient } from "../../acp-client.js";
@@ -1781,6 +1785,71 @@ describe("createSession options merging", () => {
         expect(updates.map((u) => u.update.sessionUpdate)).not.toContain("config_option_update");
       },
     );
+
+    describe("model reasoning efforts", () => {
+      const AIR_EFFORTS_CLIENT = {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["modelReasoningEfforts"] } } },
+      } as ClientCapabilities;
+      const efforts = (values: string[], recommended: string) => ({
+        jetbrains: { air: { version: 1, reasoningEfforts: { values, recommended } } },
+      });
+      const entryMetas = (response: { configOptions?: SessionConfigOption[] | null }) => {
+        const model = response.configOptions?.find((option) => option.id === "model");
+        return Object.fromEntries(
+          (model?.type === "select" ? model.options : []).flatMap((entry) =>
+            "value" in entry ? [[entry.value, entry._meta]] : [],
+          ),
+        );
+      };
+      const expected = {
+        "claude-sonnet-4-6": efforts(["low", "medium", "high"], "medium"),
+        "claude-haiku-4-5": efforts(["low", "medium"], "medium"),
+      };
+
+      it("names each model's efforts in every answer to a client that declares it", async () => {
+        await agent.initialize({ protocolVersion: 1, clientCapabilities: AIR_EFFORTS_CLIENT });
+        const created = await agent.newSession({ cwd, mcpServers: [] });
+        expect(entryMetas(created)).toEqual(expected);
+
+        const set = await agent.setSessionConfigOption({
+          sessionId: created.sessionId,
+          configId: "model",
+          value: "claude-haiku-4-5",
+        });
+        expect(entryMetas(set)).toEqual(expected);
+        const effort = await agent.setSessionConfigOption({
+          sessionId: created.sessionId,
+          configId: "effort",
+          value: "low",
+        });
+        expect(entryMetas(effort)).toEqual(expected);
+
+        const sessionId = "7f1c5b0e-3c53-4c0c-9d0a-0d6c1f0a2b11";
+        expect(entryMetas(await agent.loadSession({ sessionId, cwd, mcpServers: [] }))).toEqual(
+          expected,
+        );
+        expect(
+          entryMetas(await agent.resumeSession({ sessionId: "resumed", cwd, mcpServers: [] })),
+        ).toEqual(expected);
+        expect(
+          entryMetas(await agent.unstable_forkSession({ sessionId, cwd, mcpServers: [] })),
+        ).toEqual(expected);
+      });
+
+      it("names no efforts to a client that does not declare it", async () => {
+        await agent.initialize({
+          protocolVersion: 1,
+          clientCapabilities: {
+            _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
+          } as ClientCapabilities,
+        });
+        const created = await agent.newSession({ cwd, mcpServers: [] });
+        expect(entryMetas(created)).toEqual({
+          "claude-sonnet-4-6": undefined,
+          "claude-haiku-4-5": undefined,
+        });
+      });
+    });
 
     it("sets the configOptions of a session/fork on the fork, without an update", async () => {
       const response = await agent.unstable_forkSession({
