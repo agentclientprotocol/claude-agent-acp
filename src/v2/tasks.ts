@@ -593,8 +593,13 @@ export class SessionTasks {
     return this.agents.size > 0;
   }
 
-  /** Whether `sessionId` is an announced child session of this root. */
-  hasChild(sessionId: string): boolean {
+  /**
+   * Whether `sessionId` is a child session that this root announced in its
+   * current conversation. A child that only a replay announced, or one from
+   * before a conversation reset, is not: the client still knows those (see
+   * `AnnouncedChildren`).
+   */
+  private hasChild(sessionId: string): boolean {
     return this.children.get(sessionId)?.announced === true;
   }
 

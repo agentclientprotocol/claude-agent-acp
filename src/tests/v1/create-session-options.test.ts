@@ -1096,6 +1096,24 @@ describe("createSession options merging", () => {
       });
     });
 
+    it("keeps a live session's subagent sessions known to the client when a resume recreates it", async () => {
+      const { sessionId } = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      await agent.client.sessionUpdate({
+        sessionId,
+        update: { sessionUpdate: "subagent_update", sessionId: "agent-42" },
+      });
+
+      await agent.resumeSession({
+        sessionId,
+        cwd: process.cwd(),
+        systemPrompt: { mode: "append", content: [text("New instructions.")] },
+      });
+
+      expect(() => agent.assertNoChildSession("agent-42", "prompt")).toThrow(
+        "agent-42 is a subagent session",
+      );
+    });
+
     it("rejects an unsupported systemPrompt on resume of a live session", async () => {
       const { sessionId } = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
