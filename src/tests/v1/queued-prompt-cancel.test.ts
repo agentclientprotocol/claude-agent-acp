@@ -188,7 +188,7 @@ describe("$/cancel_request on a queued session/prompt", () => {
     t.finish.resolve();
   });
 
-  it("cancels the session when Claude Code refuses to withdraw", async () => {
+  it("leaves a queued prompt to run when Claude Code cannot withdraw it", async () => {
     const t = setup(true);
     t.query.cancelAsyncMessage = vi.fn(async () => {
       throw new Error("Unsupported control request subtype: cancel_async_message");
@@ -196,12 +196,29 @@ describe("$/cancel_request on a queued session/prompt", () => {
     const a = runPromptWithCancellation(t.agent, text("A"), new AbortController().signal);
     await untilDone(t.echoed.promise);
     const bCancel = new AbortController();
-    void runPromptWithCancellation(t.agent, text("B"), bCancel.signal);
+    const b = runPromptWithCancellation(t.agent, text("B"), bCancel.signal);
     await vi.waitFor(() => expect(t.session.turnQueue).toHaveLength(2));
     bCancel.abort();
-    await vi.waitFor(() => expect(t.cancel).toHaveBeenCalledWith({ sessionId: "test-session" }));
+    await vi.waitFor(() => expect(t.query.cancelAsyncMessage).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 20));
+    expect(t.cancel).not.toHaveBeenCalled();
     t.release.resolve();
     await untilDone(a);
+    await expect(untilDone(b)).resolves.toMatchObject({ stopReason: "end_turn" });
+    t.finish.resolve();
+  });
+
+  it("withdraws a foreground prompt Claude Code still holds, without a session cancel", async () => {
+    const t = setup(true);
+    // Queued with nothing of ours running (as during a cycle Claude Code
+    // started), so it counts as foreground, but Claude Code still holds it.
+    const aCancel = new AbortController();
+    const a = runPromptWithCancellation(t.agent, text("A"), aCancel.signal);
+    await vi.waitFor(() => expect(t.session.turnQueue).toHaveLength(1));
+    aCancel.abort();
+    await expect(untilDone(a)).resolves.toEqual({ stopReason: "cancelled" });
+    expect(t.cancel).not.toHaveBeenCalled();
+    t.release.resolve();
     t.finish.resolve();
   });
 

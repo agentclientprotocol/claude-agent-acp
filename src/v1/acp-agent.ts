@@ -3137,14 +3137,7 @@ export class ClaudeAcpAgent {
       withdrawn = await query.cancelAsyncMessage(promptUuid);
     } catch (error) {
       this.logger.error(`Session ${sessionId}: failed to withdraw a queued prompt:`, error);
-      // Only a Claude Code that does not know the request gets the session
-      // cancel the prompt had before withdrawal existed, and only while the
-      // prompt still waits: by now it may have run, and another turn started.
-      const unknown = String(error).includes("Unsupported control request subtype");
-      return unknown &&
-        !turn.settled &&
-        session.turnQueue?.includes(turn) &&
-        session.activeTurn !== turn
+      return String(error).includes("Unsupported control request subtype")
         ? "unsupported"
         : "taken";
     }
@@ -11421,19 +11414,21 @@ export async function runPromptWithCancellation(
   params: PromptRequest,
   signal: AbortSignal,
 ): Promise<PromptResponse> {
-  // What cancelling this request means depends on where its prompt is:
-  // - not queued yet: it never is, and ends cancelled;
-  // - queued behind another turn, or a cycle Claude Code runs on its own: it
-  //   is withdrawn alone and that work goes on (InitializeResponse
-  //   `_meta.claudeCode.queuedPromptCancel`), unless Claude Code already took
-  //   it in, even as the running turn by now: the client asked to take back a
-  //   waiting message, so it runs. A `/goal` is never withdrawn: queueing it
-  //   already published its goal;
-  // - the foreground prompt, or any prompt on a Claude Code that cannot
-  //   withdraw: the session is cancelled.
+  // Cancelling this request:
+  // - before its prompt is queued: it never is, and ends cancelled;
+  // - after: while Claude Code still holds the prompt in its queue, it is
+  //   withdrawn alone (cancel_async_message) and answers cancelled, and any
+  //   running work goes on (InitializeResponse
+  //   `_meta.claudeCode.queuedPromptCancel`). A `/goal` is never withdrawn:
+  //   queueing it already published its goal;
+  // - once Claude Code has taken it in, or cannot withdraw: a prompt queued
+  //   behind other work is left to run (the client asked to take back a
+  //   waiting message, and cancelling would stop that work too), and the
+  //   foreground prompt cancels the session.
   // Fire-and-forget: nothing awaits these, so log any rejection rather than
   // surfacing it as an unhandled rejection.
   let queued: { uuid: string; behind: boolean } | undefined;
+  let answered = false; // a late withdrawal result must not cancel whatever runs next
   const fail = (error: unknown) =>
     agent.logger.error(`Failed to cancel prompt via $/cancel_request: ${error}`);
   const cancelSession = () => agent.cancel({ sessionId: params.sessionId }).catch(fail);
@@ -11441,14 +11436,16 @@ export async function runPromptWithCancellation(
   const publishesGoal = goalUpdateFromPrompt(firstText) !== undefined;
   const onAbort = () => {
     if (!queued) return; // startTurn reads signal.aborted before queueing it
-    if (!queued.behind) {
-      void cancelSession();
+    const { uuid, behind } = queued;
+    if (publishesGoal) {
+      if (!behind) void cancelSession();
       return;
     }
-    if (publishesGoal) return;
     agent
-      .withdrawQueuedPrompt(params.sessionId, queued.uuid)
-      .then((outcome) => (outcome === "unsupported" ? cancelSession() : undefined))
+      .withdrawQueuedPrompt(params.sessionId, uuid)
+      .then((outcome) =>
+        outcome !== "withdrawn" && !behind && !answered ? cancelSession() : undefined,
+      )
       .catch(fail);
   };
   signal.addEventListener("abort", onAbort, { once: true });
@@ -11462,6 +11459,7 @@ export async function runPromptWithCancellation(
       () => signal.aborted,
     );
   } finally {
+    answered = true;
     signal.removeEventListener("abort", onAbort);
   }
 }
