@@ -8,6 +8,19 @@
  */
 export interface TurnEvents {
   /**
+   * The prompt was queued for Claude Code as the user message `promptUuid`,
+   * which {@link ClaudeAcpAgent.withdrawQueuedPrompt} takes; `behind` when
+   * another turn was still unsettled, so it waits for that turn to take it in.
+   * Reported once, before {@link inserted}.
+   */
+  queued?(promptUuid: string, behind: boolean): void;
+  /**
+   * Whether the client has withdrawn the prompt before it was queued: it then
+   * ends `cancelled` without reaching Claude Code. Read once, just before
+   * queueing.
+   */
+  withdrawn?(): boolean;
+  /**
    * Claude Code took the prompt in as the user message `messageId` of the
    * conversation, and the turn is the session's foreground work from then on.
    * Reported at most once per turn, and never after {@link ended} or

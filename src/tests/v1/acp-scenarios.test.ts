@@ -551,7 +551,10 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
     it("keeps promptQueueing and steering", () => {
       const initialize = zed("session-setup").find((record) => record.kind === "initialize")!
         .payload as Record<string, any>;
-      expect(initialize.agentCapabilities._meta.claudeCode).toEqual({ promptQueueing: true });
+      expect(initialize.agentCapabilities._meta.claudeCode).toEqual({
+        promptQueueing: true,
+        queuedPromptCancel: true,
+      });
       expect(initialize._meta).toEqual({ steering: { supported: true } });
     });
 

@@ -11462,7 +11462,16 @@ describe("runPromptWithCancellation", () => {
     const promptResult = deferred<PromptResponse>();
     const cancel = vi.fn(async () => {});
     const agent = {
-      prompt: vi.fn(() => promptResult.promise),
+      prompt: vi.fn(
+        (
+          _params: unknown,
+          _origin: unknown,
+          onQueued?: (uuid: string, behind: boolean) => void,
+        ) => {
+          onQueued?.("prompt-1", false); // the foreground prompt
+          return promptResult.promise;
+        },
+      ),
       cancel,
       logger: { log: () => {}, error: () => {} },
     } as any;
