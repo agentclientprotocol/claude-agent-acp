@@ -1,6 +1,9 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { once } from "node:events";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -260,6 +263,57 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("v2 core with Claude Code", 
     60_000,
   );
 
+  // The session's requests go to two local servers: it costs no API usage.
+  it("keeps a provider's route when Claude Code does not load the client's settings", async () => {
+    const servers: Server[] = [];
+    /** Starts a local server that records the paths of its POST requests in `posts`. */
+    const serve = async (posts: string[]): Promise<string> => {
+      const server = createServer((request, response) => {
+        if (request.method === "POST") posts.push(request.url ?? "");
+        // No model listing (404), and no answer to a model request (400).
+        response.writeHead(request.method === "POST" ? 400 : 404, {
+          "content-type": "application/json",
+        });
+        response.end(
+          JSON.stringify({
+            type: "error",
+            error: { type: "invalid_request_error", message: "local test server" },
+          }),
+        );
+      }).listen(0, "127.0.0.1");
+      servers.push(server);
+      await once(server, "listening");
+      return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    };
+    try {
+      const providerPosts: string[] = [];
+      const projectPosts: string[] = [];
+      // The project's settings name another base URL than the provider's.
+      await mkdir(path.join(cwd, ".claude"));
+      await writeFile(
+        path.join(cwd, ".claude", "settings.json"),
+        JSON.stringify({ env: { ANTHROPIC_BASE_URL: await serve(projectPosts) } }),
+      );
+      await agent.request(v2.methods.agent.providers.set, {
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: await serve(providerPosts),
+      });
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, {
+        cwd,
+        // `allow` must be a list, so Claude Code leaves the whole `settings` option out.
+        _meta: { claudeCode: { options: { settings: { permissions: { allow: "Bash" } } } } },
+      });
+      await prompt(sessionId, "Reply with exactly the single word: pong");
+      await until(() => states(sessionId).some((update) => update.state === "idle"));
+
+      expect(providerPosts.some((url) => url.startsWith("/v1/messages"))).toBe(true);
+      expect(projectPosts).toEqual([]);
+    } finally {
+      for (const server of servers) server.close();
+    }
+  }, 180_000);
+
   it("reports requires_action while a permission request waits", async () => {
     const sessionId = await newSession("default");
     await prompt(
@@ -329,6 +383,55 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("v2 core with Claude Code", 
       text: expect.stringMatching(/^line1\r\n[^]*line8/),
     });
   }, 240_000);
+
+  // A forked skill that the user types runs as a subagent that no tool call
+  // launched. Its child session rests on what the SDK's types do not promise:
+  // a `task_started` without a tool call, messages that name the subagent by
+  // `agent_id` only, and their order (Claude Code writes them after the
+  // task's end and before the turn's result).
+  it("gives the child of a typed forked skill its tool call and text, before its idle", async () => {
+    const skill = path.join(cwd, ".claude", "skills", "forked");
+    await mkdir(skill, { recursive: true });
+    await writeFile(
+      path.join(skill, "SKILL.md"),
+      [
+        "---",
+        "name: forked",
+        "description: Runs one command in a forked context",
+        "context: fork",
+        "---",
+        "",
+        "Run exactly this Bash command, with no other tool call: echo forked",
+        "Then reply with just: done",
+        "",
+      ].join("\n"),
+    );
+    const sessionId = await newSession("bypassPermissions");
+    await prompt(sessionId, "/forked");
+    await until(() => states(sessionId).some((update) => update.state === "idle"));
+
+    const announcement = updates.find(
+      ({ sessionId: id, update }) => id === sessionId && update.sessionUpdate === "subagent_update",
+    );
+    const childId = (announcement?.update as { sessionId?: string } | undefined)?.sessionId;
+    expect(childId).toBeDefined();
+    const child = updates.flatMap(({ sessionId: id, update }) => {
+      if (id !== childId) return [];
+      if (update.sessionUpdate === "state_update") return [update.state];
+      if (update.sessionUpdate === "agent_message_chunk") return ["text"];
+      const ended =
+        update.sessionUpdate === "tool_call_update" &&
+        (update as { status?: string }).status === "completed";
+      return ended ? ["tool call"] : [];
+    });
+    expect(child).toEqual(["running", "tool call", "text", "idle"]);
+    // The root has the command's output, and none of the child's tool calls.
+    const root = updates.flatMap(({ sessionId: id, update }) =>
+      id === sessionId ? [update.sessionUpdate] : [],
+    );
+    expect(root).toContain("agent_message_chunk");
+    expect(root).not.toContain("tool_call_update");
+  }, 180_000);
 
   it("fails a queued prompt with -32800 at a cancel and goes idle with cancelled", async () => {
     const sessionId = await newSession("bypassPermissions");

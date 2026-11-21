@@ -4,7 +4,7 @@ import {
   RequestError,
   SessionNotification,
 } from "@agentclientprotocol/sdk/unstable";
-import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
+import type { ClientCapabilities, SystemPrompt } from "@agentclientprotocol/sdk/unstable";
 import { forkSession, getSessionMessages, type Options } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../../v1/acp-agent.js";
 import type { AcpClient } from "../../acp-client.js";
@@ -28,6 +28,7 @@ let initModels: Record<string, unknown>[] | undefined;
 /** Holds the CLI initialization until the test resolves it. */
 let initGate: Promise<void> | undefined;
 let initError: Error | undefined;
+let missingConversation: string | undefined;
 /** When set, the SDK refuses the query's options with it: `query()` throws. */
 let optionsRefusal: Error | undefined;
 let setModelImpl: ((model: string) => Promise<void>) | undefined;
@@ -65,6 +66,9 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         initializationResult: async () => {
           await initGate;
           if (initError) throw initError;
+          if (args.options.resume && args.options.resume === missingConversation) {
+            throw new Error(`No conversation found with session ID: ${args.options.resume}`);
+          }
           return initializationResponse();
         },
         setModel: (model: string) => (setModelImpl ? setModelImpl(model) : Promise.resolve()),
@@ -126,6 +130,7 @@ describe("createSession options merging", () => {
     initModels = undefined;
     initGate = undefined;
     initError = undefined;
+    missingConversation = undefined;
     optionsRefusal = undefined;
     setModelImpl = undefined;
     interruptImpl = undefined;
@@ -390,6 +395,60 @@ describe("createSession options merging", () => {
     ]);
     expect(announcements[1]).not.toHaveProperty("cwd");
   });
+
+  it.each(["session/resume", "session/load"] as const)(
+    "announces a child that still works again after the response of a %s of the active session",
+    async (request) => {
+      const updates: AcpSessionNotification[] = [];
+      const client = createMockClient();
+      client.sessionUpdate = async (notification) => {
+        updates.push(notification);
+      };
+      const observedAgent = new ClaudeAcpAgent(client);
+      await observedAgent.initialize({ protocolVersion: 1, clientCapabilities: { subagents: {} } });
+      const params = { cwd: process.cwd(), mcpServers: [] };
+      const { sessionId } = await observedAgent.newSession(params);
+      // The new session's own work after its response is done.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const session = observedAgent.sessions[sessionId]!;
+      const runtime = (session.nativeSubagentRuntime = new NativeSubagentRuntime(
+        "rfd",
+        sessionId,
+        session,
+        (notification) => client.sessionUpdate(notification),
+        { log: () => {} },
+      ));
+      await runtime.taskStarted(
+        { taskId: "working", subagentType: "Explore", description: "Map the code" },
+        async () => {},
+      );
+      await runtime.taskStarted({ taskId: "ended", subagentType: "Explore" }, async () => {});
+      await runtime.finishTask("ended", "completed", async () => {});
+      updates.length = 0;
+
+      // The same settings: the session's query, and the child's run, go on. The
+      // stored history launches no subagent, so a load's replay announces none.
+      if (request === "session/load") await observedAgent.loadSession({ sessionId, ...params });
+      else await observedAgent.resumeSession({ sessionId, ...params });
+      expect(observedAgent.sessions[sessionId]).toBe(session);
+
+      await vi.waitFor(() =>
+        expect(updates.filter(({ update }) => update.sessionUpdate === "subagent_update")).toEqual([
+          {
+            sessionId,
+            update: {
+              sessionUpdate: "subagent_update",
+              sessionId: "working",
+              title: "Map the code",
+              description: "Explore",
+              capabilities: { cancel: {} },
+              state: { state: "running" },
+            },
+          },
+        ]),
+      );
+    },
+  );
 
   it("reports an AIR child's model switch under its current generation", async () => {
     const updates: AcpSessionNotification[] = [];
@@ -1056,29 +1115,20 @@ describe("createSession options merging", () => {
       });
     });
 
-    it("rejects an unsupported mode without creating a session", async () => {
+    it.each<{ name: string; systemPrompt: SystemPrompt }>([
+      { name: "an unsupported mode", systemPrompt: { mode: "_vendor", content: [text("x")] } },
+      {
+        name: "content other than text",
+        systemPrompt: {
+          mode: "append",
+          content: [{ type: "image", data: "", mimeType: "image/png" }],
+        },
+      },
+      { name: "no content", systemPrompt: { mode: "override", content: [] } },
+    ])("rejects $name without creating a session", async ({ systemPrompt }) => {
       capturedOptions = undefined;
       await expect(
-        agent.newSession({
-          cwd: process.cwd(),
-          mcpServers: [],
-          systemPrompt: { mode: "_vendor", content: [text("x")] },
-        }),
-      ).rejects.toMatchObject({ code: RequestError.invalidParams().code });
-      expect(capturedOptions).toBeUndefined();
-    });
-
-    it("rejects content other than text without creating a session", async () => {
-      capturedOptions = undefined;
-      await expect(
-        agent.newSession({
-          cwd: process.cwd(),
-          mcpServers: [],
-          systemPrompt: {
-            mode: "append",
-            content: [{ type: "image", data: "", mimeType: "image/png" }],
-          },
-        }),
+        agent.newSession({ cwd: process.cwd(), mcpServers: [], systemPrompt }),
       ).rejects.toMatchObject({ code: RequestError.invalidParams().code });
       expect(capturedOptions).toBeUndefined();
     });
@@ -1098,6 +1148,24 @@ describe("createSession options merging", () => {
         preset: "claude_code",
         append: "New instructions.",
       });
+    });
+
+    it("keeps a live session's subagent sessions known to the client when a resume recreates it", async () => {
+      const { sessionId } = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      await agent.client.sessionUpdate({
+        sessionId,
+        update: { sessionUpdate: "subagent_update", sessionId: "agent-42" },
+      });
+
+      await agent.resumeSession({
+        sessionId,
+        cwd: process.cwd(),
+        systemPrompt: { mode: "append", content: [text("New instructions.")] },
+      });
+
+      expect(() => agent.assertNoChildSession("agent-42", "prompt")).toThrow(
+        "agent-42 is a subagent session",
+      );
     });
 
     it("rejects an unsupported systemPrompt on resume of a live session", async () => {
@@ -1488,12 +1556,18 @@ describe("createSession options merging", () => {
     });
 
     it("answers session/options with what session/new returns, from a query that it closes", async () => {
-      const options = await agent.sessionOptions({ cwd, additionalDirectories: ["/extra"] });
+      const context = {
+        cwd,
+        additionalDirectories: ["/extra"],
+        _meta: { claudeCode: { options: { mcpServers: { docs: { command: "docs-server" } } } } },
+      };
+      const options = await agent.sessionOptions(context);
 
       expect(capturedOptions).toMatchObject({
         cwd,
         additionalDirectories: ["/extra"],
         mcpServers: {},
+        strictMcpConfig: true,
         persistSession: false,
       });
       expect(capturedOptions!.resume).toBeUndefined();
@@ -1501,7 +1575,7 @@ describe("createSession options merging", () => {
       expect(agent.sessions).toEqual({});
       expect(updates).toEqual([]);
 
-      const { sessionId, ...created } = await agent.newSession({ cwd, mcpServers: [] });
+      const { sessionId, ...created } = await agent.newSession({ ...context, mcpServers: [] });
       expect(sessionId).toBeDefined();
       expect(capturedOptions!.persistSession).toBeUndefined();
       expect(options).toEqual(created);
@@ -1518,7 +1592,11 @@ describe("createSession options merging", () => {
     });
 
     it("answers session/options of a held session with its current options, without a query", async () => {
-      const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+      const { sessionId } = await agent.newSession({
+        cwd,
+        mcpServers: [{ name: "docs", type: "http", url: "https://example.test/mcp", headers: [] }],
+        systemPrompt: { mode: "append", content: [{ type: "text", text: "Be brief." }] },
+      });
       const { configOptions } = await agent.setSessionConfigOption({
         sessionId,
         configId: "model",
@@ -1526,12 +1604,44 @@ describe("createSession options merging", () => {
       });
       capturedOptions = undefined;
 
-      const options = await agent.sessionOptions({ cwd, sessionId });
+      const options = await agent.sessionOptions({ cwd, sessionId, additionalDirectories: [] });
 
       expect(capturedOptions).toBeUndefined();
       expect(options).toEqual({ modes: agent.sessions[sessionId]!.modes, configOptions });
       expect(values(options).model).toBe("claude-haiku-4-5");
     });
+
+    it.each(["stored", "not yet stored"] as const)(
+      "predicts resume in a changed workspace without replacing the held session (%s)",
+      async (transcript) => {
+        const { sessionId } = await agent.newSession({
+          cwd,
+          mcpServers: [],
+          configOptions: [
+            { configId: "model", value: "claude-haiku-4-5" },
+            { configId: "mode", value: "plan" },
+          ],
+        });
+        const held = agent.sessions[sessionId]!;
+        if (transcript === "not yet stored") missingConversation = sessionId;
+
+        const context = { cwd, sessionId, additionalDirectories: [path.join(cwd, "src")] };
+        const preview = await agent.sessionOptions(context);
+        const probe = capturedOptions;
+        expect(agent.sessions[sessionId]).toBe(held);
+        expect(held.queryClosed).not.toBe(true);
+        expect(values(held).model).toBe("claude-haiku-4-5");
+
+        const { modes, configOptions } = await agent.resumeSession(context);
+        expect(preview).toEqual({ modes, configOptions });
+        expect(probe).toMatchObject({
+          persistSession: false,
+          additionalDirectories: context.additionalDirectories,
+        });
+        expect(probe!.resume).toBe(transcript === "stored" ? sessionId : undefined);
+        expect(probe!.sessionId).not.toBe(sessionId);
+      },
+    );
 
     it("answers session/options of a stored session from a query that resumes it", async () => {
       const sessionId = "7f1c5b0e-3c53-4c0c-9d0a-0d6c1f0a2b11";
@@ -1545,7 +1655,7 @@ describe("createSession options merging", () => {
 
     it("fails session/options of an unknown session with -32002", async () => {
       const sessionId = "7f1c5b0e-3c53-4c0c-9d0a-0d6c1f0a2b11";
-      initError = new Error(`No conversation found with session ID: ${sessionId}`);
+      missingConversation = sessionId;
 
       await expect(agent.sessionOptions({ cwd, sessionId })).rejects.toMatchObject({
         code: RequestError.sessionNotFound(sessionId).code,

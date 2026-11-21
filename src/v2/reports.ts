@@ -130,6 +130,8 @@ export class SessionReports {
   private lastModel: string | null = null;
   /** A `rate_limit_event` that came before the turn had usage to report it with. */
   private pendingRateLimit: unknown = null;
+  /** The last result's `usage_update` carried `_claude/origin`, so the client holds it. */
+  private originReported = false;
   /** The normalized texts of the turn's notices (see {@link repeats}). */
   private noticeTexts: string[] = [];
 
@@ -467,12 +469,17 @@ export class SessionReports {
       cacheResultContextWindow(this.providerCacheKey, matching.key, this.lastModel, window);
     }
     if (this.lastTotal === null) return;
+    // `_meta` on a v2 `usage_update` patches what the client stores, key by
+    // key. `null` removes the origin that an earlier result left, such as
+    // `{ kind: "task-notification" }`, when this result has none.
+    const origin = message.origin ?? (this.originReported ? null : undefined);
+    this.originReported = message.origin != null;
     this.sendUsage({
       sessionUpdate: "usage_update",
       used: this.lastTotal,
       size: this.contextWindow,
       cost: { amount: message.total_cost_usd, currency: "USD" },
-      ...(message.origin ? { _meta: { "_claude/origin": message.origin } } : {}),
+      ...(origin !== undefined ? { _meta: { "_claude/origin": origin } } : {}),
     });
   }
 
@@ -626,6 +633,8 @@ export class SessionReports {
   /**
    * Sends a `usage_update` with the model the usage belongs to and any
    * pending rate limit in `_meta`, as ACP's usage_update has no field for them.
+   * A v2 client keeps each `_meta` key until an update replaces or removes it,
+   * so `_claude/model` and `_claude/rateLimit` are the last ones reported.
    */
   private sendUsage(update: UsageUpdate): void {
     let meta: Record<string, unknown> = { ...(update._meta ?? {}) };

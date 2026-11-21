@@ -77,6 +77,8 @@ const sdk = vi.hoisted(() => ({
   startFailure: undefined as Error | undefined,
   /** When set, the SDK refuses the query's options with it: `query()` throws. */
   optionsRefusal: undefined as Error | undefined,
+  /** When set, Claude Code refuses flag settings with it: `applyFlagSettings` rejects. */
+  flagRefusal: undefined as Error | undefined,
   /** When set, Claude Code's start waits for it. */
   startGate: undefined as Promise<void> | undefined,
   /** When set, the query serves Remote Control with it (`enableRemoteControl`). */
@@ -121,7 +123,9 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         setModel: vi.fn(async () => {}),
         stopTask: vi.fn(async () => {}),
         close: vi.fn(() => push({ value: undefined, done: true })),
-        applyFlagSettings: vi.fn(async () => {}),
+        applyFlagSettings: vi.fn(async () => {
+          if (sdk.flagRefusal) throw sdk.flagRefusal;
+        }),
         rewindFiles: vi.fn(async () => ({ canRewind: true, filesChanged: [] })),
       };
       sdk.processes.push(fake);
@@ -227,6 +231,7 @@ beforeEach(async () => {
   sdk.previewGate = undefined;
   sdk.startFailure = undefined;
   sdk.optionsRefusal = undefined;
+  sdk.flagRefusal = undefined;
   sdk.startGate = undefined;
   sdk.enableRemoteControl = undefined;
   vi.mocked(forkSession).mockClear();
@@ -499,6 +504,65 @@ function subagent(agentId: string, launch: string, fields: Record<string, unknow
   };
 }
 
+/**
+ * A forked skill (`context: fork`), as Claude Code 2.1.328 runs
+ * `/code-review`: a subagent that no Agent call launched. `call` is the Skill
+ * call that Claude made for it. A skill that the user typed has no call: its
+ * `task_started` names none, and its messages carry
+ * `forked-command-code-review` for every run.
+ */
+function forkedSkill(agentId: string, call?: string) {
+  const from = {
+    parent_tool_use_id: call ?? "forked-command-code-review",
+    agent_id: agentId,
+    subagent_type: "general-purpose",
+    task_description: "Review the current diff",
+  };
+  const system = (subtype: string, more: Record<string, unknown>) => ({
+    type: "system",
+    subtype,
+    task_id: agentId,
+    ...(call !== undefined ? { tool_use_id: call } : {}),
+    run_id: `run-${agentId}`,
+    skip_transcript: true,
+    ambient: true,
+    uuid: randomUUID(),
+    ...more,
+  });
+  const user = (content: unknown[]) => ({
+    type: "user",
+    message: { role: "user", content },
+    ...from,
+    uuid: randomUUID(),
+  });
+  return {
+    started: () =>
+      system("task_started", {
+        description: "/code-review",
+        subagent_type: "general-purpose",
+        is_backgrounded: false,
+        spawn_depth: 1,
+        task_type: "local_agent",
+        prompt: "Review the diff",
+      }),
+    ended: (status = "completed") =>
+      system("task_notification", { status, output_file: "", summary: "/code-review" }),
+    prompt: () => user([{ type: "text", text: "Review the diff" }]),
+    runs: (toolUseId: string) => ({
+      ...assistant(`msg_${toolUseId}`, [
+        { type: "tool_use", id: toolUseId, name: "Bash", input: { command: "git diff HEAD" } },
+      ]),
+      ...from,
+    }),
+    ran: (toolUseId: string) =>
+      user([{ type: "tool_result", tool_use_id: toolUseId, content: "diff --git a/sum.js" }]),
+    says: (text: string, id = `msg_${agentId}`) => ({
+      ...assistant(id, [{ type: "text", text }]),
+      ...from,
+    }),
+  };
+}
+
 /** The updates of the session `sessionId` that the client received, in order. */
 function updatesOf(
   notifications: v2.UpdateSessionNotification[],
@@ -576,6 +640,10 @@ describe("ACP v2 core", () => {
     {
       listed: ["claude-sonnet-5", "claude-haiku-5-5"],
       pins: { ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-5" },
+      inlineSettings: {
+        permissions: { allow: "Bash" },
+        env: { ANTHROPIC_DEFAULT_HAIKU_MODEL: "claude-haiku-4-5" },
+      },
     },
     { listed: ["claude-sonnet-5-5", "claude-sonnet-5", "claude-haiku-5-5"], pins: undefined },
     // A family default in the user's settings.json is kept.
@@ -597,11 +665,13 @@ describe("ACP v2 core", () => {
       listed,
       pins,
       userSettings,
+      inlineSettings,
       resolved = "claude-sonnet-5-5",
     }: {
       listed: string[];
       pins?: object;
       userSettings?: object;
+      inlineSettings?: object;
       resolved?: string;
     }) => {
       if (userSettings) {
@@ -651,7 +721,12 @@ describe("ACP v2 core", () => {
           apiType: "anthropic",
           baseUrl: "https://gateway.example",
         });
-        const response = await agent.request(v2.methods.agent.session.new, { cwd });
+        const response = await agent.request(v2.methods.agent.session.new, {
+          cwd,
+          ...(inlineSettings && {
+            _meta: { claudeCode: { options: { settings: inlineSettings } } },
+          }),
+        });
         if (pins) {
           expect(
             response.configOptions?.find((option) => option.configId === "model"),
@@ -659,13 +734,19 @@ describe("ACP v2 core", () => {
         }
       });
       const { applyFlagSettings } = sdk.processes[0];
+      expect(applyFlagSettings).toHaveBeenNthCalledWith(1, {
+        apiKeyHelper: "",
+        env: expect.objectContaining({ ANTHROPIC_BASE_URL: "https://gateway.example" }),
+      });
+      expect(applyFlagSettings).toHaveBeenCalledTimes(pins ? 2 : 1);
       if (pins) {
         // With the route, which the flag settings already hold.
-        expect(applyFlagSettings).toHaveBeenCalledWith({
+        expect(applyFlagSettings).toHaveBeenNthCalledWith(2, {
           env: expect.objectContaining({ ANTHROPIC_BASE_URL: "https://gateway.example", ...pins }),
         });
-      } else {
-        expect(applyFlagSettings).not.toHaveBeenCalled();
+        expect(applyFlagSettings.mock.calls[1][0].env).not.toHaveProperty(
+          "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        );
       }
     },
   );
@@ -693,6 +774,43 @@ describe("ACP v2 core", () => {
     });
     // In the settings tier too, so a settings.json env cannot restore another route.
     expect(settings).toMatchObject({ apiKeyHelper: "", env: { ANTHROPIC_BASE_URL: baseUrl } });
+    // And applied to the running session, which does not depend on the `settings` option.
+    expect(sdk.processes[0].applyFlagSettings.mock.calls[0]).toEqual([
+      { apiKeyHelper: "", env: expect.objectContaining({ ANTHROPIC_BASE_URL: baseUrl }) },
+    ]);
+  });
+
+  it("starts no session when Claude Code refuses the route of a gateway login", async () => {
+    // The text of Claude Code 2.1.328 for a refused `applyFlagSettings`.
+    sdk.flagRefusal = new Error(
+      "apply_flag_settings: nothing in this request was applied and earlier settings stay in force. " +
+        "Fix or remove these invalid settings and send it again: env",
+    );
+    const initialized = vi.spyOn(SettingsManager.prototype, "initialize");
+    const disposed = vi.spyOn(SettingsManager.prototype, "dispose");
+    const client = v2Client();
+    const error = await client.connect(async (agent) => {
+      await agent.request(v2.methods.agent.initialize, {
+        protocolVersion: v2.PROTOCOL_VERSION,
+        info: { name: "v2-test-client", version: "1.0.0" },
+        capabilities: { auth: { _meta: { gateway: true } } },
+      });
+      await agent.request(v2.methods.agent.auth.login, {
+        methodId: "gateway",
+        _meta: { gateway: { baseUrl: "https://gateway.example.com" } },
+      });
+      return agent.request(v2.methods.agent.session.new, { cwd }).catch((error: unknown) => error);
+    });
+
+    expect(error).toMatchObject({
+      code: -32603,
+      message: expect.stringContaining("Claude Code did not take its provider or gateway route"),
+      data: { details: sdk.flagRefusal.message },
+    });
+    expect(sdk.processes[0].close).toHaveBeenCalledOnce();
+    expect(disposed).toHaveBeenCalledTimes(initialized.mock.calls.length);
+    initialized.mockRestore();
+    disposed.mockRestore();
   });
 
   it("rejects an incompatible provider listing before a prompt and recovers", async () => {
@@ -795,6 +913,30 @@ describe("ACP v2 core", () => {
         // The stored history that the test's SDK returns is empty: the record answers.
         expect(await agent.request(v2.methods.agent.session.prompt, keyed)).toEqual({ messageId });
         expect(sdk.processes[1].prompts).toHaveLength(0);
+      });
+    });
+
+    it("rejects a request on a subagent's session across the restart of its root's query", async () => {
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        void agent.request(v2.methods.agent.session.prompt, {
+          sessionId: response.sessionId,
+          prompt: PROMPT,
+        });
+        claude.send(lifecycle(await claude.prompt(0), "started"));
+        const helper = subagent("agent-1", "toolu_agent");
+        claude.send(helper.launch());
+        claude.send(helper.started());
+        claude.send(helper.ended());
+        claude.send(result());
+        await vi.waitFor(() => expect(client.states().at(-1)).toBe("idle"));
+
+        await setProvider(agent);
+        expect(sdk.processes).toHaveLength(2);
+        await expect(
+          agent.request(v2.methods.agent.session.close, { sessionId: "agent-1" }),
+        ).rejects.toMatchObject({ code: -32602 });
       });
     });
 
@@ -1432,7 +1574,7 @@ describe("ACP v2 core", () => {
       const { claude } = await openSession(agent);
       claude.send(cycleStart());
       await vi.waitFor(() => expect(client.states()).toEqual(["running"]));
-      return claude.options.canUseTool!(
+      const decision = await claude.options.canUseTool!(
         "Bash",
         { command: "ls" },
         {
@@ -1442,10 +1584,15 @@ describe("ACP v2 core", () => {
           suggestions: [],
         },
       );
+      // The client reads one message per event-loop task, so it gets the
+      // `running` update after Claude Code has its decision.
+      await vi.waitFor(() =>
+        expect(client.states()).toEqual(["running", "requires_action", "running"]),
+      );
+      return decision;
     });
 
     expect(decision?.behavior).toBe("allow");
-    expect(client.states()).toEqual(["running", "requires_action", "running"]);
     expect(client.permissionRequests[0].subject).toMatchObject({
       type: "tool_call",
       toolCall: { toolCallId: "toolu_1" },
@@ -2058,7 +2205,9 @@ describe("ACP v2 core", () => {
       // The turn goes on: the session sends `/clear` for the fresh context.
       const clear = await claude.prompt(1);
       expect(clear.message.content).toEqual([{ type: "text", text: "/clear" }]);
-      expect(client.states()).toEqual(["running", "requires_action", "running"]);
+      await vi.waitFor(() =>
+        expect(client.states()).toEqual(["running", "requires_action", "running"]),
+      );
       await agent.notify(v2.methods.agent.session.cancel, { sessionId });
       await vi.waitFor(() =>
         expect(client.states()).toEqual(["running", "requires_action", "running", "idle"]),
@@ -2183,6 +2332,27 @@ describe("ACP v2 core", () => {
         expect(client.states()).toEqual(["running", "idle", "running", "idle"]),
       );
     });
+  });
+
+  it("removes the origin of a usage update when the next result has none", async () => {
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      const { claude } = await openSession(agent);
+      for (const origin of [{ kind: "task-notification" }, undefined]) {
+        for (const event of textDelta(`msg_${randomUUID()}`, "Done")) claude.send(event);
+        claude.send(result(origin ? { origin } : {}));
+        claude.send(sessionState("idle"));
+      }
+      await vi.waitFor(() =>
+        expect(client.states()).toEqual(["running", "idle", "running", "idle"]),
+      );
+    });
+
+    // A v2 client keeps a `_meta` key of a `usage_update` until `null` removes it.
+    const origins = client.sessionUpdates
+      .filter((update) => update.sessionUpdate === "usage_update" && update.cost != null)
+      .map((update) => (update._meta as Record<string, unknown>)["_claude/origin"]);
+    expect(origins).toEqual([{ kind: "task-notification" }, null]);
   });
 
   it.each([
@@ -3820,6 +3990,461 @@ describe("ACP v2 core", () => {
       });
     });
 
+    describe("a forked skill", () => {
+      /** The kinds of the child's updates that show its work, with its states. */
+      const transcript = (client: ReturnType<typeof v2Client>, agentId: string) =>
+        updatesOf(client.notifications, agentId).flatMap((update) =>
+          update.sessionUpdate === "state_update"
+            ? [update.state]
+            : update.sessionUpdate === "agent_message_chunk"
+              ? [(update.content as { text: string }).text]
+              : update.sessionUpdate === "tool_call_update" && update.status === "completed"
+                ? [update.toolCallId]
+                : [],
+        );
+
+      it("that the user typed gets its messages, which come after its end, before its idle", async () => {
+        const client = v2Client();
+        const sessionId = await client.connect(async (agent) => {
+          const { response, claude } = await openSession(agent);
+          // Both runs send `forked-command-code-review`: each goes by its `agent_id`.
+          for (const [agentId, finding] of [
+            ["a995b1", "Off by one."],
+            ["a205ff", "No findings."],
+          ]) {
+            const fork = forkedSkill(agentId);
+            claude.send(fork.started());
+            claude.send(fork.ended());
+            // Claude Code writes the held messages after the turn's `init`.
+            claude.send({ type: "system", subtype: "init", uuid: randomUUID() });
+            claude.send(fork.prompt());
+            claude.send(fork.runs(`toolu_${agentId}`));
+            claude.send(fork.ran(`toolu_${agentId}`));
+            claude.send(fork.says(finding));
+            // The command's output, as the root's message.
+            claude.send(assistant(`msg_root_${agentId}`, [{ type: "text", text: finding }]));
+            claude.send(result({ num_turns: 0, result: finding }));
+          }
+          await vi.waitFor(() =>
+            expect(client.states()).toEqual(["running", "idle", "running", "idle"]),
+          );
+          return response.sessionId;
+        });
+
+        expect(transcript(client, "a995b1")).toEqual([
+          "running",
+          "toolu_a995b1",
+          "Off by one.",
+          "idle",
+        ]);
+        expect(transcript(client, "a205ff")).toEqual([
+          "running",
+          "toolu_a205ff",
+          "No findings.",
+          "idle",
+        ]);
+        // The root has the command's output only, after each child's idle.
+        expect(transcript(client, sessionId)).toEqual([
+          "running",
+          "Off by one.",
+          "idle",
+          "running",
+          "No findings.",
+          "idle",
+        ]);
+        const idle = client.notifications.findIndex(
+          (n) => n.sessionId === "a995b1" && (n.update as { state?: unknown }).state === "idle",
+        );
+        const output = client.notifications.findIndex(
+          (n) => n.sessionId === sessionId && n.update.sessionUpdate === "agent_message_chunk",
+        );
+        expect(idle).toBeLessThan(output);
+      });
+
+      it.each([
+        ["at the turn's result", (claude: FakeClaudeCode) => claude.send(result({ num_turns: 0 }))],
+        ["when the query ends", (claude: FakeClaudeCode) => claude.end()],
+        ["at Claude Code's idle", (claude: FakeClaudeCode) => claude.send(sessionState("idle"))],
+        [
+          "when the conversation is reset",
+          (claude: FakeClaudeCode) =>
+            claude.send({
+              type: "conversation_reset",
+              new_conversation_id: randomUUID(),
+              uuid: randomUUID(),
+              trigger: "clear",
+              timestamp: new Date().toISOString(),
+              session_id: "session",
+            }),
+        ],
+      ])("that the user typed ends %s when no message of it comes", async (_, end) => {
+        const client = v2Client();
+        await client.connect(async (agent) => {
+          const { claude } = await openSession(agent);
+          const fork = forkedSkill("a41595");
+          claude.send(fork.started());
+          claude.send(fork.ended("stopped"));
+          // A second report of the end, and another `system` message, end no wait.
+          claude.send({
+            type: "system",
+            subtype: "task_updated",
+            task_id: "a41595",
+            patch: { status: "killed" },
+            uuid: randomUUID(),
+          });
+          claude.send({ type: "system", subtype: "init", uuid: randomUUID() });
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          expect(transcript(client, "a41595")).toEqual(["running"]);
+          end(claude);
+          await vi.waitFor(() => expect(transcript(client, "a41595")).toEqual(["running", "idle"]));
+        });
+        expect(updatesOf(client.notifications, "a41595").at(-1)).toMatchObject({
+          state: "idle",
+          stopReason: "cancelled",
+        });
+      });
+
+      it("that the user typed also waits when some of its messages came before its task's end", async () => {
+        const client = v2Client();
+        await client.connect(async (agent) => {
+          const { claude } = await openSession(agent);
+          const fork = forkedSkill("a7c2d0");
+          claude.send(fork.started());
+          // Claude Code wrote an `init` while the command ran: the messages so far came.
+          claude.send(fork.says("First half.", "msg_first"));
+          claude.send(fork.ended());
+          claude.send(fork.says("Second half.", "msg_second"));
+          await vi.waitFor(() =>
+            expect(transcript(client, "a7c2d0")).toEqual([
+              "running",
+              "First half.",
+              "Second half.",
+            ]),
+          );
+          claude.send(assistant("msg_root", [{ type: "text", text: "Second half." }]));
+          await vi.waitFor(() => expect(transcript(client, "a7c2d0").at(-1)).toBe("idle"));
+        });
+      });
+
+      it("that the user typed and launched a subagent stays running through that subagent's messages", async () => {
+        const client = v2Client();
+        await client.connect(async (agent) => {
+          const { claude } = await openSession(agent);
+          const fork = forkedSkill("a71bcc");
+          const nested = subagent("ac5905", "toolu_agent", { parent_task_id: "a71bcc" });
+          claude.send(fork.started());
+          // Claude Code reports the subagent's task as it runs, and holds its
+          // messages along with the skill's own.
+          claude.send(nested.started());
+          claude.send(nested.ended());
+          claude.send(fork.ended());
+          claude.send({ type: "system", subtype: "init", uuid: randomUUID() });
+          claude.send(fork.prompt());
+          claude.send({ ...nested.launch("forked-command-code-review"), agent_id: "a71bcc" });
+          claude.send({ ...nested.says("nested"), agent_id: "ac5905" });
+          claude.send(fork.ran("toolu_agent"));
+          claude.send(fork.says("DONE"));
+          claude.send(assistant("msg_root", [{ type: "text", text: "DONE" }]));
+          claude.send(result({ num_turns: 0 }));
+          await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+        });
+
+        // The subagent's task ended before its Agent call came: it stays that
+        // call of the skill's child, and gets no session.
+        expect(transcript(client, "a71bcc")).toEqual(["running", "toolu_agent", "DONE", "idle"]);
+        expect(updatesOf(client.notifications, "ac5905")).toEqual([]);
+      });
+
+      it("that the user typed ends before the root's idle when its turn closes without a result", async () => {
+        const client = v2Client();
+        const sessionId = await client.connect(async (agent) => {
+          const { response, claude } = await openSession(agent);
+          const prompted = agent.request(v2.methods.agent.session.prompt, {
+            sessionId: response.sessionId,
+            prompt: PROMPT,
+          });
+          const prompt = await claude.prompt(0);
+          claude.send(lifecycle(prompt, "started"));
+          await prompted;
+          const fork = forkedSkill("a41595");
+          claude.send(fork.started());
+          claude.send(fork.ended("stopped"));
+          claude.send(lifecycle(prompt, "cancelled"));
+          await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+          return response.sessionId;
+        });
+
+        expect(
+          client.notifications.flatMap(({ sessionId: id, update }) =>
+            update.sessionUpdate === "state_update" && update.state === "idle" ? [id] : [],
+          ),
+        ).toEqual(["a41595", sessionId]);
+      });
+
+      it("that the user typed reports a failure's text that only a second report of its end gives", async () => {
+        const client = v2Client();
+        await client.connect(async (agent) => {
+          const { claude } = await openSession(agent);
+          const fork = forkedSkill("a41595");
+          claude.send(fork.started());
+          claude.send(fork.ended("failed"));
+          claude.send({
+            type: "system",
+            subtype: "task_updated",
+            task_id: "a41595",
+            patch: { status: "failed", error: "boom" },
+            uuid: randomUUID(),
+          });
+          claude.send(result({ num_turns: 0 }));
+          await vi.waitFor(() => expect(transcript(client, "a41595")).toEqual(["running", "idle"]));
+        });
+
+        expect(updatesOf(client.notifications, "a41595").at(-1)).toMatchObject({
+          state: "idle",
+          stopReason: "error",
+          error: { message: "boom" },
+        });
+      });
+
+      it("that the user typed and its own cancel stopped shows its messages, then ends cancelled", async () => {
+        const client = v2Client();
+        await client.connect(async (agent) => {
+          const { claude } = await openSession(agent);
+          const fork = forkedSkill("a41595");
+          claude.send(cycleStart());
+          claude.send(fork.started());
+          await vi.waitFor(() => expect(transcript(client, "a41595")).toEqual(["running"]));
+          await agent.notify(v2.methods.agent.session.cancel, { sessionId: "a41595" });
+          await vi.waitFor(() => expect(claude.stopTask).toHaveBeenCalledWith("a41595"));
+          // Claude Code reports the stop twice, then writes what it held.
+          claude.send({
+            type: "system",
+            subtype: "task_updated",
+            task_id: "a41595",
+            patch: { status: "killed" },
+            uuid: randomUUID(),
+          });
+          claude.send(fork.ended("stopped"));
+          claude.send({ type: "system", subtype: "init", uuid: randomUUID() });
+          claude.send(fork.prompt());
+          claude.send(fork.runs("toolu_diff"));
+          claude.send(fork.ran("toolu_diff"));
+          claude.send(result({ num_turns: 0 }));
+          await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+        });
+
+        expect(transcript(client, "a41595")).toEqual(["running", "toolu_diff", "idle"]);
+        expect(updatesOf(client.notifications, "a41595").at(-1)).toMatchObject({
+          state: "idle",
+          stopReason: "cancelled",
+        });
+      });
+
+      it("that the user typed and a cancel of the root stopped shows none of its messages, and ends cancelled", async () => {
+        const client = v2Client();
+        await client.connect(async (agent) => {
+          const { response, claude } = await openSession(agent);
+          const fork = forkedSkill("a41595");
+          claude.send(cycleStart());
+          claude.send(fork.started());
+          await vi.waitFor(() => expect(transcript(client, "a41595")).toEqual(["running"]));
+          await agent.notify(v2.methods.agent.session.cancel, { sessionId: response.sessionId });
+          await vi.waitFor(() => expect(claude.interrupt).toHaveBeenCalled());
+          claude.send(fork.ended("stopped"));
+          claude.send({ type: "system", subtype: "init", uuid: randomUUID() });
+          claude.send(fork.prompt());
+          claude.send(fork.runs("toolu_diff"));
+          claude.send(fork.says("Half a review"));
+          claude.send(result({ num_turns: 0 }));
+          claude.send(sessionState("idle"));
+          await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+        });
+
+        expect(
+          updatesOf(client.notifications, "a41595").map((update) => update.sessionUpdate),
+        ).toEqual(["state_update", "session_message", "state_update"]);
+        expect(updatesOf(client.notifications, "a41595").at(-1)).toMatchObject({
+          state: "idle",
+          stopReason: "cancelled",
+        });
+      });
+
+      it("that Claude called is referenced from its Skill call, on an update with content", async () => {
+        const client = v2Client();
+        const sessionId = await client.connect(async (agent) => {
+          const { response, claude } = await openSession(agent);
+          const fork = forkedSkill("a66033", "toolu_skill");
+          claude.send(cycleStart());
+          claude.send(
+            assistant("msg_skill", [
+              {
+                type: "tool_use",
+                id: "toolu_skill",
+                name: "Skill",
+                input: { skill: "code-review" },
+              },
+            ]),
+          );
+          claude.send(fork.started());
+          claude.send(fork.ended("failed"));
+          claude.send({
+            type: "user",
+            message: {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "toolu_skill",
+                  is_error: true,
+                  content: "The skill failed",
+                },
+              ],
+            },
+            parent_tool_use_id: null,
+            uuid: randomUUID(),
+          });
+          claude.send(result());
+          await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+          return response.sessionId;
+        });
+
+        const failed = updatesOf(client.notifications, sessionId).find(
+          (update) => update.sessionUpdate === "tool_call_update" && update.status === "failed",
+        );
+        expect((failed as { content?: unknown[] }).content?.at(-1)).toEqual({
+          type: "session",
+          sessionId: "a66033",
+        });
+      });
+
+      it("that Claude called replays as its Skill call, without a child", async () => {
+        // Claude Code 2.1.328 names no call in the metadata of a forked skill's
+        // agent. A replay shows no child even for metadata that names the Skill call.
+        sdk.subagents = new Map([
+          ["toolu_skill", { agentId: "a66033", background: false, agentType: "general-purpose" }],
+        ]);
+        const client = v2Client();
+        await client.connect(async (agent) => {
+          const { response } = await openSession(agent);
+          const sessionId = response.sessionId;
+          const row = { session_id: sessionId, parent_tool_use_id: null, parent_agent_id: null };
+          vi.mocked(getSessionMessages).mockResolvedValueOnce([
+            {
+              ...row,
+              type: "assistant",
+              uuid: "a1",
+              message: assistant("msg_skill", [
+                {
+                  type: "tool_use",
+                  id: "toolu_skill",
+                  name: "Skill",
+                  input: { skill: "code-review" },
+                },
+              ]).message,
+            },
+            {
+              ...row,
+              type: "user",
+              uuid: "u1",
+              message: {
+                role: "user",
+                content: [
+                  {
+                    type: "tool_result",
+                    tool_use_id: "toolu_skill",
+                    content: 'Skill "code-review" completed (forked execution).',
+                  },
+                ],
+              },
+            },
+          ]);
+          await agent.request(v2.methods.agent.session.resume, {
+            sessionId,
+            cwd,
+            replayFrom: { type: "start" },
+          });
+        });
+
+        expect(client.sessionUpdates.map((update) => update.sessionUpdate)).not.toContain(
+          "subagent_update",
+        );
+        expect(
+          client.sessionUpdates.flatMap((update) =>
+            update.sessionUpdate === "tool_call_update" ? [update.status] : [],
+          ),
+        ).toEqual(["pending", "completed"]);
+      });
+
+      it("that Claude called is announced on the session of its Skill call, which stays shown", async () => {
+        const client = v2Client();
+        const agentId = "a66033";
+        const sessionId = await client.connect(async (agent) => {
+          const { response, claude } = await openSession(agent);
+          const fork = forkedSkill(agentId, "toolu_skill");
+          claude.send(cycleStart());
+          claude.send(
+            assistant("msg_skill", [
+              {
+                type: "tool_use",
+                id: "toolu_skill",
+                name: "Skill",
+                input: { skill: "code-review", args: "low" },
+              },
+            ]),
+          );
+          claude.send(fork.started());
+          claude.send(fork.prompt());
+          claude.send(fork.says("Off by one."));
+          claude.send(fork.ended());
+          claude.send({
+            type: "user",
+            message: {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "toolu_skill",
+                  content: 'Skill "code-review" completed (forked execution).',
+                },
+              ],
+            },
+            parent_tool_use_id: null,
+            uuid: randomUUID(),
+          });
+          claude.send(result());
+          await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+          return response.sessionId;
+        });
+
+        // The call, then the child, and no message of the parent in place of the call.
+        const parent = updatesOf(client.notifications, sessionId).flatMap((update) =>
+          update.sessionUpdate === "tool_call_update"
+            ? [`${update.toolCallId} ${update.status}`]
+            : update.sessionUpdate === "subagent_update" ||
+                update.sessionUpdate === "session_message"
+              ? [update.sessionUpdate]
+              : [],
+        );
+        expect(parent).toEqual([
+          "toolu_skill pending",
+          "subagent_update",
+          "subagent_update",
+          "toolu_skill completed",
+        ]);
+        expect(updatesOf(client.notifications, agentId).slice(0, 2)).toEqual([
+          { sessionUpdate: "state_update", state: "running", background: [] },
+          {
+            sessionUpdate: "session_message",
+            messageId: "toolu_skill",
+            senderSessionId: sessionId,
+            recipientSessionId: agentId,
+            content: [{ type: "text", text: "Review the diff" }],
+          },
+        ]);
+        expect(transcript(client, agentId)).toEqual(["running", "Off by one.", "idle"]);
+      });
+    });
+
     it("asks a subagent's permission on its session, and blocks the work that waits on it", async () => {
       let answer = (_: v2.RequestPermissionResponse) => {};
       const client = v2Client({
@@ -4359,10 +4984,111 @@ describe("ACP v2 core", () => {
       expect(received.indexOf("live report")).toBeGreaterThan(received.indexOf("replay_complete"));
     });
 
+    describe("a live child that the replayed history does not launch", () => {
+      type LiveChild = ReturnType<typeof subagent> | ReturnType<typeof forkedSkill>;
+      /** A subagent that Claude launched after the stored history was written. */
+      const launched = (claude: FakeClaudeCode): LiveChild => {
+        const child = subagent("a5966d", "toolu_agent");
+        claude.send(cycleStart());
+        claude.send(child.launch());
+        claude.send(child.started());
+        return child;
+      };
+      // What the resume's snapshot sends of a child that works: its state, on its parent and its own stream.
+      const works = ["root subagent_update running", "child state_update running"];
+
+      it.each<{
+        name: string;
+        start: (claude: FakeClaudeCode) => LiveChild;
+        /** What Claude Code sends of the child while the transcript is read. */
+        during: (child: LiveChild) => Record<string, unknown>[];
+        /** What the client gets after the child's `replay_complete`, before the root's state. */
+        current: string[];
+      }>([
+        {
+          // Claude Code's metadata of a forked skill's agent names no call, so no replay has it.
+          name: "a forked skill's child that reports meanwhile",
+          start: (claude) => {
+            const fork = forkedSkill("a5966d");
+            claude.send(fork.started());
+            return fork;
+          },
+          during: (child) => [child.says("Live report")],
+          current: ["child agent_message_chunk", ...works],
+        },
+        {
+          name: "a subagent that sends nothing meanwhile",
+          start: launched,
+          during: () => [],
+          current: works,
+        },
+        {
+          name: "a subagent whose run ends meanwhile",
+          start: launched,
+          during: (child) => [child.ended()],
+          // The end that the replay held. The snapshot has nothing of a child that no longer works.
+          current: ["root subagent_update idle", "child state_update idle"],
+        },
+      ])(
+        "is announced again after the root's replay_complete and gets its own, before its other updates: $name",
+        async ({ start, during, current }) => {
+          const client = v2Client();
+          const read = Promise.withResolvers<Awaited<ReturnType<typeof getSessionMessages>>>();
+          let resumedAt = 0;
+          const sessionId = await client.connect(async (agent) => {
+            const { response, claude } = await openSession(agent);
+            const child = start(claude);
+            await vi.waitFor(() =>
+              expect(updatesOf(client.notifications, "a5966d")).toContainEqual(
+                expect.objectContaining({ sessionUpdate: "state_update", state: "running" }),
+              ),
+            );
+            vi.mocked(getSessionMessages).mockReturnValueOnce(read.promise);
+            resumedAt = client.notifications.length;
+            const resume = agent.request(v2.methods.agent.session.resume, {
+              sessionId: response.sessionId,
+              cwd,
+              replayFrom: { type: "start" },
+            });
+            await vi.waitFor(() => expect(getSessionMessages).toHaveBeenCalled());
+            for (const message of during(child)) claude.send(message);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            // The replay holds what the child sends.
+            expect(client.notifications.slice(resumedAt)).toEqual([]);
+            read.resolve([]);
+            await resume;
+            return response.sessionId;
+          });
+
+          const received = client.notifications
+            .slice(resumedAt)
+            .map(({ sessionId: of, update }) => {
+              const state = (update as { state?: unknown }).state;
+              const name =
+                typeof state === "object" ? (state as { state?: unknown } | null)?.state : state;
+              return `${of === sessionId ? "root" : "child"} ${update.sessionUpdate}${
+                typeof name === "string" ? ` ${name}` : ""
+              }`;
+            });
+          expect(received).toEqual([
+            "root replay_complete",
+            // Current, as it follows its parent's `replay_complete`: the child's labels, with no state.
+            "root subagent_update",
+            // The child's replay is empty.
+            "child replay_complete",
+            ...current,
+            expect.stringMatching(/^root state_update /),
+          ]);
+        },
+      );
+    });
+
     it.each([
-      ["session/prompt", v2.methods.agent.session.prompt, { prompt: PROMPT }],
-      ["session/close", v2.methods.agent.session.close, {}],
-    ])("rejects %s on a subagent's session", async (_, method, params) => {
+      ["session/prompt", v2.methods.agent.session.prompt, { prompt: PROMPT }, false],
+      ["session/close", v2.methods.agent.session.close, {}, false],
+      // The adapter no longer follows the child, and the client still holds it.
+      ["session/close after a conversation reset", v2.methods.agent.session.close, {}, true],
+    ])("rejects %s on a subagent's session", async (_, method, params, reset) => {
       const client = v2Client();
       const error = await client.connect(async (agent) => {
         const { claude } = await openSession(agent);
@@ -4372,6 +5098,22 @@ describe("ACP v2 core", () => {
         await vi.waitFor(() =>
           expect(client.notifications.some((n) => n.sessionId === "child")).toBe(true),
         );
+        if (reset) {
+          claude.send({
+            type: "conversation_reset",
+            new_conversation_id: randomUUID(),
+            uuid: randomUUID(),
+            trigger: "clear",
+            timestamp: new Date().toISOString(),
+            session_id: "session",
+          });
+          await vi.waitFor(() =>
+            expect(updatesOf(client.notifications, "child").at(-1)).toMatchObject({
+              sessionUpdate: "state_update",
+              state: "unknown",
+            }),
+          );
+        }
         return agent
           .request(
             method as typeof v2.methods.agent.session.close,
@@ -4384,6 +5126,74 @@ describe("ACP v2 core", () => {
       });
 
       expect(error).toMatchObject({ code: -32602 });
+    });
+
+    it("rejects a request on a subagent's session that only a replay announced, until its root closes", async () => {
+      sdk.subagents = new Map([
+        [
+          "toolu_launch",
+          {
+            agentId: "child",
+            background: false,
+            stoppedByUser: false,
+            agentType: "general-purpose",
+          },
+        ],
+      ]);
+      const client = v2Client();
+      const errors = await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const sessionId = response.sessionId;
+        vi.mocked(getSessionMessages).mockResolvedValueOnce([
+          {
+            type: "assistant",
+            uuid: "a1",
+            session_id: sessionId,
+            parent_tool_use_id: null,
+            parent_agent_id: null,
+            message: subagent("child", "toolu_launch").launch().message,
+          },
+        ] as never);
+        await agent.request(v2.methods.agent.session.resume, {
+          sessionId,
+          cwd,
+          replayFrom: { type: "start" },
+        });
+        // The child does not run, so a cancel of it has nothing to stop.
+        await agent.notify(v2.methods.agent.session.cancel, { sessionId: "child" });
+        const refusal = (request: Promise<unknown>) => request.catch((error: unknown) => error);
+        const close = await refusal(
+          agent.request(v2.methods.agent.session.close, { sessionId: "child" }),
+        );
+        // The child lists no tool call: it does not run.
+        const cancelItem = () =>
+          refusal(
+            agent.request(v2.methods.agent.toolCall.cancel, {
+              sessionId: "child",
+              toolCallId: "toolu_read",
+            }),
+          );
+        const whileRootRuns = await cancelItem();
+        expect(claude.stopTask).not.toHaveBeenCalled();
+        expect(claude.interrupt).not.toHaveBeenCalled();
+        // The root's query ends: the root is still active, and the child still known.
+        claude.end();
+        const afterQueryEnd = await cancelItem();
+        await agent.request(v2.methods.agent.session.close, { sessionId });
+        const afterClose = await refusal(
+          agent.request(v2.methods.agent.session.prompt, { sessionId: "child", prompt: PROMPT }),
+        );
+        return [close, whileRootRuns, afterQueryEnd, afterClose];
+      });
+
+      const notListed = { code: -32602, data: { sessionId: "child", toolCallId: "toolu_read" } };
+      expect(errors).toMatchObject([
+        { code: -32602, message: expect.stringContaining("child is a subagent session") },
+        notListed,
+        notListed,
+        // The client closed the child's root, so it can no longer name the child.
+        { code: -32002 },
+      ]);
     });
 
     it("keeps a background command's terminal running and listed until its task ends", async () => {

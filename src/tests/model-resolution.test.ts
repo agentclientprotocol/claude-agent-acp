@@ -17,6 +17,7 @@ import {
   withGatewayFamilyPins,
 } from "../session-model.js";
 import { effortFlagSettings, settingsEffortForModel } from "../session-effort.js";
+import { applyProviderRoute, providerRouteSettings } from "../providers.js";
 import { Pushable } from "../utils.js";
 
 // Mirrors a real `supportedModels()` response: alias rows carry
@@ -508,66 +509,87 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("model resolution (real SDK)
 // which the SDK does not document. A local gateway that answers nothing keeps
 // the CLI off the network, so no API key is needed.
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("gateway family pins (real SDK)", () => {
-  it("restores the live alias after a failed refresh and pins it on retry", async () => {
-    const gateway = createServer((_, res) => res.writeHead(404).end());
-    await new Promise<void>((resolve) => gateway.listen(0, "127.0.0.1", resolve));
-    const { port } = gateway.address() as { port: number };
-    const route = { ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}` };
-    const home = await mkdtemp(path.join(os.tmpdir(), "acp-pins-"));
-    // No prompt: the session only starts.
-    const input = new Pushable<SDKUserMessage>();
-    const q = query({
-      prompt: input,
-      options: {
-        sessionId: randomUUID(),
-        cwd: home,
-        settingSources: [],
-        settings: { env: route },
-        env: {
-          PATH: process.env.PATH,
-          HOME: home,
-          CLAUDE_CONFIG_DIR: path.join(home, ".claude"),
-          ANTHROPIC_API_KEY: "sk-ant-test",
-          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
-          ...route,
+  it.each([true, false])(
+    "restores the live alias and pins it on retry (valid settings: %s)",
+    async (valid) => {
+      const gateway = createServer((_, res) => res.writeHead(404).end());
+      await new Promise<void>((resolve) => gateway.listen(0, "127.0.0.1", resolve));
+      const { port } = gateway.address() as { port: number };
+      const route = { ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}` };
+      const home = await mkdtemp(path.join(os.tmpdir(), "acp-pins-"));
+      const haiku = "claude-haiku-4-5";
+      const clientEnv = { ANTHROPIC_DEFAULT_HAIKU_MODEL: haiku };
+      // No prompt: the session only starts.
+      const input = new Pushable<SDKUserMessage>();
+      const q = query({
+        prompt: input,
+        options: {
+          sessionId: randomUUID(),
+          cwd: home,
+          settingSources: [],
+          settings: {
+            env: { ...clientEnv, ...route },
+            // A non-list `allow` makes Claude Code discard the entire object.
+            ...(valid ? {} : { permissions: { allow: "Bash" as unknown as string[] } }),
+          },
+          env: {
+            PATH: process.env.PATH,
+            HOME: home,
+            CLAUDE_CONFIG_DIR: path.join(home, ".claude"),
+            ANTHROPIC_API_KEY: "sk-ant-test",
+            CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+            ...route,
+          },
         },
-      },
-    });
-    try {
-      const startup = await q.initializationResult();
-      const sonnet = startup.models.find((model) => model.value === "sonnet");
-      expect(sonnet?.resolvedModel).toBeDefined();
-      expect(sonnet?.resolvedModel).not.toBe("claude-sonnet-4-6");
-      const listed = ["claude-sonnet-4-6"];
-      const user = { env: {} };
-      const logger = { log: vi.fn(), error: vi.fn() };
-      const fallback = await withGatewayFamilyPins(
-        {
-          applyFlagSettings: (settings) => q.applyFlagSettings(settings),
-          reinitialize: vi.fn().mockRejectedValue(new Error("refresh failed")),
-        },
-        startup,
-        listed,
-        user,
-        route,
-        logger,
-      );
-      expect(fallback).toBe(startup);
-      const restored = await q.reinitialize();
-      expect(restored.models.find((model) => model.value === "sonnet")?.resolvedModel).toBe(
-        sonnet?.resolvedModel,
-      );
-      const pinned = await withGatewayFamilyPins(q, restored, listed, user, route, logger);
-      expect(pinned.models.find((model) => model.value === "sonnet")?.resolvedModel).toBe(
-        "claude-sonnet-4-6",
-      );
-    } finally {
-      input.end();
-      q.close();
-      gateway.close();
-      await rm(home, { recursive: true, force: true, maxRetries: 5 });
-    }
-  }, 60000);
+      });
+      try {
+        const startup = await q.initializationResult();
+        const sonnet = startup.models.find((model) => model.value === "sonnet");
+        const startupHaiku = startup.models.find((model) => model.value === "haiku")?.resolvedModel;
+        expect(sonnet?.resolvedModel).toBeDefined();
+        expect(sonnet?.resolvedModel).not.toBe("claude-sonnet-4-6");
+        expect(startupHaiku).toBeDefined();
+        if (valid) expect(startupHaiku).toBe(haiku);
+        else expect(startupHaiku).not.toBe(haiku);
+        await applyProviderRoute(q, providerRouteSettings(route));
+        const listed = ["claude-sonnet-4-6"];
+        const user = { env: clientEnv };
+        const logger = { log: vi.fn(), error: vi.fn() };
+        const fallback = await withGatewayFamilyPins(
+          {
+            applyFlagSettings: (settings) => q.applyFlagSettings(settings),
+            reinitialize: vi.fn().mockRejectedValue(new Error("refresh failed")),
+          },
+          startup,
+          listed,
+          user,
+          route,
+          logger,
+        );
+        expect(fallback).toBe(startup);
+        const restored = await q.reinitialize();
+        expect(restored.models.find((model) => model.value === "sonnet")?.resolvedModel).toBe(
+          sonnet?.resolvedModel,
+        );
+        expect(restored.models.find((model) => model.value === "haiku")?.resolvedModel).toBe(
+          startupHaiku,
+        );
+        const pinned = await withGatewayFamilyPins(q, restored, listed, user, route, logger);
+        expect(pinned.models.find((model) => model.value === "sonnet")?.resolvedModel).toBe(
+          "claude-sonnet-4-6",
+        );
+        expect(pinned.models.find((model) => model.value === "haiku")?.resolvedModel).toBe(
+          startupHaiku,
+        );
+      } finally {
+        input.end();
+        q.close();
+        gateway.close();
+        await rm(home, { recursive: true, force: true, maxRetries: 5 });
+      }
+    },
+    60000,
+  );
 });
 
 describe("settingsEffortForModel", () => {

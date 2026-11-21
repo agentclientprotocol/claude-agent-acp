@@ -109,14 +109,14 @@ export type AcpAuthStatus = Pick<AuthStatusResponse, "state" | "accounts">;
  *   `_meta.claudeCode` carries the `kind` and `plan`, and the `detail` again
  *   for clients that read it there.
  *
- * `--hide-claude-auth` does not change the payload: it reports the login the
- * CLI holds, also when the subscription guard refuses to use it.
+ * The legacy extension still reports a refused identity for display. ACP
+ * reports that sign-in is needed instead of listing it as an active account.
  */
-export function toAcpAuthStatus(status: AuthStatus | undefined): AcpAuthStatus {
+export function toAcpAuthStatus(status: AuthStatus | undefined, refused = false): AcpAuthStatus {
   if (!status) {
     return { state: "unknown" };
   }
-  if (status.kind === "none") {
+  if (refused || status.kind === "none") {
     return { state: "unauthenticated" };
   }
   const account: AuthAccount = { label: status.label, active: true };
@@ -236,10 +236,8 @@ export function fromAccountInfo(
   });
 }
 
-/** Pre-session mapping from `claude auth status --json` stdout. Returns
- *  `undefined` when the output is not the expected JSON object, so callers can
- *  report "not known" instead of guessing. */
-export function fromCliStatus(stdout: string, apiKeyHelper?: string): AuthStatus | undefined {
+/** An unreadable `claude auth status --json` result is unknown, not signed out. */
+export function parseCliAuthStatus(stdout: string): CliAuthStatus | undefined {
   let parsed: unknown;
   try {
     parsed = JSON.parse(stdout);
@@ -253,6 +251,10 @@ export function fromCliStatus(stdout: string, apiKeyHelper?: string): AuthStatus
   if (typeof status.loggedIn !== "boolean") {
     return undefined;
   }
+  return status;
+}
+
+export function cliAuthIdentity(status: CliAuthStatus, apiKeyHelper?: string): AuthStatus {
   // `loggedIn` tracks the claude.ai login only. On a 3P backend (Bedrock,
   // Vertex, …) it is false while the credentials live outside the agent, so the
   // backend must decide the kind before the logged-out shortcut runs.

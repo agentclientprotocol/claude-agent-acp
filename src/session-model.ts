@@ -509,7 +509,9 @@ export function gatewayFamilyPins(
 
 /**
  * Applies `gatewayFamilyPins` through the flag settings, resending `flagEnv`
- * (the provider route). `supportedModels` keeps the startup list, so
+ * (the adapter's provider route). Claude Code merges env keys. Keep the client's
+ * env in its original settings so it still depends on those settings validating.
+ * `supportedModels` keeps the startup list, so
  * `reinitialize` reads the models again. It also cancels pending hook callbacks,
  * so call it before the first prompt. If the refresh fails, restore the flag
  * environment before returning the startup list.
