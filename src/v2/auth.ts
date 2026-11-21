@@ -17,7 +17,7 @@
  */
 import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
-import type { AccountInfo, ModelInfo, Settings } from "@anthropic-ai/claude-agent-sdk";
+import type { AccountInfo, ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import type { AuthStatusKind } from "../auth-status.js";
 import type { Logger } from "../logger.js";
 import { terminalAuthMethods } from "../auth-methods.js";
@@ -40,6 +40,8 @@ import {
   PROVIDER_ID,
   type ProviderConfig,
   providerConfigFromSetRequest,
+  type ProviderRouteSettings,
+  providerRouteSettings,
   validatedGatewayAuthRequest,
   withListedModels,
 } from "../providers.js";
@@ -51,11 +53,11 @@ export interface SessionRouting {
   /** Added to the query's env. Empty without a gateway login or a provider. */
   env: Record<string, string>;
   /**
-   * The programmatic settings of the query, with the route's env too: Claude
-   * Code applies the env of settings.json after the process env, so user or
-   * project settings could restore another `ANTHROPIC_BASE_URL` otherwise.
+   * The route as settings, for the query's `settings` option and for the
+   * running session (see `providerRouteSettings` and `applyProviderRoute`).
+   * Absent without a gateway login or a provider.
    */
-  settings?: Settings;
+  settings?: ProviderRouteSettings;
   /** The models the session offers: those the provider's gateway listed. */
   models(models: ModelInfo[]): ModelInfo[];
   /** Whether {@link models} narrows the models to a gateway's list. */
@@ -243,7 +245,7 @@ export class V2Auth {
     const env = createEnvForProvider(config);
     return {
       env,
-      ...(config ? { settings: { apiKeyHelper: "", env } } : {}),
+      ...(config ? { settings: providerRouteSettings(env) } : {}),
       models: (models) =>
         config?.listedModels
           ? narrowToGatewayModels(models, config.listedModels, config.bedrockRegionPrefix)

@@ -75,6 +75,8 @@ const sdk = vi.hoisted(() => ({
   startFailure: undefined as Error | undefined,
   /** When set, the SDK refuses the query's options with it: `query()` throws. */
   optionsRefusal: undefined as Error | undefined,
+  /** When set, Claude Code refuses flag settings with it: `applyFlagSettings` rejects. */
+  flagRefusal: undefined as Error | undefined,
   /** When set, Claude Code's start waits for it. */
   startGate: undefined as Promise<void> | undefined,
   /** When set, the query serves Remote Control with it (`enableRemoteControl`). */
@@ -119,7 +121,9 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         setModel: vi.fn(async () => {}),
         stopTask: vi.fn(async () => {}),
         close: vi.fn(() => push({ value: undefined, done: true })),
-        applyFlagSettings: vi.fn(async () => {}),
+        applyFlagSettings: vi.fn(async () => {
+          if (sdk.flagRefusal) throw sdk.flagRefusal;
+        }),
         rewindFiles: vi.fn(async () => ({ canRewind: true, filesChanged: [] })),
       };
       sdk.processes.push(fake);
@@ -223,6 +227,7 @@ beforeEach(async () => {
   sdk.previewGate = undefined;
   sdk.startFailure = undefined;
   sdk.optionsRefusal = undefined;
+  sdk.flagRefusal = undefined;
   sdk.startGate = undefined;
   sdk.enableRemoteControl = undefined;
   vi.mocked(forkSession).mockClear();
@@ -650,6 +655,43 @@ describe("ACP v2 core", () => {
     });
     // In the settings tier too, so a settings.json env cannot restore another route.
     expect(settings).toMatchObject({ apiKeyHelper: "", env: { ANTHROPIC_BASE_URL: baseUrl } });
+    // And applied to the running session, which does not depend on the `settings` option.
+    expect(sdk.processes[0].applyFlagSettings.mock.calls[0]).toEqual([
+      { apiKeyHelper: "", env: expect.objectContaining({ ANTHROPIC_BASE_URL: baseUrl }) },
+    ]);
+  });
+
+  it("starts no session when Claude Code refuses the route of a gateway login", async () => {
+    // The text of Claude Code 2.1.328 for a refused `applyFlagSettings`.
+    sdk.flagRefusal = new Error(
+      "apply_flag_settings: nothing in this request was applied and earlier settings stay in force. " +
+        "Fix or remove these invalid settings and send it again: env",
+    );
+    const initialized = vi.spyOn(SettingsManager.prototype, "initialize");
+    const disposed = vi.spyOn(SettingsManager.prototype, "dispose");
+    const client = v2Client();
+    const error = await client.connect(async (agent) => {
+      await agent.request(v2.methods.agent.initialize, {
+        protocolVersion: v2.PROTOCOL_VERSION,
+        info: { name: "v2-test-client", version: "1.0.0" },
+        capabilities: { auth: { _meta: { gateway: true } } },
+      });
+      await agent.request(v2.methods.agent.auth.login, {
+        methodId: "gateway",
+        _meta: { gateway: { baseUrl: "https://gateway.example.com" } },
+      });
+      return agent.request(v2.methods.agent.session.new, { cwd }).catch((error: unknown) => error);
+    });
+
+    expect(error).toMatchObject({
+      code: -32603,
+      message: expect.stringContaining("Claude Code did not take its provider or gateway route"),
+      data: { details: sdk.flagRefusal.message },
+    });
+    expect(sdk.processes[0].close).toHaveBeenCalledOnce();
+    expect(disposed).toHaveBeenCalledTimes(initialized.mock.calls.length);
+    initialized.mockRestore();
+    disposed.mockRestore();
   });
 
   it("rejects an incompatible provider listing before a prompt and recovers", async () => {
