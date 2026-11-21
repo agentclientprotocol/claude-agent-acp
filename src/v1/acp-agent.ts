@@ -379,6 +379,7 @@ import {
   withCurrentModelInfo,
 } from "../session-model.js";
 import {
+  applyProviderRoute,
   createEnvForProvider,
   defaultProviderConfig,
   gatewayRequestToProviderConfig,
@@ -389,6 +390,7 @@ import {
   PROVIDER_ID,
   type ProviderConfig,
   providerConfigFromSetRequest,
+  providerRouteSettings,
   validatedGatewayAuthRequest,
   withListedModels,
 } from "../providers.js";
@@ -10216,14 +10218,14 @@ export class ClaudeAcpAgent {
       userProvidedOptions?.settings,
       params.cwd,
     );
-    // Claude Code applies env from settings.json after the subprocess env. Put
-    // an active ACP route in the programmatic settings tier too so user/project
-    // settings cannot silently restore a different ANTHROPIC_BASE_URL.
-    const settings = resolvedProvider
+    // An active ACP route goes into the programmatic settings tier too (see
+    // `providerRouteSettings`).
+    const route = resolvedProvider ? providerRouteSettings(providerEnv) : undefined;
+    const settings = route
       ? {
           ...configuredSettingsObject,
-          apiKeyHelper: "",
-          env: { ...configuredSettingsObject?.env, ...providerEnv },
+          ...route,
+          env: { ...configuredSettingsObject?.env, ...route.env },
         }
       : configuredSettingsObject;
     const env = {
@@ -10520,6 +10522,8 @@ export class ClaudeAcpAgent {
         }
         throw startupFailureError(error) ?? error;
       }
+      // Before a request of the session reaches the provider.
+      if (route) await applyProviderRoute(q, route);
       timing.phase("sdk-initialize");
 
       // Publish the identity BEFORE the guard can refuse this session. A

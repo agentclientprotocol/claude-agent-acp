@@ -149,6 +149,7 @@ function scriptedTurnQuery(args: any, account: Record<string, unknown>) {
   query.accountInfo = async () => account;
   query.setModel = async () => {};
   query.setPermissionMode = async () => {};
+  query.applyFlagSettings = async () => {};
   query.supportedCommands = async () => [];
   query.mcpServerStatus = async () => [];
   query.getContextUsage = async () => DEFAULT_CONTEXT_USAGE;

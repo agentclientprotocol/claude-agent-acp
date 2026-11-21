@@ -47,6 +47,7 @@ import {
   promptSuggestionOptions,
   type PromptSuggestionForms,
 } from "../prompt-suggestions.js";
+import { applyProviderRoute } from "../providers.js";
 import {
   readHistoryAcrossCompactions,
   readResumedTail,
@@ -1229,6 +1230,16 @@ class V2Agent implements AgentHandle, SessionConnection {
         throw RequestError.sessionNotFound(resume);
       }
       throw startupFailureError(error) ?? error;
+    }
+    if (routing.settings) {
+      // Before a request of the session reaches the provider.
+      try {
+        await applyProviderRoute(q, routing.settings);
+      } catch (error) {
+        q.close();
+        settings.dispose();
+        throw error;
+      }
     }
     authStarted(sessionId, initialization.account);
     try {

@@ -1,6 +1,9 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { once } from "node:events";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -259,6 +262,57 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("v2 core with Claude Code", 
     },
     60_000,
   );
+
+  // The session's requests go to two local servers: it costs no API usage.
+  it("keeps a provider's route when Claude Code does not load the client's settings", async () => {
+    const servers: Server[] = [];
+    /** Starts a local server that records the paths of its POST requests in `posts`. */
+    const serve = async (posts: string[]): Promise<string> => {
+      const server = createServer((request, response) => {
+        if (request.method === "POST") posts.push(request.url ?? "");
+        // No model listing (404), and no answer to a model request (400).
+        response.writeHead(request.method === "POST" ? 400 : 404, {
+          "content-type": "application/json",
+        });
+        response.end(
+          JSON.stringify({
+            type: "error",
+            error: { type: "invalid_request_error", message: "local test server" },
+          }),
+        );
+      }).listen(0, "127.0.0.1");
+      servers.push(server);
+      await once(server, "listening");
+      return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    };
+    try {
+      const providerPosts: string[] = [];
+      const projectPosts: string[] = [];
+      // The project's settings name another base URL than the provider's.
+      await mkdir(path.join(cwd, ".claude"));
+      await writeFile(
+        path.join(cwd, ".claude", "settings.json"),
+        JSON.stringify({ env: { ANTHROPIC_BASE_URL: await serve(projectPosts) } }),
+      );
+      await agent.request(v2.methods.agent.providers.set, {
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: await serve(providerPosts),
+      });
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, {
+        cwd,
+        // `allow` must be a list, so Claude Code leaves the whole `settings` option out.
+        _meta: { claudeCode: { options: { settings: { permissions: { allow: "Bash" } } } } },
+      });
+      await prompt(sessionId, "Reply with exactly the single word: pong");
+      await until(() => states(sessionId).some((update) => update.state === "idle"));
+
+      expect(providerPosts.some((url) => url.startsWith("/v1/messages"))).toBe(true);
+      expect(projectPosts).toEqual([]);
+    } finally {
+      for (const server of servers) server.close();
+    }
+  }, 180_000);
 
   it("reports requires_action while a permission request waits", async () => {
     const sessionId = await newSession("default");

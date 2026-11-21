@@ -1558,6 +1558,11 @@ describe("ACP v2 sessions", () => {
       expect(sdk.queryOptions).toHaveLength(2);
       expect(sdk.queryOptions[1].effort).toBeUndefined();
       expect(sdk.flagSettings).toEqual([
+        // The provider's route, before the session's own choices.
+        {
+          apiKeyHelper: "",
+          env: expect.objectContaining({ ANTHROPIC_BASE_URL: "https://gateway.example.com" }),
+        },
         { ultracode: true },
         { fastMode: false },
         { fastMode: true },
