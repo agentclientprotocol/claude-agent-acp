@@ -10488,6 +10488,36 @@ describe("ACP v2 session translation", () => {
     });
   });
 
+  it("ends a tool call's text item with a blank line when another text item follows", () => {
+    const text = (text: string): v1.ToolCallContent => ({
+      type: "content",
+      content: { type: "text", text },
+    });
+    const terminal: v1.ToolCallContent = { type: "terminal", terminalId: "term" };
+    // A v2 client joins adjacent text items without a separator.
+    expect(
+      v2SessionUpdate({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "t",
+        content: [
+          text("```\nfirst\n```"),
+          text("ends a line\n"),
+          text("before a terminal"),
+          terminal,
+          text("last"),
+        ],
+      }),
+    ).toMatchObject({
+      content: [
+        text("```\nfirst\n```\n\n"),
+        text("ends a line\n\n"),
+        text("before a terminal"),
+        terminal,
+        text("last"),
+      ],
+    });
+  });
+
   it("keeps the audience roles of a prompt block that v1 knows", () => {
     const prompt = (audience: string[]) =>
       v1PromptRequest({
