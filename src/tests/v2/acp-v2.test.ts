@@ -2481,6 +2481,82 @@ describe("ACP v2 prompts", () => {
     ]);
   });
 
+  const fixedRefusal = {
+    behavior: "deny",
+    message: "User refused permission to run tool",
+    decisionClassification: "user_reject",
+  };
+  it.each<[string, v2.RequestPermissionResponse["outcome"], Record<string, unknown>]>([
+    [
+      "a reject that gives a reason with that reason",
+      {
+        outcome: "selected",
+        optionId: "reject",
+        _meta: { claudeCode: { denyMessage: "  Run `npm test` instead.\n" } },
+      },
+      { ...fixedRefusal, message: "Run `npm test` instead." },
+    ],
+    [
+      "a reject that gives no reason with the fixed refusal",
+      { outcome: "selected", optionId: "reject", _meta: { claudeCode: {} } },
+      fixedRefusal,
+    ],
+    [
+      "a reject that gives a blank reason with the fixed refusal",
+      { outcome: "selected", optionId: "reject", _meta: { claudeCode: { denyMessage: " \n" } } },
+      fixedRefusal,
+    ],
+    [
+      "a reject whose reason is not a string with the fixed refusal",
+      { outcome: "selected", optionId: "reject", _meta: { claudeCode: { denyMessage: 42 } } },
+      fixedRefusal,
+    ],
+    [
+      "an allow that carries a reason as an allow",
+      {
+        outcome: "selected",
+        optionId: "allow-once",
+        _meta: { claudeCode: { denyMessage: "Run `npm test` instead." } },
+      },
+      {
+        behavior: "allow",
+        updatedInput: { command: "ls" },
+        decisionClassification: "user_temporary",
+      },
+    ],
+  ])("answers %s", async (_name, outcome, expected) => {
+    let decision: unknown;
+    scriptTurns(async function* (options) {
+      yield toolUseMessage(options, "toolu_1", "Bash", { command: "ls" });
+      const answer = await options.canUseTool!("Bash", { command: "ls" }, {
+        signal: new AbortController().signal,
+        toolUseID: "toolu_1",
+        suggestions: [],
+      } as unknown as Parameters<NonNullable<Options["canUseTool"]>>[2]);
+      decision = answer;
+      // Claude Code returns the deny message to the model as the tool's result.
+      yield answer?.behavior === "deny"
+        ? toolResultMessage(
+            options,
+            "toolu_1",
+            { is_error: true, content: answer.message },
+            "permission-rule",
+          )
+        : toolResultMessage(options, "toolu_1", {});
+      yield result(options);
+    });
+    const client = v2Client({ answerPermission: () => ({ outcome }) });
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      await client.authUpdate(1);
+    });
+
+    expect(decision).toEqual({ ...expected, toolUseID: "toolu_1" });
+  });
+
   it.each(["same", "different"])("forks a promptable session in the %s cwd", async (dir) => {
     const forkId = "99999999-8888-4777-8666-555555555555";
     const forkCwd = dir === "same" ? cwd : await mkdtemp(path.join(tempDir, "fork-"));
