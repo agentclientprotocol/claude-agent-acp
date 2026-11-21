@@ -1,8 +1,8 @@
 /**
- * The session updates that show the session's plans. A client with the `plan`
- * capability (every v2 client, and a v1 client that asks for it) tracks plans
- * by ID and gets `plan_update` and `plan_removed`; any other client gets the
- * legacy `plan` update, which holds one ID-less plan per session.
+ * The session updates that show the session's plans. A v2 client, and a v1
+ * client that advertises the `plan` capability, tracks plans by ID and gets
+ * `plan_update` and `plan_removed`; any other v1 client gets the legacy `plan`
+ * update, which holds one ID-less plan per session.
  */
 import type {
   PlanEntry,

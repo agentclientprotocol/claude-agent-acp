@@ -1,7 +1,7 @@
 # Subagent sessions
 
 A client that declares `clientCapabilities.subagents`, other than JetBrains AIR, gets each Agent or
-Task subagent as its own child session, following the [subagents RFD](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/rfds/subagents.mdx):
+Task subagent as its own child session, following ACP's [subagents](https://agentclientprotocol.com/protocol/v1/subagents):
 
 - `subagent_update` on the parent announces the child before any of its traffic, with the
   parent's `title` and `description` for it, and reports its work state: `running`,
@@ -108,7 +108,7 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
   that names an announced child of a running session fails with `-32602` (Invalid params),
   `session/close` and `session/delete` too.
 
-An [ACP v2](../README.md#experimental-acp-v2) client gets the same without declaring anything, since subagents
+An [ACP v2](../README.md#acp-v2-preview) client gets the same without declaring anything, since subagents
 are part of v2's baseline. Each child also reports its work state as its own `state_update`, right
 after the parent's copy. A replay ends each child's history with a `replay_complete` on the child's
 session. On v2, the parent's `replay_complete` is what separates a replayed child state from a
