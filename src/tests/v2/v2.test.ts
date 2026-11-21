@@ -2149,6 +2149,27 @@ describe("ACP v2 core", () => {
     });
   });
 
+  it("removes the origin of a usage update when the next result has none", async () => {
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      const { claude } = await openSession(agent);
+      for (const origin of [{ kind: "task-notification" }, undefined]) {
+        for (const event of textDelta(`msg_${randomUUID()}`, "Done")) claude.send(event);
+        claude.send(result(origin ? { origin } : {}));
+        claude.send(sessionState("idle"));
+      }
+      await vi.waitFor(() =>
+        expect(client.states()).toEqual(["running", "idle", "running", "idle"]),
+      );
+    });
+
+    // A v2 client keeps a `_meta` key of a `usage_update` until `null` removes it.
+    const origins = client.sessionUpdates
+      .filter((update) => update.sessionUpdate === "usage_update" && update.cost != null)
+      .map((update) => (update._meta as Record<string, unknown>)["_claude/origin"]);
+    expect(origins).toEqual([{ kind: "task-notification" }, null]);
+  });
+
   it.each([
     ["the turn of another prompt", true],
     ["a cycle that Claude Code started on its own", false],
