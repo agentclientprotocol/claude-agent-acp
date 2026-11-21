@@ -2431,7 +2431,7 @@ describe("ACP v2 core", () => {
       ];
     });
 
-    it("names each model's efforts in every answer to an AIR client that declares it", async () => {
+    it("names each model's efforts in every answer, without a capability", async () => {
       sdk.models = [
         { ...sdk.models[0], resolvedModel: "claude-opus-5" },
         { ...sdk.models[0], value: "opus", displayName: "Opus", resolvedModel: "claude-opus-5" },
@@ -2459,9 +2459,7 @@ describe("ACP v2 core", () => {
         await agent.request(v2.methods.agent.initialize, {
           protocolVersion: v2.PROTOCOL_VERSION,
           info: { name: "v2-test-client", version: "1.0.0" },
-          capabilities: {
-            _meta: { jetbrains: { air: { version: 1, capabilities: ["modelReasoningEfforts"] } } },
-          },
+          capabilities: {},
         });
         const created = await agent.request(v2.methods.agent.session.new, { cwd });
         const set = await agent.request(v2.methods.agent.session.setConfigOption, {

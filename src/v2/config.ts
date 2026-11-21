@@ -13,10 +13,7 @@
  * client takes them. For an AIR client that declares `recommendedValue`, the
  * model and effort options carry no `default` row and name a recommendation
  * (`_meta.jetbrains.air.recommendedValue`), and the effort they show is set
- * on the query at the start and at each model switch, as on v1. For an AIR
- * client that declares `modelReasoningEfforts`, each entry of the model
- * option names its model's effort levels
- * (`_meta.jetbrains.air.reasoningEfforts`).
+ * on the query at the start and at each model switch, as on v1.
  *
  * The mode follows `SessionModeManager`: a model whose `ModelInfo` does not
  * report `supportsAutoMode` runs `auto` as `acceptEdits`, with a notice,
@@ -123,8 +120,6 @@ export interface ConfigSetup {
   effortSettings(): Settings;
   /** The client declared AIR's `recommendedValue` (see the module doc). */
   recommendedValue: boolean;
-  /** The client declared AIR's `modelReasoningEfforts` (see the module doc). */
-  modelReasoningEfforts: boolean;
   /** A `providers/set` gateway listed the models, so only those can run. */
   narrowsModels: boolean;
 }
@@ -168,8 +163,6 @@ export class SessionConfig {
     private readonly effortSettings: () => Settings,
     /** The client declared AIR's `recommendedValue` (see the module doc). */
     private readonly recommendedValue: boolean,
-    /** The client declared AIR's `modelReasoningEfforts` (see the module doc). */
-    private readonly modelReasoningEfforts: boolean,
     /** Sends an update of the session, such as the Auto mode fallback's notice. */
     private readonly notify: (notification: SessionNotification) => void,
     private readonly logger: Logger,
@@ -270,10 +263,7 @@ export class SessionConfig {
         useBooleanOption: BOOLEAN_OPTIONS,
         disabledReason: fastModeDisabledReason,
       },
-      {
-        useRecommendedValue: setup.recommendedValue,
-        modelReasoningEfforts: setup.modelReasoningEfforts,
-      },
+      { useRecommendedValue: setup.recommendedValue },
       {
         supported:
           ultracodeReport?.available ?? ultracodeSupported(workflowsEnabled, currentModelInfo),
@@ -313,7 +303,6 @@ export class SessionConfig {
       },
       setup.effortSettings,
       setup.recommendedValue,
-      setup.modelReasoningEfforts,
       notify,
       logger,
       autoModeFallbackWarningPending,
@@ -707,10 +696,7 @@ export class SessionConfig {
         useBooleanOption: BOOLEAN_OPTIONS,
         disabledReason: this.fastModeDisabledReason,
       },
-      {
-        useRecommendedValue: this.recommendedValue,
-        modelReasoningEfforts: this.modelReasoningEfforts,
-      },
+      { useRecommendedValue: this.recommendedValue },
       {
         supported: ultracodeSupported(this.ultracodeWorkflowsEnabled, info),
         enabled: this.ultracodeEnabled,

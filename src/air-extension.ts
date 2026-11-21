@@ -7,12 +7,6 @@ export const AIR_ASYNC_TASKS_CAPABILITY = "asyncTasks";
 export const AIR_BACKGROUND_SUBAGENTS_CAPABILITY = "backgroundSubagents";
 export const AIR_SESSION_FAILURE_CAPABILITY = "sessionFailure";
 export const AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY = "recommendedValue";
-/**
- * Each entry of the `model` config option names the effort levels of its
- * model in `_meta.jetbrains.air` (see {@link AIR_REASONING_EFFORTS_KEY}).
- * The client declares it; the agent does not advertise it.
- */
-export const AIR_MODEL_REASONING_EFFORTS_CAPABILITY = "modelReasoningEfforts";
 export const AIR_CUSTOM_INSTRUCTIONS_CAPABILITY = "customInstructions";
 export const AIR_DIFF_PATCH_CAPABILITY = "diffPatch";
 /** AIR renders `rawInput` itself and needs no display copy of the input. */
@@ -77,7 +71,9 @@ export const AIR_PERMISSION_KEY = "permission";
 export const AIR_CUSTOM_ANSWER_KEY = "customAnswer";
 /**
  * The `_meta.jetbrains.air` key of a `model` option entry: the effort levels
- * of the model and the recommended one, `{values, recommended}`.
+ * of the model and the recommended one, `{values, recommended}`. Every client
+ * gets it: the key only adds data, and a client that does not know it
+ * ignores it.
  */
 export const AIR_REASONING_EFFORTS_KEY = "reasoningEfforts";
 /** The `_meta.jetbrains.air` key of the update that ends a whole history replay. */

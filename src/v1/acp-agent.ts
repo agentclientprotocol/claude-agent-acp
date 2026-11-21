@@ -414,7 +414,6 @@ import {
 import {
   buildConfigOptions,
   clientSupportsBooleanConfigOptions,
-  clientSupportsModelReasoningEfforts,
   clientSupportsRecommendedConfigValue,
   configOptionValue,
   setSelectedModel,
@@ -9683,7 +9682,6 @@ export class ClaudeAcpAgent {
         },
         {
           useRecommendedValue,
-          modelReasoningEfforts: clientSupportsModelReasoningEfforts(this.clientCapabilities),
         },
         {
           // Like Fast mode, the toggle hides on models without ultracode
@@ -10693,7 +10691,6 @@ export class ClaudeAcpAgent {
         fastMode,
         {
           useRecommendedValue,
-          modelReasoningEfforts: clientSupportsModelReasoningEfforts(this.clientCapabilities),
         },
         ultracode,
       );

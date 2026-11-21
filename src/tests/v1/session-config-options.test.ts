@@ -872,9 +872,6 @@ describe("session config options", () => {
     });
 
     it("keeps each model's efforts in config_option_update after an external switch", async () => {
-      (agent as any).clientCapabilities = {
-        _meta: { jetbrains: { air: { version: 1, capabilities: ["modelReasoningEfforts"] } } },
-      };
       const session = agent.sessions[SESSION_ID];
       session.modelInfos[1].supportsEffort = false;
 

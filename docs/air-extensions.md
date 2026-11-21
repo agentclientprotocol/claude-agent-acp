@@ -162,7 +162,6 @@ It does not serve the [tool call contract](#tool-call-contract) yet.
 | `diffPatch`              | yes                 | Sends an exact Git patch in the diff block of an Edit or a Write.                                               | [Diff patch](#diff-patch)                               |
 | `sessionFailure`         | yes                 | Sends warnings and errors as typed transcript records.                                                          | [Session failure](#session-failure)                     |
 | `recommendedValue`       | yes                 | Replaces the `default` model and effort rows with concrete values and a recommendation.                         | [Recommended config values](#recommended-config-values) |
-| `modelReasoningEfforts`  | no                  | Names the effort levels of each model in its `model` option entry.                                              | [Model reasoning efforts](#model-reasoning-efforts)     |
 | `asyncTasks`             | yes                 | Publishes background work that is not a subagent as async tasks.                                                | [Async tasks](#async-tasks)                             |
 | `agentFileChangeReport`  | yes                 | Accepts a report request on `session/prompt` and sends the changed file list.                                   | [Agent file-change report](#agent-file-change-report)   |
 | `nativeSubagentSessions` | yes                 | Reports an Agent or Task subagent as a native ACP child session.                                                | [Native subagent sessions](#native-subagent-sessions)   |
@@ -187,7 +186,7 @@ The agent advertises the `goal` object, and the client uses the control method w
 
 Every payload goes into `_meta.jetbrains.air`, next to `version: 1`.
 The adapter merges a payload into an existing `_meta` and keeps the other namespaces.
-The adapter sends these keys only to an AIR client. "AIR" in the Gate column means an AIR client without a further capability.
+The adapter sends these keys only to an AIR client, except a key whose Gate column says "every client". "AIR" in the Gate column means an AIR client without a further capability.
 
 | Key                            | Message and field path                                                                | Shape                                                                  | Gate                                                                                   |
 | ------------------------------ | ------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
@@ -197,7 +196,7 @@ The adapter sends these keys only to an AIR client. "AIR" in the Gate column mea
 | `diffPatch`                    | tool call and permission request `content[]` of type `diff`, `_meta.jetbrains.air`    | `{version: 1, format: "git_patch", text}`                              | `diffPatch`                                                                            |
 | `permission`                   | `session/request_permission` request `_meta.jetbrains.air`                            | `{version: 1, title, description?, defaultToNo?}`                      | AIR                                                                                    |
 | `recommendedValue`             | `model` and effort config options, `_meta.jetbrains.air`                              | option value string                                                    | `recommendedValue`                                                                     |
-| `reasoningEfforts`             | entry of the `model` config option, `_meta.jetbrains.air`                             | `{values: string[], recommended: string}`                              | `modelReasoningEfforts`                                                                |
+| `reasoningEfforts`             | entry of the `model` config option, `_meta.jetbrains.air`                             | `{values: string[], recommended: string}`                              | every client                                                                           |
 | `asyncTasks`                   | Bash `tool_call_update._meta.jetbrains.air`                                           | `{backgrounded: true}`                                                 | `asyncTasks`                                                                           |
 | `agentFileChangeReportRequest` | `session/prompt` request `_meta.jetbrains.air` (client to agent)                      | `{version: 1, requestId}`                                              | `agentFileChangeReport`                                                                |
 | `agentFileChangeReport`        | `session_info_update._meta.jetbrains.air`                                             | report object                                                          | `agentFileChangeReport`                                                                |
@@ -989,15 +988,15 @@ The live test only initializes the SDK. It sends no model prompt.
 
 ## Model reasoning efforts
 
-The `modelReasoningEfforts` extension lets a client show the effort levels of a model before the client selects that model.
+The `reasoningEfforts` key lets a client show the effort levels of a model before the client selects that model.
 The effort option shows only the levels of the current model.
 
 ### Activation
 
-The adapter enables the extension only when the client declares `modelReasoningEfforts`.
-The client declares the capability. The agent does not list it in its `initialize` response.
-Otherwise the entries of the `model` option have no `_meta`.
-The extension does not depend on `recommendedValue`.
+The adapter always sends the key, to every client.
+The key has no capability, because it only adds data.
+A client that does not know the key ignores it.
+The key does not depend on `recommendedValue`.
 
 ### Entry metadata
 

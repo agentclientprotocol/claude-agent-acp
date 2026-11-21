@@ -1787,9 +1787,6 @@ describe("createSession options merging", () => {
     );
 
     describe("model reasoning efforts", () => {
-      const AIR_EFFORTS_CLIENT = {
-        _meta: { jetbrains: { air: { version: 1, capabilities: ["modelReasoningEfforts"] } } },
-      } as ClientCapabilities;
       const efforts = (values: string[], recommended: string) => ({
         jetbrains: { air: { version: 1, reasoningEfforts: { values, recommended } } },
       });
@@ -1806,8 +1803,8 @@ describe("createSession options merging", () => {
         "claude-haiku-4-5": efforts(["low", "medium"], "medium"),
       };
 
-      it("names each model's efforts in every answer to a client that declares it", async () => {
-        await agent.initialize({ protocolVersion: 1, clientCapabilities: AIR_EFFORTS_CLIENT });
+      it("names each model's efforts in every answer, without a capability", async () => {
+        await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
         const created = await agent.newSession({ cwd, mcpServers: [] });
         expect(entryMetas(created)).toEqual(expected);
 
@@ -1834,20 +1831,16 @@ describe("createSession options merging", () => {
         expect(
           entryMetas(await agent.unstable_forkSession({ sessionId, cwd, mcpServers: [] })),
         ).toEqual(expected);
-      });
-
-      it("names no efforts to a client that does not declare it", async () => {
-        await agent.initialize({
-          protocolVersion: 1,
-          clientCapabilities: {
-            _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
-          } as ClientCapabilities,
-        });
-        const created = await agent.newSession({ cwd, mcpServers: [] });
-        expect(entryMetas(created)).toEqual({
-          "claude-sonnet-4-6": undefined,
-          "claude-haiku-4-5": undefined,
-        });
+        // The fork's command list goes out after the response. Wait for it, so
+        // that it does not reach the updates of the next test.
+        await vi.waitFor(() =>
+          expect(
+            updates.some(
+              (u) =>
+                u.sessionId === FORK_ID && u.update.sessionUpdate === "available_commands_update",
+            ),
+          ).toBe(true),
+        );
       });
     });
 

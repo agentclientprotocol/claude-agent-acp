@@ -263,8 +263,6 @@ export function buildModelConfigOption(
   models: SessionModelState,
   modelInfos: ModelInfo[],
   useRecommendedValue: boolean,
-  /** Each entry names its model's effort levels (see {@link modelReasoningEffortsMeta}). */
-  reasoningEfforts = false,
 ): SessionConfigOption {
   const defaultInfo = modelInfos.find((model) => model.value === "default");
   // The listed model that the `default` row runs, which names the row.
@@ -328,17 +326,16 @@ export function buildModelConfigOption(
       description: info?.description || undefined,
     });
   }
-  if (reasoningEfforts) {
-    for (const option of options) {
-      // The `default` row runs the model it resolves to; without one, it
-      // names no efforts.
-      const meta = modelReasoningEffortsMeta(
-        option.value === "default"
-          ? defaultTarget
-          : modelInfos.find((info) => info.value === option.value),
-      );
-      if (meta) option._meta = meta;
-    }
+  // Each entry names its model's effort levels (see
+  // `modelReasoningEffortsMeta`). The `default` row runs the model it
+  // resolves to; without one, it names no efforts.
+  for (const option of options) {
+    const meta = modelReasoningEffortsMeta(
+      option.value === "default"
+        ? defaultTarget
+        : modelInfos.find((info) => info.value === option.value),
+    );
+    if (meta) option._meta = meta;
   }
 
   return {

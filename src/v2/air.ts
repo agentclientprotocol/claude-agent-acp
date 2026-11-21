@@ -7,7 +7,6 @@
  */
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import {
-  AIR_MODEL_REASONING_EFFORTS_CAPABILITY,
   AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
   airCapabilityMeta,
   clientSupportsAirCapability,
@@ -28,8 +27,6 @@ export interface AirSupport {
   readonly client: boolean;
   /** `recommendedValue`: concrete model and effort rows with a recommendation. */
   readonly recommendedValue: boolean;
-  /** `modelReasoningEfforts`: each `model` option entry names its model's effort levels. */
-  readonly modelReasoningEfforts: boolean;
   /** `agentFileChangeReport`: the changed files of a prompt's turn. */
   readonly fileChangeReport: boolean;
 }
@@ -38,7 +35,6 @@ export interface AirSupport {
 export const NO_AIR: AirSupport = {
   client: false,
   recommendedValue: false,
-  modelReasoningEfforts: false,
   fileChangeReport: false,
 };
 
@@ -51,20 +47,15 @@ export function airSupport(capabilities: v2.ClientCapabilities | null | undefine
       capabilities,
       AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
     ),
-    modelReasoningEfforts: clientSupportsAirCapability(
-      capabilities,
-      AIR_MODEL_REASONING_EFFORTS_CAPABILITY,
-    ),
     fileChangeReport: supportsAgentFileChangeReport(capabilities),
   };
 }
 
 /**
  * The `initialize` response `_meta` of an AIR client: the capabilities this
- * core serves, which the v1 core advertises too. `loadReplayEnd` (see
- * `setup.ts`) and `modelReasoningEfforts` are served but not listed: the
- * client declares them, and the agent does not advertise them. Undefined for
- * every other client.
+ * core serves, which the v1 core advertises too. `loadReplayEnd` is served
+ * (see `setup.ts`) but not listed: the client declares it, and the agent does
+ * not advertise it. Undefined for every other client.
  */
 export function airInitializeMeta(air: AirSupport): Record<string, unknown> | undefined {
   if (!air.client) return undefined;

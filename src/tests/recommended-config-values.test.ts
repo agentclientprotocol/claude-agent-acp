@@ -3,14 +3,10 @@ import type { ClientCapabilities, SessionConfigOption } from "@agentclientprotoc
 import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import {
   buildConfigOptions,
-  clientSupportsModelReasoningEfforts,
   clientSupportsRecommendedConfigValue,
   orderedConfigOptions,
 } from "../session-config-options.js";
-import {
-  AIR_MODEL_REASONING_EFFORTS_CAPABILITY,
-  AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
-} from "../air-extension.js";
+import { AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY } from "../air-extension.js";
 import { recommendedEffortLevel } from "../session-effort.js";
 
 const MODES = {
@@ -291,7 +287,7 @@ describe("buildConfigOptions recommended values presentation", () => {
 });
 
 describe("model reasoning efforts", () => {
-  const EFFORTS_PRESENTATION = { useRecommendedValue: false, modelReasoningEfforts: true };
+  const EFFORTS_PRESENTATION = undefined;
 
   function effortsMeta(values: string[], recommended: string) {
     return { jetbrains: { air: { version: 1, reasoningEfforts: { values, recommended } } } };
@@ -307,19 +303,6 @@ describe("model reasoning efforts", () => {
   function entry(options: ReturnType<typeof buildConfigOptions>, value: string) {
     return entries(options).find((candidate) => candidate.value === value);
   }
-
-  it("is enabled through the common AIR capability list", () => {
-    const air = (capabilities: string[]) => ({
-      _meta: { jetbrains: { air: { version: 1, capabilities } } },
-    });
-    expect(clientSupportsModelReasoningEfforts(air([AIR_MODEL_REASONING_EFFORTS_CAPABILITY]))).toBe(
-      true,
-    );
-    expect(
-      clientSupportsModelReasoningEfforts(air([AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY])),
-    ).toBe(false);
-    expect(clientSupportsModelReasoningEfforts(undefined)).toBe(false);
-  });
 
   it("recommends medium when offered, else the first level", () => {
     expect(recommendedEffortLevel(["low", "medium", "high"])).toBe("medium");
@@ -451,7 +434,7 @@ describe("model reasoning efforts", () => {
         [],
         "default",
         undefined,
-        { useRecommendedValue: true, modelReasoningEfforts: true },
+        RECOMMENDED_PRESENTATION,
       );
       const recommended = (
         entry(options, currentModelId)?._meta as {
@@ -471,7 +454,7 @@ describe("model reasoning efforts", () => {
       [],
       "default",
       undefined,
-      { useRecommendedValue: true, modelReasoningEfforts: true },
+      RECOMMENDED_PRESENTATION,
     );
     const model = selectOption(options, "model");
     expect(model._meta).toEqual(recommendedMeta("sonnet"));
@@ -486,9 +469,9 @@ describe("model reasoning efforts", () => {
   });
 
   it.each([
-    ["without the capability", undefined],
-    ["with only recommendedValue", RECOMMENDED_PRESENTATION],
-  ])("adds no entry metadata %s", (_name, presentation) => {
+    ["without AIR metadata", undefined],
+    ["with recommendedValue", RECOMMENDED_PRESENTATION],
+  ])("names the efforts for every client, %s", (_name, presentation) => {
     const options = buildConfigOptions(
       MODES,
       MODELS,
@@ -499,7 +482,8 @@ describe("model reasoning efforts", () => {
       undefined,
       presentation,
     );
-    for (const candidate of entries(options)) expect(candidate).not.toHaveProperty("_meta");
+    expect(entry(options, "opus")?._meta).toEqual(effortsMeta(["low", "medium", "high"], "medium"));
+    expect(entry(options, "haiku")).not.toHaveProperty("_meta");
   });
 });
 
