@@ -1132,7 +1132,13 @@ export type Session = {
    *  populated — by each result's modelUsage. No awaited IPC is on these
    *  paths (see the seeding call sites and `contextWindowCache`). */
   contextWindowSize: number;
+  /** The tokens in context after the last main-thread request. A resumed
+   *  session starts with the value its transcript records (see
+   *  `readResumedTail`). */
   contextUsedTokens?: number;
+  /** The background `getContextUsage` that refines `contextWindowSize`;
+   *  settles, never rejects (see `refreshContextWindowInBackground`). */
+  contextWindowRefresh?: Promise<void>;
   /** Whether `contextWindowSize` came from an authoritative source (the
    *  cross-session cache, a `result.modelUsage`, or the background
    *  `getContextUsage`) rather than the default. The background read runs only
@@ -9468,7 +9474,7 @@ export class ClaudeAcpAgent {
   /**
    * The work that follows a session setup response: reading the session's
    * query, the session's commands, the current states of the subagents a load
-   * replayed, and MCP server authentication.
+   * replayed, the session's context usage, and MCP server authentication.
    *
    * Call it in the same synchronous step as the handler's `return`: an
    * `await` between them would let the timer run before the response. The ACP
@@ -9482,6 +9488,8 @@ export class ClaudeAcpAgent {
    * `v1AgentApp`) has no such order.
    */
   private afterSetupResponse(sessionId: string, mcpServers: McpServer[]): void {
+    // Taken with the response: work that runs before the timer reports its own usage.
+    const contextUsed = this.sessions[sessionId]?.contextUsedTokens;
     setTimeout(() => {
       // Claude Code can run cycles of its own before the first prompt, for
       // example a cron prompt or a finished background task of a session that a
@@ -9493,6 +9501,7 @@ export class ClaudeAcpAgent {
       if (session && !session.queryClosed) this.ensureConsumer(session, sessionId);
       this.sendAvailableCommandsUpdate(sessionId);
       void this.publishCurrentSubagentStates(sessionId);
+      void this.publishContextUsage(sessionId, contextUsed);
       startMcpAuthentication(this, sessionId, mcpServers);
     }, 0);
   }
@@ -9594,7 +9603,7 @@ export class ClaudeAcpAgent {
       session.query === query &&
       session.models.currentModelId === modelId;
     // A synchronous throw must not fail the caller either.
-    Promise.resolve()
+    session.contextWindowRefresh = Promise.resolve()
       .then(() => readContextWindow(query))
       .then(
         (window) => {
@@ -9607,6 +9616,36 @@ export class ClaudeAcpAgent {
           if (stillCurrent()) this.logger.error("Failed to read the context window:", error);
         },
       );
+  }
+
+  /**
+   * Sends `used`, the context usage that a session had when its setup
+   * answered: what a resumed session's transcript records, or a live
+   * session's own. ACP's session usage RFD asks for it after `session/load`,
+   * `session/resume` and `session/fork`. It waits for the background window
+   * read, so that `size` is the window Claude Code reports, not the default.
+   * It sends nothing when Claude works in the session or changed the usage
+   * since: that work reports its own usage.
+   */
+  private async publishContextUsage(sessionId: string, used: number | undefined): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session || used === undefined) return;
+    await session.contextWindowRefresh;
+    if (
+      this.sessions[sessionId] !== session ||
+      session.contextUsedTokens !== used ||
+      this.claudeIsWorking(sessionId, session)
+    ) {
+      return;
+    }
+    try {
+      await this.client.sessionUpdate({
+        sessionId,
+        update: { sessionUpdate: "usage_update", used, size: session.contextWindowSize },
+      });
+    } catch (error) {
+      this.logger.error(`Session ${sessionId}: failed to send the context usage:`, error);
+    }
   }
 
   private async applyConfigOptionValue(
@@ -10080,14 +10119,17 @@ export class ClaudeAcpAgent {
     // sign-out respawn, provider rerouting), so fill the same fast local hint
     // here when the caller did not provide it. Never fall back to the slow
     // getContextUsage control request.
-    // The same tail read gives the permission mode of the resumed session.
+    // The same tail read gives the permission mode and the context usage of
+    // the resumed session.
     let resumedModelHint = creationOpts.resumedModelHint;
     let resumedPermissionMode: string | undefined;
+    let resumedContextUsed: number | undefined;
     if (creationOpts.resume !== undefined) {
       const withModel = !Object.prototype.hasOwnProperty.call(creationOpts, "resumedModelHint");
       const tail = await readResumedTail(creationOpts.resume, this.logger, withModel);
       if (withModel) resumedModelHint = tail.model;
       resumedPermissionMode = tail.permissionMode;
+      resumedContextUsed = tail.contextUsed;
       timing.phase("resume-transcript");
     }
 
@@ -10773,6 +10815,7 @@ export class ClaudeAcpAgent {
         emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
         forwardSubagentText,
         contextWindowSize: seededWindow.size,
+        contextUsedTokens: resumedContextUsed,
         contextWindowAuthoritative: seededWindow.authoritative,
         providerCacheKey,
         modelsNarrowedByGateway: resolvedProvider?.listedModels !== undefined,

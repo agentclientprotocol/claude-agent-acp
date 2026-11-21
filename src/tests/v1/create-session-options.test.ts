@@ -11,7 +11,13 @@ import type { AcpClient } from "../../acp-client.js";
 import type { AcpSessionNotification } from "../../acp-subagents.js";
 import { ALLOW_BYPASS } from "../../permissions/modes.js";
 import { NativeSubagentRuntime } from "../../native-subagents.js";
-import { setModelRefusal, startupFailure } from "../helpers.js";
+import {
+  setModelRefusal,
+  startupFailure,
+  transcriptAssistant,
+  transcriptUser,
+  writeTranscript,
+} from "../helpers.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -2228,6 +2234,85 @@ describe("createSession options merging", () => {
       const beta = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
       expect(sessionFor(beta.sessionId).providerCacheKey).not.toBe(plainProviderCacheKey);
+    });
+
+    describe("the context usage of a resumed session", () => {
+      const sessionId = "5b2c8e1a-7d4f-4a3b-9c6e-2f1d0a9b8c7d";
+      let configDir: string;
+      let updates: SessionNotification[];
+      let answerWindow: (usage: { rawMaxTokens: number }) => void;
+      const usageUpdates = () =>
+        updates.map(({ update }) => update).filter((u) => u.sessionUpdate === "usage_update");
+
+      beforeEach(async () => {
+        configDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-usage-"));
+        vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
+        const response = transcriptAssistant("a1", "Hello");
+        await writeTranscript(path.join(configDir, "projects", "-workspace"), sessionId, [
+          transcriptUser("u1", "hi"),
+          {
+            ...response,
+            message: {
+              ...response.message,
+              usage: {
+                input_tokens: 2,
+                output_tokens: 300,
+                cache_read_input_tokens: 90_000,
+                cache_creation_input_tokens: 1_500,
+              },
+            },
+          },
+        ]);
+        contextUsageResult = () => new Promise((resolve) => (answerWindow = resolve));
+        updates = [];
+        agent = new ClaudeAcpAgent({
+          ...createMockClient(),
+          sessionUpdate: async (notification: SessionNotification) => {
+            updates.push(notification);
+          },
+        } as AcpClient);
+      });
+
+      afterEach(() => {
+        vi.unstubAllEnvs();
+        fs.rmSync(configDir, { recursive: true, force: true });
+      });
+
+      it.each(["loadSession", "resumeSession"] as const)(
+        "%s sends it after the response, with the window that Claude Code reads",
+        async (method) => {
+          await agent[method]({ sessionId, cwd: process.cwd(), mcpServers: [] });
+          // It waits for the window.
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          expect(usageUpdates()).toEqual([]);
+
+          answerWindow({ rawMaxTokens: 200_000 });
+
+          await vi.waitFor(() =>
+            expect(usageUpdates()).toEqual([
+              { sessionUpdate: "usage_update", used: 91_802, size: 200_000 },
+            ]),
+          );
+        },
+      );
+
+      it("is not sent once Claude works in the session", async () => {
+        await agent.loadSession({ sessionId, cwd: process.cwd(), mcpServers: [] });
+        // The mocked query never answers the prompt: its turn stays open.
+        void agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] }).catch(() => {});
+        await vi.waitFor(() =>
+          expect(
+            (sessionFor(sessionId).turnQueue ?? []).some(
+              (turn: { settled: boolean }) => !turn.settled,
+            ),
+          ).toBe(true),
+        );
+
+        answerWindow({ rawMaxTokens: 200_000 });
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        expect(usageUpdates()).toEqual([]);
+      });
     });
   });
 

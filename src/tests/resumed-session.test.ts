@@ -213,6 +213,61 @@ describe("readResumedTail", () => {
 
     expect(await readResumedTail("no-mode")).toEqual({ model: "claude-opus-5" });
   });
+
+  const responded = (model: string, usage: object, extra: object = {}) =>
+    record(model, {
+      message: { role: "assistant", model, content: [{ type: "text", text: "ok" }], usage },
+      ...extra,
+    });
+  const usage = {
+    input_tokens: 2,
+    output_tokens: 300,
+    cache_read_input_tokens: 90_000,
+    cache_creation_input_tokens: 1_500,
+  };
+  const compaction = (compactMetadata: object) => ({
+    type: "system",
+    subtype: "compact_boundary",
+    compactMetadata: { trigger: "manual", preTokens: 91_802, ...compactMetadata },
+  });
+
+  it.each([
+    [
+      "the total usage of the last real main-thread response",
+      [
+        responded("claude-opus-5", { ...usage, cache_read_input_tokens: 10 }),
+        responded("claude-opus-5", usage),
+        userLine("after"),
+        responded("<synthetic>", { input_tokens: 0, output_tokens: 0 }),
+        responded("claude-haiku-4-5", { input_tokens: 7, output_tokens: 7 }, { isSidechain: true }),
+      ],
+      91_802,
+    ],
+    [
+      "the context that a later compaction kept",
+      [
+        responded("claude-opus-5", usage),
+        compaction({ postTokens: 9_955 }),
+        prompt("summary", { isCompactSummary: true }),
+      ],
+      9_955,
+    ],
+    [
+      "no usage after a compaction that did not record what it kept",
+      [responded("claude-opus-5", usage), compaction({})],
+      undefined,
+    ],
+    [
+      "no usage for a last response without usage",
+      [responded("claude-opus-5", usage), record("claude-opus-5")],
+      undefined,
+    ],
+  ])("reads %s as the context usage", async (_case, records, contextUsed) => {
+    await transcript("usage", records);
+
+    // Also when the caller has the model already, as a load has.
+    expect((await readResumedTail("usage", undefined, false)).contextUsed).toBe(contextUsed);
+  });
 });
 
 describe("readHistoryAcrossCompactions", () => {

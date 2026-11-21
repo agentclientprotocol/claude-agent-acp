@@ -109,6 +109,8 @@ export interface ReportsSetup {
    * `withCurrentModelInfo`).
    */
   model: { id: string; info: ModelInfo | undefined };
+  /** The context usage that a resumed session's transcript records (see `readResumedTail`). */
+  contextUsed: number | undefined;
 }
 
 export class SessionReports {
@@ -139,13 +141,16 @@ export class SessionReports {
   private contextWindow = DEFAULT_CONTEXT_WINDOW;
   /** Whether {@link contextWindow} came from Claude Code, not from a guess. */
   private contextWindowAuthoritative = false;
+  /** The background read of {@link contextWindow}; settles, never rejects. */
+  private contextWindowRefresh: Promise<void> | undefined;
   /** The model that {@link contextWindow} is of. */
   private modelId: string | undefined;
   /** Scopes the cross-session window cache to the query's backend. */
   private providerCacheKey = "";
   private query: ReportsSetup["query"] | undefined;
   private disposed = false;
-  /** The context used after the last main-thread request. */
+  /** The context used after the last main-thread request. A resumed session
+   *  starts with the value its transcript records. */
   private contextUsed: number | undefined;
   /** The follow-up prompt the client holds. Undefined for a client that takes none. */
   private suggestions: PromptSuggestions | undefined;
@@ -185,6 +190,7 @@ export class SessionReports {
     // From the same env the query got.
     this.providerCacheKey = providerCacheKeyFor(setup.env);
     this.seedContextWindow(setup.model.id, setup.model.info);
+    this.contextUsed = setup.contextUsed;
     this.idleCompaction = new IdleCompaction(
       {
         isBusy: () => this.host.isBusy(),
@@ -361,6 +367,24 @@ export class SessionReports {
     this.idleCompaction?.reset();
     // The prediction came from the transcript that the reset dropped.
     this.sendSuggestions(this.suggestions?.clear());
+  }
+
+  /** The context used after the last main-thread request (see {@link contextUsed}). */
+  contextUsage(): number | undefined {
+    return this.contextUsed;
+  }
+
+  /**
+   * Sends `used`, the {@link contextUsage} of the session when its setup
+   * answered, as v1's `publishContextUsage` does. It waits for the
+   * background window read, and sends nothing when the session is busy or
+   * its usage changed since: that work reports its own usage.
+   */
+  async publishContextUsage(used: number | undefined): Promise<void> {
+    if (used === undefined) return;
+    await this.contextWindowRefresh;
+    if (this.disposed || this.contextUsed !== used || this.host.isBusy()) return;
+    this.sendUsage({ sessionUpdate: "usage_update", used, size: this.contextWindow });
   }
 
   /** Sends the usage of an empty context, as a fresh context for an approved plan starts. */
@@ -586,7 +610,7 @@ export class SessionReports {
     if (seeded.authoritative || !query) return;
     const current = () => !this.disposed && this.modelId === id;
     // A synchronous throw must not fail the caller either.
-    Promise.resolve()
+    this.contextWindowRefresh = Promise.resolve()
       .then(() => readContextWindow(query))
       .then(
         (window) => {
