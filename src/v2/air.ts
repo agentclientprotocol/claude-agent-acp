@@ -7,6 +7,7 @@
  */
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import {
+  AIR_MODEL_REASONING_EFFORTS_CAPABILITY,
   AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
   airCapabilityMeta,
   clientSupportsAirCapability,
@@ -27,6 +28,8 @@ export interface AirSupport {
   readonly client: boolean;
   /** `recommendedValue`: concrete model and effort rows with a recommendation. */
   readonly recommendedValue: boolean;
+  /** `modelReasoningEfforts`: each `model` option entry names its model's effort levels. */
+  readonly modelReasoningEfforts: boolean;
   /** `agentFileChangeReport`: the changed files of a prompt's turn. */
   readonly fileChangeReport: boolean;
 }
@@ -35,6 +38,7 @@ export interface AirSupport {
 export const NO_AIR: AirSupport = {
   client: false,
   recommendedValue: false,
+  modelReasoningEfforts: false,
   fileChangeReport: false,
 };
 
@@ -46,6 +50,10 @@ export function airSupport(capabilities: v2.ClientCapabilities | null | undefine
     recommendedValue: clientSupportsAirCapability(
       capabilities,
       AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
+    ),
+    modelReasoningEfforts: clientSupportsAirCapability(
+      capabilities,
+      AIR_MODEL_REASONING_EFFORTS_CAPABILITY,
     ),
     fileChangeReport: supportsAgentFileChangeReport(capabilities),
   };
@@ -62,5 +70,6 @@ export function airInitializeMeta(air: AirSupport): Record<string, unknown> | un
   return airCapabilityMeta(
     AGENT_FILE_CHANGE_REPORT_CAPABILITY,
     AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
+    AIR_MODEL_REASONING_EFFORTS_CAPABILITY,
   );
 }

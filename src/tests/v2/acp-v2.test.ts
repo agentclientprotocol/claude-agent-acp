@@ -437,7 +437,11 @@ describe("ACP protocol routing", () => {
     // The core lists only the AIR extensions that v2 does not cover (see
     // "ACP v2" in docs/air-extensions.md).
     const air = (response._meta as any)?.jetbrains?.air;
-    expect(air.capabilities).toEqual(["agentFileChangeReport", "recommendedValue"]);
+    expect(air.capabilities).toEqual([
+      "agentFileChangeReport",
+      "recommendedValue",
+      "modelReasoningEfforts",
+    ]);
     expect(air.capabilities).not.toContain("asyncTasks");
     expect(air).not.toHaveProperty("goal");
   });

@@ -54,6 +54,7 @@ export const AIR_CAPABILITY_NAMES = [
   "asyncTasks",
   "sessionFailure",
   "recommendedValue",
+  "modelReasoningEfforts",
   "diffPatch",
   "rawInputRendering",
   "planFile",

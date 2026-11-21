@@ -13,6 +13,7 @@ import {
 } from "@agentclientprotocol/sdk/unstable";
 import type { AgentInfo, ModelInfo, Query } from "@anthropic-ai/claude-agent-sdk";
 import {
+  AIR_MODEL_REASONING_EFFORTS_CAPABILITY,
   AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
   clientSupportsAirCapability,
 } from "./air-extension.js";
@@ -113,10 +114,21 @@ export function clientSupportsRecommendedConfigValue(
   return clientSupportsAirCapability(clientCapabilities, AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY);
 }
 
+/** Whether the Client advertised the AIR `modelReasoningEfforts` capability:
+ *  each `model` option entry then names its model's effort levels. */
+export function clientSupportsModelReasoningEfforts(
+  clientCapabilities?: ClientCapabilities | null,
+): boolean {
+  return clientSupportsAirCapability(clientCapabilities, AIR_MODEL_REASONING_EFFORTS_CAPABILITY);
+}
+
 export type ConfigOptionPresentation = {
   /** Replace ambiguous `default` rows with concrete values and advertise the
    *  SDK/adapter recommendation as `_meta.jetbrains.air.recommendedValue`. */
   useRecommendedValue: boolean;
+  /** Give each `model` option entry the effort levels of its model at
+   *  `_meta.jetbrains.air.reasoningEfforts`. */
+  modelReasoningEfforts?: boolean;
 };
 
 /**
@@ -165,7 +177,12 @@ export function buildConfigOptions(
   // there is no model option at all.
   if (models.availableModels.length > 0) {
     options.push(
-      buildModelConfigOption(models, modelInfos, presentation?.useRecommendedValue === true),
+      buildModelConfigOption(
+        models,
+        modelInfos,
+        presentation?.useRecommendedValue === true,
+        presentation?.modelReasoningEfforts === true,
+      ),
     );
   }
   const effort = buildEffortConfigOption(

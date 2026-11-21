@@ -146,6 +146,7 @@ import {
   AIR_GOAL_KEY,
   AIR_LOAD_REPLAY_END_CAPABILITY,
   AIR_LOAD_REPLAY_END_KEY,
+  AIR_MODEL_REASONING_EFFORTS_CAPABILITY,
   AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
   clientSupportsAirCapability,
   withAirMeta,
@@ -414,6 +415,7 @@ import {
 import {
   buildConfigOptions,
   clientSupportsBooleanConfigOptions,
+  clientSupportsModelReasoningEfforts,
   clientSupportsRecommendedConfigValue,
   configOptionValue,
   setSelectedModel,
@@ -1918,6 +1920,7 @@ export class ClaudeAcpAgent {
                 AIR_ASYNC_TASKS_CAPABILITY,
                 AIR_CUSTOM_INSTRUCTIONS_CAPABILITY,
                 AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
+                AIR_MODEL_REASONING_EFFORTS_CAPABILITY,
                 AIR_DIFF_PATCH_CAPABILITY,
                 AIR_PLAN_FILE_CAPABILITY,
                 AIR_BACKGROUND_SUBAGENTS_CAPABILITY,
@@ -9682,6 +9685,7 @@ export class ClaudeAcpAgent {
         },
         {
           useRecommendedValue,
+          modelReasoningEfforts: clientSupportsModelReasoningEfforts(this.clientCapabilities),
         },
         {
           // Like Fast mode, the toggle hides on models without ultracode
@@ -10691,6 +10695,7 @@ export class ClaudeAcpAgent {
         fastMode,
         {
           useRecommendedValue,
+          modelReasoningEfforts: clientSupportsModelReasoningEfforts(this.clientCapabilities),
         },
         ultracode,
       );

@@ -286,6 +286,7 @@ describe("sessionIndex negotiation", () => {
     "asyncTasks",
     "customInstructions",
     "recommendedValue",
+    "modelReasoningEfforts",
     "diffPatch",
     "planFile",
     "backgroundSubagents",
