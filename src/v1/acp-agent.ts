@@ -113,6 +113,7 @@ import { sanitizeTitle, SessionTitles } from "../session-titles.js";
 import {
   AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
   AcpSessionNotification,
+  AnnouncedChildren,
   asSdkSessionNotification,
   clientSupportsSubagents,
   restrictedChild,
@@ -1680,6 +1681,12 @@ export class ClaudeAcpAgent {
    */
   private readonly replayedSubagents = new Map<string, RfdSubagentReplay>();
   /**
+   * The subagents RFD form: the child sessions that the sessions announced,
+   * from each one's `subagent_update` until the client ends its root session
+   * (see {@link endSession}) or the connection ends (see `AnnouncedChildren`).
+   */
+  private readonly announcedChildren = new AnnouncedChildren();
+  /**
    * AIR's draft: the model that the last load of each session replayed to each
    * child session, as the model id and the entry that went out. See
    * {@link publishReplayedChildModels}.
@@ -1707,7 +1714,7 @@ export class ClaudeAcpAgent {
     agent: this,
     isAirClient: () => this.toolCallCapabilities.air.client,
     interruptSession: (sessionId) => this.cancelTurns({ sessionId }, { awaitInterrupt: false }),
-    teardownSession: (sessionId) => this.teardownSession(sessionId),
+    teardownSession: (sessionId) => this.endSession(sessionId),
   });
 
   /**
@@ -1727,7 +1734,12 @@ export class ClaudeAcpAgent {
 
   constructor(client: AcpClient, logger?: Logger) {
     this.sessions = {};
-    this.client = new ChangedMetaClient(client, () => this.toolCallCapabilities.air.client);
+    this.client = new ChangedMetaClient(
+      client,
+      () => this.toolCallCapabilities.air.client,
+      // Before the client can name the child that a `subagent_update` announces.
+      (update) => this.announcedChildren.sending(update),
+    );
     this.logger = logger ?? console;
     this.exitPlan = new ExitPlanCoordinator<Session, Turn>({
       currentSession: (id) => this.sessions[id],
@@ -7344,16 +7356,13 @@ export class ClaudeAcpAgent {
 
   /**
    * Throws invalid params (-32602) when `sessionId` is a child session that a
-   * session of this connection announced on the subagents RFD form (see
-   * `NativeSubagentRuntime.hasChild`): the client can cancel a child, and
-   * nothing else. `method` completes "the client cannot … it".
+   * session of this connection announced on the subagents RFD form, while it
+   * ran or in a load's replay, and that session is not closed (see
+   * `AnnouncedChildren`): the client can cancel a child, and nothing else.
+   * `method` completes "the client cannot … it".
    */
   assertNoChildSession(sessionId: string, method: string): void {
-    for (const session of Object.values(this.sessions)) {
-      if (session.nativeSubagentRuntime?.hasChild(sessionId)) {
-        throw restrictedChild(sessionId, method);
-      }
-    }
+    if (this.announcedChildren.has(sessionId)) throw restrictedChild(sessionId, method);
   }
 
   /**
@@ -7892,12 +7901,21 @@ export class ClaudeAcpAgent {
     await Promise.all(Object.keys(this.sessions).map((id) => this.teardownSession(id)));
   }
 
+  /**
+   * {@link teardownSession}, for a session that the client ends: with
+   * `session/close`, `session/delete`, or an archive. The client can no
+   * longer name the session's children then (see `AnnouncedChildren`). A load
+   * or resume that replaces the session's query keeps them.
+   */
+  private async endSession(sessionId: string): Promise<void> {
+    await this.teardownSession(sessionId);
+    // After the teardown's last updates, which name the children.
+    this.announcedChildren.rootClosed(sessionId);
+  }
+
   /** Idempotent: a session that is not loaded here is already closed. */
   async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
-    if (!this.sessions[params.sessionId]) {
-      return {};
-    }
-    await this.teardownSession(params.sessionId);
+    await this.endSession(params.sessionId);
     return {};
   }
 

@@ -755,6 +755,30 @@ describe("ACP v2 core", () => {
       });
     });
 
+    it("rejects a request on a subagent's session across the restart of its root's query", async () => {
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        void agent.request(v2.methods.agent.session.prompt, {
+          sessionId: response.sessionId,
+          prompt: PROMPT,
+        });
+        claude.send(lifecycle(await claude.prompt(0), "started"));
+        const helper = subagent("agent-1", "toolu_agent");
+        claude.send(helper.launch());
+        claude.send(helper.started());
+        claude.send(helper.ended());
+        claude.send(result());
+        await vi.waitFor(() => expect(client.states().at(-1)).toBe("idle"));
+
+        await setProvider(agent);
+        expect(sdk.processes).toHaveLength(2);
+        await expect(
+          agent.request(v2.methods.agent.session.close, { sessionId: "agent-1" }),
+        ).rejects.toMatchObject({ code: -32602 });
+      });
+    });
+
     it("sends a prompt of an idle session right after the response to the new query", async () => {
       const client = v2Client();
       await client.connect(async (agent) => {
@@ -4772,9 +4796,11 @@ describe("ACP v2 core", () => {
     });
 
     it.each([
-      ["session/prompt", v2.methods.agent.session.prompt, { prompt: PROMPT }],
-      ["session/close", v2.methods.agent.session.close, {}],
-    ])("rejects %s on a subagent's session", async (_, method, params) => {
+      ["session/prompt", v2.methods.agent.session.prompt, { prompt: PROMPT }, false],
+      ["session/close", v2.methods.agent.session.close, {}, false],
+      // The adapter no longer follows the child, and the client still holds it.
+      ["session/close after a conversation reset", v2.methods.agent.session.close, {}, true],
+    ])("rejects %s on a subagent's session", async (_, method, params, reset) => {
       const client = v2Client();
       const error = await client.connect(async (agent) => {
         const { claude } = await openSession(agent);
@@ -4784,6 +4810,22 @@ describe("ACP v2 core", () => {
         await vi.waitFor(() =>
           expect(client.notifications.some((n) => n.sessionId === "child")).toBe(true),
         );
+        if (reset) {
+          claude.send({
+            type: "conversation_reset",
+            new_conversation_id: randomUUID(),
+            uuid: randomUUID(),
+            trigger: "clear",
+            timestamp: new Date().toISOString(),
+            session_id: "session",
+          });
+          await vi.waitFor(() =>
+            expect(updatesOf(client.notifications, "child").at(-1)).toMatchObject({
+              sessionUpdate: "state_update",
+              state: "unknown",
+            }),
+          );
+        }
         return agent
           .request(
             method as typeof v2.methods.agent.session.close,
@@ -4796,6 +4838,74 @@ describe("ACP v2 core", () => {
       });
 
       expect(error).toMatchObject({ code: -32602 });
+    });
+
+    it("rejects a request on a subagent's session that only a replay announced, until its root closes", async () => {
+      sdk.subagents = new Map([
+        [
+          "toolu_launch",
+          {
+            agentId: "child",
+            background: false,
+            stoppedByUser: false,
+            agentType: "general-purpose",
+          },
+        ],
+      ]);
+      const client = v2Client();
+      const errors = await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const sessionId = response.sessionId;
+        vi.mocked(getSessionMessages).mockResolvedValueOnce([
+          {
+            type: "assistant",
+            uuid: "a1",
+            session_id: sessionId,
+            parent_tool_use_id: null,
+            parent_agent_id: null,
+            message: subagent("child", "toolu_launch").launch().message,
+          },
+        ] as never);
+        await agent.request(v2.methods.agent.session.resume, {
+          sessionId,
+          cwd,
+          replayFrom: { type: "start" },
+        });
+        // The child does not run, so a cancel of it has nothing to stop.
+        await agent.notify(v2.methods.agent.session.cancel, { sessionId: "child" });
+        const refusal = (request: Promise<unknown>) => request.catch((error: unknown) => error);
+        const close = await refusal(
+          agent.request(v2.methods.agent.session.close, { sessionId: "child" }),
+        );
+        // The child lists no tool call: it does not run.
+        const cancelItem = () =>
+          refusal(
+            agent.request(v2.methods.agent.toolCall.cancel, {
+              sessionId: "child",
+              toolCallId: "toolu_read",
+            }),
+          );
+        const whileRootRuns = await cancelItem();
+        expect(claude.stopTask).not.toHaveBeenCalled();
+        expect(claude.interrupt).not.toHaveBeenCalled();
+        // The root's query ends: the root is still active, and the child still known.
+        claude.end();
+        const afterQueryEnd = await cancelItem();
+        await agent.request(v2.methods.agent.session.close, { sessionId });
+        const afterClose = await refusal(
+          agent.request(v2.methods.agent.session.prompt, { sessionId: "child", prompt: PROMPT }),
+        );
+        return [close, whileRootRuns, afterQueryEnd, afterClose];
+      });
+
+      const notListed = { code: -32602, data: { sessionId: "child", toolCallId: "toolu_read" } };
+      expect(errors).toMatchObject([
+        { code: -32602, message: expect.stringContaining("child is a subagent session") },
+        notListed,
+        notListed,
+        // The client closed the child's root, so it can no longer name the child.
+        { code: -32002 },
+      ]);
     });
 
     it("keeps a background command's terminal running and listed until its task ends", async () => {

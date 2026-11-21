@@ -34,7 +34,7 @@ import packageJson from "../../package.json" with { type: "json" };
 import { messageIdForGrouping } from "../sdk-to-acp.js";
 import type { Logger } from "../logger.js";
 import { customAgents } from "../session-config-options.js";
-import { restrictedChild } from "../acp-subagents.js";
+import { AnnouncedChildren, restrictedChild } from "../acp-subagents.js";
 import { claudeCliPath, cliDelivery } from "../claude-cli.js";
 import { clientSystemPrompt, sessionSystemPrompt } from "../client-system-prompt.js";
 import type { ElicitationSupport } from "../elicitation.js";
@@ -187,6 +187,12 @@ class V2Agent implements AgentHandle, SessionConnection {
    * session whose query ended, keep the record.
    */
   private readonly promptKeys = new Map<string, PromptKeys>();
+  /**
+   * The subagent sessions that the sessions announced, from each one's
+   * `subagent_update` to the `session/close` of its root or the end of the
+   * connection (see `AnnouncedChildren`).
+   */
+  private readonly children = new AnnouncedChildren();
   readonly translator = new V2UpdateTranslator();
   readonly auth: V2Auth;
   /** The `--hide-claude-auth` subscription guard (see `subscription-guard.ts`). */
@@ -244,6 +250,8 @@ class V2Agent implements AgentHandle, SessionConnection {
 
   /** Sends the update, after the `replay_complete` of a replay that holds it (see {@link heldBy}). */
   send(notification: v2.UpdateSessionNotification): void {
+    // Before the client can name the child that a `subagent_update` announces.
+    this.children.sending(notification);
     const send = () => {
       this.ctx.notify(v2.methods.client.session.update, notification).catch((error) => {
         this.logger.error(`Failed to send a ${notification.update.sessionUpdate} update:`, error);
@@ -418,7 +426,7 @@ class V2Agent implements AgentHandle, SessionConnection {
    * with.
    */
   async forkSession(params: v2.ForkSessionRequest): Promise<v2.ForkSessionResponse> {
-    if (this.ownerOfChild(params.sessionId)) throw restrictedChild(params.sessionId, "fork");
+    if (this.children.has(params.sessionId)) throw restrictedChild(params.sessionId, "fork");
     // Rejects bad `configOptions`, a bad `cwd` or MCP server before the transcript is copied.
     const initial = initialConfigRequests(params.sessionId, params.configOptions);
     await validatedSetup(params);
@@ -471,7 +479,7 @@ class V2Agent implements AgentHandle, SessionConnection {
         `Replaying from a ${replayFrom.type} cursor is not supported`,
       );
     }
-    if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "resume");
+    if (this.children.has(sessionId)) throw restrictedChild(sessionId, "resume");
     const initial = initialConfigRequests(sessionId, params.configOptions);
     // No await before it: nothing of the session goes out between the request and the hold.
     const release = replayFrom != null ? this.replays.begin(sessionId) : undefined;
@@ -639,7 +647,7 @@ class V2Agent implements AgentHandle, SessionConnection {
   async sessionStatus({ sessionId }: v2.SessionStatusRequest): Promise<v2.SessionStatusResponse> {
     const session = this.sessions.get(sessionId);
     if (session) return { status: "open", state: session.statusState() };
-    if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "ask the status of");
+    if (this.children.has(sessionId)) throw restrictedChild(sessionId, "ask the status of");
     return savedSessionStatus(sessionId);
   }
 
@@ -668,7 +676,7 @@ class V2Agent implements AgentHandle, SessionConnection {
     };
     let session: V2Session | undefined;
     if (sessionId != null) {
-      if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "read the options of");
+      if (this.children.has(sessionId)) throw restrictedChild(sessionId, "read the options of");
       // A restart or a resume that runs makes the session active.
       await this.restarts.settled(sessionId);
       await this.startSettled(sessionId);
@@ -705,7 +713,7 @@ class V2Agent implements AgentHandle, SessionConnection {
 
   /** Closing is idempotent: a session that is not active closes at once. */
   async closeSession({ sessionId }: v2.CloseSessionRequest): Promise<v2.CloseSessionResponse> {
-    if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "close");
+    if (this.children.has(sessionId)) throw restrictedChild(sessionId, "close");
     // A restart that runs ends first, so the close ends the session it started.
     await this.restarts.closing(sessionId);
     // A resume that runs answers first: the close ends what it started, and
@@ -723,12 +731,14 @@ class V2Agent implements AgentHandle, SessionConnection {
       this.guard.sessionEnded(sessionId);
     }
     this.restarts.closed(sessionId);
+    // After the close's last updates, which name the session's children.
+    this.children.rootClosed(sessionId);
     return {};
   }
 
   /** Deleting a session that does not exist succeeds, as v2 asks. */
   async deleteSession({ sessionId }: v2.DeleteSessionRequest): Promise<v2.DeleteSessionResponse> {
-    if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "delete");
+    if (this.children.has(sessionId)) throw restrictedChild(sessionId, "delete");
     // A resume that runs, or its start, may make the session live.
     await this.setupSettled(sessionId);
     const live = this.sessions.get(sessionId);
@@ -753,7 +763,7 @@ class V2Agent implements AgentHandle, SessionConnection {
   async setTitle(params: v2.SetSessionTitleRequest): Promise<v2.SetSessionTitleResponse> {
     const request = parseRenameSessionRequest(params);
     const { sessionId } = request;
-    if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "retitle");
+    if (this.children.has(sessionId)) throw restrictedChild(sessionId, "retitle");
     // Renamed through the query that runs once a restart or resume settled.
     await this.restarts.settled(sessionId);
     await this.setupSettled(sessionId);
@@ -786,7 +796,7 @@ class V2Agent implements AgentHandle, SessionConnection {
   session(sessionId: string, method: string): V2Session {
     const session = this.sessions.get(sessionId);
     if (session) return session;
-    if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, method);
+    if (this.children.has(sessionId)) throw restrictedChild(sessionId, method);
     throw this.inactive(sessionId);
   }
 
@@ -812,8 +822,10 @@ class V2Agent implements AgentHandle, SessionConnection {
     target: { terminalId: string } | { toolCallId: string },
   ): Promise<Record<string, never>> {
     const root = this.sessions.get(sessionId) ?? this.ownerOfChild(sessionId);
-    if (!root) throw this.inactive(sessionId);
-    if (!(await root.tasks.cancelItem(sessionId, target))) {
+    // A subagent's session is known to the client also when its root's query
+    // ended: it lists nothing then.
+    if (!root && !this.children.has(sessionId)) throw this.inactive(sessionId);
+    if (!root || !(await root.tasks.cancelItem(sessionId, target))) {
       throw "terminalId" in target
         ? RequestError.invalidParams(
             { sessionId, terminalId: target.terminalId },
@@ -827,9 +839,13 @@ class V2Agent implements AgentHandle, SessionConnection {
     return {};
   }
 
-  /** The root session that `sessionId` is a subagent session of. */
+  /**
+   * The active root session that `sessionId` is a subagent session of.
+   * Undefined also for a child whose root's query ended.
+   */
   private ownerOfChild(sessionId: string): V2Session | undefined {
-    return [...this.sessions.values()].find((session) => session.tasks.hasChild(sessionId));
+    const root = this.children.rootOf(sessionId);
+    return root === undefined ? undefined : this.sessions.get(root);
   }
 
   async dispose(): Promise<void> {

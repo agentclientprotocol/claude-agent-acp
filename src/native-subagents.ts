@@ -1118,15 +1118,6 @@ export class NativeSubagentRuntime {
     return true;
   }
 
-  /**
-   * The RFD form: whether `sessionId` is a child session that this runtime
-   * announced. The client can cancel such a session and nothing else (see
-   * `restrictedChild`). False in AIR's draft, which keeps its own rules.
-   */
-  hasChild(sessionId: string): boolean {
-    return this.announcedChild(sessionId) !== undefined;
-  }
-
   /** The RFD form: the announced child session `sessionId`, with its task id. */
   private announcedChild(sessionId: string): [string, NativeSubagent] | undefined {
     if (this.form !== "rfd") return undefined;
