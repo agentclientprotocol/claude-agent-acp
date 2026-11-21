@@ -10625,6 +10625,34 @@ describe("ACP v2 providers", () => {
       baseUrl: GATEWAY,
     });
 
+  it("restarts a live query only when the queued provider configuration changes", async () => {
+    answerEachPrompt(Promise.resolve());
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      await setGateway(agent);
+      await agent.request(v2.methods.agent.session.new, { cwd });
+
+      await setGateway(agent);
+      expect(sdk.queryOptions).toHaveLength(1);
+
+      await agent.request(v2.methods.agent.providers.set, {
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: GATEWAY,
+        headers: { authorization: "Bearer rotated" },
+      });
+      const disable = () =>
+        agent.request(v2.methods.agent.providers.disable, { providerId: "main" });
+      await Promise.all([disable(), disable()]);
+      expect(sdk.queryOptions.map((options) => options.env?.ANTHROPIC_BASE_URL)).toEqual([
+        GATEWAY,
+        GATEWAY,
+        undefined,
+      ]);
+    });
+  });
+
   /**
    * Claude Code echoes each prompt and answers it. A turn of a query without
    * the gateway's route waits for `release` first.

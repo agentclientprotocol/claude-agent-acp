@@ -8,6 +8,7 @@
  * user's and the project's settings with {@link providerRouteSettings} and
  * {@link applyProviderRoute}.
  */
+import { isDeepStrictEqual } from "node:util";
 import {
   RequestError,
   type AuthenticateRequest,
@@ -237,6 +238,23 @@ export async function applyProviderRoute(
 function sameHeaders(a: Record<string, string>, b: Record<string, string>): boolean {
   const aKeys = Object.keys(a);
   return aKeys.length === Object.keys(b).length && aKeys.every((key) => b[key] === a[key]);
+}
+
+export function sameProviderConfig(
+  current: ProviderConfig | undefined,
+  next: ProviderConfig | undefined,
+): boolean {
+  if (current === next) return true;
+  return (
+    current !== undefined &&
+    next !== undefined &&
+    current.apiType === next.apiType &&
+    current.baseUrl === next.baseUrl &&
+    sameHeaders(current.headers, next.headers) &&
+    isDeepStrictEqual(current.vertex, next.vertex) &&
+    isDeepStrictEqual(current.listedModels, next.listedModels) &&
+    current.bedrockRegionPrefix === next.bedrockRegionPrefix
+  );
 }
 
 /**
