@@ -99,6 +99,13 @@ Task subagent as its own child session, following ACP's [subagents](https://agen
   neither runs nor has a response gets none.
   A launch without Claude Code's metadata file for the child stays an ordinary tool call of the
   parent, and a notice, for a client that takes notices, says that subagent history is missing.
+- A session that is loaded or resumed with the same settings while it runs keeps its children's
+  runs. After the response, each child that works and that no replay announced is announced
+  again on its parent, with its labels, the `cancel` capability and its state, and then gets the
+  configuration that the client last had for it: every working child after a `session/resume`,
+  which replays nothing, and after a `session/load` a child whose launch the history does not
+  have, such as a forked skill's. A child that no longer works but has a working child of its own
+  is named first, with its labels only.
 - After a load or resume, with or without replay, a SendMessage that resumes an agent from before
   it runs that agent in its session from before. Before the agent's traffic, each of its ancestors
   that the client was not told about in this connection is announced, parent before child and
@@ -125,8 +132,8 @@ and comes before the response: on its parent, with the cleared `cwd`, and then a
 `config_option_update`. The notice that subagent history is missing follows the root's
 `replay_complete` too.
 
-A resume of the active session that replays can meet a child that the stored history does not
-launch: a forked skill's child, or a subagent that Claude launched after the history was written.
+On v2, a resume of the active session that replays can meet a child that the stored history does
+not launch: a forked skill's child, or a subagent that Claude launched after the history was written.
 Such a child is announced again right after the root's `replay_complete`, when it works, when its
 parent lists it, or when the replay held one of its updates. Its own `replay_complete` follows at
 once, since its replay is empty, and then come the updates that the replay held.

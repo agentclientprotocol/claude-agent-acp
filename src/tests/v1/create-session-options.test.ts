@@ -396,6 +396,60 @@ describe("createSession options merging", () => {
     expect(announcements[1]).not.toHaveProperty("cwd");
   });
 
+  it.each(["session/resume", "session/load"] as const)(
+    "announces a child that still works again after the response of a %s of the active session",
+    async (request) => {
+      const updates: AcpSessionNotification[] = [];
+      const client = createMockClient();
+      client.sessionUpdate = async (notification) => {
+        updates.push(notification);
+      };
+      const observedAgent = new ClaudeAcpAgent(client);
+      await observedAgent.initialize({ protocolVersion: 1, clientCapabilities: { subagents: {} } });
+      const params = { cwd: process.cwd(), mcpServers: [] };
+      const { sessionId } = await observedAgent.newSession(params);
+      // The new session's own work after its response is done.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const session = observedAgent.sessions[sessionId]!;
+      const runtime = (session.nativeSubagentRuntime = new NativeSubagentRuntime(
+        "rfd",
+        sessionId,
+        session,
+        (notification) => client.sessionUpdate(notification),
+        { log: () => {} },
+      ));
+      await runtime.taskStarted(
+        { taskId: "working", subagentType: "Explore", description: "Map the code" },
+        async () => {},
+      );
+      await runtime.taskStarted({ taskId: "ended", subagentType: "Explore" }, async () => {});
+      await runtime.finishTask("ended", "completed", async () => {});
+      updates.length = 0;
+
+      // The same settings: the session's query, and the child's run, go on. The
+      // stored history launches no subagent, so a load's replay announces none.
+      if (request === "session/load") await observedAgent.loadSession({ sessionId, ...params });
+      else await observedAgent.resumeSession({ sessionId, ...params });
+      expect(observedAgent.sessions[sessionId]).toBe(session);
+
+      await vi.waitFor(() =>
+        expect(updates.filter(({ update }) => update.sessionUpdate === "subagent_update")).toEqual([
+          {
+            sessionId,
+            update: {
+              sessionUpdate: "subagent_update",
+              sessionId: "working",
+              title: "Map the code",
+              description: "Explore",
+              capabilities: { cancel: {} },
+              state: { state: "running" },
+            },
+          },
+        ]),
+      );
+    },
+  );
+
   it("reports an AIR child's model switch under its current generation", async () => {
     const updates: AcpSessionNotification[] = [];
     const client = createMockClient();

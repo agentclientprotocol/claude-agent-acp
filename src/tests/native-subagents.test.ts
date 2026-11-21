@@ -900,6 +900,78 @@ describe("NativeSubagentRuntime in the RFD form", () => {
     }
   });
 
+  it("gives what is current of the children that work, each after its parent", async () => {
+    const published: AcpSessionNotification[] = [];
+    const runtime = new NativeSubagentRuntime(
+      "rfd",
+      "root",
+      { cwd: "/project" },
+      async (notification) => {
+        published.push(notification);
+      },
+      { log: () => {} },
+    );
+    const deliver = async (notification: AcpSessionNotification) => {
+      const routed = await runtime.route(notification, deliver);
+      if (routed) published.push(routed);
+    };
+    const start = async (taskId: string, parentLaunch?: string) => {
+      await deliver(launch(`launch-${taskId}`, { description: `Run ${taskId}` }, parentLaunch));
+      await runtime.taskStarted(
+        { taskId, toolUseId: `launch-${taskId}`, subagentType: "Explore" },
+        deliver,
+      );
+    };
+    await start("outer");
+    await start("inner", "launch-outer");
+    const worktree = "/project/.claude/worktrees/asking";
+    await runtime.reportCwd("asking", worktree);
+    await start("asking");
+    await start("ended");
+    await start("replayed");
+    // `outer` ends while its child works on, as the parent of a background child does.
+    await runtime.finishTask("outer", "completed", deliver, "launch-outer");
+    await runtime.finishTask("ended", "completed", deliver, "launch-ended");
+    await runtime.reportModel("launch-inner", "child-model", deliver);
+    const answer = Promise.withResolvers<string>();
+    const request = runtime.awaitingUser("asking", () => answer.promise);
+    await vi.waitFor(() => expect(runtime.liveWorkState("asking")).toBe("requires_action"));
+
+    const labels = (sessionId: string) => ({
+      sessionUpdate: "subagent_update",
+      sessionId,
+      title: `Run ${sessionId}`,
+      description: "Explore",
+    });
+    // `ended` does not work, and `replayed` is one that a load's replay reports.
+    expect(runtime.currentChildren((sessionId) => sessionId === "replayed")).toEqual([
+      // Nothing of `outer` is current: it is named for its child.
+      { sessionId: "root", update: labels("outer") },
+      {
+        sessionId: "outer",
+        update: { ...labels("inner"), capabilities: { cancel: {} }, state: { state: "running" } },
+      },
+      {
+        sessionId: "inner",
+        update: {
+          sessionUpdate: "config_option_update",
+          configOptions: [expect.objectContaining({ id: "model", currentValue: "child-model" })],
+        },
+      },
+      {
+        sessionId: "root",
+        update: {
+          ...labels("asking"),
+          cwd: worktree,
+          capabilities: { cancel: {} },
+          state: { state: "requires_action" },
+        },
+      },
+    ]);
+    answer.resolve("allow");
+    await request;
+  });
+
   it("buffers model observations until the child is announced", async () => {
     const published: AcpSessionNotification[] = [];
     const runtime = new NativeSubagentRuntime(
