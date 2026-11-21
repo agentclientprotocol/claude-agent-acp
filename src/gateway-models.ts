@@ -38,9 +38,10 @@ type ListingLogger = { log: (...args: any[]) => void; error: (...args: any[]) =>
 type ListingPage = { ids: string[]; nextQuery?: Record<string, string> };
 
 /**
- * A gateway listing that failed: a network error, a status other than 2xx or
- * 4xx, a body that is not the expected listing, or the 10 s timeout. The
- * message names the request path and the reason, never a header value.
+ * A gateway listing that failed: a network error, a 401 answer, a status other
+ * than 2xx or 4xx, a body that is not the expected listing, or the 10 s
+ * timeout. The message names the request path and the reason, never a header
+ * value.
  */
 export class GatewayListingError extends Error {
   override name = "GatewayListingError";
@@ -49,9 +50,10 @@ export class GatewayListingError extends Error {
 /**
  * Lists the model ids an `anthropic` gateway at `baseUrl` serves, following
  * `has_more` / `last_id` pagination. Returns `undefined` when the gateway
- * answers 4xx: it has no listing, and nothing is narrowed. Throws a
- * {@link GatewayListingError} when the listing fails. Header values are never
- * logged.
+ * answers a 4xx other than 401 — including a 403 that forbids listing but not
+ * inference — so nothing is narrowed. Throws a {@link GatewayListingError} when
+ * the listing fails or the gateway rejects the token (401). Header values are
+ * never logged.
  */
 export async function listGatewayModels(
   baseUrl: string,
@@ -163,8 +165,11 @@ function stringField(entries: unknown[], field: string): string[] {
 
 /**
  * Reads `endpoint` page by page; `parse` returns `undefined` for a body it does
- * not understand. A 4xx answer on any page means the gateway has no listing:
- * the result is `undefined`, and nothing is narrowed.
+ * not understand. A 401 answer means the gateway rejected or expired the token
+ * and is surfaced as a {@link GatewayListingError}; any other 4xx answer means
+ * the gateway serves no listing the adapter can use (a 403 only establishes
+ * that listing is forbidden, which says nothing about inference): the result is
+ * `undefined`, and nothing is narrowed.
  */
 async function listPages(
   endpoint: string,
@@ -195,9 +200,22 @@ async function listPages(
     } catch (error) {
       throw failure(`failed: ${error instanceof Error ? error.message : String(error)}`);
     }
+    if (response.status === 401) {
+      // The token also carries inference, so an expired or rejected one is not
+      // just a gateway without a listing: fail `providers/set` instead of
+      // offering models the gateway refuses to serve.
+      throw failure(`returned ${response.status}: the gateway rejected the token`);
+    }
     if (response.status >= 400 && response.status < 500) {
+      // A 403 only says listing is forbidden: the credential can still carry
+      // inference, which Bedrock authorizes apart from ListFoundationModels.
+      // Fall back like any other 4xx instead of blocking the switch.
+      const reason =
+        response.status === 403
+          ? "the gateway forbids listing, models are not narrowed; the credential may still allow inference"
+          : "the gateway has no listing, models are not narrowed";
       logger.log(
-        `[providers/set] Model listing GET ${path} returned ${response.status}: the gateway has no listing, models are not narrowed`,
+        `[providers/set] Model listing GET ${path} returned ${response.status}: ${reason}`,
       );
       return undefined;
     }

@@ -88,7 +88,7 @@ describe("listGatewayModels", () => {
 });
 
 describe("gateways without a listing", () => {
-  it.each([400, 401, 403, 404, 405, 429])("returns undefined for a %s answer", async (status) => {
+  it.each([400, 404, 405, 429])("returns undefined for a %s answer", async (status) => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => new Response("no", { status })),
@@ -96,6 +96,40 @@ describe("gateways without a listing", () => {
 
     await expect(listGatewayModels("https://gateway.example", {}, logger)).resolves.toBe(undefined);
     await expect(listBedrockModels("https://gateway.example", {}, logger)).resolves.toBe(undefined);
+  });
+});
+
+describe("an expired or rejected gateway token", () => {
+  it("surfaces a 401 answer instead of treating it as no listing", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("nope", { status: 401 })),
+    );
+
+    await expect(listGatewayModels("https://gateway.example", {}, logger)).rejects.toThrow(
+      "Model listing GET /v1/models returned 401: the gateway rejected the token",
+    );
+    await expect(listBedrockModels("https://gateway.example", {}, logger)).rejects.toThrow(
+      "Model listing GET /foundation-models returned 401: the gateway rejected the token",
+    );
+  });
+});
+
+describe("a credential allowed to serve but not to list", () => {
+  it.each([
+    ["anthropic", listGatewayModels, "/v1/models"],
+    ["bedrock", listBedrockModels, "/foundation-models"],
+  ])("keeps the 4xx fallback when a 403 denies the %s listing", async (_protocol, list, path) => {
+    logger.log.mockClear();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("forbidden", { status: 403 })),
+    );
+
+    await expect(list("https://gateway.example", {}, logger)).resolves.toBe(undefined);
+    expect(logger.log).toHaveBeenCalledWith(
+      `[providers/set] Model listing GET ${path} returned 403: the gateway forbids listing, models are not narrowed; the credential may still allow inference`,
+    );
   });
 });
 
