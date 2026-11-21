@@ -20,6 +20,8 @@ export type NativeSubagent = {
   sessionId: string;
   parentSessionId: string;
   parentToolUseId?: string;
+  /** The original launch call id; AIR output keeps using it across resumes. */
+  launchToolUseId?: string;
   name: string;
   task: string;
   /**
@@ -331,9 +333,15 @@ export class NativeSubagentRuntime {
     this.children = session.nativeSubagentsByTaskId ??= new Map();
     this.taskByToolUse = session.nativeSubagentTaskIdByToolUseId ??= new Map();
     this.parentByToolUse = session.nativeSubagentParentByToolUseId ??= new Map();
-    for (const child of this.children.values()) {
+    for (const [taskId, child] of this.children) {
+      const launchToolUseId = child.launchToolUseId ?? child.parentToolUseId;
+      if (launchToolUseId) {
+        this.childByParentToolUse.set(launchToolUseId, child);
+        this.taskByToolUse.set(launchToolUseId, taskId);
+      }
       if (child.parentToolUseId) {
         this.childByParentToolUse.set(child.parentToolUseId, child);
+        this.taskByToolUse.set(child.parentToolUseId, taskId);
       }
     }
   }
@@ -873,6 +881,12 @@ export class NativeSubagentRuntime {
       (previous && this.resumedParentSessionId(previous)) ??
       shownLaunchParent;
     const identity = task.toolUseId ? this.identityByToolUse.get(task.toolUseId) : undefined;
+    const isControlLaunch =
+      (task.toolUseId && this.controlByToolUse.has(task.toolUseId)) ||
+      isNativeSubagentControlTool(task.launchTool);
+    const launchToolUseId = isControlLaunch
+      ? (task.toolUseId ?? undefined)
+      : (previous?.launchToolUseId ?? previous?.parentToolUseId ?? task.toolUseId ?? undefined);
     // A nested child must wait for the spawning Agent/Task frame to establish
     // its immediate parent. Root children without a tool id can be announced.
     await this.openGeneration(
@@ -881,6 +895,7 @@ export class NativeSubagentRuntime {
       {
         parentSessionId: knownParentSessionId ?? this.rootSessionId,
         parentToolUseId: task.toolUseId ?? undefined,
+        launchToolUseId,
         name: subagentDisplayName(
           identity?.name,
           identity?.description ?? task.description,
@@ -918,7 +933,12 @@ export class NativeSubagentRuntime {
    * In the AIR form, an agent that the runtime does not know is restored from
    * the session's history (see {@link restoreAgent}).
    */
-  async taskResumed(taskId: string, deliver: Publish, prompt?: string): Promise<void> {
+  async taskResumed(
+    taskId: string,
+    deliver: Publish,
+    prompt?: string,
+    toolUseId?: string,
+  ): Promise<void> {
     if (!this.enabled) return;
     const previous = this.children.get(taskId);
     if (!previous) {
@@ -932,12 +952,14 @@ export class NativeSubagentRuntime {
       return;
     }
     if (this.children.get(taskId) !== previous || previous.terminalState === undefined) return;
+    const launchToolUseId = previous.launchToolUseId ?? previous.parentToolUseId;
     await this.openGeneration(
       taskId,
       previous,
       {
         parentSessionId: this.resumedParentSessionId(previous),
-        parentToolUseId: previous.parentToolUseId,
+        parentToolUseId: toolUseId ?? previous.parentToolUseId,
+        launchToolUseId,
         name: previous.name,
         task: previous.task,
         ...promptField(promptText(prompt)),
@@ -959,7 +981,7 @@ export class NativeSubagentRuntime {
     prompt?: string,
     toolUseId?: string,
   ): Promise<void> {
-    if (this.form !== "rfd") return this.taskResumed(taskId, deliver, prompt);
+    if (this.form !== "rfd") return this.taskResumed(taskId, deliver, prompt, toolUseId);
     const child = this.children.get(taskId) ?? (await this.restore(taskId, toolUseId, deliver));
     if (!child) return;
     const finishing = this.taskFinishPromises.get(taskId);
@@ -1049,8 +1071,9 @@ export class NativeSubagentRuntime {
     const finish = Promise.resolve().then(async () => {
       try {
         await this.announce(child);
-        if (child.parentToolUseId) {
-          for (const pending of this.takePending(child.parentToolUseId)) await deliver(pending);
+        for (const id of new Set([child.parentToolUseId, child.launchToolUseId])) {
+          if (!id) continue;
+          for (const pending of this.takePending(id)) await deliver(pending);
         }
         if (this.form === "rfd" && end?.unobservable) {
           // The child's `cancel` goes with it: a forgotten child cannot be stopped.
@@ -1065,8 +1088,9 @@ export class NativeSubagentRuntime {
           this.configBySession.delete(child.sessionId);
         }
       } finally {
-        if (child.parentToolUseId) {
-          this.cleanupControl(child.parentToolUseId);
+        for (const id of new Set([child.parentToolUseId, child.launchToolUseId])) {
+          if (!id) continue;
+          this.cleanupControl(id);
         }
       }
     });
@@ -1391,6 +1415,7 @@ export class NativeSubagentRuntime {
           parentSessionId:
             parent && this.isLiveSession(parent.sessionId) ? parent.sessionId : this.rootSessionId,
           parentToolUseId: entry.launchId,
+          launchToolUseId: entry.launchId,
           name: subagentDisplayName(entry.name, entry.description, entry.agentType, agentId),
           task: subagentDescription(undefined, entry.description),
           ...promptField(promptText(prompt)),
@@ -1903,6 +1928,7 @@ export class NativeSubagentRuntime {
       NativeSubagent,
       | "parentSessionId"
       | "parentToolUseId"
+      | "launchToolUseId"
       | "name"
       | "task"
       | "prompt"
@@ -1921,14 +1947,21 @@ export class NativeSubagentRuntime {
     };
     const toolUseId = child.parentToolUseId;
     this.children.set(taskId, child);
-    if (toolUseId) {
-      this.taskByToolUse.set(toolUseId, taskId);
-      this.childByParentToolUse.set(toolUseId, child);
-      this.controlByToolUse.delete(toolUseId);
+    // AIR messages keep naming the original Agent/Task launch after a
+    // SendMessage resume. Route that stable id to the newest generation too.
+    const launchToolUseId = child.launchToolUseId ?? toolUseId;
+    for (const id of new Set([toolUseId, launchToolUseId])) {
+      if (!id) continue;
+      this.taskByToolUse.set(id, taskId);
+      this.childByParentToolUse.set(id, child);
     }
+    if (toolUseId) this.controlByToolUse.delete(toolUseId);
     if (!announce) return;
     await this.announce(child);
-    for (const pending of toolUseId ? this.takePending(toolUseId) : []) await deliver(pending);
+    for (const id of new Set([toolUseId, launchToolUseId])) {
+      if (!id) continue;
+      for (const pending of this.takePending(id)) await deliver(pending);
+    }
   }
 
   /**
