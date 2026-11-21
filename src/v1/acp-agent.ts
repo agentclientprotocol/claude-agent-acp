@@ -180,7 +180,7 @@ import {
   parseSteerRequest,
   type SteerRequest,
   type SteerResponse,
-} from "./steering.js";
+} from "../steering.js";
 import {
   AUTH_STATUS_UPDATE_METHOD,
   type AuthStatus,

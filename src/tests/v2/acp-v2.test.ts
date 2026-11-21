@@ -258,7 +258,9 @@ function v2Client({
   answerPermission = () => ({ outcome: { outcome: "cancelled" } }),
   answerElicitation = () => ({ action: "accept" }),
 }: {
-  answerPermission?: (request: v2.RequestPermissionRequest) => v2.RequestPermissionResponse;
+  answerPermission?: (
+    request: v2.RequestPermissionRequest,
+  ) => v2.RequestPermissionResponse | Promise<v2.RequestPermissionResponse>;
   answerElicitation?: (
     request: v2.CreateElicitationRequest,
   ) => v2.CreateElicitationResponse | Promise<v2.CreateElicitationResponse>;
@@ -413,8 +415,7 @@ describe("ACP protocol routing", () => {
       title: {},
     });
     expect(response.capabilities?.providers).toEqual({});
-    // Not `_session/steering`, which v1 advertises in the top-level `_meta`.
-    expect(response._meta?.steering).toBeUndefined();
+    expect(response._meta?.steering).toEqual({ supported: true });
     expect(response.authMethods?.length).toBeGreaterThan(0);
     for (const method of response.authMethods ?? []) {
       expect(method).not.toHaveProperty("id");
@@ -1852,6 +1853,264 @@ function scriptTurns(...turns: TurnScript[]): string[] {
     while (!(await input.next()).done);
   };
   return echoed;
+}
+
+describe("ACP v2 steering", () => {
+  it("keeps an idle steer host-owned on request and otherwise starts a prompt", async () => {
+    const echoed = scriptTurns(async function* (options) {
+      yield result(options);
+      yield idleState(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const prompt = text("follow up");
+      await expect(
+        agent.request("_session/steering", {
+          sessionId,
+          prompt,
+          _meta: { steering: { idleBehavior: "promptRequired" } },
+        }),
+      ).resolves.toEqual({ outcome: "promptRequired", reason: "noRunningTurn" });
+      expect(echoed).toEqual([]);
+      await expect(agent.request("_session/steering", { sessionId, prompt })).resolves.toEqual({
+        outcome: "startedNewTurn",
+      });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      expect(echoed).toHaveLength(1);
+    });
+  });
+
+  it("rejects invalid requests and unknown or closed sessions", async () => {
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      for (const prompt of [[], [null], [{ type: "audio", data: "", mimeType: "audio/wav" }]]) {
+        await expect(
+          agent.request("_session/steering", { sessionId, prompt }),
+        ).rejects.toMatchObject({ code: -32602 });
+      }
+      await agent.request(v2.methods.agent.session.close, { sessionId });
+      for (const id of [randomUUID(), sessionId]) {
+        await expect(
+          agent.request("_session/steering", { sessionId: id, prompt: text("hi") }),
+        ).rejects.toMatchObject({ code: v1.RequestError.sessionNotFound(id).code });
+      }
+    });
+  });
+
+  it.each(["permission", "elicitation", "cancel", "failed cancel"])(
+    "defers steering while %s waits for user input",
+    async (scenario) => {
+      const permission = Promise.withResolvers<v2.RequestPermissionResponse>();
+      const elicitation = Promise.withResolvers<v2.CreateElicitationResponse>();
+      const client = v2Client({
+        answerPermission: () => permission.promise,
+        answerElicitation: () => elicitation.promise,
+      });
+      const controller = new AbortController();
+      const steered = Promise.withResolvers<SDKUserMessage>();
+      const cancelled = Promise.withResolvers<void>();
+      sdk.interrupt = async () => {
+        cancelled.resolve();
+        if (scenario === "failed cancel") throw new Error("Interrupt failed");
+        controller.abort();
+      };
+      sdk.run = async function* (prompts, options) {
+        const input = prompts[Symbol.asyncIterator]();
+        const first: SDKUserMessage = (await input.next()).value;
+        yield steerEcho(first, options);
+        const answer =
+          scenario === "permission"
+            ? options.canUseTool!("Bash", { command: "ls" }, {
+                signal: controller.signal,
+                suggestions: [],
+                toolUseID: "toolu_ls",
+                requestId: randomUUID(),
+              } as Parameters<NonNullable<Options["canUseTool"]>>[2])
+            : options.onElicitation!(
+                {
+                  serverName: "linear",
+                  message: "Which team?",
+                  mode: "form",
+                  requestedSchema: { type: "object", properties: { team: { type: "string" } } },
+                },
+                { signal: controller.signal } as Parameters<
+                  NonNullable<Options["onElicitation"]>
+                >[1],
+              );
+        const steer: SDKUserMessage = (await input.next()).value;
+        steered.resolve(steer);
+        await answer;
+        if (scenario === "cancel") {
+          await cancelled.promise;
+          yield {
+            type: "command_lifecycle",
+            state: "cancelled",
+            command_uuid: steer.uuid,
+            session_id: options.sessionId,
+          };
+          yield result(options, {
+            stop_reason: null,
+            terminal_reason: "aborted_tools",
+            user_message_uuids: [first.uuid],
+          });
+        } else {
+          if (scenario === "failed cancel") {
+            yield {
+              type: "system",
+              subtype: "status",
+              status: "requesting",
+              user_message_uuids: [steer.uuid],
+              session_id: options.sessionId,
+            };
+          }
+          yield steerEcho(steer, options);
+          yield result(options, { user_message_uuids: [first.uuid, steer.uuid] });
+        }
+        yield idleState(options);
+        while (!(await input.next()).done);
+      };
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent, { elicitation: { form: {} } });
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("first") });
+        const requests =
+          scenario === "permission" ? client.permissionRequests : client.elicitations;
+        await vi.waitFor(() => expect(requests).toHaveLength(1));
+        await expect(
+          agent.request("_session/steering", { sessionId, prompt: text("follow up") }),
+        ).resolves.toEqual({ outcome: "injected" });
+        expect(await steered.promise).toMatchObject({ priority: "later" });
+        expect(await agent.request(v2.methods.agent.session.status, { sessionId })).toMatchObject({
+          state: { state: "requires_action" },
+        });
+        expect(client.cancelledRequests).toEqual([]);
+        if (scenario.endsWith("cancel")) {
+          await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+          await cancelled.promise;
+        }
+        if (scenario !== "cancel") {
+          permission.resolve({ outcome: { outcome: "selected", optionId: "allow-once" } });
+          elicitation.resolve({ action: "accept", content: { team: "core" } });
+        }
+        const reason = scenario === "cancel" ? "cancelled" : "end_turn";
+        await vi.waitFor(() =>
+          expect(client.updates("state_update").at(-1)).toMatchObject({
+            state: "idle",
+            stopReason: reason,
+            usage: { totalTokens: 5 },
+          }),
+        );
+        expect(client.cancelledRequests).toEqual(
+          scenario === "cancel" ? ["elicitation/create"] : [],
+        );
+        expect(
+          client.updates("state_update").filter((update) => update.state === "idle"),
+        ).toHaveLength(1);
+      });
+    },
+  );
+
+  it.each(["stamped", "unstamped", "missing final"])(
+    "prioritizes a steer and reports one completion with %s runtime results",
+    async (format) => {
+      const intermediate = Promise.withResolvers<void>();
+      const finishSteer = Promise.withResolvers<void>();
+      sdk.run = async function* (prompts, options) {
+        const input = prompts[Symbol.asyncIterator]();
+        const first = (await input.next()).value as SDKUserMessage;
+        yield steerEcho(first, options);
+        const queued = (await input.next()).value as SDKUserMessage;
+        const steer = (await input.next()).value as SDKUserMessage;
+        expect(queued.priority).toBeUndefined();
+        expect(steer.priority).toBe("now");
+        expect(steer.message.content).toContainEqual({
+          type: "image",
+          source: { type: "base64", data: "aGk=", media_type: "image/png" },
+        });
+        yield result(options, {
+          stop_reason: null,
+          terminal_reason: "aborted_streaming",
+          origin: { kind: "human" },
+          ...(format === "stamped" ? { user_message_uuids: [first.uuid] } : {}),
+        });
+        yield idleState(options);
+        intermediate.resolve();
+        await finishSteer.promise;
+        yield steerEcho(steer, options);
+        if (format === "missing final") {
+          yield {
+            type: "command_lifecycle",
+            state: "completed",
+            command_uuid: steer.uuid,
+            session_id: options.sessionId,
+          };
+        } else {
+          yield result(options, {
+            origin: { kind: "human" },
+            ...(format === "stamped" ? { user_message_uuids: [steer.uuid] } : {}),
+          });
+        }
+        yield idleState(options);
+        yield steerEcho(queued, options);
+        yield result(options);
+        yield idleState(options);
+        while (!(await input.next()).done);
+      };
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("first") });
+        const queued = agent.request(v2.methods.agent.session.prompt, {
+          sessionId,
+          prompt: text("queued"),
+        });
+        void queued.catch(() => {});
+        await waitForQueuedPrompt(sessionId);
+        await expect(
+          agent.request("_session/steering", {
+            sessionId,
+            prompt: [...text("steer"), { type: "image", data: "aGk=", mimeType: "image/png" }],
+          }),
+        ).resolves.toEqual({ outcome: "injected" });
+        await intermediate.promise;
+        const status = await agent.request(v2.methods.agent.session.status, { sessionId });
+        expect(status.state).toMatchObject({ state: "running" });
+        expect(client.updates("state_update").map((update) => update.state)).toEqual(["running"]);
+        finishSteer.resolve();
+        await queued;
+        await vi.waitFor(() =>
+          expect(client.updates("state_update").map((update) => update.state)).toEqual([
+            "running",
+            "idle",
+            "running",
+            "idle",
+          ]),
+        );
+        const idle = client.updates("state_update").filter((update) => update.state === "idle");
+        expect(idle).toMatchObject([
+          { usage: { totalTokens: format === "missing final" ? 5 : 10 } },
+          { usage: { totalTokens: 5 } },
+        ]);
+      });
+    },
+  );
+});
+
+function steerEcho(message: SDKUserMessage, options: Options) {
+  return {
+    type: "user",
+    message: message.message,
+    uuid: message.uuid,
+    parent_tool_use_id: null,
+    isReplay: true,
+    origin: { kind: "human" },
+    session_id: options.sessionId,
+  };
 }
 
 /** An entry of a Claude Code transcript, as `getSessionMessages` returns it. */
@@ -8801,6 +9060,34 @@ describe("ACP v2 terminal of a command in the background", () => {
       return client;
     }
 
+    it("keeps a background terminal listed across a steer folded into the active cycle", async () => {
+      sdk.run = async function* (prompts, options) {
+        const input = prompts[Symbol.asyncIterator]();
+        const first: SDKUserMessage = (await input.next()).value;
+        yield steerEcho(first, options);
+        yield level(options, [{}]);
+        yield taskStarted(options);
+        yield bashUse(options);
+        yield backgrounded(options);
+        const steer: SDKUserMessage = (await input.next()).value;
+        // A shared result can name the steer even if the runtime omitted its echo.
+        yield result(options, { user_message_uuids: [first.uuid, steer.uuid] });
+        yield idleState(options);
+        while (!(await input.next()).done);
+      };
+      const client = await promptUntil("running [toolu_bg]", async (agent, sessionId, client) => {
+        await expect(
+          agent.request("_session/steering", { sessionId, prompt: text("steer") }),
+        ).resolves.toEqual({ outcome: "injected" });
+        await vi.waitFor(() =>
+          expect(backgroundTrace(client)).toContain("idle end_turn [toolu_bg]"),
+        );
+      });
+      expect(backgroundTrace(client).filter((entry) => entry.startsWith("idle"))).toEqual([
+        "idle end_turn [toolu_bg]",
+      ]);
+    });
+
     it("lists the terminal from the Bash result until the command's task ends, and lets the client cancel it meanwhile", async () => {
       scriptTurns(async function* (options) {
         yield level(options, [{}]);
@@ -11192,6 +11479,29 @@ describe("ACP v2 Remote Control", () => {
       "agent_message_chunk",
       "idle end_turn",
     ]);
+  });
+
+  it("rejects a steer while the adapter is changing Remote Control", async () => {
+    const remote = Promise.withResolvers<{ session_url: string }>();
+    sdk.enableRemoteControl = vi.fn(() => remote.promise);
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("/remote-control"),
+      });
+      await expect(
+        agent.request("_session/steering", { sessionId, prompt: text("steer") }),
+      ).rejects.toMatchObject({
+        code: -32600,
+        message:
+          "Invalid request: Remote Control is being changed. Try steering when the command ends.",
+      });
+      remote.resolve({ session_url: SESSION_URL });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates).at(-1)).toBe("idle end_turn"));
+    });
   });
 
   // v2 asks that held prompts be inserted in the order received.

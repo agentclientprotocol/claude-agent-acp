@@ -5316,7 +5316,7 @@ describe("ACP v2 core", () => {
           capabilities,
         }),
       );
-      expect(response._meta).toEqual(expected);
+      expect(response._meta).toEqual({ ...expected, steering: { supported: true } });
     });
 
     it.each([

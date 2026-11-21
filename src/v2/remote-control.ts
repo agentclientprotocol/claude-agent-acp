@@ -38,8 +38,13 @@ export interface RemoteControlHost {
 export class SessionRemoteControl {
   /** The uuids of the prompts that this session sent, until Claude Code echoes them. */
   private readonly sent = new Set<string>();
+  private changing = false;
 
   constructor(private readonly host: RemoteControlHost) {}
+
+  get isChanging(): boolean {
+    return this.changing;
+  }
 
   /** Whether `prompt` may be the adapter's command, which {@link run} then decides. */
   mayRun(prompt: Parameters<typeof parseRemoteControlCommand>[0]): boolean {
@@ -63,13 +68,18 @@ export class SessionRemoteControl {
     const command = await adapterRemoteControlCommand(prompt, query, this.host.terminalCommands());
     if (!command) return false;
     if (!(await this.host.idle()) || !stillPending()) return true;
-    this.host.begin(uuid);
-    // The turn is open across the network call, so the session reads as busy.
-    const text = await runRemoteControlCommand(command.query, command.command, (message) =>
-      this.host.logger.error(message),
-    );
-    this.host.end(text, randomUUID());
-    return true;
+    this.changing = true;
+    try {
+      this.host.begin(uuid);
+      // The turn is open across the network call, so the session reads as busy.
+      const text = await runRemoteControlCommand(command.query, command.command, (message) =>
+        this.host.logger.error(message),
+      );
+      this.host.end(text, randomUUID());
+      return true;
+    } finally {
+      this.changing = false;
+    }
   }
 
   /** The session sent the prompt `uuid` to Claude Code. */

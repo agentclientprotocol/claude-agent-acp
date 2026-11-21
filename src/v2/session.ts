@@ -17,7 +17,8 @@
  *   and quota the idle carries (see `outcome.ts`). Claude Code's own
  *   `session_state_changed` stays `running` while background subagents work,
  *   which v2 lists as background work instead (`background`), so its `idle`
- *   only ends a turn that ended without a result.
+ *   only ends a turn that ended without a result. Steering can span more
+ *   than one runtime cycle within that same foreground turn.
  * - `requires_action` is this session's own: a turn is open, and a
  *   permission request or elicitation of this session is open, or, while
  *   the turn waits on subagents, each of them waits on one.
@@ -52,6 +53,7 @@ import type {
   SDKResultMessage,
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import { STEER_PRIORITY_LATER, STEER_PRIORITY_NOW } from "../steering.js";
 import { AUTONOMOUS_RESULT_ORIGINS } from "../result-end.js";
 import { promptToClaude } from "../prompt-to-claude.js";
 import type { Logger } from "../logger.js";
@@ -85,6 +87,7 @@ import {
   type TurnEnd,
 } from "./outcome.js";
 import type { KeyedAttempt, PromptKeys } from "./prompt-keys.js";
+import { SessionSteering } from "./steering.js";
 import { StoppedWork } from "./stopped-work.js";
 import { SessionReports } from "./reports.js";
 import { SessionElicitations } from "./elicitation.js";
@@ -174,6 +177,7 @@ export class V2Session implements RequestTarget {
   /** The result that ended the open turn, with what the turn spent. */
   private lastEnd: TurnEnd | undefined;
   private usage = new ResultUsage(false);
+  private readonly steering = new SessionSteering();
   /**
    * Whether Claude Code's `idle` for the last result is still to come. It can
    * come after the next cycle's first output, and does not end that cycle.
@@ -460,6 +464,37 @@ export class V2Session implements RequestTarget {
     return this.keys.once(key, (attempt) => this.submit(params, request, guard, attempt));
   }
 
+  /** Pushes directly to the SDK's priority queue while foreground work is open. */
+  injectSteer(params: v2.PromptRequest): boolean {
+    if (this.closed) throw RequestError.sessionNotFound(this.sessionId);
+    const request = v1PromptRequest(params);
+    if (!this.foreground) return false;
+    if (this.cancelledWork || this.interrupting || this.lastEnd) {
+      throw RequestError.invalidRequest(
+        undefined,
+        "Claude is ending the turn. Try again when it ends.",
+      );
+    }
+    if (this.remoteControl.isChanging) {
+      throw RequestError.invalidRequest(
+        undefined,
+        "Remote Control is being changed. Try steering when the command ends.",
+      );
+    }
+    const uuid = randomUUID();
+    const message = promptToClaude(request);
+    message.uuid = uuid;
+    message.priority =
+      this.requests.size > 0 || this.tasks.hasOpenRequests()
+        ? STEER_PRIORITY_LATER
+        : STEER_PRIORITY_NOW;
+    this.reports.disarmIdleCompaction("steer");
+    this.steering.add(uuid);
+    this.remoteControl.pushed(uuid);
+    this.input.push(message);
+    return true;
+  }
+
   /**
    * Sends the prompt to Claude Code as the message `attempt.uuid` (see
    * {@link prompt}).
@@ -649,6 +684,7 @@ export class V2Session implements RequestTarget {
   async cancel(): Promise<void> {
     if (this.closed || !this.query) return;
     this.reports.disarmIdleCompaction("cancel");
+    const queuedSteers = this.steering.queued();
     this.stopForeground();
     // `cancelQueued` is untyped in the SDK (`Query.interrupt` takes it since
     // the CLI's `interrupt_cancel_queued_v1`): Claude Code then drops the
@@ -664,7 +700,7 @@ export class V2Session implements RequestTarget {
         this.connection.logger.error(`Session ${this.sessionId}: the interrupt failed`, error);
         this.cancelledWork = false;
         this.output.cancelled = false;
-        this.stopped.interruptFailed();
+        this.stopped.interruptFailed(queuedSteers);
         this.tasks.foregroundCancelFailed();
         // The withdrawn requests reported no `running`: the work goes on.
         this.reportState();
@@ -692,7 +728,7 @@ export class V2Session implements RequestTarget {
     // adapter's prompts are stopped work too, and no frame of the turn's own
     // prompt is left to end it.
     const heldTurn = this.clearContext.holdsTurn();
-    pushed.push(...this.clearContext.stop());
+    pushed.push(...this.clearContext.stop(), ...this.steering.queued());
     this.stopped.cancelled(pushed, this.foreground);
     if (this.foreground) {
       this.cancelledWork = true;
@@ -1011,8 +1047,7 @@ export class V2Session implements RequestTarget {
    */
   private handle(message: SDKMessage): void | Promise<void> {
     if ((message as { type: string }).type === "command_lifecycle") {
-      this.lifecycle(message as unknown as CommandLifecycleFrame);
-      return;
+      return this.lifecycle(message as unknown as CommandLifecycleFrame);
     }
     // Before the tasks take a subagent's messages: its file edits are the turn's.
     this.fileChanges?.message(message);
@@ -1155,21 +1190,31 @@ export class V2Session implements RequestTarget {
     this.reports.handle(message);
   }
 
-  private lifecycle(frame: CommandLifecycleFrame): void {
+  private lifecycle(frame: CommandLifecycleFrame): void | Promise<void> {
     this.lifecycleFrames = true;
     const uuid = frame.command_uuid;
     switch (frame.state) {
       case "started":
         this.promptStarted(uuid);
         return;
-      case "cancelled":
+      case "cancelled": {
         if (this.failPrompt(uuid, RequestError.requestCancelled())) return;
-        this.stopped.promptEnded(uuid, true);
+        const wasSteer = this.steering.forget(uuid);
+        // Pre-emption can end the original command without cancelling the
+        // foreground work. Its result still contributes to the turn's usage.
+        this.stopped.promptEnded(uuid, this.cancelledWork || !this.steering.outstanding);
+        if (wasSteer && !this.cycleOpen && !this.steering.outstanding) {
+          return this.endSteering();
+        }
         // The prompt had started: the interrupt stopped its turn.
         if (uuid === this.turnCommand) this.closeTurn();
         return;
+      }
       case "discarded":
       case "refused":
+        if (this.steering.forget(uuid) && !this.cycleOpen && !this.steering.outstanding) {
+          return this.endSteering();
+        }
         this.failPrompt(
           uuid,
           RequestError.internalError(
@@ -1185,7 +1230,10 @@ export class V2Session implements RequestTarget {
         // then ends the turn. Nothing but Claude Code's order tells the two
         // apart.
         this.stopped.promptEnded(uuid);
-        if (uuid === this.cycleCommand) this.closeTurn();
+        if (uuid === this.cycleCommand) {
+          this.steering.forget(uuid);
+          this.closeTurn();
+        }
         return;
       default:
         // `queued`: the prompt waits in Claude Code's queue.
@@ -1200,7 +1248,9 @@ export class V2Session implements RequestTarget {
    * nothing (see {@link StoppedWork}).
    */
   private promptStarted(uuid: string): void {
-    if (this.stopped.promptStarted(uuid, this.foreground)) return;
+    if (this.steering.repeatedStart(uuid) || this.stopped.promptStarted(uuid, this.foreground)) {
+      return;
+    }
     // Claude Code takes its prompts in order: the work that a cancel stopped
     // has ended, also when the cancel came while it ran nothing.
     this.tasks.foregroundCancelEnded();
@@ -1270,12 +1320,18 @@ export class V2Session implements RequestTarget {
     this.reports.result(message);
     // Before the result's text below, which can repeat the failed request's.
     this.reportApiError(end);
+    if (!this.cancelledWork) this.steering.observeResult(message);
     // The turn goes on in a fresh context (see `ClearContext`).
     if (this.clearContext.holdsResult(message, end)) {
       this.turnReport.reset();
       return;
     }
-    this.lastEnd = this.clearContext.turnEnd(end);
+    if (!this.cancelledWork && this.steering.outstanding) {
+      this.steering.carry(end);
+      this.turnReport.reset();
+      return;
+    }
+    this.lastEnd = this.steering.finish(this.clearContext.turnEnd(end));
     const local = this.turnLocalCommand;
     if (message.stop_reason === "refusal") {
       // The refused message shows nothing: its explanation answers.
@@ -1305,6 +1361,11 @@ export class V2Session implements RequestTarget {
       }
       this.output.agentMessage(message.result, message.uuid);
     }
+    return this.endTurn();
+  }
+
+  private endSteering(): void | Promise<void> {
+    this.lastEnd = this.steering.finish();
     return this.endTurn();
   }
 
@@ -1356,6 +1417,7 @@ export class V2Session implements RequestTarget {
       return;
     }
     this.stopped.idle();
+    this.steering.cycleEnded();
     this.tasks.foregroundCancelEnded();
     this.closeTurn();
   }
@@ -1447,6 +1509,13 @@ export class V2Session implements RequestTarget {
    */
   private closeTurn(): void {
     if (!this.foreground || this.clearContext.holdsTurn()) return;
+    if (this.steering.outstanding && !this.cancelledWork) {
+      this.cycleOpen = false;
+      this.cycleCommand = undefined;
+      return;
+    }
+    this.lastEnd ??= this.steering.finish();
+    this.steering.clear();
     // A subagent's end that still waited for its messages, before the turn's idle.
     this.tasks.turnClosed();
     // v2 asks for a final status of the turn's tool calls before its idle. A

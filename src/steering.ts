@@ -27,7 +27,7 @@ type SteerMeta = {
 /** Params of a {@link STEER_METHOD} request. Shaped like the relevant subset of
  *  a `PromptRequest` so the same `promptToClaude` conversion applies. Delivery
  *  priority is deliberately NOT exposed here — it's an internal detail the agent
- *  chooses (see {@link STEER_PRIORITY}). */
+ *  chooses (see {@link STEER_PRIORITY_NOW}). */
 export type SteerRequest = {
   sessionId: string;
   prompt: PromptRequest["prompt"];

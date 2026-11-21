@@ -73,7 +73,18 @@ with replay, which `replay_complete` ends, `session/close`, `session/prompt`, `s
 `session/fork`, `session/status`, `session/options` (with initial `configOptions` on `session/new`,
 `session/resume` and `session/fork`), `session/set_title`, additional directories, config options (the mode is one), plans, notices,
 compaction, display terminals for commands, permission requests, elicitation, providers, auth, and
-[subagents](docs/subagent-sessions.md). Steering is v1 only for now.
+[subagents](docs/subagent-sessions.md).
+
+Both protocol versions advertise `_meta.steering.supported: true` in `initialize`.
+On v2, send `_session/steering` with `sessionId` and `prompt` to inject a message
+into foreground work. The agent returns `injected` when it queues the message with Claude Code
+at steering priority. If a permission or elicitation is open, delivery waits so the user can
+answer it. The foreground work stays open until the steered work ends, and background tasks
+keep their own lifecycle.
+
+With no foreground work, the request starts a prompt and returns `startedNewTurn` once
+Claude Code takes it in. Set `_meta.steering.idleBehavior` to `"promptRequired"` to receive
+`{ "outcome": "promptRequired", "reason": "noRunningTurn" }` without starting a prompt.
 
 `session/prompt` takes an `idempotencyKey`: a prompt that a client sends again with the same key
 is inserted once, and the retry gets the first `messageId`. The key is known for as long as Claude
