@@ -23,13 +23,6 @@ import {
   type CreateElicitationResponse,
 } from "@agentclientprotocol/sdk/unstable";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
-import {
-  AIR_CUSTOM_ANSWER_FIELDS_KEY,
-  AIR_CUSTOM_ANSWER_KEY,
-  LEGACY_AIR_CUSTOM_ANSWER_KEY,
-  airExtensionMeta,
-  withAirMeta,
-} from "../air-extension.js";
 import type { CanUseTool, Options, Query } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "../logger.js";
 import {
@@ -70,15 +63,9 @@ export function v2ElicitationRequest(
       return [name, rest];
     }),
   );
-  const fields = Object.entries(requestedSchema.properties ?? {})
-    .filter(([, property]) => isCustomAnswer(property._meta))
-    .map(([key]) => key);
   return {
     ...request,
     requestedSchema: { ...requestedSchema, properties },
-    ...(fields.length === 0
-      ? {}
-      : { _meta: withAirMeta(request._meta, AIR_CUSTOM_ANSWER_FIELDS_KEY, fields) }),
   } as v2.CreateElicitationRequest;
 }
 
@@ -284,18 +271,4 @@ export class SessionElicitations {
       releases.add(release);
     });
   }
-}
-
-function isCustomAnswer(meta: unknown): boolean {
-  if (meta === null || typeof meta !== "object" || Array.isArray(meta)) return false;
-  const marker =
-    airExtensionMeta(meta)?.[AIR_CUSTOM_ANSWER_KEY] ??
-    (meta as Record<string, unknown>)[LEGACY_AIR_CUSTOM_ANSWER_KEY];
-  return (
-    marker === true ||
-    (marker !== null &&
-      typeof marker === "object" &&
-      !Array.isArray(marker) &&
-      Object.keys(marker).length > 0)
-  );
 }

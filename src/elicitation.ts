@@ -18,6 +18,7 @@ import type {
   AskUserQuestionOutput,
 } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import {
+  AIR_CUSTOM_ANSWER_FIELDS_KEY,
   AIR_CUSTOM_ANSWER_KEY,
   LEGACY_AIR_CUSTOM_ANSWER_KEY,
   withAirMeta,
@@ -257,6 +258,15 @@ export function askUserQuestionsToCreateRequest(
     ...(toolCallId ? { toolCallId } : {}),
     message,
     requestedSchema,
+    ...(airClient && questions.length > 0
+      ? {
+          _meta: withAirMeta(
+            undefined,
+            AIR_CUSTOM_ANSWER_FIELDS_KEY,
+            questions.map((_, index) => questionCustomFieldKey(index)),
+          ),
+        }
+      : {}),
   };
 }
 
