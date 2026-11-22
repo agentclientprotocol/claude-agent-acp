@@ -4,11 +4,12 @@ import * as path from "node:path";
 // SDK; API may shift in a future release.
 import {
   filterEscalatingDefaultMode,
+  type Options,
   resolveSettings,
   type Settings,
 } from "@anthropic-ai/claude-agent-sdk";
 import { unloadedPolicySources } from "./managed-policy.js";
-import { claudeConfigDir } from "./paths.js";
+import { claudeConfigDir, launchClaudeConfigDir } from "./paths.js";
 
 /**
  * Permission rule format examples:
@@ -36,9 +37,47 @@ function getManagedSettingsPath(): string {
 export interface SettingsManagerOptions {
   onChange?: () => void;
   logger?: { log: (...args: any[]) => void; error: (...args: any[]) => void };
+  /** The session's env overrides, before provider routing. */
+  launchEnv?: Options["env"];
 }
 
 type ModelSelectionSettings = Pick<Settings, "availableModels" | "modelOverrides">;
+type AuthSourceSettings = Pick<Settings, "apiKeyHelper" | "env">;
+
+function mergeEnvironment(...tiers: Array<Settings["env"]>): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const tier of tiers) {
+    for (const [name, value] of Object.entries(tier ?? {})) {
+      if (value !== undefined) env[name] = value;
+    }
+  }
+  return env;
+}
+
+/** Only the fields used to attribute a CLI auth status are read here. */
+async function readAuthSourceSettings(file: string): Promise<AuthSourceSettings> {
+  try {
+    const text = await fs.promises.readFile(file, "utf8");
+    const settings = JSON.parse(text.replace(/^\uFEFF/, "")) as {
+      apiKeyHelper?: unknown;
+      env?: unknown;
+    } | null;
+    const { apiKeyHelper, env } = settings ?? {};
+    if (apiKeyHelper !== undefined && typeof apiKeyHelper !== "string") return {};
+    if (env !== undefined && (env === null || typeof env !== "object" || Array.isArray(env))) {
+      return {};
+    }
+    return {
+      apiKeyHelper,
+      env: Object.fromEntries(
+        Object.entries(env ?? {}).map(([name, value]) => [name, String(value)]),
+      ),
+    };
+  } catch {
+    // The user settings file may be missing or unreadable, as in resolveSettings.
+    return {};
+  }
+}
 
 /** The settings that decide whether Claude Code compacts (see `idle-compaction.ts`). */
 export type CompactionSettings = {
@@ -59,6 +98,8 @@ export type CompactionSettings = {
 export class SettingsManager {
   private cwd: string;
   private effective: Settings = {};
+  private authSourceSettings: AuthSourceSettings = {};
+  private readonly launchEnv?: Options["env"];
   private managedDeniedModels: string[] = [];
   private managedModelSettings: ModelSelectionSettings = {};
   private managedApiKeyHelper?: string;
@@ -76,6 +117,7 @@ export class SettingsManager {
 
   constructor(cwd: string, options?: SettingsManagerOptions) {
     this.cwd = cwd;
+    this.launchEnv = options?.launchEnv;
     this.onChange = options?.onChange;
     this.logger = options?.logger ?? console;
   }
@@ -102,16 +144,24 @@ export class SettingsManager {
     return this.initPromise;
   }
 
+  private authUserSettingsPath(): string {
+    const configDir = launchClaudeConfigDir(this.cwd, { ...process.env, ...this.launchEnv });
+    return path.join(configDir, "settings.json");
+  }
+
   /**
    * Paths the SDK reads when resolving settings for this cwd. Watching the
    * containing directories means we pick up file creation as well as edits.
    */
   private getWatchedPaths(): string[] {
     return [
-      path.join(claudeConfigDir(), "settings.json"),
-      path.join(this.cwd, ".claude", "settings.json"),
-      path.join(this.cwd, ".claude", "settings.local.json"),
-      getManagedSettingsPath(),
+      ...new Set([
+        path.resolve(claudeConfigDir(), "settings.json"),
+        this.authUserSettingsPath(),
+        path.join(this.cwd, ".claude", "settings.json"),
+        path.join(this.cwd, ".claude", "settings.local.json"),
+        getManagedSettingsPath(),
+      ]),
     ];
   }
 
@@ -134,6 +184,23 @@ export class SettingsManager {
         }
       }
       this.effective = filterEscalatingDefaultMode(resolved);
+      const authUserPath = this.authUserSettingsPath();
+      if (authUserPath === path.resolve(claudeConfigDir(), "settings.json")) {
+        this.authSourceSettings = this.effective;
+      } else {
+        // resolveSettings uses the adapter's env. Substitute the launched CLI's
+        // user tier for auth attribution while retaining the SDK's other tiers.
+        const tiers = [
+          await readAuthSourceSettings(authUserPath),
+          ...resolved.sources
+            .filter((entry) => entry.source !== "user")
+            .map((entry) => entry.settings),
+        ];
+        this.authSourceSettings = {
+          apiKeyHelper: tiers.findLast((tier) => tier.apiKeyHelper !== undefined)?.apiKeyHelper,
+          env: mergeEnvironment(...tiers.map((tier) => tier.env)),
+        };
+      }
       // The CLI reads `deniedModels` from managed settings only.
       this.managedDeniedModels = resolved.sources
         .filter((entry) => entry.source === "managed")
@@ -167,6 +234,7 @@ export class SettingsManager {
     } catch (error) {
       this.logger.error("Failed to resolve settings:", error);
       this.effective = {};
+      this.authSourceSettings = {};
       this.managedDeniedModels = [];
       this.managedModelSettings = {};
       this.managedApiKeyHelper = undefined;
@@ -240,7 +308,9 @@ export class SettingsManager {
    */
   getApiKeyHelper(settingsOverride?: Settings): string | undefined {
     return (
-      this.managedApiKeyHelper ?? settingsOverride?.apiKeyHelper ?? this.effective.apiKeyHelper
+      this.managedApiKeyHelper ??
+      settingsOverride?.apiKeyHelper ??
+      this.authSourceSettings.apiKeyHelper
     );
   }
 
@@ -264,20 +334,13 @@ export class SettingsManager {
     };
   }
 
-  /** Settings env as the CLI resolves it: files, then `--settings`, then
-   *  managed policy. Undefined entries do not hide a lower tier's value. */
+  /** The auth probe's settings env: files, then `--settings`, then managed policy. */
   getEnvironment(settingsOverride?: Settings): Record<string, string> {
-    const env: Record<string, string> = {};
-    for (const tier of [
-      this.effective.env,
+    return mergeEnvironment(
+      this.authSourceSettings.env,
       settingsOverride?.env,
       this.managedCompactionSettings.env,
-    ]) {
-      for (const [name, value] of Object.entries(tier ?? {})) {
-        if (value !== undefined) env[name] = value;
-      }
-    }
-    return env;
+    );
   }
 
   /** `idleCompaction`, `autoCompactEnabled` and `env` as the CLI resolves them:
@@ -291,7 +354,7 @@ export class SettingsManager {
         managed.autoCompactEnabled ??
         settingsOverride?.autoCompactEnabled ??
         this.effective.autoCompactEnabled,
-      env: this.getEnvironment(settingsOverride),
+      env: mergeEnvironment(this.effective.env, settingsOverride?.env, managed.env),
     };
   }
 

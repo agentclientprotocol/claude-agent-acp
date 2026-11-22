@@ -6,6 +6,15 @@ export function claudeConfigDir(): string {
   return process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
 }
 
+/** The config directory as seen by a Claude subprocess launched in `cwd`. */
+export function launchClaudeConfigDir(
+  cwd: string,
+  env: Readonly<Record<string, string | undefined>>,
+): string {
+  const home = env[process.platform === "win32" ? "USERPROFILE" : "HOME"] || os.homedir();
+  return path.resolve(cwd, env.CLAUDE_CONFIG_DIR || path.join(home, ".claude"));
+}
+
 /** `<config>/projects`, normalized like the SDK does. */
 export function projectsRoot(): string {
   return path.join(claudeConfigDir(), "projects").normalize("NFC");

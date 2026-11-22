@@ -28,6 +28,7 @@ import {
   mergeAuthStatus,
   parseCliAuthStatus,
   sameAuthStatus,
+  sameIdentity,
   toAcpAuthStatus,
 } from "./auth-status.js";
 import { claudeCliPath } from "./claude-cli.js";
@@ -36,6 +37,7 @@ import {
   isClaudeEnterprisePlan,
   shouldHideClaudeAuth,
 } from "./hide-claude-auth.js";
+import { launchClaudeConfigDir } from "./paths.js";
 import type { SettingsManager } from "./settings.js";
 
 const execFileAsync = promisify(execFile);
@@ -54,6 +56,11 @@ export type AuthProbeScope = (
   override?: Settings,
   env?: Options["env"],
 ) => boolean;
+
+/** Capture the selected settings before waiting on a query account read. */
+export type SessionAccountReporter = (
+  source: "startup" | "cached",
+) => (account: AccountInfo | undefined) => void;
 
 export interface AuthStatusReporterOptions {
   /** Sends `_auth/status_update`. */
@@ -77,7 +84,7 @@ export class AuthStatusReporter {
    * A probe records it at start and publishes only if it has not moved, so a
    * slow read can never overwrite a newer login or logout.
    */
-  epoch = 0;
+  private epoch = 0;
   private settings?: {
     manager: AuthStatusSettings;
     override?: Settings;
@@ -99,8 +106,13 @@ export class AuthStatusReporter {
   private loggedProbeTimeout = false;
   /** Numbers the probe runs in start order. */
   private probeRuns = 0;
-  /** The latest-started probe run that published its read. */
-  private publishedRun = 0;
+  /** The latest-started probe that published, with the credential sources it observed. */
+  private lastProbe?: {
+    run: number;
+    status: AuthStatus;
+    refused: boolean;
+    appliesTo: AuthProbeScope;
+  };
   private acpStatus: AcpAuthStatus = { state: "unknown" };
 
   constructor(private readonly options: AuthStatusReporterOptions) {}
@@ -204,6 +216,36 @@ export class AuthStatusReporter {
   }
 
   /**
+   * Bind display updates to a query at launch. Later accountInfo() calls
+   * return the account cached at launch, so a probe started after launch can
+   * supersede them within the same credential scope.
+   */
+  sessionAccountReporter(
+    manager: AuthStatusSettings,
+    override?: Settings,
+    env?: Options["env"],
+  ): SessionAccountReporter {
+    const launchRun = this.probeRuns;
+    return (source) => {
+      const epoch = this.epoch;
+      return (account) => {
+        if (epoch !== this.epoch) return;
+        const probe = this.lastProbe;
+        this.publishSessionAccount(
+          account,
+          manager.getApiKeyHelper(override),
+          source === "cached" &&
+            probe &&
+            probe.run > launchRun &&
+            probe.appliesTo(manager, override, env)
+            ? probe
+            : undefined,
+        );
+      };
+    };
+  }
+
+  /**
    * Report the identity behind a session's `AccountInfo`.
    *
    * `AccountInfo` describes what the live query authenticates with, but lacks
@@ -228,7 +270,11 @@ export class AuthStatusReporter {
    * under an apiKeyHelper) means "nothing to add", not "logged out" — keep
    * what the CLI probe already established instead of overwriting it.
    */
-  publishSessionAccount(account: AccountInfo | undefined, apiKeyHelper?: string): void {
+  private publishSessionAccount(
+    account: AccountInfo | undefined,
+    apiKeyHelper: string | undefined,
+    probe?: { status: AuthStatus; refused: boolean },
+  ): void {
     if (this.options.providerOverride()) {
       if (!this.loggedOverriddenAccount) {
         this.loggedOverriddenAccount = true;
@@ -243,6 +289,13 @@ export class AuthStatusReporter {
     }
     const fromSession = fromAccountInfo(account, apiKeyHelper);
     if (account && fromSession) {
+      if (probe) {
+        if (sameIdentity(probe.status, fromSession)) {
+          // An older account can fill gaps in the probe for the same identity.
+          this.set(mergeAuthStatus(fromSession, probe.status, "cli"), probe.refused);
+        }
+        return;
+      }
       this.set(
         mergeAuthStatus(this.current, fromSession, "session"),
         shouldHideClaudeAuth() && claudeAuthRefusal(account) !== undefined,
@@ -371,13 +424,12 @@ export class AuthStatusReporter {
       logger.log("[authStatus] discarding a probe that predates the latest auth change");
       return this.current;
     }
-    if (run < this.publishedRun) {
+    if (this.lastProbe && run < this.lastProbe.run) {
       // Probes can overlap (`fresh`) and land out of order. A read that
       // started before one already published is the older of the two.
       logger.log("[authStatus] discarding a probe that a newer one overtook");
       return this.current;
     }
-    this.publishedRun = run;
     // The CLI probe can be poorer than the session `AccountInfo` for the very
     // same login (no organization, say). Keep those extra fields rather than
     // regressing the payload; a different identity replaces it wholesale.
@@ -389,19 +441,35 @@ export class AuthStatusReporter {
       status.kind === "account" &&
       cli.authMethod !== "oauth_token" &&
       !isClaudeEnterprisePlan(cli.subscriptionType);
-    this.set(merged, refused);
-    this.options.onProbe?.(status.kind, (manager, override, env) => {
+    const configDir = launchClaudeConfigDir(cwd, launchEnv);
+    const appliesTo: AuthProbeScope = (manager, override, env) => {
       // A relative key helper command can resolve differently in another cwd.
       if (apiKeyHelper !== manager.getApiKeyHelper(override)) return false;
       if (apiKeyHelper && cwd !== manager.getCwd()) return false;
-      const sessionEnv = { ...processEnv, ...env, ...manager.getEnvironment(override) };
+      const sessionLaunchEnv = { ...processEnv, ...env };
+      if (configDir !== launchClaudeConfigDir(manager.getCwd(), sessionLaunchEnv)) return false;
+      const sessionEnv = { ...sessionLaunchEnv, ...manager.getEnvironment(override) };
       return (
         Object.keys(effectiveEnv).length === Object.keys(sessionEnv).length &&
         Object.entries(effectiveEnv).every(
           ([name, value]) => Object.hasOwn(sessionEnv, name) && sessionEnv[name] === value,
         )
       );
-    });
+    };
+    this.lastProbe = {
+      run,
+      status: merged,
+      refused,
+      appliesTo: (manager, override, env) =>
+        // A watcher may have reloaded the very files this probe read.
+        (manager === context?.manager &&
+          cwd === manager.getCwd() &&
+          override === context.override &&
+          env === context.env) ||
+        appliesTo(manager, override, env),
+    };
+    this.set(merged, refused);
+    this.options.onProbe?.(status.kind, appliesTo);
     return merged;
   }
 }

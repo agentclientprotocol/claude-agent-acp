@@ -190,7 +190,12 @@ import {
   gatewayAuthStatus,
   notLoggedInAuthStatus,
 } from "../auth-status.js";
-import { AuthStatusReporter, cliLogout, type AuthProbeScope } from "../auth-status-reporter.js";
+import {
+  AuthStatusReporter,
+  cliLogout,
+  type AuthProbeScope,
+  type SessionAccountReporter,
+} from "../auth-status-reporter.js";
 import { terminalAuthMethods as authMethodsForTerminal } from "../auth-methods.js";
 import { McpOverAcp, sdkMcpServers, type UnservedMcpServer } from "../mcp-servers.js";
 import { claudeCliPath, cliDelivery } from "../claude-cli.js";
@@ -1432,6 +1437,7 @@ export type Session = {
    *  cached account was swapped. Undefined when the account carried no
    *  identity signal, which is "nothing to compare", not a match. */
   accountKind?: AuthStatusKind;
+  reportAccount?: SessionAccountReporter;
   /** Set under `--hide-claude-auth` when the CLI reported a sign-out during
    *  this session. The query is closed and the account it cached at
    *  `initialize` now describes a credential that no longer works, so the next
@@ -2892,13 +2898,7 @@ export class ClaudeAcpAgent {
       query: session.query,
       guardState: (session.claudeSubscriptionGuard ??= {}),
       logger: this.logger,
-      // The guard reads the account anyway; reuse that read to keep the
-      // reported identity current, refusal or not.
-      onAccount: (account) =>
-        this.authStatus.publishSessionAccount(
-          account,
-          session.settingsManager.getApiKeyHelper(session.effortSettingsOverride),
-        ),
+      onAccount: session.reportAccount?.("cached"),
     });
   }
 
@@ -10113,8 +10113,11 @@ export class ClaudeAcpAgent {
 
     const input = new Pushable<SDKUserMessage>();
 
+    const sessionMeta = params._meta as NewSessionMeta | undefined;
+    const userProvidedOptions = sessionMeta?.claudeCode?.options;
     const settingsManager = new SettingsManager(params.cwd, {
       logger: this.logger,
+      launchEnv: userProvidedOptions?.env,
     });
     await settingsManager.initialize();
     timing.phase("settings");
@@ -10126,8 +10129,6 @@ export class ClaudeAcpAgent {
       customInstructions,
     );
 
-    // Extract options from _meta if provided
-    const sessionMeta = params._meta as NewSessionMeta | undefined;
     // Bypass is off for root outside a sandbox, when settings disable it (the
     // CLI refuses bypass then too), and hosts may opt a session out. Decided
     // once here: it gates the SDK flag, the spawn-time mode (the SDK rejects
@@ -10150,7 +10151,6 @@ export class ClaudeAcpAgent {
         { allowBypass, allowAuto },
       );
 
-    const userProvidedOptions = sessionMeta?.claudeCode?.options;
     const forwardSubagentText = this.forwardsSubagentText(params._meta);
 
     // Configure thinking behavior from environment variables
@@ -10509,7 +10509,12 @@ export class ClaudeAcpAgent {
       configuredSettingsObject,
       userProvidedOptions?.env,
     );
-    const authSettingsEpoch = this.authStatus.epoch;
+    const reportAccount = this.authStatus.sessionAccountReporter(
+      settingsManager,
+      configuredSettingsObject,
+      userProvidedOptions?.env,
+    );
+    const reportStartupAccount = reportAccount("startup");
     timing.phase("prepare-query");
 
     // `query()` spawns the CLI at once. Any throw between here and the
@@ -10539,12 +10544,7 @@ export class ClaudeAcpAgent {
       // Publish the identity BEFORE the guard can refuse this session. A
       // refusal is exactly when the client most needs to know which account it
       // was refused for.
-      if (authSettingsEpoch === this.authStatus.epoch) {
-        this.authStatus.publishSessionAccount(
-          initializationResult.account,
-          settingsManager.getApiKeyHelper(configuredSettingsObject),
-        );
-      }
+      reportStartupAccount(initializationResult.account);
 
       // Shared with the per-turn guard, so "warn once" spans the whole session.
       const claudeSubscriptionGuard: ClaudeSubscriptionGuardState = {};
@@ -10805,6 +10805,7 @@ export class ClaudeAcpAgent {
         sessionFailureState:
           creationOpts.replayState?.sessionFailureState ?? createSessionFailureState(),
         claudeSubscriptionGuard,
+        reportAccount,
         accountKind: fromAccountInfo(
           initializationResult.account,
           settingsManager.getApiKeyHelper(configuredSettingsObject),

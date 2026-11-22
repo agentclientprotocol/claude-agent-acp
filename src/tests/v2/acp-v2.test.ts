@@ -10899,6 +10899,125 @@ describe("ACP v2 auth", () => {
     }
   });
 
+  it("attributes a bearer in the launched Claude config directory", async () => {
+    const childConfig = path.join(tempDir, "claude-child");
+    await mkdir(childConfig);
+    await writeFile(
+      path.join(childConfig, "settings.json"),
+      `\uFEFF${JSON.stringify({ env: bearerEnv })}`,
+    );
+    execFileSpy.mockImplementation((_cli, _args, execOptions, callback) => {
+      if (execOptions.env.CLAUDE_CONFIG_DIR !== childConfig) {
+        callback(null, { stdout: JSON.stringify({ loggedIn: false, apiProvider: "firstParty" }) });
+        return;
+      }
+      void readFile(path.join(execOptions.env.CLAUDE_CONFIG_DIR, "settings.json"), "utf8").then(
+        (contents) => {
+          const bearer = JSON.parse(contents.replace(/^\uFEFF/, "")).env.ANTHROPIC_AUTH_TOKEN;
+          callback(null, {
+            stdout: JSON.stringify({
+              loggedIn: Boolean(bearer),
+              authMethod: "oauth_token",
+              apiProvider: "firstParty",
+            }),
+          });
+        },
+        callback,
+      );
+    });
+    const { app, authUpdate, acpAuthUpdates } = v2Client();
+    await app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      expect((await authUpdate(1)).authStatus.kind).toBe("none");
+      await agent.request(v2.methods.agent.session.new, {
+        cwd,
+        _meta: { claudeCode: { options: { env: { CLAUDE_CONFIG_DIR: childConfig } } } },
+      });
+      expect(sdk.queryOptions[0]?.env?.CLAUDE_CONFIG_DIR).toBe(childConfig);
+      expect((await authUpdate(2)).authStatus).toEqual({
+        kind: "api_key",
+        label: "Anthropic API key",
+        detail: "ANTHROPIC_AUTH_TOKEN",
+      });
+      await vi.waitFor(() =>
+        expect(acpAuthUpdates.at(-1)).toMatchObject({ state: "authenticated" }),
+      );
+    });
+  });
+
+  it.each(["CLI", "SDK"])(
+    "keeps a token removal when the %s account read completes first",
+    async (first) => {
+      vi.stubEnv("ANTHROPIC_AUTH_TOKEN", bearerEnv.ANTHROPIC_AUTH_TOKEN);
+      const probeStarted = Promise.withResolvers<void>();
+      const releaseProbe = Promise.withResolvers<void>();
+      let removed = false;
+      execFileSpy.mockImplementation((_cli, _args, _execOptions, callback) => {
+        const stdout = JSON.stringify({
+          loggedIn: !removed,
+          authMethod: "oauth_token",
+          apiProvider: "firstParty",
+        });
+        if (removed) {
+          probeStarted.resolve();
+          void releaseProbe.promise.then(() => callback(null, { stdout }));
+        } else {
+          callback(null, { stdout });
+        }
+      });
+      const cached = { tokenSource: "ANTHROPIC_AUTH_TOKEN", apiProvider: "firstParty" };
+      sdk.initializationResult = async () => ({
+        ...(await sdkDefaults.initializationResult()),
+        account: cached,
+      });
+      const guardStarted = Promise.withResolvers<void>();
+      const releaseGuard = Promise.withResolvers<typeof cached>();
+      sdk.accountInfo = () => {
+        guardStarted.resolve();
+        return releaseGuard.promise;
+      };
+      scriptTurns(async function* (options) {
+        yield result(options);
+      });
+      const argv = process.argv;
+      process.argv = [...argv, "--hide-claude-auth"];
+      try {
+        const { app, authUpdate, acpAuthUpdates, sessionUpdates } = v2Client();
+        await app.connectWith(connectRouter(), async (agent) => {
+          await initializeV2(agent);
+          expect((await authUpdate(1)).authStatus.kind).toBe("api_key");
+          const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+          vi.stubEnv("ANTHROPIC_AUTH_TOKEN", undefined);
+          removed = true;
+          const prompting = agent.request(v2.methods.agent.session.prompt, {
+            sessionId,
+            prompt: text("hi"),
+          });
+          await Promise.all([guardStarted.promise, probeStarted.promise]);
+          if (first === "CLI") {
+            releaseProbe.resolve();
+            expect((await authUpdate(2)).authStatus.kind).toBe("none");
+          }
+          releaseGuard.resolve(cached);
+          await prompting;
+          await vi.waitFor(() => expect(turnTrace(sessionUpdates)).toContain("idle end_turn"));
+          if (first === "SDK") {
+            releaseProbe.resolve();
+            expect((await authUpdate(2)).authStatus.kind).toBe("none");
+          }
+          await vi.waitFor(() =>
+            expect(acpAuthUpdates.at(-1)).toEqual({ state: "unauthenticated" }),
+          );
+          expect(acpAuthUpdates).toHaveLength(2);
+        });
+      } finally {
+        releaseProbe.resolve();
+        releaseGuard.resolve(cached);
+        process.argv = argv;
+      }
+    },
+  );
+
   it("pushes the auth status of the connection after initialize", async () => {
     const { app, authUpdate } = v2Client();
     const update = await app.connectWith(connectRouter(), async (agent) => {

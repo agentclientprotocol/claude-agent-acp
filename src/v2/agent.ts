@@ -1071,7 +1071,10 @@ class V2Agent implements AgentHandle, SessionConnection {
     // Read before the settings watchers open: only a failed query start disposes them.
     const configured = await configuredSettings(client?.settings, request.cwd);
     const pathToClaudeCodeExecutable = await claudeCliPath();
-    const settings = new SettingsManager(request.cwd, { logger: this.logger });
+    const settings = new SettingsManager(request.cwd, {
+      logger: this.logger,
+      launchEnv: client?.env,
+    });
     await settings.initialize();
     // A client can remove bypass from the session with `false`.
     const allowBypass =

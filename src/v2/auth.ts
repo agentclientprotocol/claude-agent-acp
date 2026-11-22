@@ -27,7 +27,12 @@ import {
   gatewayAuthStatus,
   notLoggedInAuthStatus,
 } from "../auth-status.js";
-import { AuthStatusReporter, cliLogout, type AuthStatusSettings } from "../auth-status-reporter.js";
+import {
+  AuthStatusReporter,
+  cliLogout,
+  type AuthStatusSettings,
+  type SessionAccountReporter,
+} from "../auth-status-reporter.js";
 import { clearContextWindowCache } from "../context-window.js";
 import {
   createEnvForProvider,
@@ -79,6 +84,7 @@ type SessionAuthSettings = {
   manager: AuthStatusSettings;
   override?: Settings;
   env?: Options["env"];
+  reportAccount: SessionAccountReporter;
 };
 
 export class V2Auth {
@@ -277,12 +283,11 @@ export class V2Auth {
     env?: Options["env"],
   ): (sessionId: string, account: AccountInfo | undefined) => void {
     this.status.useSettings(manager, override, env);
-    const epoch = this.status.epoch;
+    const reportAccount = this.status.sessionAccountReporter(manager, override, env);
+    const reportStartupAccount = reportAccount("startup");
     return (sessionId, account) => {
-      this.sessionSettings.set(sessionId, { manager, override, env });
-      if (epoch === this.status.epoch) {
-        this.status.publishSessionAccount(account, manager.getApiKeyHelper(override));
-      }
+      this.sessionSettings.set(sessionId, { manager, override, env, reportAccount });
+      reportStartupAccount(account);
     };
   }
 
@@ -296,13 +301,9 @@ export class V2Auth {
     void this.status.probe();
   }
 
-  /** Reports the account that the query of `sessionId` cached, as the identity. */
-  publishAccount(sessionId: string, account: AccountInfo): void {
-    const settings = this.sessionSettings.get(sessionId);
-    this.status.publishSessionAccount(
-      account,
-      settings?.manager.getApiKeyHelper(settings.override),
-    );
+  /** Captures the query and selected context before a guarded account read. */
+  accountReporter(sessionId: string): ((account: AccountInfo) => void) | undefined {
+    return this.sessionSettings.get(sessionId)?.reportAccount("cached");
   }
 
   sessionEnded(sessionId: string): void {

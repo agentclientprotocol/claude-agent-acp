@@ -785,6 +785,132 @@ describe("auth status over ACP", () => {
     },
   );
 
+  it.each(["CLI", "SDK"])(
+    "keeps a token removal when the %s account read completes first",
+    async (first) => {
+      vi.stubEnv("ANTHROPIC_AUTH_TOKEN", "synthetic-bearer");
+      statusStdout = JSON.stringify({
+        loggedIn: true,
+        authMethod: "oauth_token",
+        apiProvider: "firstParty",
+      });
+      const cached = { tokenSource: "ANTHROPIC_AUTH_TOKEN", apiProvider: "firstParty" };
+      const guardStarted = Promise.withResolvers<void>();
+      const releaseGuard = Promise.withResolvers<typeof cached>();
+      mockQuery.mockImplementation((args: any) =>
+        Object.assign(scriptedTurnQuery(args, cached), {
+          accountInfo: () => {
+            guardStarted.resolve();
+            return releaseGuard.promise;
+          },
+        }),
+      );
+      const argv = process.argv;
+      process.argv = [...argv, "--hide-claude-auth"];
+      try {
+        await initialize();
+        await vi.waitFor(() => expect(lastPush()?.kind).toBe("api_key"));
+        const { sessionId } = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+        vi.stubEnv("ANTHROPIC_AUTH_TOKEN", undefined);
+        statusStdout = CLI_LOGGED_OUT;
+        statusFails = true;
+        deferStatus = true;
+        const prompting = promptOnce(sessionId);
+        await guardStarted.promise;
+        await vi.waitFor(() => expect(pendingStatus).toHaveLength(1));
+        if (first === "CLI") await releaseStatus(0);
+        releaseGuard.resolve(cached);
+        await prompting;
+        if (first === "SDK") await releaseStatus(0);
+        expect(lastPush()?.kind).toBe("none");
+        expect(authStatusUpdate.mock.lastCall?.[0]).toEqual({ state: "unauthenticated" });
+      } finally {
+        releaseGuard.resolve(cached);
+        process.argv = argv;
+        vi.unstubAllEnvs();
+      }
+    },
+  );
+
+  it("attributes a bearer in the launched Claude config directory", async () => {
+    const childConfig = await fs.mkdtemp(path.join(configDir, "child-"));
+    const env = { ANTHROPIC_AUTH_TOKEN: "synthetic-bearer" };
+    await fs.writeFile(path.join(childConfig, "settings.json"), JSON.stringify({ env }));
+    execFileSpy.mockImplementation((_cli, args, options, callback) => {
+      expect(isStatusProbe(args)).toBe(true);
+      const childDir = path.resolve(options.cwd, options.env.CLAUDE_CONFIG_DIR);
+      callback(null, {
+        stdout: JSON.stringify({
+          loggedIn: childDir === childConfig,
+          authMethod: "oauth_token",
+          apiProvider: "firstParty",
+        }),
+      });
+    });
+    mockQuery.mockImplementation((args: any) =>
+      scriptedTurnQuery(args, { apiProvider: "firstParty" }),
+    );
+    await initialize();
+    await vi.waitFor(() => expect(lastPush()?.kind).toBe("none"));
+    const { sessionId } = await agent.newSession({
+      cwd: configDir,
+      mcpServers: [],
+      _meta: {
+        claudeCode: { options: { env: { CLAUDE_CONFIG_DIR: path.basename(childConfig) } } },
+      },
+    });
+    await promptOnce(sessionId);
+    await vi.waitFor(() =>
+      expect(lastPush()).toMatchObject({
+        kind: "api_key",
+        detail: "ANTHROPIC_AUTH_TOKEN",
+      }),
+    );
+    expect(authStatusUpdate.mock.lastCall?.[0]).toMatchObject({ state: "authenticated" });
+    expect(JSON.stringify(updates())).not.toContain(env.ANTHROPIC_AUTH_TOKEN);
+  });
+
+  it("reports a refused startup account after a pending initialize probe", async () => {
+    const account = {
+      apiProvider: "firstParty",
+      subscriptionType: "max",
+      email: "user@example.com",
+    };
+    const queryStarted = Promise.withResolvers<void>();
+    const releaseStartup = Promise.withResolvers<void>();
+    mockQuery.mockImplementation((args: any) =>
+      Object.assign(scriptedTurnQuery(args, account), {
+        initializationResult: async () => {
+          queryStarted.resolve();
+          await releaseStartup.promise;
+          return { models: MOCK_MODELS, account };
+        },
+      }),
+    );
+    const argv = process.argv;
+    process.argv = [...argv, "--hide-claude-auth"];
+    try {
+      statusStdout = CLI_LOGGED_OUT;
+      statusFails = true;
+      deferStatus = true;
+      await initialize();
+      const starting = agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      const refused = expect(starting).rejects.toMatchObject({
+        data: { reason: "claude_subscription_not_supported" },
+      });
+      await queryStarted.promise;
+      await releaseStatus(0);
+      expect(lastPush()?.kind).toBe("none");
+      releaseStartup.resolve();
+      await refused;
+      expect(lastPush()).toMatchObject({ kind: "account", account: { email: account.email } });
+      expect(authStatusUpdate.mock.lastCall?.[0]?.state).toBe("unauthenticated");
+    } finally {
+      releaseStartup.resolve();
+      process.argv = argv;
+    }
+  });
+
   it("isolates overlapping probe settings and keeps their values out of output", async () => {
     execFileSpy.mockImplementation(() => {});
     const logger = { log: vi.fn(), error: vi.fn() };
