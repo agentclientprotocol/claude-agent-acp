@@ -38,6 +38,7 @@ const OPTION_REBUILDS_SESSION = {
   maxThinkingTokens: true,
   maxTurns: true,
   mcpServers: true,
+  mcpServersDelivery: true,
   model: true,
   outputFormat: true,
   pathToClaudeCodeExecutable: true,
@@ -135,8 +136,7 @@ export function computeSessionFingerprint(params: {
     canonicalJson({
       cwd: params.cwd,
       mcpServers: servers,
-      additionalDirectories: params.additionalDirectories,
-      additionalRoots: meta?.additionalRoots,
+      additionalDirectories: params.additionalDirectories ?? meta?.additionalRoots ?? [],
       systemPrompt: meta?.systemPrompt,
       clientSystemPrompt: params.systemPrompt ?? undefined,
       disableBuiltInTools: meta?.disableBuiltInTools,

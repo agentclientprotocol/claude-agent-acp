@@ -71,7 +71,7 @@ export interface RestartHost {
    */
   start(sessionId: string, params: SetupParams): Promise<V2Session>;
   /** `previous` could not start again: the session stops. */
-  lost(sessionId: string, previous: V2Session): Promise<void>;
+  lost(sessionId: string, previous: V2Session, error: unknown): Promise<void>;
   send(notification: v2.UpdateSessionNotification): void;
 }
 
@@ -316,7 +316,7 @@ export class SessionRestarts {
       } catch (error) {
         if (keepOnFailure) throw error;
         this.host.logger.error(`Session ${sessionId}: could not start again`, error);
-        await this.host.lost(sessionId, previous);
+        await this.host.lost(sessionId, previous, error);
         return;
       }
       // The new query read the account in force.

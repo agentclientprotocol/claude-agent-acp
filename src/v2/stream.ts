@@ -42,9 +42,11 @@ import { isCompactSummaryMessage, replayCompactSummary } from "../context-compac
 import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
 import { RetractedToolCalls } from "../tool-calls/retracted.js";
+import { UnansweredServerToolCalls } from "../tool-calls/server-tool-calls.js";
 import { AcpToolCallRenderer, progressToolCallId, V2_CANCELLED } from "../tool-calls/renderer.js";
 import { changedTaskPlanEntries, unregisterHookCallback, type TaskState } from "../tools.js";
 import { recordStreamedDelta, unstreamedRemainder, type StreamedBlock } from "../streamed-text.js";
+import { forkCursorUpdate, hasForkCursor } from "../session-cursors.js";
 import { replayClear, type V2UpdateTranslator } from "./update-translator.js";
 
 /** Every v2 client gets the same tool call reports: v2 diffs and display terminals. */
@@ -104,6 +106,8 @@ export class SessionOutput {
   private readonly dispatched = new Set<string>();
   /** The tool uses of the assistant messages, for {@link closeRetracted}. */
   private readonly retracted = new RetractedToolCalls();
+  /** The server tool calls that still wait for their result, for {@link closeUnanswered}. */
+  private readonly serverToolCalls = new UnansweredServerToolCalls();
   /**
    * Whether the output comes from work that a `session/cancel` stopped, until
    * its idle. The session's streamed deltas still go out,
@@ -155,6 +159,10 @@ export class SessionOutput {
     if (message.parent_tool_use_id !== null && !this.subagent) return;
     if (message.event.type === "message_start") {
       this.streamingMessageId = message.event.message.id;
+      this.serverToolCalls.replyStarted(
+        message.parent_tool_use_id,
+        this.streamingMessageId || undefined,
+      );
       // A message that never reached its consolidated message, such as one an
       // interrupt cut short, leaves its record behind.
       this.streamedBlocks.length = 0;
@@ -177,6 +185,11 @@ export class SessionOutput {
         },
       ),
     );
+    // After the block that shows them, so a client sees the next step start
+    // before the calls it leaves behind end.
+    if (message.event.type === "content_block_start") {
+      this.closeUnanswered(message.parent_tool_use_id, message.event.content_block);
+    }
   }
 
   /**
@@ -203,6 +216,9 @@ export class SessionOutput {
         );
     if (ownText) this.streamedBlocks.length = 0;
     if (this.stoppedWork(message)) return;
+    for (const block of message.message.content) {
+      this.closeUnanswered(message.parent_tool_use_id, block, message.message.id || undefined);
+    }
     this.content(content, "assistant", message.parent_tool_use_id, { messageId });
   }
 
@@ -391,7 +407,9 @@ export class SessionOutput {
    * messages and its tool calls, as the live session sent them. Subagent
    * transcripts are left out, as live. The client may hold the replayed
    * messages already, so each message is cleared before its first chunk.
-   * `hooks` replays the subagents' own histories to their sessions.
+   * `hooks` replays the subagents' own histories to their sessions. Each
+   * user message of the root session that a fork can start before gets its
+   * session cursor right after it (see `session-cursors.ts`).
    *
    * A replayed tool call that the history gives no result, such as one that
    * ran when Claude Code was killed, ends `failed` after the replay, as v2
@@ -410,7 +428,7 @@ export class SessionOutput {
     this.replayHooks = hooks;
     const unfinished = (this.replayUnfinished = new Set());
     try {
-      for (const message of messages) {
+      for (const [index, message] of messages.entries()) {
         if (message.parent_tool_use_id !== null || isReplayHiddenMetaMessage(message)) continue;
         // Claude Code's sign-in message, which the live session did not show either.
         if (message.type === "assistant" && isSyntheticLoginMessage(message.message)) continue;
@@ -442,6 +460,10 @@ export class SessionOutput {
             { messageId: message.uuid, replay: true },
             running,
           );
+          // The client cannot fork a subagent's session, so a child gets no cursors.
+          if (!this.subagent && hasForkCursor(messages, index)) {
+            this.send(forkCursorUpdate(message.uuid));
+          }
         }
         hooks?.replayed(message);
       }
@@ -585,6 +607,21 @@ export class SessionOutput {
    */
   closeRetracted(message: SDKMessage): void {
     for (const toolCallId of this.retracted.retractedBy(message)) {
+      if (this.unfinished.has(toolCallId)) {
+        this.close({ toolCallId, ran: this.dispatched.has(toolCallId), retracted: true });
+      }
+    }
+  }
+
+  /**
+   * Records `block`, of a reply in the conversation of `parentToolUseId`, and
+   * ends the open server tool calls that it shows will never get a result
+   * (see `UnansweredServerToolCalls.observe`), `cancelled`: Claude Code gave
+   * up on the reply that made them and asked again, so they end as
+   * `retracted`, as in {@link closeRetracted}.
+   */
+  private closeUnanswered(parentToolUseId: string | null, block: unknown, replyId?: string): void {
+    for (const toolCallId of this.serverToolCalls.observe(parentToolUseId, block, replyId)) {
       if (this.unfinished.has(toolCallId)) {
         this.close({ toolCallId, ran: this.dispatched.has(toolCallId), retracted: true });
       }

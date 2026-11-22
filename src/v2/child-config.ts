@@ -4,14 +4,16 @@
  * child's hooks report (its mode, model after a `PostModelSwitch`, effort and
  * agent type, see `subagentHookOptions`) and the model of its responses. Each
  * report merges into the child's options, by id, and the client gets all of
- * them again when any changed, in `orderedSubagentConfiguration`'s order.
+ * them again when any changed, in the root session's order
+ * (`orderedConfigOptions`).
  *
  * A hook can come before the child's announcement: its options wait for it.
  */
 import type { SessionConfigOption, SessionModeState } from "@agentclientprotocol/sdk/unstable";
 import type { AgentInfo, HookCallbackMatcher, HookInput } from "@anthropic-ai/claude-agent-sdk";
 import type { SubagentModels } from "../native-subagents.js";
-import { orderedSubagentConfiguration, subagentHookOptions } from "../subagent-configuration.js";
+import { orderedConfigOptions } from "../session-config-options.js";
+import { subagentHookOptions } from "../subagent-configuration.js";
 
 /** The most children not announced yet whose options wait. */
 const MAX_PENDING_CHILDREN = 64;
@@ -76,7 +78,7 @@ export class ChildConfigurations {
   unsent(agentId: string): SessionConfigOption[] | undefined {
     const config = this.children.get(agentId);
     if (!config) return undefined;
-    const options = orderedSubagentConfiguration(config.options.values());
+    const options = orderedConfigOptions(config.options.values());
     const snapshot = JSON.stringify(options);
     if (config.published === snapshot) return undefined;
     config.published = snapshot;

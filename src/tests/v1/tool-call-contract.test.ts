@@ -6,10 +6,16 @@ import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
 import { AcpClient } from "../../acp-client.js";
 import { toAcpNotifications, ToolUseCache } from "../../sdk-to-acp.js";
 import { ClientCapabilities as ToolCallCapabilities } from "../../tool-calls/client-capabilities.js";
-import { backgroundedBashToolCall, withRunningTerminal } from "../../tool-calls/background.js";
+import {
+  backgroundedBashToolCall,
+  withRunningTerminal,
+  streamedTerminals,
+  withStreamedTerminal,
+} from "../../tool-calls/background.js";
+import { foregroundBashTerminal } from "../../v1/background-work.js";
 import { ChangedMetaFilter } from "../../v1/tool-calls/changed-meta-filter.js";
 import { ToolCallFieldTracker } from "../../tool-calls/field-tracker.js";
-import { AcpToolCallRenderer, mcpToolName } from "../../tool-calls/renderer.js";
+import { AcpToolCallRenderer } from "../../tool-calls/renderer.js";
 import { changedTaskPlanEntries, createTaskHook, type TaskState } from "../../tools.js";
 
 const logger = { log: () => {}, error: () => {} };
@@ -674,22 +680,20 @@ describe("tool call reports outside the tool_use stream", () => {
   });
 });
 
-describe("mcpToolName", () => {
-  /** Splits at the first separator after the prefix; the tool keeps any later separator. */
+describe("MCP tool names", () => {
   it.each([
-    ["mcp__docs__search", { server: "docs", tool: "search" }],
     [
-      "mcp__plugin_documents_docs__doc_export",
-      { server: "plugin_documents_docs", tool: "doc_export" },
+      "mcp__plugin_documents_docs__doc_export__v2",
+      { server: "plugin_documents_docs", tool: "doc_export__v2" },
     ],
-    ["mcp__srv__a__b", { server: "srv", tool: "a__b" }],
-  ])("parses %s", (name, expected) => {
-    expect(mcpToolName(name)).toEqual(expected);
-  });
-
-  /** Names that are not a complete mcp__server__tool name give no result. */
-  it.each(["mcp__x", "mcp____tool", "mcp__srv__", "Bash"])("rejects %s", (name) => {
-    expect(mcpToolName(name)).toBeUndefined();
+    ["mcp__x", undefined],
+    ["mcp____tool", undefined],
+    ["mcp__srv__", undefined],
+    ["custom__tool", undefined],
+  ] as const)("formats only complete MCP names: %s", (name, mcp) => {
+    const { call } = report(terminalAir, name, {});
+    expect(call.title).toBe(mcp ? `${mcp.server}: ${mcp.tool}` : name);
+    expect(call._meta.jetbrains?.air?.mcp).toEqual(mcp);
   });
 });
 
@@ -846,5 +850,86 @@ describe("background Bash", () => {
       update: { ...completed.update, _meta: { terminal_exit: exit } },
     };
     expect(withRunningTerminal(onlyExit, "t")).toEqual(completed);
+  });
+
+  describe("the result of a command whose terminal showed output as the command ran", () => {
+    const output = { terminal_id: "t", data: "line1\nline2" };
+    const resultWith = (meta: Record<string, unknown>) => ({
+      ...completed,
+      update: { ...completed.update, _meta: meta },
+    });
+    // A client that appends chunks gets the result as a chunk, any other
+    // client, such as a v2 client, as the terminal's whole output.
+    const asChunk = resultWith({ terminal_output_delta: output });
+    const asWhole = resultWith({ terminal_output: output });
+
+    it.each([
+      { how: "replace" as const, sent: asChunk, expected: asWhole },
+      { how: "replace" as const, sent: asWhole, expected: asWhole },
+      { how: "append" as const, sent: asWhole, expected: asChunk },
+      { how: "append" as const, sent: asChunk, expected: asChunk },
+    ])("makes the output $how what the terminal showed", ({ how, sent, expected }) => {
+      expect(withStreamedTerminal(sent, new Map([["t", how]]))).toEqual(expected);
+    });
+
+    it("leaves the result of any other command as it is", () => {
+      expect(withStreamedTerminal(asChunk, new Map([["other", "replace"]]))).toBe(asChunk);
+    });
+
+    it("replaces with a result that carries the command's output, and appends a text of Claude Code", () => {
+      // What CLI 2.1.325 stamps on the result of a command that an interrupt
+      // stopped, and on one that ran after the user allowed it.
+      const toolResultMeta = [
+        { id: "stopped", non_execution_kind: "user-rejected" },
+        { id: "ran", permission_decision: { decision: "accept", source: "user_temporary" } },
+      ];
+      expect([
+        ...streamedTerminals(["ran", "stopped", "backgrounded"], "backgrounded", toolResultMeta),
+      ]).toEqual([
+        ["ran", "replace"],
+        ["stopped", "append"],
+        ["backgrounded", "append"],
+      ]);
+    });
+  });
+
+  describe("foregroundBashTerminal", () => {
+    const owner = {
+      liveBackgroundTasks: new Map([
+        ["agent1", { parentToolUseId: "toolu_agent", isSubagent: true }],
+      ]),
+      toolUseCache: {
+        toolu_bash: { name: "Bash" },
+        toolu_powershell: { name: "PowerShell" },
+        toolu_read: { name: "Read" },
+      },
+      emittedToolCalls: new Set(["toolu_bash", "toolu_powershell", "toolu_read"]),
+    };
+    const started = {
+      task_type: "local_bash",
+      is_backgrounded: false,
+      tool_use_id: "toolu_bash",
+    };
+
+    it("names the terminal of a foreground command, under its subagent's Agent call if any", () => {
+      expect(foregroundBashTerminal(owner, started)).toEqual({ toolCallId: "toolu_bash" });
+      expect(
+        foregroundBashTerminal(owner, { ...started, tool_use_id: "toolu_powershell" }),
+      ).toEqual({ toolCallId: "toolu_powershell" });
+      expect(foregroundBashTerminal(owner, { ...started, parent_task_id: "agent1" })).toEqual({
+        toolCallId: "toolu_bash",
+        parentToolUseId: "toolu_agent",
+      });
+    });
+
+    it.each([
+      ["a command in the background", { is_backgrounded: true }],
+      ["a task that is not a command", { task_type: "local_agent" }],
+      ["a tool call that runs no command", { tool_use_id: "toolu_read" }],
+      ["a tool call the client was not sent", { tool_use_id: "toolu_other" }],
+      ["a subagent whose Agent call is not known", { parent_task_id: "agent2" }],
+    ])("names none for %s", (_case, fields) => {
+      expect(foregroundBashTerminal(owner, { ...started, ...fields })).toBeUndefined();
+    });
   });
 });

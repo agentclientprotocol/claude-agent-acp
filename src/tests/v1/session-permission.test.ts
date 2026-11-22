@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type { SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import { ClaudeAcpAgent } from "../../v1/acp-agent.js";
 import type { AcpClient } from "../../acp-client.js";
+import { SettingsManager } from "../../settings.js";
 import { makeMockQuery } from "../helpers.js";
 
 const SESSION_ID = "test-session-id";
@@ -46,6 +47,7 @@ describe("session permission updates", () => {
       emittedToolCalls: new Set(["toolu_1"]),
       contextWindowSize: 200_000,
       toolUseCache: {},
+      settingsManager: { getShowClearContextOnPlanAccept: () => false },
     } as any;
   });
 
@@ -60,7 +62,6 @@ describe("session permission updates", () => {
 
     expect(capturedPermissionRequest.options.map((option: any) => option.optionId)).toEqual([
       "exit-plan-default",
-      "exit-plan-clear-accept-edits",
       "exit-plan-accept-edits",
       "reject",
     ]);
@@ -79,6 +80,27 @@ describe("session permission updates", () => {
         sessionId: SESSION_ID,
         update: { sessionUpdate: "config_option_update", configOptions: [] },
       },
+    ]);
+  });
+
+  it("offers clearing the context when the client's settings option turns it on", async () => {
+    permissionResponse = { outcome: { outcome: "selected", optionId: "exit-plan-default" } };
+    const session = agent.sessions[SESSION_ID];
+    // Not initialized: it has read no settings file, so only the option counts.
+    session.settingsManager = new SettingsManager(session.cwd);
+    session.effortSettingsOverride = { showClearContextOnPlanAccept: true };
+
+    await (agent as any).canUseTool(SESSION_ID)(
+      "ExitPlanMode",
+      { plan: "do stuff" },
+      { signal: new AbortController().signal, toolUseID: "toolu_1" },
+    );
+
+    expect(capturedPermissionRequest.options.map((option: any) => option.optionId)).toEqual([
+      "exit-plan-default",
+      "exit-plan-clear-accept-edits",
+      "exit-plan-accept-edits",
+      "reject",
     ]);
   });
 

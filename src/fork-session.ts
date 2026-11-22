@@ -9,7 +9,8 @@ import {
   type SessionStoreEntry,
 } from "@anthropic-ai/claude-agent-sdk";
 import { createHash } from "node:crypto";
-import { loadFullSessionHistory } from "./resumed-session.js";
+import { loadFullSessionHistory, readHistoryAcrossCompactions } from "./resumed-session.js";
+import { forkPointOf } from "./session-cursors.js";
 import { assistantMessageText } from "./session-failure-extension.js";
 import { SessionTiming } from "./session-timing.js";
 
@@ -176,6 +177,15 @@ function isUnknownSessionError(error: unknown, sessionId: string): boolean {
   );
 }
 
+/**
+ * Copies the transcript of `params.sessionId` into a new session: all of it,
+ * or with a `cursorId` the history before that session cursor (see
+ * `session-cursors.ts`).
+ *
+ * Fails with invalid params (-32602) for a `cursorId` that is no cursor of
+ * the session's stored history. ACP forbids forking the whole session, or at
+ * another position, in its place.
+ */
 export async function forkSession(
   params: ForkSessionRequest,
   dependencies: ForkSessionDependencies,
@@ -195,6 +205,24 @@ async function forkTranscript(
   dependencies: ForkSessionDependencies,
 ): Promise<ForkSessionResponse> {
   const timing = new SessionTiming(dependencies.logger, "fork", params.sessionId);
+  if (params.cursorId != null) {
+    // The history as a replay reads it, which announces the cursors.
+    const history = await readHistoryAcrossCompactions(
+      params.sessionId,
+      await getSessionMessages(params.sessionId),
+    );
+    const upToMessageId = forkPointOf(params.cursorId, history);
+    timing.phase("cursor", ` resolution=${upToMessageId ? "found" : "missing"}`);
+    if (upToMessageId === undefined) {
+      throw RequestError.invalidParams(
+        { cursorId: params.cursorId },
+        `Session ${params.sessionId} has no cursor ${params.cursorId} that a fork can start at. Use a cursor that the session announced with the \`fork\` capability, or send the request without \`cursorId\` to fork the whole session.`,
+      );
+    }
+    const forked = await forkClaudeSession(params.sessionId, { upToMessageId });
+    timing.phase("sdk-fork");
+    return { sessionId: forked.sessionId };
+  }
   const point = forkPoint(params._meta);
   // SDK `dir` scopes source lookup, not the fork's working directory. Search
   // all projects: params.cwd can name a different workspace for the new session.

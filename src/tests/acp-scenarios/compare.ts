@@ -12,6 +12,8 @@
  *   change since the previous report of the same tool call. An update with
  *   nothing new is not sent. ACP does not merge `_meta` keys, so every
  *   `_meta` key that origin/main sent must still be there.
+ * - An MCP tool call, including one in a permission request, has title
+ *   `server: tool` where origin/main used the programmatic name as its title.
  * - A `compaction_update` leaves out a summary whose text is the same as the
  *   `compaction_summary_chunk` text that went out before it.
  * - A subagent message or thought is not sent again in full when the chunks
@@ -38,6 +40,10 @@
  *   `agentCapabilities.sessionCapabilities.options`, which origin/main did
  *   not: the agent now serves `session/options` and takes `configOptions` on
  *   session setup requests.
+ * - The `initialize` response also advertises
+ *   `agentCapabilities.mcpCapabilities.acp`, which origin/main did not: the
+ *   agent now takes MCP servers that the client serves over the ACP
+ *   connection (`"type": "acp"`).
  * - A SandboxNetworkAccess tool call is settled by a `tool_call_update` with
  *   only its final `status` once its permission request is answered. The
  *   callback runs nothing, so origin/main never settled the call (see
@@ -172,6 +178,21 @@ function updateOf(record: Recorded): Json | undefined {
   return (record.payload as { update: Json }).update;
 }
 
+/** Changes only a baseline tool call's title, not its name or raw input. */
+function withMcpToolTitle(record: Recorded): Recorded {
+  if (record.kind !== "sessionUpdate" && record.kind !== "requestPermission") return record;
+  const payload = record.payload as Json;
+  const key = record.kind === "requestPermission" ? "toolCall" : "update";
+  const call = payload[key] as Json | undefined;
+  if (!call?.toolCallId || typeof call.title !== "string") return record;
+  const meta = call._meta as { claudeCode?: { toolName?: string } } | undefined;
+  if (call.title !== (call.name ?? meta?.claudeCode?.toolName)) return record;
+  const [prefix, server, ...rest] = call.title.split("__");
+  const tool = rest.join("__");
+  if (prefix !== "mcp" || !server || !tool) return record;
+  return { ...record, payload: { ...payload, [key]: { ...call, title: `${server}: ${tool}` } } };
+}
+
 /** The key and the text of a subagent message or thought chunk. */
 function subagentChunk(update: Json | undefined): { key: string; text: string } | undefined {
   if (
@@ -253,16 +274,16 @@ function withoutSessionCapabilities(record: Recorded, keys: readonly string[]): 
   } as Recorded;
 }
 
-/** `record` without `agentCapabilities.auth.status`, when it is an `initialize` response. */
-function withoutAuthStatusCapability(record: Recorded): Recorded {
+/** `record` without `agentCapabilities.<group>.<key>`, when it is an `initialize` response. */
+function withoutAgentCapability(record: Recorded, group: string, key: string): Recorded {
   if (record.kind !== "initialize") return record;
   const payload = record.payload as Json;
   const agent = payload.agentCapabilities as Json | undefined;
-  const auth = agent?.auth as Json | undefined;
-  if (!auth || !("status" in auth)) return record;
+  const capabilities = agent?.[group] as Json | undefined;
+  if (!capabilities || !(key in capabilities)) return record;
   return {
     ...record,
-    payload: { ...payload, agentCapabilities: { ...agent, auth: without(auth, "status") } },
+    payload: { ...payload, agentCapabilities: { ...agent, [group]: without(capabilities, key) } },
   } as Recorded;
 }
 
@@ -275,14 +296,21 @@ export function compareWithBaseline(baseline: Recorded[], traffic: Recorded[]): 
     .map((record) =>
       withoutSessionCapabilities(withoutAirOnlyKeys(record) as Recorded, ["subagents"]),
     )
+    .map(withMcpToolTitle)
     .filter((record) => {
       const update = updateOf(record);
       return !(update?.sessionUpdate === "session_info_update" && Object.keys(update).length === 1);
     });
   const current = withoutSandboxNetworkSettlements(
     traffic.map((record) =>
-      withoutAuthStatusCapability(
-        withoutSessionCapabilities(record, ["systemPrompt", "status", "title", "options"]),
+      withoutAgentCapability(
+        withoutAgentCapability(
+          withoutSessionCapabilities(record, ["systemPrompt", "status", "title", "options"]),
+          "auth",
+          "status",
+        ),
+        "mcpCapabilities",
+        "acp",
       ),
     ),
   );

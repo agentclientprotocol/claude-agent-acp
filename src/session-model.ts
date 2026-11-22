@@ -1,3 +1,5 @@
+import { RequestError } from "@agentclientprotocol/sdk/unstable";
+import { PROVIDER_ID } from "./providers.js";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk/unstable";
 // matchDeniedModels is marked @alpha in the SDK; API may shift in a future release.
 import {
@@ -595,7 +597,9 @@ export async function applyAvailableModelsAllowlist(
  *
  * When no row matches by its model (a `default` row kept only for lacking a
  * `resolvedModel` does not count), the gateway serves none of the SDK's
- * models, and nothing is left: the session offers no model.
+ * models. If every row has a nonempty `resolvedModel`, session setup fails
+ * with an error to choose a different provider. An empty catalog or any row
+ * without a resolved model leaves no model config option instead.
  */
 export function narrowToGatewayModels(
   models: ModelInfo[],
@@ -615,9 +619,16 @@ export function narrowToGatewayModels(
     if (model.value === "default") return true;
     return MODEL_FAMILY_ALIASES.has(id) && [...listed].some((entry) => entry.includes(`-${id}`));
   });
-  return narrowed.some((model) => listed.has(normalizeModelId(model.resolvedModel ?? model.value)))
-    ? narrowed
-    : [];
+  if (narrowed.some((model) => listed.has(normalizeModelId(model.resolvedModel ?? model.value)))) {
+    return narrowed;
+  }
+  if (models.length > 0 && models.every((model) => model.resolvedModel?.trim())) {
+    throw RequestError.internalError(
+      { providerId: PROVIDER_ID },
+      "The selected provider offers no compatible Claude models. Choose a different provider and try again.",
+    );
+  }
+  return [];
 }
 
 /**

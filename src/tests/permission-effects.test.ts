@@ -26,6 +26,7 @@ describe("Claude permission response effects", () => {
       durableChangeSet,
       allowPersistentOptions,
       availableModes,
+      showClearContextOnPlanAccept: true,
     });
 
   it.each([

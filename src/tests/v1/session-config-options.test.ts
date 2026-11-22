@@ -3,7 +3,7 @@ import { SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../../v1/acp-agent.js";
 import type { AcpClient } from "../../acp-client.js";
-import { makeMockQuery } from "../helpers.js";
+import { makeMockQuery, setModelRefusal } from "../helpers.js";
 
 const { registerHookCallbackSpy } = vi.hoisted(() => ({
   registerHookCallbackSpy: vi.fn(),
@@ -38,18 +38,6 @@ const MOCK_MODELS = {
 
 const MOCK_CONFIG_OPTIONS = [
   {
-    id: "mode",
-    name: "Mode",
-    type: "select",
-    category: "mode",
-    currentValue: "default",
-    options: MOCK_MODES.availableModes.map((m) => ({
-      value: m.id,
-      name: m.name,
-      description: m.description,
-    })),
-  },
-  {
     id: "model",
     name: "Model",
     type: "select",
@@ -74,6 +62,18 @@ const MOCK_CONFIG_OPTIONS = [
       { value: "medium", name: "Medium" },
       { value: "high", name: "High" },
     ],
+  },
+  {
+    id: "mode",
+    name: "Mode",
+    type: "select",
+    category: "mode",
+    currentValue: "default",
+    options: MOCK_MODES.availableModes.map((m) => ({
+      value: m.id,
+      name: m.name,
+      description: m.description,
+    })),
   },
 ];
 
@@ -331,18 +331,22 @@ describe("session config options", () => {
       expect(modelOption?.currentValue).toBe("claude-sonnet-4-6");
     });
 
-    // "a" is a substring of "Claude", "son" of "sonnet": only whole words match.
+    // "a" is a substring of "Claude", "son" of "sonnet": only whole words match,
+    // so each goes to Claude Code as it is, which refuses an id it does not know.
     it.each(["gpt-4", "not-a-model", "son", "foo-sonnet"])(
-      "rejects the model %s and leaves the model as it was",
+      "rejects the model %s that Claude Code refuses and leaves the model as it was",
       async (value) => {
+        setModelSpy.mockRejectedValue(setModelRefusal(`Model '${value}' not found`, "not_found"));
         await expect(
           agent.setSessionConfigOption({ sessionId: SESSION_ID, configId: "model", value }),
         ).rejects.toMatchObject({
           code: -32602,
-          message: expect.stringContaining(`Invalid value for config option model: ${value}`),
+          message: expect.stringContaining(
+            `Invalid value for config option model: ${value}. Model '${value}' not found`,
+          ),
         });
 
-        expect(setModelSpy).not.toHaveBeenCalled();
+        expect(setModelSpy).toHaveBeenCalledWith(value);
         const session = (
           agent as unknown as {
             sessions: Record<string, { configOptions: typeof MOCK_CONFIG_OPTIONS }>;
@@ -351,6 +355,28 @@ describe("session config options", () => {
         expect(session.configOptions.find((o) => o.id === "model")?.currentValue).toBe(
           "claude-opus-4-5",
         );
+      },
+    );
+
+    // These failures do not judge the id, which Claude Code may well run.
+    it.each([
+      setModelRefusal("Authentication failed. Please check your API credentials.", "auth_failed"),
+      setModelRefusal("Network error. Please check your internet connection.", "check_unreachable"),
+      setModelRefusal("Model switch blocked by a PreModelSwitch hook: not now", "blocked_by_hook"),
+      // A query that closed: the SDK's own error, with no code.
+      new Error("Query closed before response received"),
+    ])(
+      "keeps a failed switch to an unlisted model as the error it is: $message",
+      async (failure) => {
+        setModelSpy.mockRejectedValue(failure);
+
+        await expect(
+          agent.setSessionConfigOption({
+            sessionId: SESSION_ID,
+            configId: "model",
+            value: "claude-fable-5-2",
+          }),
+        ).rejects.toBe(failure);
       },
     );
 
@@ -1169,13 +1195,21 @@ describe("session config options", () => {
         value: "claude-sonnet-4-6",
       });
       expect(modelValues(switched.configOptions)).toEqual(["claude-opus-4-5", "claude-sonnet-4-6"]);
-      await expect(
-        agent.setSessionConfigOption({
-          sessionId: SESSION_ID,
-          configId: "model",
-          value: "claude-offlist-9",
-        }),
-      ).rejects.toThrow("Invalid value");
+    });
+
+    it("passes a model id the option does not list to Claude Code, and lists it once Claude Code takes it", async () => {
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-fable-5-2",
+      });
+
+      expect(setModelSpy).toHaveBeenCalledWith("claude-fable-5-2");
+      const model = response.configOptions?.find((o) => o.id === "model");
+      expect(model?.currentValue).toBe("claude-fable-5-2");
+      expect(
+        (model as { options: { value: string }[] } | undefined)?.options.map((o) => o.value),
+      ).toEqual(["claude-opus-4-5", "claude-sonnet-4-6", "claude-fable-5-2"]);
     });
 
     it("setSessionMode also syncs configOptions", async () => {

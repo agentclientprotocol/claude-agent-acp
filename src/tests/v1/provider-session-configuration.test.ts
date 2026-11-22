@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -6,7 +7,10 @@ import type { ModelInfo, Options } from "@anthropic-ai/claude-agent-sdk";
 import { ClaudeAcpAgent } from "../../v1/acp-agent.js";
 import { FAST_MODE_CONFIG_ID } from "../../session-fast-mode.js";
 import type { AcpClient } from "../../acp-client.js";
-import { AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY } from "../../air-extension.js";
+import {
+  AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
+  AIR_SESSION_FAILURE_CAPABILITY,
+} from "../../air-extension.js";
 import { initializeClient, makeMockQuery } from "../helpers.js";
 import { successfulResultMessage, userEcho } from "./session-doubles.js";
 
@@ -64,6 +68,8 @@ describe("provider updates preserve session configuration", { timeout: 10_000 },
   let rejectConfigUpdate: boolean;
   let models: typeof MODELS;
   let mcpServers: Array<{ name: string; status: string }>;
+  /** What a query that resumes a session sends before it reads a prompt. */
+  let backlog: any[];
 
   function createQuery(request: { options: Options; prompt: AsyncIterable<any> }) {
     const state = {
@@ -108,6 +114,7 @@ describe("provider updates preserve session configuration", { timeout: 10_000 },
       }),
       close: vi.fn(),
       [Symbol.asyncIterator]: async function* () {
+        if (request.options.resume) yield* backlog;
         for await (const message of request.prompt) {
           calls.push({ prompt: message.message.content, state: { ...state } });
           yield userEcho(message);
@@ -137,6 +144,7 @@ describe("provider updates preserve session configuration", { timeout: 10_000 },
     rejectConfigUpdate = false;
     models = MODELS;
     mcpServers = [];
+    backlog = [];
     sdk.query.mockImplementation((request) => {
       const query = createQuery(request);
       queries.push(query);
@@ -340,6 +348,18 @@ describe("provider updates preserve session configuration", { timeout: 10_000 },
     expect(updates.at(-1).update.configOptions).toEqual(agent.sessions[sessionId].configOptions);
   });
 
+  // The gateway of `providers/set` listed the models, so only those can run
+  // there, though Claude Code would take the id.
+  it("refuses a model id the option does not list without asking Claude Code", async () => {
+    const { sessionId } = await newSession();
+
+    await expect(select(sessionId, "model", "claude-fable-5-2")).rejects.toMatchObject({
+      code: -32602,
+      message: expect.stringMatching(/Invalid value for config option model: claude-fable-5-2$/),
+    });
+    expect(lastQuery().setModel).not.toHaveBeenCalledWith("claude-fable-5-2");
+  });
+
   it("restores Auto once the restored model supports it", async () => {
     models = MODELS.map((model) =>
       model.value === "sonnet" ? { ...model, supportsAutoMode: false } : model,
@@ -516,6 +536,38 @@ describe("provider updates preserve session configuration", { timeout: 10_000 },
     },
   );
 
+  it("reports sessionFailure for an incompatible provider restart", async () => {
+    await initializeClient(agent, {
+      _meta: { jetbrains: { air: { version: 1, capabilities: [AIR_SESSION_FAILURE_CAPABILITY] } } },
+    });
+    const { sessionId } = await newSession();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Response.json({ data: [{ id: "gpt-5" }] })),
+    );
+
+    await agent.unstable_setProvider({ ...PROVIDER, baseUrl: "https://incompatible.example" });
+
+    expect(updates).toContainEqual(
+      expect.objectContaining({
+        sessionId,
+        update: expect.objectContaining({
+          _meta: expect.objectContaining({
+            jetbrains: expect.objectContaining({
+              air: expect.objectContaining({
+                sessionFailure: expect.objectContaining({
+                  details: expect.stringContaining(
+                    "The selected provider offers no compatible Claude models.",
+                  ),
+                }),
+              }),
+            }),
+          }),
+        }),
+      }),
+    );
+  });
+
   it("removes the old session when provider recreation fails", async () => {
     const { sessionId } = await newSession();
     const held = deferred();
@@ -637,6 +689,33 @@ describe("provider updates preserve session configuration", { timeout: 10_000 },
         state: expect.objectContaining({ model: "opus", effort: "high" }),
       }),
     ]);
+  });
+
+  // Claude Code can run a cycle of its own on the new query before the next
+  // prompt, for example a cron prompt. The reader of the old query ended with
+  // that query.
+  it("reads what the new query sends before the next prompt", async () => {
+    const { sessionId } = await newSession();
+    // The reader of the first query starts in a timer after the setup response.
+    // Without this wait the timer would run after the restart and start the
+    // reader of the new query.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const state = (state: "running" | "idle") => ({
+      type: "system",
+      subtype: "session_state_changed",
+      state,
+      uuid: randomUUID(),
+      session_id: sessionId,
+    });
+    const usage = { ...successfulResultMessage().usage, input_tokens: 111 };
+    // A cron prompt: its result has no origin.
+    backlog = [state("running"), successfulResultMessage({ usage }), state("idle")];
+    await refresh();
+    await vi.waitFor(() => expect(agent.sessions[sessionId].lastSessionState).toBe("idle"));
+
+    const response = await prompt(sessionId);
+
+    expect(response.usage).toMatchObject({ inputTokens: 0 });
   });
 
   it("reports a failed client MCP server once across a provider refresh", async () => {

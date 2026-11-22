@@ -4,20 +4,29 @@ import { AcpClient } from "../../acp-client.js";
 import { loggableBaseUrl } from "../../providers.js";
 
 const mockQuery = vi.hoisted(() =>
-  vi.fn(() => ({
-    initializationResult: vi.fn().mockResolvedValue({
-      models: [
-        { value: "id", displayName: "name", description: "description", supportsAutoMode: true },
-      ],
-    }),
-    setModel: vi.fn(),
-    setPermissionMode: vi.fn(),
-    supportedCommands: vi.fn().mockResolvedValue([]),
-    close: vi.fn(),
-    interrupt: vi.fn().mockResolvedValue(undefined),
-    getContextUsage: vi.fn().mockResolvedValue({ totalTokens: 0, rawMaxTokens: 200000 }),
-    [Symbol.asyncIterator]: async function* () {},
-  })),
+  vi.fn(() => {
+    // Like Claude Code's, the stream stays open until the query is closed.
+    const closed = Promise.withResolvers<void>();
+    return {
+      initializationResult: vi.fn().mockResolvedValue({
+        models: [
+          { value: "id", displayName: "name", description: "description", supportsAutoMode: true },
+        ],
+      }),
+      setModel: vi.fn(),
+      setPermissionMode: vi.fn(),
+      applyFlagSettings: vi.fn().mockResolvedValue(undefined),
+      supportedCommands: vi.fn().mockResolvedValue([]),
+      close: vi.fn(() => closed.resolve()),
+      interrupt: vi.fn().mockResolvedValue(undefined),
+      getContextUsage: vi.fn().mockResolvedValue({ totalTokens: 0, rawMaxTokens: 200000 }),
+      next: async () => {
+        await closed.promise;
+        return { done: true as const, value: undefined };
+      },
+      [Symbol.asyncIterator]: async function* () {},
+    };
+  }),
 );
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => ({
@@ -213,7 +222,63 @@ describe("providers", () => {
 
     expect(mockQuery).toHaveBeenCalledOnce();
     expect(mockQuery.mock.calls[0][0].options.resume).toBeUndefined();
+    expect(mockQuery.mock.results[0].value.applyFlagSettings).not.toHaveBeenCalled();
     expect(mockQuery.mock.results[0].value.close).not.toHaveBeenCalled();
+  });
+
+  it("applies the route to the running session before its first context read", async () => {
+    const [agent, mockQuery] = await createAgentMock();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    await agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: "https://gateway.example",
+      headers: { "x-api-key": "test" },
+    });
+
+    await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+    const query = mockQuery.mock.results[0].value;
+    // The route of the `settings` option, without the client's settings.
+    expect(query.applyFlagSettings.mock.calls[0]).toEqual([
+      {
+        apiKeyHelper: "",
+        env: expect.objectContaining({
+          ANTHROPIC_AUTH_TOKEN: "acp-proxy",
+          ANTHROPIC_BASE_URL: "https://gateway.example",
+          ANTHROPIC_CUSTOM_HEADERS: "x-api-key: test",
+        }),
+      },
+    ]);
+    expect(query.applyFlagSettings.mock.invocationCallOrder[0]).toBeLessThan(
+      query.getContextUsage.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("starts no session when Claude Code refuses the route", async () => {
+    const [agent, mockQuery] = await createAgentMock();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    await agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: "https://gateway.example",
+    });
+    // The text of Claude Code 2.1.328 for a refused `applyFlagSettings`.
+    const refusal =
+      "apply_flag_settings: nothing in this request was applied and earlier settings stay in force. Fix or remove these invalid settings and send it again: env";
+    const query = mockQuery.getMockImplementation()!();
+    query.applyFlagSettings.mockRejectedValue(new Error(refusal));
+    mockQuery.mockReturnValueOnce(query);
+
+    await expect(agent.newSession({ cwd: process.cwd(), mcpServers: [] })).rejects.toMatchObject({
+      code: -32603,
+      message: expect.stringContaining("Claude Code did not take its provider or gateway route"),
+      data: { details: refusal },
+    });
+
+    expect(query.getContextUsage).not.toHaveBeenCalled();
+    expect(query.close).toHaveBeenCalledOnce();
+    expect(Object.keys(agent.sessions)).toEqual([]);
   });
 
   it("recreates loaded sessions with the new provider between turns", async () => {
@@ -607,6 +672,7 @@ describe("providers", () => {
         initializationResult: vi.fn().mockResolvedValue({ models }),
         setModel,
         setPermissionMode: vi.fn(),
+        applyFlagSettings: vi.fn().mockResolvedValue(undefined),
         supportedCommands: vi.fn().mockResolvedValue([]),
         close: vi.fn(),
         interrupt: vi.fn().mockResolvedValue(undefined),
@@ -799,7 +865,7 @@ describe("providers", () => {
       );
     });
 
-    it("offers no model when the listing succeeds but matches none", async () => {
+    it("rejects incompatible provider models", async () => {
       const [agent, mockQuery] = await createAgentMock();
       const setModel = mockQueryWithModels(mockQuery);
       stubListing(["gpt-5"]);
@@ -810,9 +876,17 @@ describe("providers", () => {
         baseUrl: "https://gateway.example",
       });
 
-      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      await expect(agent.newSession({ cwd: process.cwd(), mcpServers: [] })).rejects.toMatchObject({
+        code: -32603,
+        message: expect.stringContaining(
+          "The selected provider offers no compatible Claude models.",
+        ),
+        data: { providerId: "main" },
+      });
 
-      expect(response.configOptions?.find((o: any) => o.id === "model")).toBeUndefined();
+      expect(Object.keys(agent.sessions)).toEqual([]);
+      const rejectedQuery = mockQuery.mock.results.at(-1)!.value;
+      expect(rejectedQuery.close).toHaveBeenCalledOnce();
       expect(setModel).not.toHaveBeenCalled();
     });
 

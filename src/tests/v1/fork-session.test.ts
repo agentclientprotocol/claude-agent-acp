@@ -186,3 +186,44 @@ describe.each(["same directory", "different directory"])("fork into %s", (direct
     expect(await fs.readFile(sourceFile, "utf8")).toBe(transcript);
   });
 });
+
+describe("fork at a session cursor", () => {
+  /** The entries of the source transcript, as `getSessionMessages` returns its active chain. */
+  const history = () => getSessionMessages(sessionId, { dir: sourceCwd });
+
+  it("copies the history before the cursor's user message", async () => {
+    const [, firstAnswer, followup] = await history();
+    const response = await forkSession(
+      { sessionId, cwd: destinationCwd, mcpServers: [], cursorId: `before:${followup!.uuid}` },
+      { messageIdForGrouping },
+    );
+
+    const forked = await getSessionMessages(response.sessionId);
+    expect(forked.map((message) => message.message)).toEqual([
+      { role: "user", content: "First prompt" },
+      expect.objectContaining({ id: "msg_first" }),
+    ]);
+    expect(firstAnswer!.message).toMatchObject({ id: "msg_first" });
+    expect(await fs.readFile(sourceFile, "utf8")).toBe(transcript);
+  });
+
+  it.each([
+    ["an id that the session did not announce", () => "cur_9f2c41"],
+    // Nothing is before the first entry.
+    ["the first entry of the history", async () => `before:${(await history())[0]!.uuid}`],
+    ["an entry that is no user message", async () => `before:${(await history())[1]!.uuid}`],
+  ])("rejects %s without forking anything", async (_, cursor) => {
+    const cursorId = await cursor();
+    await expect(
+      forkSession(
+        { sessionId, cwd: sourceCwd, mcpServers: [], cursorId },
+        { messageIdForGrouping },
+      ),
+    ).rejects.toMatchObject({
+      code: -32602,
+      data: { cursorId },
+      message: expect.stringContaining("that a fork can start at"),
+    });
+    expect(await fs.readdir(path.dirname(sourceFile))).toEqual([path.basename(sourceFile)]);
+  });
+});

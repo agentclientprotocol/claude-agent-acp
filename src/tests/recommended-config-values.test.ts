@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
-import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
+import type { ClientCapabilities, SessionConfigOption } from "@agentclientprotocol/sdk/unstable";
 import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import {
   buildConfigOptions,
   clientSupportsRecommendedConfigValue,
+  orderedConfigOptions,
 } from "../session-config-options.js";
 import { AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY } from "../air-extension.js";
 
@@ -281,5 +282,53 @@ describe("buildConfigOptions recommended values presentation", () => {
       currentValue: "high",
       _meta: recommendedMeta("high"),
     });
+  });
+});
+
+describe("config option order", () => {
+  const TOGGLE = { supported: true, enabled: false, useBooleanOption: true };
+  /** The options of a root session that has all six. */
+  const allSix = () =>
+    buildConfigOptions(
+      MODES,
+      MODELS,
+      MODEL_INFOS,
+      undefined,
+      [{ name: "reviewer", description: "Reviews code" }],
+      "default",
+      TOGGLE,
+      undefined,
+      TOGGLE,
+    );
+
+  it("builds a root session's options as model, effort, Fast mode, ultracode, mode, agent", () => {
+    expect(allSix().map((option) => option.id)).toEqual([
+      "model",
+      "effort",
+      "fast",
+      "ultracode",
+      "mode",
+      "agent",
+    ]);
+  });
+
+  it("orders options by id, and puts other ids last in the order they came", () => {
+    const other = (id: string): SessionConfigOption => ({
+      id,
+      name: id,
+      type: "boolean",
+      currentValue: false,
+    });
+    const options = [other("zeta"), ...allSix().reverse(), other("alpha")];
+    expect(orderedConfigOptions(options).map((option) => option.id)).toEqual([
+      "model",
+      "effort",
+      "fast",
+      "ultracode",
+      "mode",
+      "agent",
+      "zeta",
+      "alpha",
+    ]);
   });
 });

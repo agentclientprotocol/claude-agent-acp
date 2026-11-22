@@ -74,8 +74,14 @@ export function normalizeFastModeDisabledReason(
 
 /** Build the Fast mode config option. When the Client supports boolean config
  *  options we expose a native `type: "boolean"` toggle; otherwise we degrade to
- *  a two-value `select` ("on"/"off") so older Clients still get a usable
+ *  a two-value `select` ("off"/"on") so older Clients still get a usable
  *  control.
+ *
+ *  Its category is `speed`, the unstable ACP category of an option that
+ *  changes how fast the model responds, in v1 and v2. A category needs no
+ *  capability: a Client that does not know `speed` handles it as any unknown
+ *  category. ACP asks for a `speed` select's values from slowest to fastest,
+ *  so the fallback lists off before on.
  *
  *  `disabledReason` (the SDK's `fast_mode_disabled_reason`) is folded into the
  *  description while the toggle reads off, so a user whose account or provider
@@ -92,7 +98,7 @@ export function createFastModeConfigOption(
     id: FAST_MODE_CONFIG_ID,
     name: "Fast mode",
     description: explanation ? `${FAST_MODE_DESCRIPTION} — ${explanation}` : FAST_MODE_DESCRIPTION,
-    category: "model_config",
+    category: "speed",
   } as const;
 
   if (useBooleanOption) {
@@ -104,8 +110,8 @@ export function createFastModeConfigOption(
     type: "select",
     currentValue: enabled ? FAST_MODE_ON : FAST_MODE_OFF,
     options: [
-      { value: FAST_MODE_ON, name: "On" },
       { value: FAST_MODE_OFF, name: "Off" },
+      { value: FAST_MODE_ON, name: "On" },
     ],
   };
 }
@@ -128,6 +134,27 @@ export function resolveFastModeEnabled(params: SetSessionConfigOptionRequest): b
     undefined,
     `Invalid value for config option ${FAST_MODE_CONFIG_ID}: ${value}`,
   );
+}
+
+/** Set the Fast mode flag on Claude Code, through `applyFlagSettings`.
+ *
+ *  Turning it on sends `fastMode: false` first, a workaround for Claude Code
+ *  (CLI 2.1.325): it acts on `fastMode: true` only when its flag does not hold
+ *  `true` already, and ignores a repeat. Its flag stays `true` while it stops
+ *  serving Fast mode at a model switch (Fable 5.2 and Mythos 5.2 take only a
+ *  Fast mode that was turned on while they were selected) and reports
+ *  `fast_mode_state: "off"`. Without the reset, turning the toggle back on
+ *  changes nothing there, and the next `system`/init turns it off again.
+ *
+ *  A refusal of the reset changes nothing. If Claude Code takes the reset and
+ *  refuses `true`, it is left off; the caller's option keeps its value, and the
+ *  next `system`/init turns off an option that reads on. */
+export async function applyFastModeFlag(
+  applyFlagSettings: (settings: { fastMode: boolean }) => Promise<void>,
+  enabled: boolean,
+): Promise<void> {
+  if (enabled) await applyFlagSettings({ fastMode: false });
+  await applyFlagSettings({ fastMode: enabled });
 }
 
 /** Per-model Fast mode state threaded into `buildConfigOptions`. The
@@ -162,8 +189,10 @@ export type FastModeOptionState = {
  *  `notice` is set when the user had Fast mode on and the SDK turned it off
  *  with a retained reason: the description carries the same explanation, but a
  *  toggle silently snapping back is worth saying out loud once. Off with no
- *  reason, `sdk_opt_in_required` or `pending` stays quiet: a `result` can carry
- *  the turn-start snapshot, so a notice there would falsely say "turned off". */
+ *  reason, `sdk_opt_in_required` or `pending` stays quiet: a report can carry
+ *  the flag as it was before a request of ours (see
+ *  {@link fastModeResultIsNews}), so a notice there would falsely say "turned
+ *  off". */
 export function fastModeStateChange(
   current: { enabled: boolean; disabledReason?: FastModeDisabledReason },
   state: FastModeState | undefined,
@@ -193,6 +222,41 @@ export function fastModeStateChange(
       transcript: `**Fast mode turned off:** ${explanation}.`,
     },
   };
+}
+
+/** A Fast mode report of Claude Code: the `fast_mode_state` and
+ *  `fast_mode_disabled_reason` of a `system`/init or of a result. */
+export type FastModeReport = {
+  state: FastModeState | undefined;
+  reason: FastModeDisabledReason | undefined;
+};
+
+/** Whether a result's Fast mode report says something that `init`, the report
+ *  of its turn's `system`/init, did not.
+ *
+ *  Claude Code (CLI 2.1.325) reads the `fastMode` flag once when a turn starts
+ *  and builds that turn's init and result from the one reading. A result that
+ *  repeats its init therefore predates a `session/set_config_option` that
+ *  arrived in between: mirroring it would turn the toggle back, until the next
+ *  turn's init. What a result adds is what Claude Code evaluates when it sends
+ *  it: a refusal by the account or the model, or the end of one.
+ *
+ *  Reasons compare as retained ({@link normalizeFastModeDisabledReason}):
+ *  turning Fast mode on mid-turn drops `sdk_opt_in_required` from the result,
+ *  which is no news. True without an init, as for a result whose turn sent none.
+ *
+ *  Not covered: a request that Claude Code applies after it read the flag and
+ *  before it sent the init. That init reports the earlier value too, and the
+ *  next turn's init corrects the toggle. */
+export function fastModeResultIsNews(
+  init: FastModeReport | undefined,
+  result: FastModeReport,
+): boolean {
+  if (init === undefined) return true;
+  return (
+    result.state !== init.state ||
+    normalizeFastModeDisabledReason(result.reason) !== normalizeFastModeDisabledReason(init.reason)
+  );
 }
 
 /** The notice of Fast mode that the SDK turned off, and its transcript line

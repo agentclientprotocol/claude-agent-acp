@@ -1,6 +1,6 @@
 /**
- * The config options of a v2 session: its permission mode, model,
- * effort, Fast mode, ultracode and main-thread agent. Claude Code owns them
+ * The config options of a v2 session: its model, effort, Fast mode,
+ * ultracode, permission mode and main-thread agent. Claude Code owns them
  * all. The session sets each on the query when the client picks a value, and
  * follows the changes it learns of (an approved plan's mode, a model switch
  * that the adapter did not make, the Fast mode state that Claude Code
@@ -51,6 +51,7 @@ import {
   AGENT_CONFIG_ID,
   buildConfigOptions,
   configOptionValue,
+  setSelectedModel,
   discoverCustomAgents,
 } from "../session-config-options.js";
 import {
@@ -62,11 +63,14 @@ import {
   type EffortState,
 } from "../session-effort.js";
 import {
+  applyFastModeFlag,
   createFastModeConfigOption,
   FAST_MODE_CONFIG_ID,
+  fastModeResultIsNews,
   fastModeStateChange,
   fastModeStateEnabled,
   normalizeFastModeDisabledReason,
+  type FastModeReport,
 } from "../session-fast-mode.js";
 import {
   MODEL_CONFIG_ID,
@@ -116,6 +120,8 @@ export interface ConfigSetup {
   effortSettings(): Settings;
   /** The client declared AIR's `recommendedValue` (see the module doc). */
   recommendedValue: boolean;
+  /** A `providers/set` gateway listed the models, so only those can run. */
+  narrowsModels: boolean;
 }
 
 export class SessionConfig {
@@ -128,10 +134,14 @@ export class SessionConfig {
   private effort: EffortState;
   private fastModeEnabled: boolean;
   private fastModeDisabledReason: FastModeDisabledReason | undefined;
+  /** The Fast mode report of the last `system`/init, until a result of a prompt takes it. */
+  private fastModeInitReport: FastModeReport | undefined;
   private ultracodeEnabled: boolean;
   private readonly ultracodeWorkflowsEnabled: boolean | undefined;
   /** The end of the last change (see the module doc). */
   private changes: Promise<void> = Promise.resolve();
+  /** A model id the option does not list goes to Claude Code (`configOptionValue`), unless a gateway listed the models. */
+  private readonly passUnlistedModels: boolean;
 
   private constructor(
     private readonly sessionId: string,
@@ -157,7 +167,9 @@ export class SessionConfig {
     private readonly notify: (notification: SessionNotification) => void,
     private readonly logger: Logger,
     autoModeFallbackWarningPending: boolean,
+    narrowsModels: boolean,
   ) {
+    this.passUnlistedModels = !narrowsModels;
     this.session = {
       query,
       modes,
@@ -294,6 +306,7 @@ export class SessionConfig {
       notify,
       logger,
       autoModeFallbackWarningPending,
+      setup.narrowsModels,
     );
   }
 
@@ -379,7 +392,8 @@ export class SessionConfig {
       };
       const select = (configId: string, value: string) =>
         restore(`${configId} "${value}"`, () =>
-          this.apply({ sessionId: this.sessionId, configId, type: "id", value }),
+          // A model the new query does not list falls back: it may be one the new provider cannot serve.
+          this.apply({ sessionId: this.sessionId, configId, type: "id", value }, false, true),
         );
       const model = previous.session.models.currentModelId;
       if (this.session.models.currentModelId !== model) await select(MODEL_CONFIG_ID, model);
@@ -425,10 +439,15 @@ export class SessionConfig {
     return result;
   }
 
-  /** `duringSetup`: see {@link setInitial}. */
+  /**
+   * `duringSetup`: see {@link setInitial}. `restoring`: the value is the
+   * previous query's ({@link restoreFrom}), so a model id the option does not
+   * list is refused rather than passed to Claude Code.
+   */
   private async apply(
     params: v2.SetSessionConfigOptionRequest,
     duringSetup = false,
+    restoring = false,
   ): Promise<void> {
     const request = v1SetSessionConfigOptionRequest(params);
     const option = this.session.configOptions.find((entry) => entry.id === request.configId);
@@ -438,7 +457,12 @@ export class SessionConfig {
         `Unknown config option: ${request.configId}`,
       );
     }
-    const selected = configOptionValue(option, request, this.modelInfos);
+    const selected = configOptionValue(
+      option,
+      request,
+      this.modelInfos,
+      this.passUnlistedModels && !restoring,
+    );
     if ("enabled" in selected) {
       if (request.configId === FAST_MODE_CONFIG_ID) await this.setFastMode(selected.enabled);
       else await this.setUltracode(selected.enabled);
@@ -450,7 +474,7 @@ export class SessionConfig {
         await this.applyMode(value as PermissionMode, duringSetup);
         return;
       case MODEL_CONFIG_ID:
-        await this.session.query.setModel(value);
+        await setSelectedModel(this.session.query, selected);
         await this.recordModel(value, duringSetup);
         return;
       case EFFORT_CONFIG_ID:
@@ -527,22 +551,28 @@ export class SessionConfig {
   }
 
   /**
-   * Claude Code reported a Fast mode state (`system`/init, a result). Returns
-   * whether the option changed. Without a Fast mode option the model does not
-   * support it, and the state says nothing of the user's intent, which stays
-   * for a model that does (see `fastModeStateChange`).
+   * Claude Code reported a Fast mode state, on a `system`/init or on a result
+   * (`from`). Returns whether the option changed. A result that repeats the
+   * init of its turn changes nothing (see `fastModeResultIsNews`). Without a
+   * Fast mode option the model does not support it, and the state says nothing
+   * of the user's intent, which stays for a model that does (see
+   * `fastModeStateChange`).
    */
-  fastModeReported(
-    state: FastModeState | undefined,
-    reason: FastModeDisabledReason | undefined,
-  ): boolean {
+  fastModeReported(report: FastModeReport, from: "init" | "result"): boolean {
+    if (from === "init") {
+      this.fastModeInitReport = report;
+    } else {
+      const init = this.fastModeInitReport;
+      this.fastModeInitReport = undefined;
+      if (!fastModeResultIsNews(init, report)) return false;
+    }
     if (!this.session.configOptions.some((option) => option.id === FAST_MODE_CONFIG_ID)) {
       return false;
     }
     const change = fastModeStateChange(
       { enabled: this.fastModeEnabled, disabledReason: this.fastModeDisabledReason },
-      state,
-      reason,
+      report.state,
+      report.reason,
     );
     if (!change) return false;
     this.fastModeEnabled = change.enabled;
@@ -581,9 +611,12 @@ export class SessionConfig {
     this.setCurrentValue(AGENT_CONFIG_ID, value);
   }
 
-  /** Applied first, so a rejected control request leaves the option as it was. */
+  /**
+   * Applied first, so a rejected control request leaves the option as it was
+   * (see `applyFastModeFlag` for a refusal after its reset).
+   */
   private async setFastMode(enabled: boolean): Promise<void> {
-    await this.session.query.applyFlagSettings({ fastMode: enabled });
+    await applyFastModeFlag((settings) => this.session.query.applyFlagSettings(settings), enabled);
     this.fastModeEnabled = enabled;
     this.refreshFastModeOption();
   }

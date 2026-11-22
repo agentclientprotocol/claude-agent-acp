@@ -17,6 +17,7 @@ import {
   type CompleteElicitationNotification,
   type CreateElicitationRequest,
   type CreateElicitationResponse,
+  type McpServer,
 } from "@agentclientprotocol/sdk/unstable";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import {
@@ -25,6 +26,7 @@ import {
   listSessions,
   query,
   type Options,
+  type Query,
   type SDKUserMessage,
   type SessionMessage,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -32,13 +34,20 @@ import packageJson from "../../package.json" with { type: "json" };
 import { messageIdForGrouping } from "../sdk-to-acp.js";
 import type { Logger } from "../logger.js";
 import { customAgents } from "../session-config-options.js";
-import { claudeCliPath } from "../claude-cli.js";
+import { AnnouncedChildren, restrictedChild } from "../acp-subagents.js";
+import { claudeCliPath, cliDelivery } from "../claude-cli.js";
 import { clientSystemPrompt, sessionSystemPrompt } from "../client-system-prompt.js";
 import type { ElicitationSupport } from "../elicitation.js";
 import { forkSession } from "../fork-session.js";
 import { supportsMcpOAuth } from "../mcp-oauth.js";
-import { sdkMcpServers } from "../mcp-servers.js";
+import { McpOverAcp, sdkMcpServers } from "../mcp-servers.js";
 import { ALLOW_BYPASS, autoModeDisabled } from "../permissions/modes.js";
+import {
+  clientTakesPromptSuggestions,
+  promptSuggestionOptions,
+  type PromptSuggestionForms,
+} from "../prompt-suggestions.js";
+import { applyProviderRoute } from "../providers.js";
 import {
   readHistoryAcrossCompactions,
   readResumedTail,
@@ -70,8 +79,10 @@ import { airInitializeMeta, airSupport, NO_AIR, type AirSupport } from "./air.js
 import { V2Auth } from "./auth.js";
 import { subagentHooks } from "./child-config.js";
 import { modelSwitchHook, SessionConfig } from "./config.js";
+import { v2ElicitationRequest } from "./elicitation.js";
 import { fileChangePreviewHook } from "./file-preview.js";
 import { canUseTool, denyingStoppedWork } from "./permissions.js";
+import { PromptKeys } from "./prompt-keys.js";
 import { ReplayHolds } from "./replay-hold.js";
 import { reportHooks } from "./reports.js";
 import { savedSessionStatus } from "../session-status.js";
@@ -87,7 +98,6 @@ import {
 } from "./setup.js";
 import type { SubagentReplay } from "./subagent-replay.js";
 import { SubscriptionGuard } from "./subscription-guard.js";
-import { restrictedChild } from "./tasks.js";
 
 /** The sessions per `session/list` page. */
 const SESSION_LIST_PAGE_SIZE = 1000;
@@ -103,13 +113,15 @@ export function v2AgentApp(
   onAgent: (agent: AgentHandle) => void,
 ): v2.AgentApp {
   let agent!: V2Agent;
+  const mcp = new McpOverAcp();
   return (
     v2
       .agent({ name: "claude-code-acp" })
       .onConnect((connection) => {
-        agent = new V2Agent(connection.client, logger ?? console);
+        agent = new V2Agent(connection.client, logger ?? console, mcp);
         onAgent(agent);
       })
+      .onNotification(v2.methods.agent.mcp.message, mcp.handleNotification)
       .onRequest(v2.methods.agent.initialize, ({ params }) => agent.initialize(params))
       .onRequest(v2.methods.agent.auth.login, ({ params }) => agent.auth.login(params))
       .onRequest(v2.methods.agent.auth.logout, () => agent.auth.logout())
@@ -154,7 +166,7 @@ class V2Agent implements AgentHandle, SessionConnection {
    * connection ends, so its requests fail with what happened, not -32002,
    * until a resume starts it again.
    */
-  private readonly stopped = new Map<string, string>();
+  private readonly stopped = new Map<string, string | RequestError>();
   /**
    * The query starts that run, by session id, until each settles (see
    * {@link startSession}). A resume, close or dispose of a session waits for
@@ -169,6 +181,19 @@ class V2Agent implements AgentHandle, SessionConnection {
   private readonly resuming = new Map<string, Set<Promise<unknown>>>();
   /** What the resumes that replay hold back until their `replay_complete` (see `replay-hold.ts`). */
   private readonly replays = new ReplayHolds();
+  /**
+   * The `idempotencyKey`s of each session's prompts, from the session's
+   * start to `session/close` or the end of the connection (see
+   * `prompt-keys.ts`). A restart of the session's query, and a resume of a
+   * session whose query ended, keep the record.
+   */
+  private readonly promptKeys = new Map<string, PromptKeys>();
+  /**
+   * The subagent sessions that the sessions announced, from each one's
+   * `subagent_update` to the `session/close` of its root or the end of the
+   * connection (see `AnnouncedChildren`).
+   */
+  private readonly children = new AnnouncedChildren();
   readonly translator = new V2UpdateTranslator();
   readonly auth: V2Auth;
   /** The `--hide-claude-auth` subscription guard (see `subscription-guard.ts`). */
@@ -183,10 +208,14 @@ class V2Agent implements AgentHandle, SessionConnection {
   elicitation: ElicitationSupport = { form: false, url: false };
   /** The AIR extensions that the client takes (see `air.ts`). */
   air: AirSupport = NO_AIR;
+  /** The forms of the predicted follow-up prompt that the client takes, read at `initialize`. */
+  promptSuggestions: PromptSuggestionForms = { meta: false, update: false };
 
   constructor(
     private readonly ctx: v2.AgentContext,
     readonly logger: Logger,
+    /** Serves the client's `acp` MCP servers to Claude Code (see `mcp-servers.ts`). */
+    private readonly mcp: McpOverAcp,
   ) {
     this.auth = new V2Auth(ctx, logger, {
       routeChanged: () => this.restarts.reroute(),
@@ -199,12 +228,18 @@ class V2Agent implements AgentHandle, SessionConnection {
       logger,
       active: (sessionId) => this.sessions.get(sessionId),
       start: (sessionId, params) => this.restartSession(sessionId, params),
-      lost: async (sessionId, previous) => {
+      lost: async (sessionId, previous, error) => {
         await previous.retire();
         if (this.sessions.get(sessionId) === previous) {
           this.stop(
             sessionId,
-            "Claude Code could not start again. Resume the session to continue.",
+            error instanceof RequestError
+              ? new RequestError(
+                  error.code,
+                  `${error.message} Then resume the session to continue.`,
+                  error.data,
+                )
+              : "Claude Code could not start again. Resume the session to continue.",
           );
         }
       },
@@ -216,6 +251,8 @@ class V2Agent implements AgentHandle, SessionConnection {
 
   /** Sends the update, after the `replay_complete` of a replay that holds it (see {@link heldBy}). */
   send(notification: v2.UpdateSessionNotification): void {
+    // Before the client can name the child that a `subagent_update` announces.
+    this.children.sending(notification);
     const send = () => {
       this.ctx.notify(v2.methods.client.session.update, notification).catch((error) => {
         this.logger.error(`Failed to send a ${notification.update.sessionUpdate} update:`, error);
@@ -223,7 +260,7 @@ class V2Agent implements AgentHandle, SessionConnection {
     };
     const held = this.heldBy(notification.sessionId);
     if (held === undefined) send();
-    else this.replays.defer(held, send);
+    else this.replays.defer(held, send, notification.sessionId);
   }
 
   /**
@@ -249,12 +286,16 @@ class V2Agent implements AgentHandle, SessionConnection {
     send: () => Promise<T>,
   ): Promise<T> {
     const held = sessionId === undefined ? undefined : this.heldBy(sessionId);
-    if (held === undefined) return send();
+    if (sessionId === undefined || held === undefined) return send();
     return new Promise((resolve, reject) =>
-      this.replays.defer(held, () => {
-        if (signal.aborted) reject(new Error("The request was withdrawn"));
-        else send().then(resolve, reject);
-      }),
+      this.replays.defer(
+        held,
+        () => {
+          if (signal.aborted) reject(new Error("The request was withdrawn"));
+          else send().then(resolve, reject);
+        },
+        sessionId,
+      ),
     );
   }
 
@@ -277,15 +318,11 @@ class V2Agent implements AgentHandle, SessionConnection {
   ): Promise<CreateElicitationResponse> {
     // An elicitation of a request, not of a session, names no session.
     const sessionId = (request as { sessionId?: unknown }).sessionId;
-    // The v1 types accept a property schema with any tag; the v2 types accept
-    // one only in a received value. An MCP server's schema is relayed
-    // unchanged, as on v1, so this cast does not check it.
     return this.afterReplay(typeof sessionId === "string" ? sessionId : undefined, signal, () =>
-      this.ctx.request(
-        v2.methods.client.elicitation.create,
-        request as v2.CreateElicitationRequest,
-        { cancellationSignal: signal, stopWaitingOnCancel: true },
-      ),
+      this.ctx.request(v2.methods.client.elicitation.create, v2ElicitationRequest(request), {
+        cancellationSignal: signal,
+        stopWaitingOnCancel: true,
+      }),
     );
   }
 
@@ -300,9 +337,9 @@ class V2Agent implements AgentHandle, SessionConnection {
   }
 
   /** The session's query ended: a later `session/resume` starts it again from its transcript. */
-  private stop(sessionId: string, message: string): void {
+  private stop(sessionId: string, reason: string | RequestError): void {
     this.sessions.delete(sessionId);
-    this.stopped.set(sessionId, message);
+    this.stopped.set(sessionId, reason);
     this.translator.forget(sessionId);
     this.auth.sessionEnded(sessionId);
     this.guard.sessionEnded(sessionId);
@@ -326,6 +363,10 @@ class V2Agent implements AgentHandle, SessionConnection {
       url: request.capabilities?.elicitation?.url != null,
     };
     this.air = airSupport(request.capabilities);
+    this.promptSuggestions = {
+      meta: this.air.client,
+      update: clientTakesPromptSuggestions(request.capabilities?.session),
+    };
     const { authMethods, auth, _meta } = this.auth.initialize(request.capabilities);
     const airMeta = airInitializeMeta(this.air);
     return {
@@ -390,7 +431,7 @@ class V2Agent implements AgentHandle, SessionConnection {
    * with.
    */
   async forkSession(params: v2.ForkSessionRequest): Promise<v2.ForkSessionResponse> {
-    if (this.ownerOfChild(params.sessionId)) throw restrictedChild(params.sessionId, "fork");
+    if (this.children.has(params.sessionId)) throw restrictedChild(params.sessionId, "fork");
     // Rejects bad `configOptions`, a bad `cwd` or MCP server before the transcript is copied.
     const initial = initialConfigRequests(params.sessionId, params.configOptions);
     await validatedSetup(params);
@@ -443,7 +484,7 @@ class V2Agent implements AgentHandle, SessionConnection {
         `Replaying from a ${replayFrom.type} cursor is not supported`,
       );
     }
-    if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "resume");
+    if (this.children.has(sessionId)) throw restrictedChild(sessionId, "resume");
     const initial = initialConfigRequests(sessionId, params.configOptions);
     // No await before it: nothing of the session goes out between the request and the hold.
     const release = replayFrom != null ? this.replays.begin(sessionId) : undefined;
@@ -497,10 +538,11 @@ class V2Agent implements AgentHandle, SessionConnection {
       // session's.
       const request = await validatedSetup(params);
       assertCwdOf(session, request.cwd, "resume it");
-      await session.setMcpServers({
-        ...clientOptions(params._meta)?.mcpServers,
-        ...sdkMcpServers(request.mcpServers),
-      });
+      const served = await this.sdkMcpServers(sessionId, request.mcpServers);
+      await session.setMcpServers(
+        { ...clientOptions(params._meta)?.mcpServers, ...served.configs },
+        served.unserved,
+      );
       if (!sameDirectories(request.additionalDirectories ?? [], session.additionalDirectories)) {
         // The SDK cannot change them on a running query: it restarts with
         // them at its next turn boundary (see `restarts.ts`).
@@ -526,25 +568,16 @@ class V2Agent implements AgentHandle, SessionConnection {
       release?.();
       // A notice is not history, so it follows `replay_complete`.
       subagents?.reportMissingHistory();
+      // A `subagent_update` after its parent's `replay_complete` is current,
+      // and so is a `state_update` of the child: the replayed children's
+      // current states go out here, before the snapshot and the response.
+      subagents?.currentStates();
     }
     // The current title, after the replay and before the state.
     await session.reports.publishTitle();
     for (const notification of session.resumeSnapshot()) this.send(notification);
     const response = await this.setupFields(session);
     this.afterSetup(session, params);
-    // A replayed child's state that comes before the response is history to
-    // the client, also after the child's `replay_complete`: the children's
-    // current states follow the response. The ACP SDK (2.7.0)
-    // gives a request handler no responder and no after-response hook, so the
-    // order rests on two things that its source shows and its API does not
-    // promise. `registerAppRequest` queues the response in the microtask that
-    // follows this handler's return, with no macrotask in between, so the
-    // timer runs after it. And `Connection.sendMessage` writes in call order,
-    // so what the timer sends is written after the response. The timer is
-    // set in the same synchronous step as the `return`: an `await` between
-    // them would let it run first. The v1 core's `afterSetupResponse` relies
-    // on the same.
-    if (subagents) setTimeout(() => subagents.afterResponse(), 0);
     return response;
   }
 
@@ -553,7 +586,10 @@ class V2Agent implements AgentHandle, SessionConnection {
    * subagents (`subagents`), and ends the replay: each replayed child's
    * `replay_complete` (see `SubagentReplay.finish`), then the session's. An
    * AIR client that declared `loadReplayEnd` gets AIR's own mark after it.
-   * All in one synchronous step, as `ReplayHolds.replay` requires.
+   * Then each live child that the history did not have is announced again and
+   * gets its `replay_complete` (see `SessionTasks.unreplayedChildren`), ahead
+   * of what the replay held of it. All in one synchronous step, as
+   * `ReplayHolds.replay` requires.
    */
   private replay(
     session: V2Session,
@@ -572,6 +608,11 @@ class V2Agent implements AgentHandle, SessionConnection {
       this.send({ sessionId, update: REPLAY_COMPLETE });
       const end = replayEndUpdate(this.clientCapabilities);
       if (end) this.send({ sessionId, update: end });
+      const unreplayed = session.tasks.unreplayedChildren(
+        (child) => subagents?.announced(child) === true,
+        this.replays.senders(sessionId),
+      );
+      for (const notification of unreplayed) this.send(notification);
     });
   }
 
@@ -619,7 +660,7 @@ class V2Agent implements AgentHandle, SessionConnection {
   async sessionStatus({ sessionId }: v2.SessionStatusRequest): Promise<v2.SessionStatusResponse> {
     const session = this.sessions.get(sessionId);
     if (session) return { status: "open", state: session.statusState() };
-    if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "ask the status of");
+    if (this.children.has(sessionId)) throw restrictedChild(sessionId, "ask the status of");
     return savedSessionStatus(sessionId);
   }
 
@@ -648,7 +689,7 @@ class V2Agent implements AgentHandle, SessionConnection {
     };
     let session: V2Session | undefined;
     if (sessionId != null) {
-      if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "read the options of");
+      if (this.children.has(sessionId)) throw restrictedChild(sessionId, "read the options of");
       // A restart or a resume that runs makes the session active.
       await this.restarts.settled(sessionId);
       await this.startSettled(sessionId);
@@ -656,7 +697,7 @@ class V2Agent implements AgentHandle, SessionConnection {
     }
     const fields = (config: SessionConfig, commands: v2.AvailableCommand[]) => ({
       configOptions: config.options(),
-      // The draft leaves out an empty list.
+      // An omitted list means none, like an empty one.
       ...(commands.length > 0 ? { availableCommands: commands } : {}),
     });
     const listed = (commands: SessionCommands) =>
@@ -685,13 +726,15 @@ class V2Agent implements AgentHandle, SessionConnection {
 
   /** Closing is idempotent: a session that is not active closes at once. */
   async closeSession({ sessionId }: v2.CloseSessionRequest): Promise<v2.CloseSessionResponse> {
-    if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "close");
+    if (this.children.has(sessionId)) throw restrictedChild(sessionId, "close");
     // A restart that runs ends first, so the close ends the session it started.
     await this.restarts.closing(sessionId);
     // A resume that runs answers first: the close ends what it started, and
     // its updates go out before the close response.
     await this.setupSettled(sessionId);
     this.stopped.delete(sessionId);
+    // A closed session is no longer active here: only its stored messages keep their keys.
+    this.promptKeys.delete(sessionId);
     const session = this.sessions.get(sessionId);
     if (session) {
       await session.close();
@@ -701,12 +744,14 @@ class V2Agent implements AgentHandle, SessionConnection {
       this.guard.sessionEnded(sessionId);
     }
     this.restarts.closed(sessionId);
+    // After the close's last updates, which name the session's children.
+    this.children.rootClosed(sessionId);
     return {};
   }
 
   /** Deleting a session that does not exist succeeds, as v2 asks. */
   async deleteSession({ sessionId }: v2.DeleteSessionRequest): Promise<v2.DeleteSessionResponse> {
-    if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "delete");
+    if (this.children.has(sessionId)) throw restrictedChild(sessionId, "delete");
     // A resume that runs, or its start, may make the session live.
     await this.setupSettled(sessionId);
     const live = this.sessions.get(sessionId);
@@ -731,7 +776,7 @@ class V2Agent implements AgentHandle, SessionConnection {
   async setTitle(params: v2.SetSessionTitleRequest): Promise<v2.SetSessionTitleResponse> {
     const request = parseRenameSessionRequest(params);
     const { sessionId } = request;
-    if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, "retitle");
+    if (this.children.has(sessionId)) throw restrictedChild(sessionId, "retitle");
     // Renamed through the query that runs once a restart or resume settled.
     await this.restarts.settled(sessionId);
     await this.setupSettled(sessionId);
@@ -764,13 +809,14 @@ class V2Agent implements AgentHandle, SessionConnection {
   session(sessionId: string, method: string): V2Session {
     const session = this.sessions.get(sessionId);
     if (session) return session;
-    if (this.ownerOfChild(sessionId)) throw restrictedChild(sessionId, method);
+    if (this.children.has(sessionId)) throw restrictedChild(sessionId, method);
     throw this.inactive(sessionId);
   }
 
   /** The error of a request of `sessionId`, which is not running. */
   private inactive(sessionId: string): RequestError {
     const stopped = this.stopped.get(sessionId);
+    if (stopped instanceof RequestError) return stopped;
     return stopped !== undefined
       ? RequestError.internalError({ sessionId }, stopped)
       : RequestError.sessionNotFound(sessionId);
@@ -789,8 +835,10 @@ class V2Agent implements AgentHandle, SessionConnection {
     target: { terminalId: string } | { toolCallId: string },
   ): Promise<Record<string, never>> {
     const root = this.sessions.get(sessionId) ?? this.ownerOfChild(sessionId);
-    if (!root) throw this.inactive(sessionId);
-    if (!(await root.tasks.cancelItem(sessionId, target))) {
+    // A subagent's session is known to the client also when its root's query
+    // ended: it lists nothing then.
+    if (!root && !this.children.has(sessionId)) throw this.inactive(sessionId);
+    if (!root || !(await root.tasks.cancelItem(sessionId, target))) {
       throw "terminalId" in target
         ? RequestError.invalidParams(
             { sessionId, terminalId: target.terminalId },
@@ -804,9 +852,13 @@ class V2Agent implements AgentHandle, SessionConnection {
     return {};
   }
 
-  /** The root session that `sessionId` is a subagent session of. */
+  /**
+   * The active root session that `sessionId` is a subagent session of.
+   * Undefined also for a child whose root's query ended.
+   */
   private ownerOfChild(sessionId: string): V2Session | undefined {
-    return [...this.sessions.values()].find((session) => session.tasks.hasChild(sessionId));
+    const root = this.children.rootOf(sessionId);
+    return root === undefined ? undefined : this.sessions.get(root);
   }
 
   async dispose(): Promise<void> {
@@ -815,6 +867,7 @@ class V2Agent implements AgentHandle, SessionConnection {
     const sessions = [...this.sessions.values()];
     this.sessions.clear();
     this.stopped.clear();
+    this.promptKeys.clear();
     await Promise.all(sessions.map((session) => session.close()));
   }
 
@@ -860,7 +913,7 @@ class V2Agent implements AgentHandle, SessionConnection {
     });
     return {
       configOptions: session.config.options(),
-      // The draft leaves out an empty list.
+      // An omitted list means none, like an empty one.
       ...(commands.length > 0 ? { availableCommands: commands } : {}),
     };
   }
@@ -939,11 +992,23 @@ class V2Agent implements AgentHandle, SessionConnection {
       configuredSettings: opened.configured,
       env: opened.env,
       mcpServers: opened.request.mcpServers.map((server) => server.name),
+      unservedMcpServers: opened.unservedMcpServers,
       mcpOAuth: this.elicitation.url && supportsMcpOAuth(q),
       query: q,
       model: { id: models.models.currentModelId, info: models.allowlistedModelInfo },
     });
-    session.start(q, config, opened.mcpServers, resume !== undefined);
+    let keys = this.promptKeys.get(sessionId);
+    if (!keys) {
+      const { cwd } = opened.request;
+      keys = new PromptKeys(
+        sessionId,
+        () => storedPromptIds(sessionId, cwd, this.logger),
+        this.logger,
+      );
+      this.promptKeys.set(sessionId, keys);
+    }
+    keys.queryStarted(resume !== undefined);
+    session.start(q, config, opened.mcpServers, keys, resume !== undefined);
     this.sessions.set(sessionId, session);
     this.stopped.delete(sessionId);
     // A route change during the start did not find this session live.
@@ -951,6 +1016,22 @@ class V2Agent implements AgentHandle, SessionConnection {
       staleRoute: this.auth.routeGeneration !== opened.routeGeneration,
     });
     return session;
+  }
+
+  /**
+   * The SDK configs of a setup request's MCP servers. An `acp` server is
+   * served to Claude Code over this connection (see `mcp-servers.ts`). One
+   * that gets no endpoint is in `unserved`, and the session goes on without
+   * it.
+   */
+  private async sdkMcpServers(sessionId: string, servers: readonly McpServer[]) {
+    const served = await sdkMcpServers(servers, (server) => this.mcp.sdkConfig(this.ctx, server));
+    for (const server of served.unserved) {
+      this.logger.error(
+        `Session ${sessionId} runs without MCP server ${server.name}: ${server.error}`,
+      );
+    }
+    return served;
   }
 
   /**
@@ -973,6 +1054,8 @@ class V2Agent implements AgentHandle, SessionConnection {
   ) {
     const request = await validatedSetup(params);
     const client = clientOptions(params._meta);
+    const served = await this.sdkMcpServers(sessionId, request.mcpServers);
+    const mcpServers = { ...client?.mcpServers, ...served.configs };
     // After a provider change that is still listing its models.
     await this.auth.routeSettled();
     // The resumed transcript's last model and mode.
@@ -1014,8 +1097,6 @@ class V2Agent implements AgentHandle, SessionConnection {
       process.env.CLAUDE_CODE_THINKING_DISPLAY,
       this.logger,
     );
-    const mcpServers = { ...client?.mcpServers, ...sdkMcpServers(request.mcpServers) };
-
     const clientPrompt = clientSystemPrompt(request.systemPrompt);
     const input = new Pushable<SDKUserMessage>();
     // A client can turn the affordance off (`_meta.claudeCode.options`). Then
@@ -1045,10 +1126,14 @@ class V2Agent implements AgentHandle, SessionConnection {
       // client stops one at a time: `session/cancel` must leave listed work
       // running. Before the client's options.
       perTaskStopAffordance: true,
-      // AIR's predicted follow-up prompt (see `reports.ts`), as on v1. Only
-      // AIR gets it, so no other client's session spends a request on it.
+      // The predicted follow-up prompt (see `reports.ts`): only AIR and a
+      // client that advertised `session.promptSuggestions` get it, so no
+      // other client's session spends a request on it.
       // Before the client's options: `promptSuggestions: false` turns it off.
-      ...(this.air.client ? { promptSuggestions: true } : {}),
+      ...promptSuggestionOptions(this.promptSuggestions),
+      // Before the client's options: its own `mcpServersDelivery` and
+      // `settingsDelivery` win.
+      ...cliDelivery(client?.extraArgs),
       ...client,
       // The checkpoints that AIR's file-change reports read (see
       // `file-changes.ts`), only for a client that declared them, as on v1.
@@ -1121,7 +1206,16 @@ class V2Agent implements AgentHandle, SessionConnection {
       ...(resume !== undefined ? { resume } : { sessionId }),
       ...(persist ? {} : { persistSession: false }),
     };
-    const q = query({ prompt: input, options });
+    let q: Query;
+    try {
+      q = query({ prompt: input, options });
+    } catch (error) {
+      // The SDK refuses options that it cannot send to Claude Code, e.g. a
+      // client's hook matcher without `hooks`: "hooks.PreToolUse[0].hooks must
+      // be an array of callbacks".
+      settings.dispose();
+      throw error;
+    }
     let initialization;
     try {
       initialization = await q.initializationResult();
@@ -1136,6 +1230,16 @@ class V2Agent implements AgentHandle, SessionConnection {
         throw RequestError.sessionNotFound(resume);
       }
       throw startupFailureError(error) ?? error;
+    }
+    if (routing.settings) {
+      // Before a request of the session reaches the provider.
+      try {
+        await applyProviderRoute(q, routing.settings);
+      } catch (error) {
+        q.close();
+        settings.dispose();
+        throw error;
+      }
     }
     authStarted(sessionId, initialization.account);
     try {
@@ -1186,6 +1290,7 @@ class V2Agent implements AgentHandle, SessionConnection {
           client,
           effortSettings: () => mergeEffortSettings(settings.getSettings(), configured),
           recommendedValue: this.air.recommendedValue,
+          narrowsModels: routing.narrowsModels,
         },
         (notification) => session.output.emitV1([notification]),
         this.logger,
@@ -1205,6 +1310,7 @@ class V2Agent implements AgentHandle, SessionConnection {
       env: options.env ?? {},
       request,
       mcpServers,
+      unservedMcpServers: served.unserved,
       routeGeneration,
     };
   }
@@ -1239,6 +1345,22 @@ async function validatedSetup(
     }
   }
   return request;
+}
+
+/**
+ * The uuids of the user messages in the stored history of the session
+ * `sessionId`, as a replay reads it: the messages before each compaction too.
+ */
+async function storedPromptIds(sessionId: string, cwd: string, logger: Logger): Promise<string[]> {
+  const messages = await readHistoryAcrossCompactions(
+    sessionId,
+    await getSessionMessages(sessionId, { dir: cwd }),
+    logger,
+    cwd,
+  );
+  return messages.flatMap((message) =>
+    message.type === "user" && message.uuid ? [message.uuid] : [],
+  );
 }
 
 /** A request of the active `session` names its `cwd`, as `session/resume` must. */

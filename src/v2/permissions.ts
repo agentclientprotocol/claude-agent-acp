@@ -52,7 +52,11 @@ export interface PermissionHost {
    * Whether ExitPlanMode of the agent `agentId` offers to clear the context
    * (see `ClearContext`), and how much of the context is in use.
    */
-  contextReset(agentId: string | undefined): { offered: boolean; usedPercent: number | undefined };
+  contextReset(agentId: string | undefined): {
+    offered: boolean;
+    shown: boolean;
+    usedPercent: number | undefined;
+  };
   /**
    * An ExitPlanMode answer that interrupts the cycle: "No, keep planning", or
    * a plan accepted with clearing the context (`reset`).
@@ -168,6 +172,7 @@ export function canUseTool(host: PermissionHost): CanUseTool {
       availableModes: host.availableModes(),
       prePlanMode: host.prePlanMode(),
       allowContextReset: contextReset.offered,
+      showClearContextOnPlanAccept: contextReset.shown,
       contextUsedPercent: contextReset.usedPercent,
     });
     // The stream never shows SandboxNetworkAccess's tool call: the client
@@ -254,7 +259,7 @@ export function v2PermissionRequest(request: AcpPermissionRequest): v2.RequestPe
 /**
  * The v1 form of the answer to a permission request.
  *
- * v2 adds outcomes that v1 does not know, which the draft says are no
+ * v2 adds outcomes that v1 does not know, which v2 says are no
  * approval. They become `cancelled`. In v2, `cancelled` also means that the
  * user dismissed the prompt or the client declined it by policy. So the v2
  * core reads a `cancelled` outcome as the user refusing the tool, unless a

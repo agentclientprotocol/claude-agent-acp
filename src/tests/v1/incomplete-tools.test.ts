@@ -24,6 +24,8 @@ vi.mock("node:child_process", async () => ({
 
 const sessionId = "test-session";
 const toolCallId = "unfinished-bash";
+/** The id of a question that Claude Code's confirmWithUser asks. */
+const confirmId = "confirm_0b7c5f3e-5a7e-4d55-9a54-2f7f0a1c9e11";
 
 afterEach(() => clearHookCallbacks(sessionId));
 
@@ -67,6 +69,90 @@ describe("incomplete foreground tools", () => {
     await expect(prompt()).rejects.toMatchObject({ data: { errorKind: "incomplete_tool_call" } });
     expect(updates).toContainEqual(expect.objectContaining({ toolCallId, status: "failed" }));
   });
+
+  it.each([
+    {
+      client: "answers",
+      answer: async () => ({ action: "accept", content: { question_0: "Download" } }),
+      toolCall: "completed",
+    },
+    // A declined form answers the question with nothing selected.
+    { client: "declines", answer: async () => ({ action: "decline" }), toolCall: "completed" },
+    { client: "cancels", answer: async () => ({ action: "cancel" }), toolCall: "failed" },
+    {
+      client: "cannot show",
+      answer: async () => {
+        throw new Error("Invalid params");
+      },
+      toolCall: "failed",
+    },
+  ])(
+    "ends the turn after a confirmWithUser question that the client $client, with its tool call $toolCall",
+    async ({ answer, toolCall }) => {
+      const { agent, prompt, updates } = createTestSession(confirmQuestionMessages, {
+        createElicitation: answer as AcpClient["createElicitation"],
+      });
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { elicitation: { form: {} } },
+      });
+
+      await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+      // No tool_result comes for the question, so its answer ends the tool call.
+      expect(
+        updates.filter((update) => update.toolCallId === confirmId).map((update) => update.status),
+      ).toEqual(["pending", toolCall]);
+    },
+  );
+
+  it("ends the turn after a confirmWithUser question that Claude Code withdrew", async () => {
+    const { createElicitation, messages } = withdrawnConfirmQuestion(false);
+    const { agent, prompt } = createTestSession(messages, { createElicitation });
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { elicitation: { form: {} } },
+    });
+
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+  });
+
+  it.each([
+    {
+      cancel: "while the client shows it",
+      session: () => withdrawnConfirmQuestion(true),
+      // The cancel ends it, as it ends the turn's other open tool calls.
+      ends: [["failed", "The turn was cancelled before this tool call returned a result."]],
+    },
+    {
+      cancel: "after the client answered it",
+      session: () => ({
+        messages: answeredConfirmQuestionThenCancelMessages,
+        createElicitation: async () => ({
+          action: "accept" as const,
+          content: { question_0: "Download" },
+        }),
+      }),
+      // The answer ended it: the cancel does not end it again.
+      ends: [["completed", undefined]],
+    },
+  ])(
+    "ends the tool call of a confirmWithUser question once at a cancel $cancel",
+    async ({ session, ends }) => {
+      const { createElicitation, messages } = session();
+      const { agent, prompt, updates } = createTestSession(messages, { createElicitation });
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { elicitation: { form: {} } },
+      });
+
+      await expect(prompt()).resolves.toMatchObject({ stopReason: "cancelled" });
+      expect(
+        updates
+          .filter((update) => update.toolCallId === confirmId && update.status !== "pending")
+          .map((update) => [update.status, update.content?.[0].content.text]),
+      ).toEqual(ends);
+    },
+  );
 
   it("allows a completed tool with a late PostToolUse hook", async () => {
     const { prompt, logError } = createTestSession(completedToolMessages);
@@ -168,6 +254,135 @@ describe("incomplete foreground tools", () => {
     expect(agent.sessions[sessionId].dispatchedToolCalls?.has(advisorId)).toBe(false);
   });
 
+  it("closes an advisor call whose reply Claude Code gave up on once the next reply's first block has reached the client, and ends the turn as usual", async () => {
+    const advisorId = "srvtoolu_cut_off";
+    const nextToolId = "toolu_next";
+    const { prompt, updates, logError, agent } = createTestSession(async function* (input) {
+      yield* echoNextPrompt(input);
+      yield messageStart("msg_cut_off");
+      yield advisorStart(advisorId);
+      yield advisorToolUse(advisorId, "msg_cut_off");
+      // No result: Claude Code gives up on the reply and asks again.
+      yield messageStart("msg_asked_again");
+      yield toolStart(nextToolId);
+      yield blockStart({ type: "text", text: "" }, 1);
+      yield {
+        ...blockStart({}),
+        event: {
+          type: "content_block_delta",
+          index: 1,
+          delta: { type: "text_delta", text: "Next." },
+        },
+      };
+      yield successfulResultMessage();
+    });
+
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+    const ends = updates.filter(
+      (update) =>
+        update.toolCallId === advisorId && ["completed", "failed"].includes(update.status),
+    );
+    expect(ends).toHaveLength(1);
+    expect(ends[0]).toMatchObject({ status: "failed" });
+    expect(ends[0].content[0].content.text).toBe(
+      "Claude Code replaced the response that made this tool call, and stopped the call. If it had started, some of its effects may have happened.",
+    );
+    const advisorEnds = updates.indexOf(ends[0]);
+    const nextToolStarts = updates.findIndex(
+      (update) => update.sessionUpdate === "tool_call" && update.toolCallId === nextToolId,
+    );
+    const nextText = updates.findIndex(
+      (update) => update.sessionUpdate === "agent_message_chunk" && update.content.text === "Next.",
+    );
+    expect(nextToolStarts).toBeGreaterThanOrEqual(0);
+    expect(advisorEnds).toBeGreaterThan(nextToolStarts);
+    expect(advisorEnds).toBeLessThan(nextText);
+    expect(agent.sessions[sessionId].emittedToolCalls.has(advisorId)).toBe(false);
+    expect(logError).not.toHaveBeenCalled();
+  });
+
+  it("closes an advisor call whose reply Claude Code gave up on when the next reply does not stream, by its message id", async () => {
+    const advisorId = "srvtoolu_cut_off";
+    const retryToolId = "toolu_retry";
+    const retry = toolUse(retryToolId);
+    const { prompt, updates, logError } = createTestSession(async function* (input) {
+      yield* echoNextPrompt(input);
+      yield messageStart("msg_cut_off");
+      yield advisorStart(advisorId);
+      yield advisorToolUse(advisorId, "msg_cut_off");
+      // Claude Code asks again without streaming, as its fallback after a
+      // streaming error does: only the consolidated message comes.
+      yield { ...retry, message: { ...retry.message, id: "msg_retry" } };
+      yield toolResult(retryToolId);
+      yield successfulResultMessage();
+    });
+
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+    const ends = updates.filter(
+      (update) =>
+        update.toolCallId === advisorId && ["completed", "failed"].includes(update.status),
+    );
+    expect(ends).toHaveLength(1);
+    expect(ends[0]).toMatchObject({ status: "failed" });
+    expect(ends[0].content[0].content.text).toBe(
+      "Claude Code replaced the response that made this tool call, and stopped the call. If it had started, some of its effects may have happened.",
+    );
+    expect(updates).toContainEqual(
+      expect.objectContaining({ toolCallId: retryToolId, status: "completed" }),
+    );
+    expect(logError).not.toHaveBeenCalled();
+  });
+
+  it("names the subagent on the close of its advisor call whose reply Claude Code gave up on", async () => {
+    const advisorId = "srvtoolu_subagent_cut_off";
+    const subagent = { parent_tool_use_id: "toolu_agent" };
+    const { prompt, updates } = createTestSession(async function* (input) {
+      yield* echoNextPrompt(input);
+      yield { ...messageStart("msg_subagent_cut_off"), ...subagent };
+      yield { ...advisorStart(advisorId), ...subagent };
+      yield { ...messageStart("msg_subagent_asked_again"), ...subagent };
+      yield { ...blockStart({ type: "text", text: "" }), ...subagent };
+      yield assistantText("Done.");
+      yield successfulResultMessage();
+    });
+
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+    const ends = updates.filter(
+      (update) =>
+        update.toolCallId === advisorId && ["completed", "failed"].includes(update.status),
+    );
+    expect(ends).toMatchObject([
+      { status: "failed", _meta: { claudeCode: { parentToolUseId: "toolu_agent" } } },
+    ]);
+    const mainText = updates.findIndex(
+      (update) => update.sessionUpdate === "agent_message_chunk" && update.content.text === "Done.",
+    );
+    expect(updates.indexOf(ends[0])).toBeLessThan(mainText);
+  });
+
+  it("leaves an advisor call that its reply left pending for the result that starts the next reply", async () => {
+    const advisorId = "srvtoolu_pending";
+    const result = { type: "advisor_result", text: "Check the edge case." };
+    const { prompt, updates, logError } = createTestSession(async function* (input) {
+      yield* echoNextPrompt(input);
+      yield messageStart("msg_paused");
+      yield advisorStart(advisorId);
+      yield advisorToolUse(advisorId, "msg_paused");
+      yield messageStart("msg_continued");
+      yield advisorResult(advisorId, result, "msg_continued");
+      yield blockStart({ type: "text", text: "" }, 1);
+      yield successfulResultMessage();
+    });
+
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+    const ends = updates.filter(
+      (update) =>
+        update.toolCallId === advisorId && ["completed", "failed"].includes(update.status),
+    );
+    expect(ends.map((update) => update.status)).toEqual(["completed"]);
+    expect(logError).not.toHaveBeenCalled();
+  });
+
   it("allows a tool explicitly handed off to a background task", async () => {
     const { prompt, updates } = createTestSession(backgroundToolMessages);
 
@@ -177,6 +392,12 @@ describe("incomplete foreground tools", () => {
 
   it("does not claim a subagent's tool as a foreground tool", async () => {
     const { prompt } = createTestSession(subagentToolMessages);
+
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+  });
+
+  it("does not claim a workflow agent's permission tool as a foreground tool", async () => {
+    const { prompt } = createTestSession(workflowAgentPermissionMessages);
 
     await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
   });
@@ -1161,6 +1382,66 @@ describe("tool calls of a background subagent that a cancel stops", () => {
   });
 });
 
+// The model can write an input that Claude Code rejects when it runs the tool,
+// after the adapter reported the tool use (issue #1308).
+describe("a tool use whose input Claude Code rejects", () => {
+  it("reports a Read with a number for file_path as failed, and ends the turn", async () => {
+    const id = "toolu_number_path";
+    const error =
+      "InputValidationError: Read failed due to the following issue:\n" +
+      "The parameter `file_path` type is expected as `string` but provided as `number`";
+    const { prompt, updates, logError } = createTestSession(async function* (prompts) {
+      yield* echoNextPrompt(prompts);
+      yield toolUse(id, null, "Read", { file_path: 12345 });
+      yield {
+        ...toolResult(id),
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: id, is_error: true, content: error }],
+        },
+      };
+      yield successfulResultMessage();
+    });
+
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+
+    const reports = updates.filter((update) => update.toolCallId === id);
+    expect(reports[0]).toMatchObject({
+      sessionUpdate: "tool_call",
+      title: "Read File",
+      locations: [],
+      rawInput: { file_path: 12345 },
+    });
+    expect(reports.at(-1)).toMatchObject({ status: "failed" });
+    expect(logError).not.toHaveBeenCalled();
+  });
+});
+
+/** The stream event that starts an API reply, which carries its message id. */
+function messageStart(id: string) {
+  return {
+    type: "stream_event",
+    session_id: sessionId,
+    uuid: `stream-${id}`,
+    parent_tool_use_id: null,
+    event: {
+      type: "message_start",
+      message: { id, model: "claude-test", usage: successfulResultMessage().usage },
+    },
+  };
+}
+
+/** The stream event that starts a block of the reply streaming: `block` at `index`. */
+function blockStart(block: Record<string, unknown>, index = 0) {
+  return {
+    type: "stream_event",
+    session_id: sessionId,
+    uuid: "stream-message",
+    parent_tool_use_id: null,
+    event: { type: "content_block_start", index, content_block: block },
+  };
+}
+
 function toolStart(id = toolCallId, parent: string | null = null, name = "Bash") {
   return {
     type: "stream_event",
@@ -1206,12 +1487,13 @@ function advisorStart(id: string) {
 }
 
 /** The complete assistant message that dispatches the advisor server tool. */
-function advisorToolUse(id: string) {
+function advisorToolUse(id: string, messageId?: string) {
   return {
     type: "assistant",
     session_id: sessionId,
     parent_tool_use_id: null,
     message: {
+      ...(messageId && { id: messageId }),
       role: "assistant",
       usage: successfulResultMessage().usage,
       content: [{ type: "server_tool_use", id, name: "advisor", input: {} }],
@@ -1219,12 +1501,13 @@ function advisorToolUse(id: string) {
   };
 }
 
-function advisorResult(id: string, content: unknown) {
+function advisorResult(id: string, content: unknown, messageId?: string) {
   return {
     type: "assistant",
     session_id: sessionId,
     parent_tool_use_id: null,
     message: {
+      ...(messageId && { id: messageId }),
       role: "assistant",
       usage: successfulResultMessage().usage,
       content: [{ type: "advisor_tool_result", tool_use_id: id, content }],
@@ -1259,6 +1542,7 @@ function toolResult(id = toolCallId, parent: string | null = null) {
 
 function createTestSession(
   createSdkMessages: (input: Pushable<any>, agent: ClaudeAcpAgent) => AsyncGenerator<any>,
+  client: Partial<AcpClient> = {},
 ) {
   const updates: any[] = [];
   const logError = vi.fn();
@@ -1271,6 +1555,7 @@ function createTestSession(
       requestPermission: async () => ({ outcome: { outcome: "selected", optionId: "allow-once" } }),
       extNotification: async () => {},
       authStatusUpdate: async () => {},
+      ...client,
     } as unknown as AcpClient,
     { log: () => {}, error: logError },
   );
@@ -1313,6 +1598,44 @@ async function* permissionOnlyToolMessages(input: Pushable<any>, agent: ClaudeAc
   yield* echoNextPrompt(input);
   await agent.canUseTool(sessionId)("Bash", { command: "echo test" }, {
     toolUseID: toolCallId,
+    signal: new AbortController().signal,
+    suggestions: [],
+  } as any);
+  yield successfulResultMessage();
+}
+
+/** A workflow agent asks for permission while the turn runs. The workflow's
+ *  task_started names the Workflow call, not the agent, and the agent's
+ *  tool_use and tool_result never stream on the root query. */
+async function* workflowAgentPermissionMessages(input: Pushable<any>, agent: ClaudeAcpAgent) {
+  yield* echoNextPrompt(input);
+  yield toolStart("workflow", null, "Workflow");
+  yield toolUse("workflow", null, "Workflow", { script: "await agent('Stamp the date')" });
+  yield {
+    type: "system",
+    subtype: "task_started",
+    session_id: sessionId,
+    task_id: "wzr1bosoo",
+    tool_use_id: "workflow",
+    description: "Stamp the date",
+    task_type: "local_workflow",
+  };
+  yield {
+    ...toolResult("workflow"),
+    message: {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "workflow",
+          content: "Workflow launched in background. Task ID: wzr1bosoo",
+        },
+      ],
+    },
+  };
+  await agent.canUseTool(sessionId)("Bash", { command: "date > stamp.txt; cat stamp.txt" }, {
+    toolUseID: toolCallId,
+    agentID: "a2a57f1ad0803996a",
     signal: new AbortController().signal,
     suggestions: [],
   } as any);
@@ -1884,4 +2207,78 @@ async function* steeredAbandonedToolMessages(input: Pushable<any>, agent: Claude
   yield userEcho((await messages.next()).value);
   yield assistantText("Done as you asked.");
   yield successfulResultMessage();
+}
+
+/** How Claude Code's confirmWithUser asks the user: through AskUserQuestion,
+ *  under a synthetic `confirm_` id, with no tool_use or tool_result. */
+function askConfirmQuestion(agent: ClaudeAcpAgent, signal = new AbortController().signal) {
+  const questions = [
+    {
+      question: "Download report.pdf from Drive?",
+      header: "Download",
+      options: [
+        { label: "Download", description: "" },
+        { label: "Don't download", description: "" },
+      ],
+      multiSelect: false,
+    },
+  ];
+  return agent.canUseTool(sessionId)(
+    "AskUserQuestion",
+    { questions, metadata: { source: "mcp_connector_download" } },
+    { toolUseID: confirmId, signal, suggestions: [] } as any,
+  );
+}
+
+async function* confirmQuestionMessages(input: Pushable<any>, agent: ClaudeAcpAgent) {
+  yield* echoNextPrompt(input);
+  // A question that the client cancelled rejects.
+  await askConfirmQuestion(agent).catch(() => {});
+  yield successfulResultMessage();
+}
+
+/**
+ * A confirmWithUser question whose request Claude Code withdraws while the
+ * client still shows it: at a `session/cancel` (`cancel`), or with the turn
+ * going on, as when another client of the session answered it.
+ */
+function withdrawnConfirmQuestion(cancel: boolean) {
+  let asked!: () => void;
+  const shown = new Promise<void>((resolve) => (asked = resolve));
+  return {
+    // The ACP connection rejects a request whose signal aborts.
+    createElicitation: ((_request: unknown, signal: AbortSignal) => {
+      asked();
+      return new Promise((_resolve, reject) =>
+        signal.addEventListener("abort", () => reject(new Error("Request cancelled"))),
+      );
+    }) as unknown as AcpClient["createElicitation"],
+    async *messages(input: Pushable<any>, agent: ClaudeAcpAgent) {
+      yield* echoNextPrompt(input);
+      const withdrawal = new AbortController();
+      const answer = askConfirmQuestion(agent, withdrawal.signal).catch(() => {});
+      await shown;
+      if (cancel) void agent.cancel({ sessionId });
+      withdrawal.abort();
+      await answer;
+      if (cancel) {
+        yield interruptNote;
+        yield abortedResult();
+      } else {
+        yield successfulResultMessage();
+      }
+    },
+  };
+}
+
+/** A `session/cancel` later in the turn of a confirmWithUser question that the client answered. */
+async function* answeredConfirmQuestionThenCancelMessages(
+  input: Pushable<any>,
+  agent: ClaudeAcpAgent,
+) {
+  yield* echoNextPrompt(input);
+  await askConfirmQuestion(agent);
+  await agent.cancel({ sessionId });
+  yield interruptNote;
+  yield abortedResult();
 }

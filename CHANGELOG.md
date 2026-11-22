@@ -1,5 +1,92 @@
 # Changelog
 
+## [0.109.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.109.0...v0.109.1) (2026-11-21)
+
+
+### Bug Fixes
+
+* announce a live subagent again when its session is loaded or resumed ([#1688](https://github.com/agentclientprotocol/claude-agent-acp/issues/1688)) ([b977017](https://github.com/agentclientprotocol/claude-agent-acp/commit/b977017ed88148fbbc8bdd6e24cd275313c546e6))
+* apply a provider's route to the running session ([#1691](https://github.com/agentclientprotocol/claude-agent-acp/issues/1691)) ([988a58b](https://github.com/agentclientprotocol/claude-agent-acp/commit/988a58b908d55a933e9d297c142e9040d478bd69))
+* give a forked skill's child session its tool calls and text ([#1677](https://github.com/agentclientprotocol/claude-agent-acp/issues/1677)) ([1c90fb9](https://github.com/agentclientprotocol/claude-agent-acp/commit/1c90fb959a003eba1eed1dac94400c9cdef63195))
+* keep built-in web-fetch and claude-code-guide agents out of the Agent picker ([#1672](https://github.com/agentclientprotocol/claude-agent-acp/issues/1672)) ([eb4c16f](https://github.com/agentclientprotocol/claude-agent-acp/commit/eb4c16f10a753925090289c21f2d95bd902a7b63))
+* match v1 session/options to resume when workspace roots change ([#1679](https://github.com/agentclientprotocol/claude-agent-acp/issues/1679)) ([184b7df](https://github.com/agentclientprotocol/claude-agent-acp/commit/184b7df993c0c64df593188f15bb0e5206f3e6fb))
+* reject requests that name a replayed subagent session with -32602 ([#1686](https://github.com/agentclientprotocol/claude-agent-acp/issues/1686)) ([3304ca7](https://github.com/agentclientprotocol/claude-agent-acp/commit/3304ca724c25c7258c837cc0394adb4111ea8987))
+* report unusable Claude subscriptions as unauthenticated ([#1678](https://github.com/agentclientprotocol/claude-agent-acp/issues/1678)) ([a4f0f78](https://github.com/agentclientprotocol/claude-agent-acp/commit/a4f0f78bb31539005d0d54ab69f7e28f91443b14))
+* send a replayed subagent's configuration after the replay, not inside it ([#1685](https://github.com/agentclientprotocol/claude-agent-acp/issues/1685)) ([6a760cb](https://github.com/agentclientprotocol/claude-agent-acp/commit/6a760cbca64adc72634274088914e99a51da084a))
+* show readable titles for MCP tool calls ([#1674](https://github.com/agentclientprotocol/claude-agent-acp/issues/1674)) ([80440d8](https://github.com/agentclientprotocol/claude-agent-acp/commit/80440d8b8294f9d4cd086d7cba39c716107657f0))
+* update to @agentclientprotocol/sdk 2.9.0 ([#1687](https://github.com/agentclientprotocol/claude-agent-acp/issues/1687)) ([022ff53](https://github.com/agentclientprotocol/claude-agent-acp/commit/022ff532449371198a0d715a921578e27c101532))
+* update to @agentclientprotocol/sdk 2.9.1 ([#1690](https://github.com/agentclientprotocol/claude-agent-acp/issues/1690)) ([85a0d6c](https://github.com/agentclientprotocol/claude-agent-acp/commit/85a0d6c6f111119855b0e199801a9f71b60f50bf))
+* update to @anthropic-ai/claude-agent-sdk 0.3.330 ([#1689](https://github.com/agentclientprotocol/claude-agent-acp/issues/1689)) ([6d9e276](https://github.com/agentclientprotocol/claude-agent-acp/commit/6d9e2766c74dcd9ccd5c5a83b8523b65c234041f))
+
+## [0.109.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.108.1...v0.109.0) (2026-11-19)
+
+
+### Features
+
+* announce session cursors on v2 and fork at a cursor ([#1658](https://github.com/agentclientprotocol/claude-agent-acp/issues/1658)) ([5075d2e](https://github.com/agentclientprotocol/claude-agent-acp/commit/5075d2e0dffed68c4c1417d67c1c1e3ed43e6549))
+* insert one message per idempotencyKey on v2 session/prompt ([#1657](https://github.com/agentclientprotocol/claude-agent-acp/issues/1657)) ([1c0792e](https://github.com/agentclientprotocol/claude-agent-acp/commit/1c0792ea8cbdfb96ac2afb1f675e4309446d0e5c))
+* order config options as model, effort, fast, ultracode, mode, agent ([#1666](https://github.com/agentclientprotocol/claude-agent-acp/issues/1666)) ([f31da7f](https://github.com/agentclientprotocol/claude-agent-acp/commit/f31da7f9f5264eb2b57fbda577ac35141eb530c8))
+* report Fast mode in the speed config option category ([#1659](https://github.com/agentclientprotocol/claude-agent-acp/issues/1659)) ([8990c24](https://github.com/agentclientprotocol/claude-agent-acp/commit/8990c2441d3d45cb4781cd81316b3ffbafee85ee))
+* send the predicted next prompt as prompt_suggestions_update ([#1660](https://github.com/agentclientprotocol/claude-agent-acp/issues/1660)) ([f20ed1d](https://github.com/agentclientprotocol/claude-agent-acp/commit/f20ed1d96ac786af36b6bee3b4d5925a85b6d7ae))
+
+
+### Bug Fixes
+
+* send a session's settings to Claude Code over stdin ([#1669](https://github.com/agentclientprotocol/claude-agent-acp/issues/1669)) ([a768a9f](https://github.com/agentclientprotocol/claude-agent-acp/commit/a768a9f50c65b66b9f2d5806909a1db643fe3b6e))
+* update to @anthropic-ai/claude-agent-sdk 0.3.328 ([#1668](https://github.com/agentclientprotocol/claude-agent-acp/issues/1668)) ([6e30711](https://github.com/agentclientprotocol/claude-agent-acp/commit/6e307116d461af22fb5d42eb4b8fbdb3643c6d6c))
+
+## [0.108.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.108.0...v0.108.1) (2026-11-18)
+
+
+### Bug Fixes
+
+* answer -32602 on v1 for a request that names a subagent's session ([#1656](https://github.com/agentclientprotocol/claude-agent-acp/issues/1656)) ([253cd84](https://github.com/agentclientprotocol/claude-agent-acp/commit/253cd84ed84efd38fd9d90faaf954690d1610677))
+* close a server tool call whose reply Claude Code gave up on, once its next reply starts ([#1604](https://github.com/agentclientprotocol/claude-agent-acp/issues/1604)) ([3205f0b](https://github.com/agentclientprotocol/claude-agent-acp/commit/3205f0bf0211f9346dad8583944f007bd0ef73c2))
+* end a v1 turn at its result for a client in the subagents RFD form ([#1603](https://github.com/agentclientprotocol/claude-agent-acp/issues/1603)) ([c4b64f6](https://github.com/agentclientprotocol/claude-agent-acp/commit/c4b64f628d1fad37ed1d56016b91eefc59df5052))
+* reject session setup for an incompatible model provider ([#1506](https://github.com/agentclientprotocol/claude-agent-acp/issues/1506)) ([90070d6](https://github.com/agentclientprotocol/claude-agent-acp/commit/90070d6cbf29f5425e4e08828552f91493dd3e59))
+* start a session without an MCP-over-ACP server whose local endpoint cannot open ([#1653](https://github.com/agentclientprotocol/claude-agent-acp/issues/1653)) ([96dd2bb](https://github.com/agentclientprotocol/claude-agent-acp/commit/96dd2bb10d838aeb39d75bb0cfde1c7b4eae958a)), closes [#1651](https://github.com/agentclientprotocol/claude-agent-acp/issues/1651)
+* update to @agentclientprotocol/sdk 2.8.0 ([#1655](https://github.com/agentclientprotocol/claude-agent-acp/issues/1655)) ([b6167a8](https://github.com/agentclientprotocol/claude-agent-acp/commit/b6167a82dba9864a13dad31a7cad151704badf5e))
+
+## [0.108.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.107.3...v0.108.0) (2026-11-17)
+
+
+### Features
+
+* stream the output of foreground Bash commands ([#1587](https://github.com/agentclientprotocol/claude-agent-acp/issues/1587)) ([378e85d](https://github.com/agentclientprotocol/claude-agent-acp/commit/378e85d06027f5fa1802e94535548747a0feccc9))
+* support MCP servers that the client serves over the ACP connection (MCP-over-ACP) ([#1645](https://github.com/agentclientprotocol/claude-agent-acp/issues/1645)) ([20aeb46](https://github.com/agentclientprotocol/claude-agent-acp/commit/20aeb46ecedc60fef26ca8b1439b37e3bbd9b27a))
+
+
+### Bug Fixes
+
+* an autonomous result naming the original prompt must not end a steered turn early ([#1451](https://github.com/agentclientprotocol/claude-agent-acp/issues/1451)) ([edab713](https://github.com/agentclientprotocol/claude-agent-acp/commit/edab7135028d83efaeaa38d0f8efe62ea7ddf203))
+* do not count a confirmWithUser question as an unfinished tool call ([#1644](https://github.com/agentclientprotocol/claude-agent-acp/issues/1644)) ([bcd3cda](https://github.com/agentclientprotocol/claude-agent-acp/commit/bcd3cdad35e4356247303870ac3137675e401227))
+* handle invalid file paths in tool reports ([#1419](https://github.com/agentclientprotocol/claude-agent-acp/issues/1419)) ([0073280](https://github.com/agentclientprotocol/claude-agent-acp/commit/0073280b977a69934fb56670943d1ef42e7b687e))
+* keep a workflow agent's tool call out of the turn's unfinished tools ([#1638](https://github.com/agentclientprotocol/claude-agent-acp/issues/1638)) ([451bc04](https://github.com/agentclientprotocol/claude-agent-acp/commit/451bc04ae022ef02473bdd92740cf19d8ceb5f3c))
+* offer clearing the context on plan approval only when Claude Code's setting is on ([#1627](https://github.com/agentclientprotocol/claude-agent-acp/issues/1627)) ([9d71d12](https://github.com/agentclientprotocol/claude-agent-acp/commit/9d71d12336c392c28967c600f8409841deaab7e0))
+* send MCP servers to Claude Code over stdin, not on its command line ([#1647](https://github.com/agentclientprotocol/claude-agent-acp/issues/1647)) ([c4dd80d](https://github.com/agentclientprotocol/claude-agent-acp/commit/c4dd80d7392b035f331b50bfdd802cfb3e144d37))
+* update to @anthropic-ai/claude-agent-sdk 0.3.326 ([#1646](https://github.com/agentclientprotocol/claude-agent-acp/issues/1646)) ([4a07639](https://github.com/agentclientprotocol/claude-agent-acp/commit/4a076397c6e785a8dd9166e8ea1df14fe17c52ed))
+
+## [0.107.3](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.107.2...v0.107.3) (2026-11-16)
+
+
+### Bug Fixes
+
+* allow Claude Enterprise accounts under --hide-claude-auth ([#1641](https://github.com/agentclientprotocol/claude-agent-acp/issues/1641)) ([be2219c](https://github.com/agentclientprotocol/claude-agent-acp/commit/be2219cef1f5b2b93129d5eef4b80574f57bdb1b))
+* pass a model id the picker does not list to Claude Code ([#1630](https://github.com/agentclientprotocol/claude-agent-acp/issues/1630)) ([dc769c1](https://github.com/agentclientprotocol/claude-agent-acp/commit/dc769c132cacc8bbc7aff0d512e5ab587a1802e3))
+
+## [0.107.2](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.107.1...v0.107.2) (2026-11-16)
+
+
+### Bug Fixes
+
+* end the turn task of a cycle that has no turn to claim its result ([#1622](https://github.com/agentclientprotocol/claude-agent-acp/issues/1622)) ([8de4981](https://github.com/agentclientprotocol/claude-agent-acp/commit/8de49818f1172c5187496a736f721dc6d2ba3fec))
+* keep Fast mode on when it is turned on after a model switch or mid-turn ([#1637](https://github.com/agentclientprotocol/claude-agent-acp/issues/1637)) ([81650db](https://github.com/agentclientprotocol/claude-agent-acp/commit/81650db3d3ca6f7b640fd5e1bbb5e1ff45f62fb7))
+* list a live Monitor whose task Claude Code reports as local_bash ([#1607](https://github.com/agentclientprotocol/claude-agent-acp/issues/1607)) ([41417f6](https://github.com/agentclientprotocol/claude-agent-acp/commit/41417f6eeeb5010c0eb439e256032cd7e9a44e37))
+* read the Claude Code stream after a query restart, not at the next prompt ([#1636](https://github.com/agentclientprotocol/claude-agent-acp/issues/1636)) ([c03b66c](https://github.com/agentclientprotocol/claude-agent-acp/commit/c03b66cc9f1aa6aa5e56668ac05e5a7f48418850))
+* read the Claude Code stream after every session setup, not at the first prompt ([#1623](https://github.com/agentclientprotocol/claude-agent-acp/issues/1623)) ([7d9e1f6](https://github.com/agentclientprotocol/claude-agent-acp/commit/7d9e1f6135b2c85cd8bdd0e76bc2bcf00795e6c9))
+* reject the SDK no-token sentinel in auth guards ([#1609](https://github.com/agentclientprotocol/claude-agent-acp/issues/1609)) ([c203b91](https://github.com/agentclientprotocol/claude-agent-acp/commit/c203b919ecca8a58e11bebb72274a5a203653d88))
+* update to @anthropic-ai/claude-agent-sdk 0.3.325 ([#1634](https://github.com/agentclientprotocol/claude-agent-acp/issues/1634)) ([db54135](https://github.com/agentclientprotocol/claude-agent-acp/commit/db5413513cbe58c045885e6bb015abfdb76be524))
+
 ## [0.107.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.107.0...v0.107.1) (2026-11-16)
 
 
