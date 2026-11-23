@@ -380,8 +380,7 @@ class V2Agent implements AgentHandle, SessionConnection {
         // `providers/list`, `set`, and `disable`, served for every client.
         providers: {},
         auth,
-        // A prompt that comes while Claude works waits in Claude Code's queue.
-        _meta: { claudeCode: { promptQueueing: true }, ..._meta },
+        _meta,
       },
       authMethods,
     };

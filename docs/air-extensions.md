@@ -148,6 +148,12 @@ The response to a client that is not AIR has no `_meta.jetbrains` key.
 
 ### ACP v2
 
+A busy `session/prompt` steers the current turn on ACP v2.
+It waits while a root or child permission request or elicitation is open.
+The adapter does not advertise `claudeCode.promptQueueing` on v2.
+On ACP v1, an ordinary `session/prompt` queues behind the current turn.
+The separate `_session/steering` request steers that turn.
+
 The v2 core (`src/v2/`) serves an AIR client only the extensions that ACP v2 does not cover.
 Its `initialize` response lists `agentFileChangeReport` and `recommendedValue`.
 It also serves the [permission presentation](#permission-presentation), the [question custom answers](#question-custom-answers), the [predicted follow-up prompt](#predicted-follow-up-prompt), and [load replay end](#load-replay-end).

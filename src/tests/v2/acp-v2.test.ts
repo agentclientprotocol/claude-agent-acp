@@ -433,6 +433,7 @@ describe("ACP protocol routing", () => {
       title: {},
     });
     expect(response.capabilities?.providers).toEqual({});
+    expect(response.capabilities?._meta ?? {}).not.toHaveProperty("claudeCode.promptQueueing");
     // Not `_session/steering`, which v1 advertises in the top-level `_meta`.
     expect(response._meta?.steering).toBeUndefined();
     expect(response.authMethods?.length).toBeGreaterThan(0);
