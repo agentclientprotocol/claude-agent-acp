@@ -4783,6 +4783,9 @@ describe("subagent transcript replay", () => {
               // A failed hand-back delivered nothing, so it stays a tool call.
               assistant("c4", [toolUse("toolu_lost", "SubagentHandback", { message: "Again" })]),
               user("c5", [{ ...toolResult("toolu_lost", "Not delivered"), is_error: true }]),
+              assistant("c6", [
+                toolUse("toolu_unfinished", "SubagentHandback", { message: "Not delivered yet" }),
+              ]),
             ],
           },
         },
@@ -4798,6 +4801,46 @@ describe("subagent transcript replay", () => {
         "abc123 tool_call toolu_lost",
         "root agent_message_chunk It said PONG.",
         'root subagent_update abc123 {"state":"idle","stopReason":"end_turn"}',
+      ]);
+    });
+
+    it("replays AIR hand-backs through the shared result scan without changing assistant text", async () => {
+      const trace = await replayRfd(
+        [
+          user("u1", "Ask it"),
+          assistant("a1", [toolUse("toolu_agent", "Agent", { prompt: "Check it" })]),
+          user("u2", [toolResult("toolu_agent", "Delivered")]),
+        ],
+        {
+          abc123: {
+            meta: { toolUseId: "toolu_agent", requestShape: "foreground" },
+            records: [
+              user("c1", "Check it"),
+              assistant("c2", [
+                { type: "text", text: "Checking." },
+                toolUse("toolu_first", "SubagentHandback", { message: "First report" }),
+                toolUse("toolu_second", "SubagentHandback", { message: "Second report" }),
+                toolUse("toolu_failed", "SubagentHandback", { message: "Failed report" }),
+                toolUse("toolu_unfinished", "SubagentHandback", { message: "Unfinished report" }),
+              ]),
+              user("c3", [
+                toolResult("toolu_first", "Delivered"),
+                toolResult("toolu_second", "Delivered"),
+                { ...toolResult("toolu_failed", "Not delivered"), is_error: true },
+              ]),
+            ],
+          },
+        },
+        AIR_NATIVE_SUBAGENTS,
+      );
+      const child = `${sessionId}:replay-subagent:toolu_agent`;
+      expect(trace.filter((line) => line.startsWith(`${child} agent_message_chunk`))).toEqual([
+        `${child} agent_message_chunk Checking.`,
+        `${child} agent_message_chunk First report`,
+        `${child} agent_message_chunk Second report`,
+      ]);
+      expect(trace.filter((line) => line.includes(" tool_call "))).toEqual([
+        `${child} tool_call toolu_failed`,
       ]);
     });
 

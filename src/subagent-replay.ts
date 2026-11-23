@@ -100,15 +100,19 @@ export type SendMessageCall = {
   outgoingSent: boolean;
 };
 
-/** A SubagentHandback call: its report, whether its result failed, and whether the replay sent it. */
-type ReplayHandback = { message: string; failed: boolean; sent: boolean };
+/** A SubagentHandback call, its result, and whether the replay sent its report. */
+type ReplayHandback = {
+  message: string;
+  status: "pending" | "completed" | "failed";
+  sent: boolean;
+};
 
 /**
- * What both replays read from the transcripts before they send anything: the
+ * What the v1 and v2 replays read from the transcripts before they send anything: the
  * children that launches with metadata started, the launches without metadata
  * (left out), the SendMessage calls, and the SubagentHandback calls. It sends
- * nothing; `RfdSubagentReplay` (v1) and `src/v2/subagent-replay.ts` send the
- * replay from it.
+ * nothing. The v1 AIR replay, `RfdSubagentReplay`, and the v2 replay send
+ * their updates from it.
  */
 export class ReplayTranscript<Child extends ReplayChild = ReplayChild> {
   /** The children by the id of the tool use that launched each. */
@@ -118,7 +122,7 @@ export class ReplayTranscript<Child extends ReplayChild = ReplayChild> {
   /** Launches without metadata, which the replay leaves out. */
   readonly omitted = new Set<string>();
   /** The SubagentHandback calls, by tool use id. */
-  readonly handbacks = new Map<string, ReplayHandback>();
+  private readonly handbacks = new Map<string, ReplayHandback>();
   /** The agent that each TaskStop or SendMessage call names (see `targetAgentId`), by tool use id. */
   private readonly targets = new Map<string, string>();
 
@@ -156,7 +160,7 @@ export class ReplayTranscript<Child extends ReplayChild = ReplayChild> {
             this.registerLaunch(block.id, inputOf(block), ownerSessionId);
           } else if (block.name === HANDBACK_TOOL) {
             const message = handbackMessage(block.input);
-            if (message) this.handbacks.set(block.id, { message, failed: false, sent: false });
+            if (message) this.handbacks.set(block.id, { message, status: "pending", sent: false });
           } else if (block.name === "SendMessage") {
             const input = inputOf(block);
             if (typeof input.to === "string" && typeof input.message === "string") {
@@ -172,7 +176,7 @@ export class ReplayTranscript<Child extends ReplayChild = ReplayChild> {
           }
         } else if (block.type === "tool_result" && typeof block.tool_use_id === "string") {
           const handback = this.handbacks.get(block.tool_use_id);
-          if (handback && block.is_error === true) handback.failed = true;
+          if (handback) handback.status = block.is_error === true ? "failed" : "completed";
           const child = this.children.get(block.tool_use_id);
           // A background launch answers at once; its result is not the end.
           if (child && !child.record.background) {
@@ -181,6 +185,25 @@ export class ReplayTranscript<Child extends ReplayChild = ReplayChild> {
         }
       }
     }
+  }
+
+  /**
+   * The report of a completed hand-back, once. `null` hides its other updates
+   * and unfinished calls. `undefined` leaves failed calls and other updates visible.
+   */
+  handbackUpdate(
+    update: AcpSessionNotification["update"],
+  ): { messageId: string; text: string } | null | undefined {
+    if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") {
+      return undefined;
+    }
+    const handback = this.handbacks.get(update.toolCallId);
+    if (!handback || handback.status === "failed") return undefined;
+    if (handback.status !== "completed" || update.status !== "completed" || handback.sent) {
+      return null;
+    }
+    handback.sent = true;
+    return { messageId: update.toolCallId, text: handback.message };
   }
 
   private registerLaunch(
@@ -343,8 +366,8 @@ export class RfdSubagentReplay {
    * Takes a replayed update of a tool call, from the transcript of `owner`
    * when it is a child's. Returns whether the client is not shown it: an
    * update of the launch of a child that the replay shows, of a SendMessage
-   * call whose message the replay already delivered, or of a successful
-   * SubagentHandback call of `owner`. A foreground launch's completed result
+   * call whose message the replay already delivered, or of a pending or
+   * successful SubagentHandback call of `owner`. A foreground launch's completed result
    * goes out as the child's reply, a delivered SendMessage as the sender's
    * outgoing message, and a hand-back as the child's message to its parent.
    */
@@ -375,16 +398,15 @@ export class RfdSubagentReplay {
       }
       return true;
     }
-    const handback = owner ? this.transcript.handbacks.get(update.toolCallId) : undefined;
-    if (owner && handback && !handback.failed) {
-      if (!handback.sent) {
-        handback.sent = true;
+    const handback = owner ? this.transcript.handbackUpdate(update) : undefined;
+    if (owner && handback !== undefined) {
+      if (handback !== null) {
         owner.handedBack = true;
         for (const view of linkedSessionMessages(
           update.toolCallId,
           owner.sessionId,
           owner.parentSessionId,
-          handback.message,
+          handback.text,
         )) {
           await this.publish(view);
         }

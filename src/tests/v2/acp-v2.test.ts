@@ -2887,11 +2887,36 @@ describe("ACP v2 prompts", () => {
             role: "user",
             content: [{ type: "tool_result", tool_use_id: "toolu_handback", content: "Delivered" }],
           }),
+          response("cf1", "c3", "claude-haiku-4-5", [
+            {
+              type: "tool_use",
+              id: "toolu_failed",
+              name: "SubagentHandback",
+              input: { message: "Failed report" },
+            },
+            {
+              type: "tool_use",
+              id: "toolu_unfinished",
+              name: "SubagentHandback",
+              input: { message: "Unfinished report" },
+            },
+          ]),
+          transcriptRecord(sessionId, "cf2", "cf1", {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_failed",
+                is_error: true,
+                content: "Not delivered",
+              },
+            ],
+          }),
           // Claude Code frames a SendMessage call's message for the child's model.
           transcriptRecord(
             sessionId,
             "c4",
-            "c3",
+            "cf2",
             {
               role: "user",
               content:
@@ -2966,7 +2991,12 @@ describe("ACP v2 prompts", () => {
       "abc123 toolu_send root -> abc123",
       "root toolu_send root -> abc123",
     ]);
-    expect(client.updates("tool_call_update")).toEqual([]);
+    expect(
+      client.updates("tool_call_update").map(({ toolCallId, status }) => [toolCallId, status]),
+    ).toEqual([
+      ["toolu_failed", "pending"],
+      ["toolu_failed", "failed"],
+    ]);
     // The client cannot fork a child, so the messages a child received get no cursor.
     expect(client.updates("cursor_update")).toEqual([]);
   });

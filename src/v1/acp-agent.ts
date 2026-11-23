@@ -221,7 +221,6 @@ import {
 } from "../client-system-prompt.js";
 import {
   readSubagentMessages,
-  airSubagentMessages,
   subagentHistory,
   subagentLaunchIds,
   subagentLaunchedBy,
@@ -230,6 +229,7 @@ import {
 import {
   type ReplayChild,
   RfdSubagentReplay,
+  ReplayTranscript,
   replaySubagentTerminalState,
 } from "../subagent-replay.js";
 import {
@@ -8227,6 +8227,8 @@ export class ClaudeAcpAgent {
       nativeReplayEnabled && replayChildren.size > 0
         ? await subagentHistory(sessionId)
         : { agents: new Map() };
+    const airReplay = nativeReplayEnabled ? new ReplayTranscript(subagents) : undefined;
+    airReplay?.scan(messages, sessionId);
     const replayedSubagents = new Set<string>();
     const rfdHistory =
       form === "rfd" &&
@@ -8476,6 +8478,22 @@ export class ClaudeAcpAgent {
           continue;
         }
         if (rfdReplay && (await rfdReplay.toolCallUpdate(notification.update, child))) continue;
+        const handback = parentToolUseId
+          ? airReplay?.handbackUpdate(notification.update)
+          : undefined;
+        if (handback !== undefined) {
+          if (handback !== null) {
+            await this.client.sessionUpdate({
+              sessionId: replayTargetSessionId,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                messageId: handback.messageId,
+                content: { type: "text", text: handback.text },
+              },
+            });
+          }
+          continue;
+        }
         const replayed = { ...notification, sessionId: replayTargetSessionId };
         await this.client.sessionUpdate(
           rfdReplay
@@ -8500,8 +8518,8 @@ export class ClaudeAcpAgent {
             this.logger,
           );
           registerLaunches(childMessages);
-          for (const childMessage of airSubagentMessages(childMessages))
-            await replayMessage(childMessage);
+          airReplay?.scan(childMessages, agentId);
+          for (const childMessage of childMessages) await replayMessage(childMessage);
         }
       }
       // The RFD form announces a child right after its launch, then sends its

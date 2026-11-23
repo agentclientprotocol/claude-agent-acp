@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { SessionMessage } from "@anthropic-ai/claude-agent-sdk";
-import { airSubagentMessages, stripForkPrefix, subagentLineage } from "../subagent-history.js";
+import { stripForkPrefix, subagentLineage } from "../subagent-history.js";
 
 const sessionId = "33333333-3333-4333-8333-333333333333";
 const base = {
@@ -314,106 +314,5 @@ describe("stripForkPrefix", () => {
   it("returns a transcript without a fork directive unchanged", () => {
     const messages = [record(user("u1", "Work")), record(launch("a1", "launch-worker"))];
     expect(stripForkPrefix(messages)).toBe(messages);
-  });
-});
-
-describe("airSubagentMessages", () => {
-  it("replays each successful hand-back as a separate child answer", () => {
-    const messages: SessionMessage[] = [
-      {
-        ...user("prompt", "Look around"),
-        type: "user",
-        session_id: sessionId,
-        parent_tool_use_id: null,
-        parent_agent_id: null,
-      },
-    ];
-    for (const id of ["first", "second"]) {
-      messages.push({
-        ...base,
-        type: "assistant",
-        uuid: id,
-        message: {
-          role: "assistant",
-          content: [
-            { type: "tool_use", id, name: "SubagentHandback", input: { message: `Report ${id}` } },
-          ],
-        },
-        session_id: sessionId,
-        parent_tool_use_id: null,
-        parent_agent_id: null,
-      });
-      messages.push({
-        ...base,
-        type: "user",
-        uuid: `${id}-result`,
-        message: {
-          role: "user",
-          content: [{ type: "tool_result", tool_use_id: id, content: "Delivered" }],
-        },
-        session_id: sessionId,
-        parent_tool_use_id: null,
-        parent_agent_id: null,
-      });
-    }
-    expect(airSubagentMessages(messages)).toEqual([
-      messages[0],
-      {
-        ...messages[1],
-        message: {
-          role: "assistant",
-          id: "first",
-          content: [{ type: "text", text: "Report first" }],
-        },
-      },
-      {
-        ...messages[3],
-        message: {
-          role: "assistant",
-          id: "second",
-          content: [{ type: "text", text: "Report second" }],
-        },
-      },
-    ]);
-  });
-
-  it.each([true, undefined])("keeps an unsuccessful hand-back as a tool call (%s)", (failed) => {
-    const messages: SessionMessage[] = [
-      {
-        ...base,
-        session_id: sessionId,
-        parent_tool_use_id: null,
-        parent_agent_id: null,
-        type: "assistant",
-        uuid: "handback",
-        message: {
-          role: "assistant",
-          content: [
-            {
-              type: "tool_use",
-              id: "handback",
-              name: "SubagentHandback",
-              input: { message: "Report" },
-            },
-          ],
-        },
-      },
-    ];
-    if (failed)
-      messages.push({
-        ...base,
-        type: "user",
-        uuid: "failed",
-        message: {
-          role: "user",
-          content: [
-            { type: "tool_result", tool_use_id: "handback", is_error: true, content: "Failed" },
-          ],
-        },
-        session_id: sessionId,
-        parent_tool_use_id: null,
-        parent_agent_id: null,
-      });
-    expect(airSubagentMessages(messages)).toEqual(messages);
   });
 });
