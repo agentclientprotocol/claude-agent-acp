@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.110.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.109.1...v0.110.0) (2026-11-23)
+
+
+### Features
+
+* name each model's effort levels in its model option entry for AIR ([#1692](https://github.com/agentclientprotocol/claude-agent-acp/issues/1692)) ([130fbbc](https://github.com/agentclientprotocol/claude-agent-acp/commit/130fbbc02ab4771443b2f365f2af1659ceb0c591))
+
 ## [0.109.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.109.0...v0.109.1) (2026-11-21)
 
 
