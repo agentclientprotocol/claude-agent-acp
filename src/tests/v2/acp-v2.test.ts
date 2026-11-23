@@ -10234,30 +10234,39 @@ describe("ACP v2 session translation", () => {
     expect(terminals.split("s", hook)).toEqual({ terminal: [], report: hook });
   });
 
-  it("sends piped output with each line feed as CR LF, as a PTY would", () => {
+  it("adds CR only to bare line feeds in terminal chunks and snapshots", () => {
     const terminals = new V2Terminals();
-    const decoded = (data: unknown) => Buffer.from(String(data), "base64").toString();
     terminals.split("s", {
       sessionUpdate: "tool_call",
       toolCallId: "toolu_bash",
       title: "Terminal",
       _meta: { terminal_info: { terminal_id: "term" } },
     });
-    const [chunk] = terminals.split("s", {
-      sessionUpdate: "tool_call_update",
-      toolCallId: "toolu_bash",
-      _meta: { terminal_output_delta: { terminal_id: "term", data: "a\nb\n" } },
-    }).terminal;
-    expect(chunk).toMatchObject({ sessionUpdate: "terminal_output_chunk" });
-    expect(decoded((chunk as { data: string }).data)).toBe("a\r\nb\r\n");
-    // The line discipline adds a CR before every LF, also one that a CR precedes.
-    const [snapshot] = terminals.split("s", {
-      sessionUpdate: "tool_call_update",
-      toolCallId: "toolu_bash",
-      _meta: { terminal_output: { terminal_id: "term", data: "a\nb\r\n" } },
-    }).terminal;
-    expect(snapshot).toMatchObject({ sessionUpdate: "terminal_update" });
-    expect(decoded((snapshot as { output: { data: string } }).output.data)).toBe("a\r\nb\r\r\n");
+    const emit = (key: "terminal_output" | "terminal_output_delta", data: string) =>
+      terminals.split("s", {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "toolu_bash",
+        _meta: { [key]: { terminal_id: "term", data } },
+      }).terminal[0];
+    const chunk = (text: string, expected: string) =>
+      expect(emit("terminal_output_delta", text)).toMatchObject({
+        sessionUpdate: "terminal_output_chunk",
+        data: Buffer.from(expected).toString("base64"),
+      });
+    const snapshot = (text: string, expected: string) =>
+      expect(emit("terminal_output", text)).toMatchObject({
+        sessionUpdate: "terminal_update",
+        output: { data: Buffer.from(expected).toString("base64") },
+      });
+
+    chunk("a\nb\r\n10%\r20%\r", "a\r\nb\r\n10%\r20%\r");
+    chunk("", "");
+    chunk("\nend\r", "\nend\r");
+    // A snapshot replaces the preceding bytes, including their trailing CR.
+    snapshot("\ndone\r\n", "\r\ndone\r\n");
+    chunk("\n", "\r\n");
+    snapshot("waiting\r", "waiting\r");
+    chunk("\n", "\n");
   });
 
   it("leaves an exit code that the agent does not know out of the terminal's exit", () => {
