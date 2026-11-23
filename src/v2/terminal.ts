@@ -33,13 +33,17 @@ const TERMINAL_KEYS = [
   "terminal_exit",
 ] as const;
 
+interface RunningTerminal {
+  terminalId: string;
+  command?: string;
+  cancellable?: boolean;
+  endsInCR: boolean;
+}
+
 /** The terminal updates of the tool call reports of one v2 connection. */
 export class V2Terminals {
-  /** The terminal and the last reported command of each running command, by session and tool call. */
-  private readonly running = new Map<
-    string,
-    { terminalId: string; command?: string; cancellable?: boolean }
-  >();
+  /** The display terminal of each running command, by session and tool call. */
+  private readonly running = new Map<string, RunningTerminal>();
 
   /**
    * The terminal updates that a tool call report carries in the extension's
@@ -63,7 +67,7 @@ export class V2Terminals {
       meta.terminal_info &&
       this.running.get(key)?.terminalId !== meta.terminal_info.terminal_id
     ) {
-      this.running.set(key, { terminalId: meta.terminal_info.terminal_id });
+      this.running.set(key, { terminalId: meta.terminal_info.terminal_id, endsInCR: false });
     }
     const terminal: v2.SessionUpdate[] = [];
     const running = this.running.get(key);
@@ -77,7 +81,7 @@ export class V2Terminals {
           sessionUpdate: "terminal_update",
           terminalId: running.terminalId,
           ...(newCommand ? { command } : {}),
-          ...(output ? { output: { data: terminalBytes(output.data) } } : {}),
+          ...(output ? { output: { data: terminalBytes(output.data, running, "snapshot") } } : {}),
           ...(exit
             ? {
                 exitStatus: {
@@ -94,7 +98,7 @@ export class V2Terminals {
         terminal.push({
           sessionUpdate: "terminal_output_chunk",
           terminalId: running.terminalId,
-          data: terminalBytes(delta.data),
+          data: terminalBytes(delta.data, running, "chunk"),
         });
       }
       if (exit) this.running.delete(key);
@@ -161,13 +165,16 @@ function commandOf(rawInput: unknown): string | undefined {
   return typeof command === "string" && command.length > 0 ? command : undefined;
 }
 
-/**
- * The output as the bytes a PTY would have delivered, base64-encoded as a v2
- * terminal carries them. A v2 terminal carries the bytes a terminal emulator
- * receives, but Claude Code runs a command with its output piped, so no line
- * discipline turned each LF into CR LF (`ONLCR`). Without the CR, an emulator
- * moves down a row and keeps the column: "a\nb" draws "b" under the end of "a".
- */
-function terminalBytes(text: string): string {
-  return Buffer.from(text.replaceAll("\n", "\r\n"), "utf8").toString("base64");
+/** Insert a carriage return before bare LF so the next line starts at column zero. */
+function terminalBytes(
+  text: string,
+  terminal: RunningTerminal,
+  kind: "snapshot" | "chunk",
+): string {
+  const followsCR = kind === "chunk" && terminal.endsInCR;
+  const normalized = text.replace(/(?<!\r)\n/g, (lf, offset) =>
+    offset === 0 && followsCR ? lf : "\r\n",
+  );
+  if (kind === "snapshot" || text.length > 0) terminal.endsInCR = text.endsWith("\r");
+  return Buffer.from(normalized, "utf8").toString("base64");
 }
