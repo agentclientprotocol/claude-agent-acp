@@ -589,7 +589,8 @@ export class V2Session implements RequestTarget {
    * Whether no turn is open and no prompt waits in Claude Code's queue. With
    * `restart`, for a restart of the query (see `restarts.ts`), also no
    * prompt of the session waits to go to Claude Code, which the restart would
-   * answer with -32800. No task or input request remains. Without it, for
+   * answer with -32800. No live subagent remains. Background commands and
+   * tool tasks end when the old query retires. Without it, for
    * the adapter's `/remote-control`, whose own prompt waits for the boundary.
    */
   atTurnBoundary(restart: boolean): boolean {
@@ -597,8 +598,13 @@ export class V2Session implements RequestTarget {
       !this.closed &&
       !this.foreground &&
       ![...this.pending.values()].some((prompt) => restart || prompt.pushed) &&
-      !(restart && (this.tasks.hasLiveWork() || this.requests.size > 0))
+      !(restart && this.tasks.hasLiveAgents())
     );
+  }
+
+  /** Whether a resume can replace roots without ending work or withdrawing an input request. */
+  canReplaceRoots(): boolean {
+    return this.atTurnBoundary(true) && !this.tasks.hasLiveWork() && this.requests.size === 0;
   }
 
   /**

@@ -10,7 +10,7 @@
  * - The route: `providers/set`, `providers/disable`, and an `auth/logout`
  *   that drops a provider or a gateway login. Each live session restarts at
  *   its next turn boundary: no turn is open, no prompt of the session waits
- *   to go to Claude Code or in its queue, and no task or input request remains.
+ *   to go to Claude Code or in its queue, and no subagent runs.
  *   A session at a turn boundary restarts right away, and the
  *   request that changed the route answers once it did. A busy session's
  *   restart is due at its next turn boundary, which the request does not
@@ -34,7 +34,8 @@
  * The new query starts before the old one ends, so a failed start leaves the
  * session as it was. The old one ends at its next turn boundary after that,
  * so work that started on it during the start, such as a turn that Claude
- * Code started on its own, is not cut. Detached tasks also end before retirement.
+ * Code started on its own, is not cut. Retirement ends background commands
+ * and tool tasks with the old query; it does not wait for them to finish.
  * The new query starts without
  * the effort of the setup's `_meta`, and the client's choices are set again
  * on it (`SessionConfig.restoreFrom`), which then reports its options in a

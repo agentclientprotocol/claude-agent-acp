@@ -8450,7 +8450,7 @@ describe("ACP v2 requests that subagents make", () => {
         ).toBe("idle end_turn"),
       );
       const session = v2Session(sessionId);
-      expect(session.atTurnBoundary(true)).toBe(false);
+      expect(session.canReplaceRoots()).toBe(false);
       await expect(
         agent.request(v2.methods.agent.session.resume, {
           sessionId,
@@ -8472,7 +8472,7 @@ describe("ACP v2 requests that subagents make", () => {
         },
       });
       await vi.waitFor(() => expect(answered).toMatchObject({ behavior: "allow" }));
-      await vi.waitFor(() => expect(session.atTurnBoundary(true)).toBe(true));
+      await vi.waitFor(() => expect(session.canReplaceRoots()).toBe(true));
     });
   });
 
@@ -10210,7 +10210,8 @@ describe("ACP v2 terminal of a command in the background", () => {
             expect(sdk.close).not.toHaveBeenCalled();
             expect(sdk.setMcpServers).not.toHaveBeenCalled();
             expect(v2Session(sessionId)).toBe(original);
-            expect(original.atTurnBoundary(true)).toBe(false);
+            expect(original.atTurnBoundary(true)).toBe(true);
+            expect(original.canReplaceRoots()).toBe(false);
             await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
             expect(client.updates("state_update").at(-1)).toMatchObject({
               state: "idle",
@@ -10241,6 +10242,81 @@ describe("ACP v2 terminal of a command in the background", () => {
             );
           },
         );
+      },
+    );
+
+    it.each(
+      ["terminal", "tool_call"].flatMap((kind) =>
+        ["set", "disable", "logout"].map((change) => ({ kind, change })),
+      ),
+    )(
+      "retires an idle background $kind when the route changes through $change",
+      async ({ kind, change }) => {
+        scriptTurns(
+          async function* (options) {
+            if (kind === "terminal") {
+              yield level(options, [{}]);
+              yield taskStarted(options);
+              yield bashUse(options);
+              yield backgrounded(options);
+            } else {
+              yield level(options, [
+                { task_id: "wf1", task_type: "local_workflow", description: "Review" },
+              ]);
+              yield taskEvent(options, "task_started", {
+                task_id: "wf1",
+                task_type: "local_workflow",
+                description: "Review",
+              });
+            }
+            yield result(options);
+            yield idleState(options);
+          },
+          async function* (options) {
+            yield result(options);
+          },
+        );
+        sdk.close = vi.fn();
+        const client = v2Client();
+        await client.app.connectWith(connectRouter(), async (agent) => {
+          await initializeV2(agent);
+          const provider = {
+            providerId: "main",
+            apiType: "anthropic" as const,
+            baseUrl: "https://gateway.example.com",
+          };
+          if (change !== "set") await agent.request(v2.methods.agent.providers.set, provider);
+          const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+          await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("work") });
+          await vi.waitFor(() =>
+            expect(client.updates("state_update").at(-1)).toMatchObject({
+              state: "idle",
+              background: [expect.objectContaining({ type: kind })],
+            }),
+          );
+          scriptTurns(async function* (options) {
+            yield result(options);
+          });
+          if (change === "set") await agent.request(v2.methods.agent.providers.set, provider);
+          else if (change === "disable")
+            await agent.request(v2.methods.agent.providers.disable, { providerId: "main" });
+          else await agent.request(v2.methods.agent.auth.logout, {});
+          expect(sdk.queryOptions).toHaveLength(2);
+          expect(sdk.close).toHaveBeenCalledOnce();
+          expect(sdk.queryOptions[1]).toMatchObject({ resume: sessionId });
+          expect(sdk.queryOptions[1].env?.ANTHROPIC_BASE_URL).toBe(
+            change === "set" ? provider.baseUrl : undefined,
+          );
+          const before = client.updates("state_update").length;
+          await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("next") });
+          await vi.waitFor(() =>
+            expect(client.updates("state_update").slice(before).at(-1)).toMatchObject({
+              state: "idle",
+              stopReason: "end_turn",
+              background: [],
+            }),
+          );
+        });
       },
     );
 
@@ -11687,28 +11763,52 @@ describe("ACP v2 subscription guard (--hide-claude-auth)", () => {
     expect(client.updates("user_message")).toEqual([]);
   });
 
-  it("starts the query again after a sign-out, and refuses the next prompt on the account it finds", async () => {
-    accountsAtStart(API_KEY, SUBSCRIPTION);
-    sdk.accountInfo = async () => API_KEY;
-    scriptTurns(async function* (options) {
-      yield result(options, { is_error: true, result: "Not logged in · Please run /login" });
-    });
-    const client = v2Client();
-    await client.app.connectWith(connectRouter(), async (agent) => {
-      await initializeV2(agent);
-      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
-      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
-      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle error"));
-      await expect(
-        agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("again") }),
-      ).rejects.toMatchObject(NOT_SUPPORTED);
-      expect(sdk.queryOptions).toHaveLength(2);
-      expect(sdk.queryOptions[1]).toMatchObject({ resume: sessionId });
-      await client.authUpdate(1);
-    });
+  it.each([false, true])(
+    "restarts after a sign-out and checks the new account with background work: %s",
+    async (background) => {
+      accountsAtStart(API_KEY, SUBSCRIPTION);
+      sdk.accountInfo = async () => API_KEY;
+      scriptTurns(async function* (options) {
+        if (background) {
+          yield {
+            type: "system",
+            subtype: "background_tasks_changed",
+            uuid: randomUUID(),
+            session_id: options.sessionId,
+            tasks: [{ task_id: "wf1", task_type: "local_workflow", description: "Review" }],
+          };
+          yield {
+            type: "system",
+            subtype: "task_started",
+            task_id: "wf1",
+            task_type: "local_workflow",
+            description: "Review",
+            uuid: randomUUID(),
+            session_id: options.sessionId,
+          };
+        }
+        yield result(options, { is_error: true, result: "Not logged in · Please run /login" });
+      });
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+        await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle error"));
+        expect(client.updates("state_update").at(-1)?.background).toEqual(
+          background ? [{ type: "tool_call", toolCallId: "task_wf1" }] : [],
+        );
+        await expect(
+          agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("again") }),
+        ).rejects.toMatchObject(NOT_SUPPORTED);
+        expect(sdk.queryOptions).toHaveLength(2);
+        expect(sdk.queryOptions[1]).toMatchObject({ resume: sessionId });
+        await client.authUpdate(1);
+      });
 
-    expect(client.updates("user_message")).toHaveLength(1);
-  });
+      expect(client.updates("user_message")).toHaveLength(1);
+    },
+  );
 
   it("restarts the query for a provider change only after the account restart that runs", async () => {
     accountsAtStart(API_KEY);

@@ -598,6 +598,11 @@ export class SessionTasks {
     });
   }
 
+  /** Whether a subagent still runs, including in the background. */
+  hasLiveAgents(): boolean {
+    return this.agents.size > 0;
+  }
+
   /** Whether a child awaits permission or an elicitation response. */
   hasOpenRequests(): boolean {
     return this.agentRequests.size > 0;
@@ -606,7 +611,7 @@ export class SessionTasks {
   /** Whether a child, terminal, tool task, or child request remains. */
   hasLiveWork(): boolean {
     return (
-      this.agents.size > 0 ||
+      this.hasLiveAgents() ||
       this.terminals.size > 0 ||
       this.toolCalls.size > 0 ||
       this.hasOpenRequests()

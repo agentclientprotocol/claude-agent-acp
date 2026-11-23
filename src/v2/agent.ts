@@ -541,7 +541,7 @@ class V2Agent implements AgentHandle, SessionConnection {
       assertCwdOf(session, request.cwd, "resume it");
       if (!sameDirectories(request.additionalDirectories ?? [], session.additionalDirectories)) {
         // Claude Code cannot replace launch roots while work or requests remain.
-        if (!session.atTurnBoundary(true)) {
+        if (!session.canReplaceRoots()) {
           throw RequestError.invalidParams(
             { additionalDirectories: request.additionalDirectories ?? [] },
             "Workspace roots cannot change while work or input requests remain. Resume with the current roots, or try again after work ends.",
