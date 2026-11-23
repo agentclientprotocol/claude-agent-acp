@@ -280,6 +280,20 @@ export class SessionOutput {
     return this.emittedToolCalls.has(toolCallId);
   }
 
+  /** Whether a dispatched tool still runs outside the waiting and delegated work. */
+  hasProgressingTool(waiting: ReadonlySet<string>, excluded: ReadonlySet<string>): boolean {
+    for (const toolCallId of this.dispatched) {
+      if (
+        this.unfinished.has(toolCallId) &&
+        !waiting.has(toolCallId) &&
+        !excluded.has(toolCallId)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /** The tool uses of the session's tool calls, by id. */
   toolUses(): Readonly<ToolUseCache> {
     return this.toolUseCache;

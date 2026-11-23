@@ -78,6 +78,7 @@ import {
   endWaitsForMessages,
   HANDBACK_TOOL,
   handbackMessage,
+  handbackReportText,
   isNativeSubagentControlTool,
   launchReply,
   linkedSessionMessages,
@@ -127,7 +128,7 @@ export interface TaskHost {
   send(notification: v2.UpdateSessionNotification): void;
   /** The root session's foreground state now. */
   rootState(): WorkStateName;
-  /** A subagent's open requests changed, which can block the root's foreground work. */
+  /** Task work or requests changed, which can affect foreground state and restart admission. */
   foregroundRequestsChanged(): void;
   /** The entries of the root session's `model` option, for a child's `model`. */
   models(): SubagentModels;
@@ -140,6 +141,9 @@ export interface TaskHost {
    */
   taskOutput(): ((taskId: string) => Promise<TaskOutput>) | undefined;
 }
+
+/** The work that waits for an input request. */
+export type RequestContext = { type: "session" } | { type: "tool_call"; toolCallId: string };
 
 /** Where a permission request or elicitation goes: the root session or a child. */
 export interface RequestTarget {
@@ -160,7 +164,11 @@ export interface RequestTarget {
    * settles. Its signal aborts with `signal`, or when a cancel or close
    * withdraws the target's requests.
    */
-  openRequest<T>(signal: AbortSignal, send: (signal: AbortSignal) => Promise<T>): Promise<T>;
+  openRequest<T>(
+    signal: AbortSignal,
+    send: (signal: AbortSignal) => Promise<T>,
+    context?: RequestContext,
+  ): Promise<T>;
 }
 
 type ChildState = "idle" | "running" | "requires_action" | "unknown";
@@ -478,6 +486,7 @@ export class SessionTasks {
     // Before the result's own updates: a SendMessage call whose message
     // reached its child is that message.
     this.sendMessageResumed(message, results, toolUses);
+    this.handbackResult(output, message, results);
 
     const command = backgroundBashTaskFromToolResult(
       content,
@@ -589,9 +598,37 @@ export class SessionTasks {
     });
   }
 
-  /** Whether a subagent task runs, announced or not, in the foreground or the background. */
-  hasLiveSubagents(): boolean {
+  /** Whether a subagent still runs, including in the background. */
+  hasLiveAgents(): boolean {
     return this.agents.size > 0;
+  }
+
+  /** Whether a child awaits permission or an elicitation response. */
+  hasOpenRequests(): boolean {
+    return this.agentRequests.size > 0;
+  }
+
+  /** Whether a child, terminal, tool task, or child request remains. */
+  hasLiveWork(): boolean {
+    return (
+      this.hasLiveAgents() ||
+      this.terminals.size > 0 ||
+      this.toolCalls.size > 0 ||
+      this.hasOpenRequests()
+    );
+  }
+
+  /** Whether a root tool can progress independently of the waiting requests and delegated work. */
+  foregroundToolsCanProgress(waiting: ReadonlySet<string>): boolean {
+    const excluded = this.backgroundCalls(this.host.sessionId);
+    for (const [toolCallId, child] of this.childByToolUse) {
+      if (child.parentSessionId === this.host.sessionId) excluded.add(toolCallId);
+    }
+    for (const agentId of this.agents.keys()) {
+      const toolCallId = this.started.get(agentId)?.toolUseId;
+      if (toolCallId) excluded.add(toolCallId);
+    }
+    return this.rootOutput.hasProgressingTool(waiting, excluded);
   }
 
   /**
@@ -1029,6 +1066,7 @@ export class SessionTasks {
         state: this.host.rootState(),
       }),
     );
+    this.host.foregroundRequestsChanged();
   }
 
   // --- Task events ----------------------------------------------------------------
@@ -1768,17 +1806,47 @@ export class SessionTasks {
     if (update.status !== "completed" || !handback.message) {
       return [unexposedControlFallback(handback.initial, notification, child.sessionId)];
     }
-    if (handback.delegationId !== undefined) child.handedBack.add(handback.delegationId);
-    const [outgoing, incoming] = linkedSessionMessages(
+    this.publishHandback(
+      child,
+      handback.delegationId ?? update.toolCallId,
+      handback.message,
       update.toolCallId,
+    );
+    return [];
+  }
+
+  /** A launch result carries the report when Claude Code sends no child stream. */
+  private handbackResult(
+    output: SessionOutput,
+    message: SDKUserMessage,
+    results: ToolResultBlock[],
+  ): void {
+    if (results.length !== 1 || results[0]!.is_error) return;
+    const text = handbackReportText(message.tool_use_result);
+    if (text === undefined) return;
+    const launchId = results[0]!.tool_use_id;
+    const child = this.childByToolUse.get(launchId);
+    if (!child || child.handedBack.has(launchId)) return;
+    if (!child.announced) this.announce(child, output.sessionId);
+    this.publishHandback(child, launchId, text, `${launchId}:handback`);
+  }
+
+  private publishHandback(
+    child: Child,
+    delegationId: string,
+    text: string,
+    messageId: string,
+  ): void {
+    child.handedBack.add(delegationId);
+    const [outgoing, incoming] = linkedSessionMessages(
+      messageId,
       child.sessionId,
       child.parentSessionId,
-      handback.message,
+      text,
     );
-    // Sent here, in order: an output routes each update once the ones before it went out.
+    // Sent in order: each output routes its updates after the preceding ones.
     child.output!.emitV1([outgoing!]);
     this.outputOf(child.parentSessionId)?.emitV1([incoming!]);
-    return [];
   }
 
   /**

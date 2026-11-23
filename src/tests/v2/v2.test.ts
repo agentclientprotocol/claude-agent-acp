@@ -1,7 +1,7 @@
 /**
  * The ACP v2 core (`src/v2/`), driven through the protocol
- * router with the SDK's v2 client app, which validates every response and
- * session update against the v2 schema.
+ * router with the SDK's v2 client app. Raw notifications are checked against
+ * the v2 schema before the SDK handles them.
  *
  * Claude Code is a double that the test drives message by message (see
  * {@link FakeClaudeCode}), shaped like what the bundled CLI sends: prompt
@@ -24,6 +24,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { McpOverAcp } from "../../mcp-servers.js";
 import { acpProtocolRouter } from "../../serve.js";
+import { validateV2Notification } from "../acp-scenarios/schema.js";
 import { SettingsManager } from "../../settings.js";
 import type { AgentHandle } from "../../v2/agent.js";
 import { v2ElicitationRequest } from "../../v2/elicitation.js";
@@ -48,6 +49,7 @@ type FakeClaudeCode = {
   /** Ends the stream, with `error` as a crash. */
   end(error?: Error): void;
   interrupt: ReturnType<typeof vi.fn>;
+  cancelAsyncMessage: ReturnType<typeof vi.fn>;
   setPermissionMode: ReturnType<typeof vi.fn>;
   setModel: ReturnType<typeof vi.fn>;
   stopTask: ReturnType<typeof vi.fn>;
@@ -117,6 +119,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         send: (message) => push({ value: message, done: false }),
         end: (error) => push(error ?? { value: undefined, done: true }),
         interrupt: vi.fn(async () => undefined),
+        cancelAsyncMessage: vi.fn(async (_uuid: string) => true),
         setPermissionMode: vi.fn(async () => {}),
         setModel: vi.fn(async () => {}),
         stopTask: vi.fn(async () => {}),
@@ -155,6 +158,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
           { name: "review", description: "Review a change", argumentHint: "<pull request>" },
         ],
         interrupt: fake.interrupt,
+        cancelAsyncMessage: fake.cancelAsyncMessage,
         setPermissionMode: fake.setPermissionMode,
         setModel: fake.setModel,
         stopTask: fake.stopTask,
@@ -213,10 +217,12 @@ vi.mock("node:child_process", async () => ({
 }));
 
 const agents: AgentHandle[] = [];
+const notificationErrors: string[] = [];
 let tempDir: string;
 let cwd: string;
 
 beforeEach(async () => {
+  notificationErrors.length = 0;
   tempDir = await mkdtemp(path.join(os.tmpdir(), "acp-v2-"));
   cwd = await mkdtemp(path.join(tempDir, "project-"));
   vi.stubEnv("CLAUDE_CONFIG_DIR", path.join(tempDir, "claude"));
@@ -237,6 +243,7 @@ afterEach(async () => {
   await Promise.all(agents.splice(0).map((agent) => agent.dispose()));
   vi.unstubAllEnvs();
   await rm(tempDir, { recursive: true, force: true, maxRetries: 10 });
+  expect(notificationErrors).toEqual([]);
 });
 
 /** A v2 client of the v2 core that records the session updates it receives. */
@@ -277,7 +284,12 @@ function v2Client({
       completedElicitations.push(params.elicitationId);
     });
   const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
-  const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
+  const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>({
+    transform(message, controller) {
+      notificationErrors.push(...validateV2Notification(message));
+      controller.enqueue(message);
+    },
+  });
   acpProtocolRouter(undefined, () => {}, "v2", {
     onV2Agent: (agent) => agents.push(agent),
   }).connect({ readable: toAgent.readable, writable: toClient.writable });
@@ -1416,6 +1428,117 @@ describe("ACP v2 core", () => {
     expect(error).toMatchObject({ code });
   });
 
+  it.each([true, false])(
+    "withdraws only the queued prompt when Claude Code cancels it: %s",
+    async (cancelled) => {
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const sessionId = response.sessionId;
+        const completedSignal = new AbortController();
+        const first = agent.request(
+          v2.methods.agent.session.prompt,
+          { sessionId, prompt: PROMPT },
+          {
+            cancellationSignal: completedSignal.signal,
+          },
+        );
+        const running = await claude.prompt(0);
+        claude.send(sessionState("running"));
+        claude.send(lifecycle(running, "started"));
+        await first;
+        completedSignal.abort();
+        expect(claude.cancelAsyncMessage).not.toHaveBeenCalled();
+        const controller = new AbortController();
+        const queued = agent
+          .request(
+            v2.methods.agent.session.prompt,
+            { sessionId, prompt: PROMPT },
+            {
+              cancellationSignal: controller.signal,
+            },
+          )
+          .catch((error: unknown) => error);
+        const waiting = await claude.prompt(1);
+        claude.cancelAsyncMessage.mockResolvedValue(cancelled);
+        controller.abort();
+        await vi.waitFor(() =>
+          expect(claude.cancelAsyncMessage).toHaveBeenCalledWith(waiting.uuid),
+        );
+        if (cancelled) {
+          expect(await queued).toMatchObject({ code: -32800 });
+          claude.send(lifecycle(waiting, "cancelled"));
+        } else {
+          claude.send(lifecycle(waiting, "started"));
+          expect(await queued).toEqual({ messageId: waiting.uuid });
+        }
+        expect(claude.interrupt).not.toHaveBeenCalled();
+        expect(client.states()).toEqual(["running"]);
+        expect(
+          client.sessionUpdates.filter((update) => update.sessionUpdate === "user_message"),
+        ).toHaveLength(cancelled ? 1 : 2);
+        claude.send(result());
+        claude.send(sessionState("idle"));
+        await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+        expect(client.sessionUpdates.at(-1)).toMatchObject({
+          state: "idle",
+          stopReason: "end_turn",
+        });
+      });
+    },
+  );
+
+  it.each(["frame-first", "response-first"])(
+    "ends held work when the last steering prompt is withdrawn (%s)",
+    async (order) => {
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const sessionId = response.sessionId;
+        const first = agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: PROMPT });
+        const running = await claude.prompt(0);
+        claude.send(lifecycle(running, "started"));
+        await first;
+        for (const event of textDelta("msg_first", "First reply")) claude.send(event);
+        const controller = new AbortController();
+        const queued = agent
+          .request(
+            v2.methods.agent.session.prompt,
+            { sessionId, prompt: PROMPT },
+            { cancellationSignal: controller.signal },
+          )
+          .catch((error: unknown) => error);
+        const waiting = await claude.prompt(1);
+        expect(waiting.priority).toBe("now");
+        claude.send(result({ user_message_uuids: [running.uuid] }));
+        await vi.waitFor(() =>
+          expect(client.sessionUpdates).toContainEqual(
+            expect.objectContaining({ sessionUpdate: "usage_update", cost: expect.any(Object) }),
+          ),
+        );
+        expect(client.states()).not.toContain("idle");
+        const cancelled = Promise.withResolvers<boolean>();
+        claude.cancelAsyncMessage.mockReturnValue(cancelled.promise);
+        controller.abort();
+        await vi.waitFor(() =>
+          expect(claude.cancelAsyncMessage).toHaveBeenCalledWith(waiting.uuid),
+        );
+        if (order === "frame-first") claude.send(lifecycle(waiting, "cancelled"));
+        else cancelled.resolve(true);
+        expect(await queued).toMatchObject({ code: -32800 });
+        await vi.waitFor(() => expect(client.states().at(-1)).toBe("idle"));
+        if (order === "frame-first") cancelled.resolve(true);
+        else claude.send(lifecycle(waiting, "cancelled"));
+        const next = agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: PROMPT });
+        claude.send(lifecycle(await claude.prompt(2), "started"));
+        await next;
+        claude.send(result());
+        await vi.waitFor(() => expect(client.states().slice(-2)).toEqual(["running", "idle"]));
+        expect(claude.interrupt).not.toHaveBeenCalled();
+      });
+    },
+  );
+
   it("cancels the work and the prompts not inserted yet with one interrupt", async () => {
     const client = v2Client();
     await client.connect(async (agent) => {
@@ -2029,6 +2152,85 @@ describe("ACP v2 core", () => {
       ),
     ).toEqual([]);
   });
+
+  it.each([
+    ["tool_use", "cancelled"],
+    ["null", "error"],
+  ] as const)(
+    "handles a rejected plan diagnostic with stop_reason=%s",
+    async (reason, expected) => {
+      const client = v2Client({
+        answerPermission: () => ({ outcome: { outcome: "selected", optionId: "reject" } }),
+      });
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const sessionId = response.sessionId;
+        const prompted = agent.request(v2.methods.agent.session.prompt, {
+          sessionId,
+          prompt: PROMPT,
+        });
+        claude.send(echo(await claude.prompt(0)));
+        await prompted;
+        claude.send(
+          assistant("msg_plan", [
+            { type: "tool_use", id: "toolu_plan", name: "ExitPlanMode", input: { plan: "Do it" } },
+          ]),
+        );
+        const decision = await askPermission(
+          claude,
+          "ExitPlanMode",
+          { plan: "Do it" },
+          { toolUseID: "toolu_plan" },
+        );
+        expect(decision).toMatchObject({ behavior: "deny", interrupt: true });
+        claude.send({
+          type: "user",
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_plan",
+                content: "The user rejected this plan.",
+                is_error: true,
+              },
+            ],
+          },
+          tool_result_meta: [{ id: "toolu_plan", non_execution_kind: "user-rejected" }],
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+        });
+        claude.send(
+          result({
+            subtype: "error_during_execution",
+            is_error: true,
+            stop_reason: null,
+            errors: [
+              `[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=${reason}`,
+            ],
+          }),
+        );
+        await vi.waitFor(() => expect(client.states().at(-1)).toBe("idle"));
+        expect(client.sessionUpdates.at(-1)).toMatchObject({ state: "idle", stopReason: expected });
+        if (expected === "cancelled")
+          expect(client.sessionUpdates.at(-1)).not.toHaveProperty("error");
+
+        const followup = agent.request(v2.methods.agent.session.prompt, {
+          sessionId,
+          prompt: PROMPT,
+        });
+        claude.send(echo(await claude.prompt(1)));
+        await followup;
+        claude.send(result());
+        await vi.waitFor(() =>
+          expect(client.sessionUpdates.at(-1)).toMatchObject({
+            state: "idle",
+            stopReason: "end_turn",
+          }),
+        );
+      });
+    },
+  );
 
   it("ends a turn cancelled when a cancel comes while an approved plan waits for its fresh context", async () => {
     const client = v2Client({
@@ -6141,6 +6343,7 @@ describe("v2ElicitationRequest", () => {
       mode: "form" as const,
       sessionId: "s1",
       message: "Which release?",
+      _meta: { jetbrains: { air: { version: 1, existing: true } } },
       requestedSchema: {
         type: "object" as const,
         required: ["tag"],
@@ -6149,6 +6352,13 @@ describe("v2ElicitationRequest", () => {
           // A property that is named `pattern` is no keyword.
           pattern: { type: "string" as const, enum: ["a", "b"] },
           count: { type: "integer" as const, minimum: 1 },
+          note: {
+            type: "string" as const,
+            _meta: {
+              _askUserQuestionCustomAnswer: { questionId: "pattern", isCustomAnswer: true },
+              jetbrains: { air: { customAnswer: true } },
+            },
+          },
         },
       },
     };

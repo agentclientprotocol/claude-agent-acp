@@ -106,26 +106,25 @@ export class ClearContext {
   }
 
   /**
-   * A result of the open turn. Returns whether the turn goes on: it is the
-   * interruption of a plan accepted with clearing the context, or `/clear`'s.
-   * The fresh context starts with the first.
+   * Classifies the result of a plan interruption or a fresh context.
+   * A rejected plan ends the turn cancelled. An accepted plan continues after `/clear`.
    */
-  holdsResult(message: SDKResultMessage, end: TurnEnd): boolean {
+  resultDisposition(message: SDKResultMessage, end: TurnEnd): "held" | "rejected" | "ended" {
     const continuation = this.continuation;
     if (continuation) {
-      if (continuation.planStarted) return false;
+      if (continuation.planStarted) return "ended";
       continuation.carried.push(end);
       // Without a `conversation_reset` (an older Claude Code), `/clear`'s result shows it ran.
       this.mounted();
-      return true;
+      return "held";
     }
     const interruption = this.interruption;
-    if (!interruption || !isExitPlanInterruptionResult(message, interruption)) return false;
+    if (!interruption || !isExitPlanInterruptionResult(message, interruption)) return "ended";
     this.interruption = undefined;
     const reset = this.accepted;
     this.accepted = undefined;
     // "No, keep planning": the turn ends.
-    if (!reset || reset.toolUseId !== interruption.toolUseId) return false;
+    if (!reset || reset.toolUseId !== interruption.toolUseId) return "rejected";
     const clearUuid = this.newUuid();
     this.continuation = {
       reset,
@@ -136,7 +135,7 @@ export class ClearContext {
       planStarted: false,
     };
     this.host.push("/clear", clearUuid);
-    return true;
+    return "held";
   }
 
   /** Claude Code mounted a fresh conversation: the plan goes out in it. */

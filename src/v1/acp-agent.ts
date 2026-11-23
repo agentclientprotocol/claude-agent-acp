@@ -175,8 +175,6 @@ import {
 } from "./async-task-stop.js";
 import {
   STEER_METHOD,
-  STEER_PRIORITY_LATER,
-  STEER_PRIORITY_NOW,
   parseSteerRequest,
   type SteerRequest,
   type SteerResponse,
@@ -196,6 +194,7 @@ import { McpOverAcp, sdkMcpServers, type UnservedMcpServer } from "../mcp-server
 import { claudeCliPath, cliDelivery } from "../claude-cli.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { randomUUID } from "node:crypto";
+import { steeringPriority } from "../steering-priority.js";
 import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -229,6 +228,7 @@ import {
 import {
   type ReplayChild,
   RfdSubagentReplay,
+  ReplayTranscript,
   replaySubagentTerminalState,
 } from "../subagent-replay.js";
 import {
@@ -3063,8 +3063,7 @@ export class ClaudeAcpAgent {
     userMessage.uuid = steeredUuid;
     // Deliver into the running turn rather than queuing behind it as a fresh
     // prompt would.
-    userMessage.priority =
-      (session.openUserInputs?.size ?? 0) > 0 ? STEER_PRIORITY_LATER : STEER_PRIORITY_NOW;
+    userMessage.priority = steeringPriority((session.openUserInputs?.size ?? 0) > 0);
     // Mark before the push and in the same synchronous section as the in-flight
     // check: the interrupt can have the CLI finalizing the aborted cycle by the
     // time the consumer next runs, and an unmarked result would settle the turn
@@ -6916,6 +6915,7 @@ export class ClaudeAcpAgent {
 
             let content: typeof message.message.content;
             let toolUseResult = message.type === "user" ? message.tool_use_result : undefined;
+            if (message.type === "user") await subagents.toolResult(message);
             if (
               message.type === "assistant" &&
               (message.parent_tool_use_id === null || forwardsSubagentText())
@@ -8225,6 +8225,8 @@ export class ClaudeAcpAgent {
       nativeReplayEnabled && replayChildren.size > 0
         ? await subagentHistory(sessionId)
         : { agents: new Map() };
+    const airReplay = nativeReplayEnabled ? new ReplayTranscript(subagents) : undefined;
+    airReplay?.scan(messages, sessionId);
     const replayedSubagents = new Set<string>();
     const rfdHistory =
       form === "rfd" &&
@@ -8474,6 +8476,22 @@ export class ClaudeAcpAgent {
           continue;
         }
         if (rfdReplay && (await rfdReplay.toolCallUpdate(notification.update, child))) continue;
+        const handback = parentToolUseId
+          ? airReplay?.handbackUpdate(notification.update)
+          : undefined;
+        if (handback !== undefined) {
+          if (handback !== null) {
+            await this.client.sessionUpdate({
+              sessionId: replayTargetSessionId,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                messageId: handback.messageId,
+                content: { type: "text", text: handback.text },
+              },
+            });
+          }
+          continue;
+        }
         const replayed = { ...notification, sessionId: replayTargetSessionId };
         await this.client.sessionUpdate(
           rfdReplay
@@ -8498,6 +8516,7 @@ export class ClaudeAcpAgent {
             this.logger,
           );
           registerLaunches(childMessages);
+          airReplay?.scan(childMessages, agentId);
           for (const childMessage of childMessages) await replayMessage(childMessage);
         }
       }

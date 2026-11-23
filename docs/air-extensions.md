@@ -148,6 +148,12 @@ The response to a client that is not AIR has no `_meta.jetbrains` key.
 
 ### ACP v2
 
+A busy `session/prompt` steers the current turn on ACP v2.
+It waits while a root or child permission request or elicitation is open.
+The adapter does not advertise `claudeCode.promptQueueing` on v2.
+On ACP v1, an ordinary `session/prompt` queues behind the current turn.
+The separate `_session/steering` request steers that turn.
+
 The v2 core (`src/v2/`) serves an AIR client only the extensions that ACP v2 does not cover.
 Its `initialize` response lists `agentFileChangeReport` and `recommendedValue`.
 It also serves the [permission presentation](#permission-presentation), the [question custom answers](#question-custom-answers), the [predicted follow-up prompt](#predicted-follow-up-prompt), and [load replay end](#load-replay-end).
@@ -207,6 +213,7 @@ The adapter sends these keys only to an AIR client. "AIR" in the Gate column mea
 | `mcp`                          | MCP tool call `_meta.jetbrains.air`                                                   | `{server, tool}`                                                       | AIR                                                                                    |
 | `contextCompaction`            | compaction tool call or `compaction_update`, `_meta.jetbrains.air`                    | `{version: 1, trigger?, preTokens?, postTokens?, durationMs?, error?}` | AIR                                                                                    |
 | `customAnswer`                 | elicitation schema property `_meta.jetbrains.air`                                     | `{questionId, isCustomAnswer: true}`                                   | AIR, when the client supports form elicitation                                         |
+| `customAnswerFields`           | elicitation request `_meta.jetbrains.air`                                             | companion field keys                                                   | AIR, when the client supports form elicitation                                         |
 | `kind`                         | session mode `_meta.jetbrains.air` and mode config option value `_meta.jetbrains.air` | `standard`, `plan`, `auto_review`, or `full_access`                    | AIR                                                                                    |
 | `kind`                         | available command `_meta.jetbrains.air` of a skill                                    | `skill`                                                                | AIR, when the skill's `SKILL.md` is found; not for a built-in command or an MCP prompt |
 | `skillPath`                    | available command `_meta.jetbrains.air` of a skill                                    | absolute path of the skill's `SKILL.md`                                | AIR, together with `kind: "skill"`                                                     |
@@ -1808,6 +1815,18 @@ A client can render the companion as the free-text choice of that question.
 For AIR, the companion field also carries the same value under the root key `_meta._askUserQuestionCustomAnswer`.
 Released AIR versions read only that key.
 A client that is not AIR gets neither key.
+
+For AIR on both protocol versions, the request also lists the companion field keys in `_meta.jetbrains.air.customAnswerFields`:
+
+```json
+{ "jetbrains": { "air": { "version": 1, "customAnswerFields": ["question_0_custom"] } } }
+```
+
+The Kotlin ACP SDK property models do not retain `_meta`.
+The TypeScript v2 schema supports property metadata.
+AIR reads the request list to show the companion with its question.
+The field keys and the response content stay the same in both versions.
+A client that is not AIR gets no `customAnswerFields` key.
 
 ## Load replay end
 

@@ -259,14 +259,10 @@ export class SubagentReplay {
   }
 
   /**
-   * Registers the launches, the launch results, the SendMessage calls and the
-   * SubagentHandback calls in `messages`, of the session `ownerSessionId`.
-   */
-  /**
    * A replayed update of a tool call of `output`, the session of `owner`
    * when it is a child's. The client is not shown the launch of a replayed
    * child, a SendMessage call whose message the replay delivered, or a
-   * successful SubagentHandback call: a foreground launch's completed result
+   * pending or successful SubagentHandback call: a foreground launch's completed result
    * goes out as the child's reply, a delivered SendMessage as the sender's
    * outgoing message, and a hand-back as the child's message to its parent.
    */
@@ -297,16 +293,15 @@ export class SubagentReplay {
       );
       return [outgoing!];
     }
-    const handback = owner ? this.transcript.handbacks.get(update.toolCallId) : undefined;
-    if (owner && handback && !handback.failed) {
-      if (handback.sent) return [];
-      handback.sent = true;
+    const handback = owner ? this.transcript.handbackUpdate(update) : undefined;
+    if (owner && handback !== undefined) {
+      if (handback === null) return [];
       owner.handedBack = true;
       const [outgoing, incoming] = linkedSessionMessages(
         update.toolCallId,
         owner.sessionId,
         owner.parentSessionId,
-        handback.message,
+        handback.text,
       );
       // Sent here, in order: an output routes each update once the ones before it went out.
       output.emitV1([outgoing!]);

@@ -29,7 +29,7 @@ import {
 } from "../acp-scenarios/harness.js";
 import { SCENARIOS } from "../acp-scenarios/scenarios.js";
 import { canonical } from "../acp-scenarios/compare.js";
-import { validateV2Message } from "../acp-scenarios/schema.js";
+import { validateV2Message, validateV2Notification } from "../acp-scenarios/schema.js";
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@anthropic-ai/claude-agent-sdk")>();
@@ -126,17 +126,24 @@ describe("ACP v2 scenarios", () => {
   });
 
   describe("schema check", () => {
-    const chunk = (update: Record<string, unknown>): WireRecorded => ({
-      kind: "notification",
-      method: "session/update",
-      payload: { sessionId: "s", update: { sessionUpdate: "agent_message_chunk", ...update } },
-    });
-
-    it("rejects a message that breaks the v2 schema", () => {
+    it("rejects a raw notification that breaks the v2 schema", () => {
+      const chunk = (update: Record<string, unknown>) => ({
+        jsonrpc: "2.0" as const,
+        method: "session/update",
+        params: { sessionId: "s", update: { sessionUpdate: "agent_message_chunk", ...update } },
+      });
       const content = { type: "text", text: "hi" };
-      expect(validateV2Message(chunk({ messageId: "m", content }))).toEqual([]);
+      expect(validateV2Notification(chunk({ messageId: "m", content }))).toEqual([]);
       // v2 requires the id of the message a chunk belongs to.
-      expect(validateV2Message(chunk({ content }))).not.toEqual([]);
+      expect(validateV2Notification(chunk({ content }))).not.toEqual([]);
+      expect(validateV2Notification({ jsonrpc: "2.0", method: "unknown/update" })).not.toEqual([]);
+      expect(
+        validateV2Notification({
+          jsonrpc: "2.0",
+          method: "$/cancel_request",
+          params: { requestId: 1 },
+        }),
+      ).toEqual([]);
     });
 
     it.each(SCENARIOS.map((scenario) => scenario.name))("%s", (scenario) => {

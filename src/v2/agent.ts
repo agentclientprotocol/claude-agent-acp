@@ -143,7 +143,9 @@ export function v2AgentApp(
       .onRequest(v2.methods.agent.session.setConfigOption, ({ params }) =>
         agent.setConfigOption(params),
       )
-      .onRequest(v2.methods.agent.session.prompt, ({ params }) => agent.prompt(params))
+      .onRequest(v2.methods.agent.session.prompt, ({ params, signal }) =>
+        agent.prompt(params, signal),
+      )
       .onRequest(v2.methods.agent.terminal.cancel, ({ params }) =>
         agent.cancelItem(params.sessionId, { terminalId: params.terminalId }),
       )
@@ -378,8 +380,7 @@ class V2Agent implements AgentHandle, SessionConnection {
         // `providers/list`, `set`, and `disable`, served for every client.
         providers: {},
         auth,
-        // A prompt that comes while Claude works waits in Claude Code's queue.
-        _meta: { claudeCode: { promptQueueing: true }, ..._meta },
+        _meta,
       },
       authMethods,
     };
@@ -399,9 +400,9 @@ class V2Agent implements AgentHandle, SessionConnection {
    * order but the number of promise hops (v2 allows either), and the golden
    * files of the scenarios (`acp-scenarios-v2.test.ts`) hold it.
    */
-  prompt(params: v2.PromptRequest): Promise<v2.PromptResponse> {
+  prompt(params: v2.PromptRequest, signal: AbortSignal): Promise<v2.PromptResponse> {
     const prompt = () =>
-      this.session(params.sessionId, "prompt").prompt(params, (query) =>
+      this.session(params.sessionId, "prompt").prompt(params, signal, (query) =>
         this.guard.beforePrompt(params.sessionId, query),
       );
     try {
@@ -538,17 +539,31 @@ class V2Agent implements AgentHandle, SessionConnection {
       // session's.
       const request = await validatedSetup(params);
       assertCwdOf(session, request.cwd, "resume it");
-      const served = await this.sdkMcpServers(sessionId, request.mcpServers);
-      await session.setMcpServers(
-        { ...clientOptions(params._meta)?.mcpServers, ...served.configs },
-        served.unserved,
-      );
       if (!sameDirectories(request.additionalDirectories ?? [], session.additionalDirectories)) {
-        // The SDK cannot change them on a running query: it restarts with
-        // them at its next turn boundary (see `restarts.ts`).
-        this.restarts.rootsChanged(sessionId, params);
+        // Claude Code cannot replace launch roots while work or requests remain.
+        if (!session.canReplaceRoots()) {
+          throw RequestError.invalidParams(
+            { additionalDirectories: request.additionalDirectories ?? [] },
+            "Workspace roots cannot change while work or input requests remain. Resume with the current roots, or try again after work ends.",
+          );
+        }
+        await this.restarts.rootsChanged(sessionId, params);
+        session = this.sessions.get(sessionId);
+        if (
+          !session ||
+          !sameDirectories(request.additionalDirectories ?? [], session.additionalDirectories)
+        ) {
+          throw RequestError.internalError(
+            { sessionId },
+            "The session could not activate the workspace roots. Try resuming it again.",
+          );
+        }
       } else {
-        // A restart of its query starts with these servers.
+        const served = await this.sdkMcpServers(sessionId, request.mcpServers);
+        await session.setMcpServers(
+          { ...clientOptions(params._meta)?.mcpServers, ...served.configs },
+          served.unserved,
+        );
         this.restarts.track(sessionId, params);
       }
     } else {
