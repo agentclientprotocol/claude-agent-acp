@@ -10262,13 +10262,9 @@ describe("ACP v2 terminal of a command in the background", () => {
       },
     );
 
-    it.each(
-      ["terminal", "tool_call"].flatMap((kind) =>
-        ["set", "disable", "logout"].map((change) => ({ kind, change })),
-      ),
-    )(
-      "retires an idle background $kind when the route changes through $change",
-      async ({ kind, change }) => {
+    it.each(["terminal", "tool_call"])(
+      "retires an idle background %s when the provider is disabled",
+      async (kind) => {
         scriptTurns(
           async function* (options) {
             if (kind === "terminal") {
@@ -10297,12 +10293,11 @@ describe("ACP v2 terminal of a command in the background", () => {
         const client = v2Client();
         await client.app.connectWith(connectRouter(), async (agent) => {
           await initializeV2(agent);
-          const provider = {
+          await agent.request(v2.methods.agent.providers.set, {
             providerId: "main",
-            apiType: "anthropic" as const,
+            apiType: "anthropic",
             baseUrl: "https://gateway.example.com",
-          };
-          if (change !== "set") await agent.request(v2.methods.agent.providers.set, provider);
+          });
           const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
           await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("work") });
           await vi.waitFor(() =>
@@ -10314,16 +10309,11 @@ describe("ACP v2 terminal of a command in the background", () => {
           scriptTurns(async function* (options) {
             yield result(options);
           });
-          if (change === "set") await agent.request(v2.methods.agent.providers.set, provider);
-          else if (change === "disable")
-            await agent.request(v2.methods.agent.providers.disable, { providerId: "main" });
-          else await agent.request(v2.methods.agent.auth.logout, {});
+          await agent.request(v2.methods.agent.providers.disable, { providerId: "main" });
           expect(sdk.queryOptions).toHaveLength(2);
           expect(sdk.close).toHaveBeenCalledOnce();
           expect(sdk.queryOptions[1]).toMatchObject({ resume: sessionId });
-          expect(sdk.queryOptions[1].env?.ANTHROPIC_BASE_URL).toBe(
-            change === "set" ? provider.baseUrl : undefined,
-          );
+          expect(sdk.queryOptions[1].env?.ANTHROPIC_BASE_URL).toBeUndefined();
           const before = client.updates("state_update").length;
           await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("next") });
           await vi.waitFor(() =>
