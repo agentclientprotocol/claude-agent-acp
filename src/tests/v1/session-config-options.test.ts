@@ -871,6 +871,37 @@ describe("session config options", () => {
       });
     });
 
+    it("keeps each model's efforts in config_option_update after an external switch", async () => {
+      const { ClientCapabilities } = await import("../../tool-calls/client-capabilities.js");
+      (agent as any).toolCallCapabilities = ClientCapabilities.from({
+        _meta: { jetbrains: { air: { version: 1, capabilities: [] } } },
+      });
+      const session = agent.sessions[SESSION_ID];
+      session.modelInfos[1].supportsEffort = false;
+
+      await (agent as any).syncModelAfterExternalSwitch(SESSION_ID, session, "claude-sonnet-4-6");
+
+      const update = sessionUpdates
+        .filter((notification) => notification.update.sessionUpdate === "config_option_update")
+        .at(-1)?.update as { configOptions: any[] } | undefined;
+      const model = update?.configOptions.find((option) => option.id === "model");
+      expect(model.options).toEqual([
+        expect.objectContaining({
+          value: "claude-opus-4-5",
+          _meta: {
+            jetbrains: {
+              air: {
+                version: 1,
+                reasoningEfforts: { values: ["low", "medium", "high"], recommended: "medium" },
+              },
+            },
+          },
+        }),
+        expect.not.objectContaining({ _meta: expect.anything() }),
+      ]);
+      expect(update?.configOptions.find((option) => option.id === "effort")).toBeUndefined();
+    });
+
     it("drops effort option when switching to a model without effort support", async () => {
       // Make sonnet not support effort
       const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];

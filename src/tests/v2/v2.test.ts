@@ -2431,6 +2431,58 @@ describe("ACP v2 core", () => {
       ];
     });
 
+    it("names each model's efforts in every answer to an AIR client, without a capability", async () => {
+      sdk.models = [
+        { ...sdk.models[0], resolvedModel: "claude-opus-5" },
+        { ...sdk.models[0], value: "opus", displayName: "Opus", resolvedModel: "claude-opus-5" },
+        sdk.models[1],
+        { value: "sonnet", displayName: "Sonnet", description: "Balanced", supportsEffort: false },
+      ];
+      const efforts = (values: string[]) => ({
+        jetbrains: { air: { version: 1, reasoningEfforts: { values, recommended: "medium" } } },
+      });
+      const expected = {
+        default: efforts(["low", "medium", "high"]),
+        opus: efforts(["low", "medium", "high"]),
+        haiku: efforts(["low", "medium"]),
+        sonnet: undefined,
+      };
+      const entryMetas = (options: v2.SessionConfigOption[] | undefined) => {
+        const model = options?.find((option) => option.configId === "model") as
+          { options: Array<{ value: string; _meta?: unknown }> } | undefined;
+        return Object.fromEntries(
+          (model?.options ?? []).map((entry) => [entry.value, entry._meta]),
+        );
+      };
+      const client = v2Client();
+      const answers = await client.connect(async (agent) => {
+        await agent.request(v2.methods.agent.initialize, {
+          protocolVersion: v2.PROTOCOL_VERSION,
+          info: { name: "v2-test-client", version: "1.0.0" },
+          capabilities: { _meta: { jetbrains: { air: { version: 1, capabilities: [] } } } },
+        });
+        const created = await agent.request(v2.methods.agent.session.new, { cwd });
+        const set = await agent.request(v2.methods.agent.session.setConfigOption, {
+          sessionId: created.sessionId,
+          configId: "model",
+          type: "id",
+          value: "haiku",
+        });
+        const resumed = await agent.request(v2.methods.agent.session.resume, {
+          sessionId: STORED,
+          cwd,
+        });
+        const fork = await agent.request(v2.methods.agent.session.fork, { sessionId: STORED, cwd });
+        return [created, set, resumed, fork].map((answer) => answer.configOptions);
+      });
+
+      for (const options of answers) expect(entryMetas(options)).toEqual(expected);
+      const update = client.sessionUpdates.find(
+        (candidate) => candidate.sessionUpdate === "config_option_update",
+      ) as { configOptions: v2.SessionConfigOption[] } | undefined;
+      expect(entryMetas(update?.configOptions)).toEqual(expected);
+    });
+
     it("answers session/options with what session/new returns, from a query that it closes", async () => {
       const client = v2Client();
       const { options, created } = await client.connect(async (agent) => {

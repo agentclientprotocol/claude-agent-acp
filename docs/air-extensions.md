@@ -22,6 +22,7 @@ It describes only this adapter.
 - [Goal](#goal)
 - [Predicted follow-up prompt](#predicted-follow-up-prompt)
 - [Recommended config values](#recommended-config-values)
+- [Model reasoning efforts](#model-reasoning-efforts)
 - [Async tasks](#async-tasks)
 - [Agent file-change report](#agent-file-change-report)
 - [Session failure](#session-failure)
@@ -195,6 +196,7 @@ The adapter sends these keys only to an AIR client. "AIR" in the Gate column mea
 | `diffPatch`                    | tool call and permission request `content[]` of type `diff`, `_meta.jetbrains.air`    | `{version: 1, format: "git_patch", text}`                              | `diffPatch`                                                                            |
 | `permission`                   | `session/request_permission` request `_meta.jetbrains.air`                            | `{version: 1, title, description?, defaultToNo?}`                      | AIR                                                                                    |
 | `recommendedValue`             | `model` and effort config options, `_meta.jetbrains.air`                              | option value string                                                    | `recommendedValue`                                                                     |
+| `reasoningEfforts`             | entry of the `model` config option, `_meta.jetbrains.air`                             | `{values: string[], recommended: string}`                              | AIR                                                                                    |
 | `asyncTasks`                   | Bash `tool_call_update._meta.jetbrains.air`                                           | `{backgrounded: true}`                                                 | `asyncTasks`                                                                           |
 | `agentFileChangeReportRequest` | `session/prompt` request `_meta.jetbrains.air` (client to agent)                      | `{version: 1, requestId}`                                              | `agentFileChangeReport`                                                                |
 | `agentFileChangeReport`        | `session_info_update._meta.jetbrains.air`                                             | report object                                                          | `agentFileChangeReport`                                                                |
@@ -983,6 +985,58 @@ RUN_INTEGRATION_TESTS=true npx vitest run src/tests/model-presentation.test.ts
 
 Review the changes to the Opus entries and labels before you update the version guard.
 The live test only initializes the SDK. It sends no model prompt.
+
+## Model reasoning efforts
+
+The `reasoningEfforts` key lets a client show the effort levels of a model before the client selects that model.
+The effort option shows only the levels of the current model.
+
+### Activation
+
+The adapter sends the key to every AIR client.
+The key has no capability, because it only adds data.
+A client that is not AIR gets no `reasoningEfforts`.
+The key does not depend on `recommendedValue`.
+
+### Entry metadata
+
+Each entry of the `model` option gets the levels of its model at `_meta.jetbrains.air.reasoningEfforts`:
+
+```json
+{
+  "value": "claude-opus-5-5",
+  "name": "Opus 5.5",
+  "_meta": {
+    "jetbrains": {
+      "air": {
+        "version": 1,
+        "reasoningEfforts": {
+          "values": ["low", "medium", "high", "xhigh", "max"],
+          "recommended": "medium"
+        }
+      }
+    }
+  }
+}
+```
+
+`values` are the `supportedEffortLevels` of the SDK `ModelInfo` of the entry, in the SDK order.
+The effort option lists the same levels in the same order.
+`values` never contain the `default` row of the effort option.
+
+`recommended` is `medium` when the model offers it, else the first level.
+The SDK names no recommended effort, so the adapter uses the rule of the effort option.
+For the current model, `recommended` is the `recommendedValue` of the effort option.
+
+The adapter finds the `ModelInfo` of an entry by its value.
+The `default` entry gets the levels of the listed model that its `resolvedModel` names.
+When no listed model has that `resolvedModel`, the `default` entry gets no `reasoningEfforts`.
+A running model that the picker does not list gets its own entry, with the same lookup.
+A model without effort support, or with no levels, gets no `reasoningEfforts`.
+
+The entries carry the metadata in each answer that carries config options, on ACP v1 and v2.
+These are `session/new`, `session/load` on v1, `session/resume`, `session/fork`, `session/set_config_option`, and `config_option_update`.
+The `model` option of a subagent's session has no `reasoningEfforts`.
 
 ## Async tasks
 

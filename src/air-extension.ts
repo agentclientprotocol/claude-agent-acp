@@ -69,6 +69,12 @@ export const AIR_KIND_KEY = "kind";
 export const AIR_SKILL_PATH_KEY = "skillPath";
 export const AIR_PERMISSION_KEY = "permission";
 export const AIR_CUSTOM_ANSWER_KEY = "customAnswer";
+/**
+ * The `_meta.jetbrains.air` key of a `model` option entry: the effort levels
+ * of the model and the recommended one, `{values, recommended}`. Every AIR
+ * client gets it, without a capability: the key only adds data.
+ */
+export const AIR_REASONING_EFFORTS_KEY = "reasoningEfforts";
 /** The `_meta.jetbrains.air` key of the update that ends a whole history replay. */
 export const AIR_LOAD_REPLAY_END_KEY = "loadReplayEnd";
 /**

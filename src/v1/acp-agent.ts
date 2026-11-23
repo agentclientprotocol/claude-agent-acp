@@ -9682,6 +9682,7 @@ export class ClaudeAcpAgent {
         },
         {
           useRecommendedValue,
+          airClient: this.toolCallCapabilities.air.client,
         },
         {
           // Like Fast mode, the toggle hides on models without ultracode
@@ -10691,6 +10692,7 @@ export class ClaudeAcpAgent {
         fastMode,
         {
           useRecommendedValue,
+          airClient: this.toolCallCapabilities.air.client,
         },
         ultracode,
       );

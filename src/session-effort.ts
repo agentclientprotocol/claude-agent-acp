@@ -1,6 +1,10 @@
 import type { SessionConfigOption } from "@agentclientprotocol/sdk/unstable";
 import type { EffortLevel, ModelInfo, Settings } from "@anthropic-ai/claude-agent-sdk";
-import { AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY, withAirMeta } from "./air-extension.js";
+import {
+  AIR_REASONING_EFFORTS_KEY,
+  AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
+  withAirMeta,
+} from "./air-extension.js";
 import { EFFORT_CONFIG_ID } from "./session-config-ids.js";
 
 export { EFFORT_CONFIG_ID } from "./session-config-ids.js";
@@ -103,24 +107,51 @@ export function effortLevelName(level: string): string {
     .join(" ");
 }
 
+/**
+ * The effort levels of `model`, or `[]` when it has no effort support. They
+ * are in Claude Code's order, which lists the levels from lowest to highest
+ * ("low" to "max"), as ACP v2 asks of a `thought_level` select. Nothing here
+ * sorts them.
+ */
+export function supportedEffortLevels(model: ModelInfo | undefined): string[] {
+  return model?.supportsEffort ? [...(model.supportedEffortLevels ?? [])] : [];
+}
+
+/**
+ * The effort that the adapter recommends of `levels`: "medium" when the model
+ * offers it, else the first level. The SDK names no recommended effort.
+ */
+export function recommendedEffortLevel(levels: readonly string[]): string | undefined {
+  return levels.includes("medium") ? "medium" : levels[0];
+}
+
+/**
+ * The `_meta` of a `model` option entry for `model`: its effort levels and
+ * the recommended one, at `_meta.jetbrains.air.reasoningEfforts`. They match
+ * the effort option that {@link buildEffortConfigOption} builds for the
+ * model, without its `default` row. Undefined for a model without effort
+ * levels.
+ */
+export function modelReasoningEffortsMeta(
+  model: ModelInfo | undefined,
+): Record<string, unknown> | undefined {
+  const values = supportedEffortLevels(model);
+  const recommended = recommendedEffortLevel(values);
+  if (recommended === undefined) return undefined;
+  return withAirMeta(undefined, AIR_REASONING_EFFORTS_KEY, { values, recommended });
+}
+
 export function buildEffortConfigOption(
   modelInfos: ModelInfo[],
   currentModelId: string,
   currentEffortLevel: string | undefined,
   useRecommendedValue: boolean,
 ): SessionConfigOption | undefined {
-  const currentModelInfo = modelInfos.find((model) => model.value === currentModelId);
-  // In Claude Code's order, which lists the levels from lowest to highest
-  // ("low" to "max"), as ACP v2 asks of a `thought_level` select. Nothing
-  // here sorts them.
-  const supportedLevels = currentModelInfo?.supportsEffort
-    ? (currentModelInfo.supportedEffortLevels ?? [])
-    : [];
-  if (supportedLevels.length === 0) return undefined;
-
-  const recommendedEffort = (supportedLevels as string[]).includes("medium")
-    ? "medium"
-    : supportedLevels[0];
+  const supportedLevels = supportedEffortLevels(
+    modelInfos.find((model) => model.value === currentModelId),
+  );
+  const recommendedEffort = recommendedEffortLevel(supportedLevels);
+  if (recommendedEffort === undefined) return undefined;
   const options = [
     ...(useRecommendedValue ? [] : [{ value: "default", name: "Default" }]),
     ...supportedLevels.map((level) => ({
@@ -129,7 +160,7 @@ export function buildEffortConfigOption(
     })),
   ];
   const includes = (level: string) =>
-    (!useRecommendedValue && level === "default") || (supportedLevels as string[]).includes(level);
+    (!useRecommendedValue && level === "default") || supportedLevels.includes(level);
   const currentValue =
     currentEffortLevel && includes(currentEffortLevel)
       ? currentEffortLevel
