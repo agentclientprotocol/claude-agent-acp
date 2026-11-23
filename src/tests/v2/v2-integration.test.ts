@@ -439,19 +439,36 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("v2 core with Claude Code", 
       sessionId,
       `Use the Bash tool in the foreground (not run_in_background) to run exactly: printf "cancel-ready\\n"; sleep 30. Then reply with just: woke`,
     );
-    // Wait for actual stdout so the foreground command is running when we queue the prompt.
+    // Wait for the command's stdout, so it is running when the prompt is queued.
+    // Output that is not UTF-8 arrives as a `terminal_update` snapshot, not a chunk.
     await until(() =>
+      updates.some(({ sessionId: id, update }) => {
+        if (id !== sessionId) return false;
+        const data =
+          update.sessionUpdate === "terminal_output_chunk"
+            ? (update as v2.TerminalOutputChunk).data
+            : update.sessionUpdate === "terminal_update"
+              ? (update as v2.TerminalUpdate).output?.data
+              : undefined;
+        return (
+          data !== undefined && Buffer.from(data, "base64").toString().includes("cancel-ready")
+        );
+      }),
+    );
+    // Claude Code takes in a prompt sent while it works only at its next step,
+    // here the end of the Bash call, so this one is still queued at the cancel.
+    // It answers when Claude Code starts it, so the cancel fails it with -32800.
+    const queued = prompt(sessionId, "Reply with just: queued");
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    // The tool result also sends the output as a snapshot, just before the exit.
+    expect(
       updates.some(
         ({ sessionId: id, update }) =>
           id === sessionId &&
-          update.sessionUpdate === "terminal_output_chunk" &&
-          Buffer.from((update as v2.TerminalOutputChunk).data, "base64")
-            .toString()
-            .includes("cancel-ready"),
+          update.sessionUpdate === "terminal_update" &&
+          (update as v2.TerminalUpdate).exitStatus,
       ),
-    );
-    const queued = prompt(sessionId, "Reply with just: queued");
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    ).toBe(false);
     await agent.notify(v2.methods.agent.session.cancel, { sessionId });
     await expect(queued).rejects.toMatchObject({ code: -32800 });
     await until(() => states(sessionId).some((update) => update.state === "idle"));
