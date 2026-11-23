@@ -37,7 +37,14 @@ import {
   v2ConfigOptions,
 } from "../../v2/session-requests.js";
 import { encodeProjectPath } from "../../session-index/project-dirs.js";
-import { claudeCodeMcpRequest, setModelRefusal, startupFailure } from "../helpers.js";
+import {
+  claudeCodeMcpRequest,
+  setModelRefusal,
+  startupFailure,
+  transcriptAssistant,
+  transcriptUser,
+  writeTranscript,
+} from "../helpers.js";
 import packageJson from "../../../package.json" with { type: "json" };
 
 const execFileSpy = vi.hoisted(() => vi.fn());
@@ -1105,6 +1112,78 @@ describe("ACP v2 sessions", () => {
         response.configOptions?.find((option) => option.configId === "mode")?.currentValue,
       ).toBe("plan");
       await authUpdate(1);
+    });
+  });
+
+  /** Stores a transcript whose last response used 91,802 tokens, and holds
+   *  Claude Code's answer of the context window until `answerWindow`. */
+  async function usageTranscript(sessionId: string) {
+    clearContextWindowCache();
+    let answerWindow!: (usage: { totalTokens: number; rawMaxTokens: number }) => void;
+    sdk.contextUsage = () => new Promise((resolve) => (answerWindow = resolve));
+    const response = transcriptAssistant("a1", "Hello");
+    await writeTranscript(path.join(tempDir, "claude", "projects", "-project"), sessionId, [
+      transcriptUser("u1", "hi"),
+      {
+        ...response,
+        message: {
+          ...response.message,
+          usage: {
+            input_tokens: 2,
+            output_tokens: 300,
+            cache_read_input_tokens: 90_000,
+            cache_creation_input_tokens: 1_500,
+          },
+        },
+      },
+    ]);
+    return (rawMaxTokens: number) => answerWindow({ totalTokens: 0, rawMaxTokens });
+  }
+
+  it("sends the context usage that the transcript records after session/resume, with the window that Claude Code reads", async () => {
+    const sessionId = randomUUID();
+    const answerWindow = await usageTranscript(sessionId);
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+      // It waits for the window.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(client.updates("usage_update")).toEqual([]);
+
+      answerWindow(200_000);
+
+      await vi.waitFor(() =>
+        expect(client.updates("usage_update")).toEqual([
+          { sessionUpdate: "usage_update", used: 91_802, size: 200_000 },
+        ]),
+      );
+      await client.authUpdate(1);
+    });
+  });
+
+  it("does not send the transcript's context usage after a turn reported its own", async () => {
+    const sessionId = randomUUID();
+    const answerWindow = await usageTranscript(sessionId);
+    scriptTurns(async function* (options) {
+      yield assistantText(options, "Done.");
+      yield result(options);
+      yield idleState(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      const turnUsage = client.updates("usage_update");
+      expect(turnUsage).not.toEqual([]);
+
+      answerWindow(200_000);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(client.updates("usage_update")).toEqual(turnUsage);
+      await client.authUpdate(1);
     });
   });
 
