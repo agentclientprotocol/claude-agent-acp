@@ -95,7 +95,9 @@ const sdk = vi.hoisted(() => ({
   /** The flag settings that the agent applied (`applyFlagSettings`), in order. */
   flagSettings: [] as Array<Record<string, unknown>>,
   /** What `getContextUsage({ detail: "summary" })` answers. */
-  contextUsage: async (): Promise<{ totalTokens: number; rawMaxTokens: number }> => ({
+  contextUsage: async (_options?: {
+    detail?: "summary" | "full";
+  }): Promise<{ totalTokens: number; rawMaxTokens: number }> => ({
     totalTokens: 0,
     rawMaxTokens: 200000,
   }),
@@ -146,7 +148,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         applyFlagSettings: async (settings: Record<string, unknown>) => {
           sdk.flagSettings.push(settings);
         },
-        getContextUsage: () => sdk.contextUsage(),
+        getContextUsage: (options?: { detail?: "summary" | "full" }) => sdk.contextUsage(options),
         mcpAuthenticate: (serverName: string) => sdk.mcpAuthenticate(serverName),
         interrupt: () => sdk.interrupt(),
         stopTask: (taskId: string) => sdk.stopTask(taskId),
@@ -757,6 +759,49 @@ describe("ACP v2 sessions", () => {
       await agent.request(v2.methods.agent.session.delete, { sessionId });
       await authUpdate(1);
     });
+  });
+
+  it.each([1, 2])("serves the full context usage report on demand over v%i", async (version) => {
+    const report = {
+      totalTokens: 100,
+      rawMaxTokens: 200000,
+      categories: [{ name: "Skills", tokens: 25, kind: "used" }],
+    };
+    const usage = vi.fn(async (options?: { detail?: string }) =>
+      options?.detail === "full" ? report : sdkDefaults.contextUsage(),
+    );
+    sdk.contextUsage = usage;
+    const method = "_claude/context_usage";
+    const check = async (
+      capabilities: unknown,
+      sessionId: string,
+      request: (id: string) => Promise<unknown>,
+    ) => {
+      expect(capabilities).toMatchObject({ _meta: { [method]: {} } });
+      expect(usage).not.toHaveBeenCalledWith({ detail: "full" });
+      await expect(request(sessionId)).resolves.toEqual(report);
+      await expect(request(randomUUID())).rejects.toMatchObject({ code: -32002 });
+    };
+    if (version === 1) {
+      await v1
+        .client({ name: "test" })
+        .connectWith(connectRouter() as unknown as v1.Stream, async (agent) => {
+          const init = await agent.request(v1.methods.agent.initialize, { protocolVersion: 1 });
+          const { sessionId } = await agent.request(v1.methods.agent.session.new, {
+            cwd,
+            mcpServers: [],
+          });
+          await check(init.agentCapabilities, sessionId, (id) =>
+            agent.request(method, { sessionId: id }),
+          );
+        });
+    } else {
+      await v2Client().app.connectWith(connectRouter(), async (agent) => {
+        const init = await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await check(init.capabilities, sessionId, (id) => agent.request(method, { sessionId: id }));
+      });
+    }
   });
 
   describe("session/status", () => {

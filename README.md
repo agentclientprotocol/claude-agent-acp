@@ -58,6 +58,17 @@ npm run build:binary
 npm run smoke:binary            # add `-- --full` to drive a real session; needs a Claude login
 ```
 
+### Context usage
+
+Clients can request a structured context report for an open root session on ACP v1 and v2.
+Check for the `_claude/context_usage` key in `agentCapabilities._meta` on v1 or
+`capabilities._meta` on v2, then send
+`_claude/context_usage` with `{ "sessionId": "..." }`. The result is the Claude
+Agent SDK's full `getContextUsage` report, including the window size, category
+token counts, MCP tools, memory files and skill details when available.
+Request it when someone opens the breakdown: full detail can issue token-counting
+API calls. Use `usage_update` for the running meter.
+
 ### ACP v2 (Preview)
 
 The adapter also serves [ACP v2](https://agentclientprotocol.com/protocol/v2/overview), which is in

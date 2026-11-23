@@ -151,10 +151,11 @@ import {
   withAirMeta,
 } from "../air-extension.js";
 import * as sessionIndex from "./session-index.js";
-import type {
-  BatchGetSessionsRequest,
-  RenameSessionRequest,
-  SessionIdRequest,
+import {
+  parseSessionIdRequest,
+  type BatchGetSessionsRequest,
+  type RenameSessionRequest,
+  type SessionIdRequest,
 } from "../session-index/service.js";
 import type {
   ListSubscribeRequest,
@@ -431,6 +432,8 @@ import {
   type FastModeReport,
 } from "../session-fast-mode.js";
 import {
+  CONTEXT_USAGE_METHOD,
+  readContextUsage,
   cacheResultContextWindow,
   clearContextWindowCache,
   immediateContextWindow,
@@ -1864,6 +1867,7 @@ export class ClaudeAcpAgent {
       protocolVersion: 1,
       agentCapabilities: {
         _meta: {
+          [CONTEXT_USAGE_METHOD]: {},
           claudeCode: {
             promptQueueing: true,
           },
@@ -7935,6 +7939,12 @@ export class ClaudeAcpAgent {
     return savedSessionStatus(sessionId);
   }
 
+  async contextUsage({ sessionId }: SessionIdRequest) {
+    if (!Object.hasOwn(this.sessions, sessionId)) throw RequestError.sessionNotFound(sessionId);
+    const session = this.sessions[sessionId];
+    return readContextUsage(session.queryClosed ? undefined : session.query);
+  }
+
   /** See {@link sessionIndex.SessionIndexConnection.setTitle}. */
   setSessionTitle(params: SetSessionTitleRequest): Promise<SetSessionTitleResponse> {
     return this.sessionIndex.setTitle(params);
@@ -11410,6 +11420,13 @@ export function v1AgentApp(
     })
     .onNotification(methods.agent.mcp.message, mcp.handleNotification)
     .onRequest(methods.agent.initialize, (ctx) => agent.initialize(ctx.params))
+    .onRequest(
+      CONTEXT_USAGE_METHOD,
+      { parse: parseSessionIdRequest },
+      ofRootSession("read context usage of", (ctx: { params: SessionIdRequest }) =>
+        agent.contextUsage(ctx.params),
+      ),
+    )
     .onRequest(methods.agent.session.new, (ctx) => agent.newSession(ctx.params))
     .onRequest(
       methods.agent.session.load,

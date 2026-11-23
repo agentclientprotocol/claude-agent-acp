@@ -31,6 +31,7 @@ import {
   type SessionMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import packageJson from "../../package.json" with { type: "json" };
+import { CONTEXT_USAGE_METHOD } from "../context-window.js";
 import { messageIdForGrouping } from "../sdk-to-acp.js";
 import type { Logger } from "../logger.js";
 import { customAgents } from "../session-config-options.js";
@@ -60,6 +61,7 @@ import { sanitizeTitle } from "../session-titles.js";
 import { renameSession } from "../session-index/rename.js";
 import {
   parseRenameSessionRequest,
+  parseSessionIdRequest,
   transcriptWriter,
   type SessionIndexService,
 } from "../session-index/service.js";
@@ -130,6 +132,9 @@ export function v2AgentApp(
       .onRequest(v2.methods.agent.providers.set, ({ params }) => agent.auth.setProvider(params))
       .onRequest(v2.methods.agent.providers.disable, ({ params }) =>
         agent.auth.disableProvider(params),
+      )
+      .onRequest(CONTEXT_USAGE_METHOD, { parse: parseSessionIdRequest }, ({ params }) =>
+        agent.session(params.sessionId, "read context usage of").contextUsage(),
       )
       .onRequest(v2.methods.agent.session.new, ({ params }) => agent.newSession(params))
       .onRequest(v2.methods.agent.session.resume, ({ params }) => agent.resumeSession(params))
@@ -379,7 +384,7 @@ class V2Agent implements AgentHandle, SessionConnection {
         providers: {},
         auth,
         // A prompt that comes while Claude works waits in Claude Code's queue.
-        _meta: { claudeCode: { promptQueueing: true }, ..._meta },
+        _meta: { [CONTEXT_USAGE_METHOD]: {}, claudeCode: { promptQueueing: true }, ..._meta },
       },
       authMethods,
     };

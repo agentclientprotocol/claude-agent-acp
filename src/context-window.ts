@@ -4,6 +4,7 @@
  * session starts or switches models, refined by a background
  * `getContextUsage`, and learned from each result's `modelUsage`.
  */
+import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import type { ModelInfo, Query } from "@anthropic-ai/claude-agent-sdk";
 import { DEFAULT_CONTEXT_WINDOW } from "./session-usage.js";
 
@@ -156,4 +157,16 @@ export async function readContextWindow(
 ): Promise<number | undefined> {
   const usage = await query.getContextUsage({ detail: "summary" });
   return usage.rawMaxTokens > 0 ? usage.rawMaxTokens : undefined;
+}
+
+export const CONTEXT_USAGE_METHOD = "_claude/context_usage";
+
+export async function readContextUsage(query: Pick<Query, "getContextUsage"> | undefined) {
+  if (!query) {
+    throw RequestError.internalError(
+      undefined,
+      "The Claude session has ended. Resume it to read context usage.",
+    );
+  }
+  return query.getContextUsage({ detail: "full" });
 }

@@ -305,7 +305,10 @@ export function compareWithBaseline(baseline: Recorded[], traffic: Recorded[]): 
     traffic.map((record) =>
       withoutAgentCapability(
         withoutAgentCapability(
-          withoutSessionCapabilities(record, ["systemPrompt", "status", "title", "options"]),
+          withoutSessionCapabilities(
+            withoutAgentCapability(record, "_meta", "_claude/context_usage"),
+            ["systemPrompt", "status", "title", "options"],
+          ),
           "auth",
           "status",
         ),
