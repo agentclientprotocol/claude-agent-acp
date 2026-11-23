@@ -52,6 +52,7 @@ import type {
   SDKResultMessage,
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import { readContextUsage } from "../context-window.js";
 import { AUTONOMOUS_RESULT_ORIGINS } from "../result-end.js";
 import { promptToClaude } from "../prompt-to-claude.js";
 import type { Logger } from "../logger.js";
@@ -423,6 +424,10 @@ export class V2Session implements RequestTarget {
       this.mcpServers = key;
     }
     this.reports.mcpServersChanged(Object.keys(servers), unserved);
+  }
+
+  contextUsage() {
+    return readContextUsage(this.closed ? undefined : this.query);
   }
 
   // --- Requests ---------------------------------------------------------
