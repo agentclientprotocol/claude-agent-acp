@@ -2,7 +2,8 @@
  * One ACP v2 session, served straight from its Claude Code query.
  *
  * Prompts go to Claude Code, and its updates report the session's work.
- * A busy prompt uses priority `now`, unless an input request is open.
+ * A busy prompt steers with priority `now`, unless a root or child input
+ * request is open.
  * The session keeps the foreground work open while Claude Code answers it.
  *
  * - A prompt is pushed to Claude Code at once, with a uuid. Its response is
@@ -32,6 +33,7 @@
  * {@link SessionOutput}).
  */
 import { randomUUID } from "node:crypto";
+import { steeringPriority } from "../steering-priority.js";
 import {
   RequestError,
   type CompleteElicitationNotification,
@@ -570,7 +572,9 @@ export class V2Session implements RequestTarget {
           }
           if (this.foreground || [...this.pending.values()].some((prompt) => prompt.pushed)) {
             // Interrupting an open input callback would withdraw the client's request.
-            message.priority = this.requests.size > 0 ? "later" : "now";
+            message.priority = steeringPriority(
+              this.requests.size > 0 || this.tasks.hasOpenRequests(),
+            );
             if (message.priority === "now") this.steeredPrompts.add(uuid);
           }
           pending.pushed = true;
@@ -1206,18 +1210,13 @@ export class V2Session implements RequestTarget {
         this.promptStarted(uuid);
         return;
       case "cancelled":
-        this.steeredPrompts.delete(uuid);
-        if (this.failPrompt(uuid, RequestError.requestCancelled())) {
-          if (!this.cycleOpen) return this.endTurn();
-          return;
-        }
+        if (this.failPrompt(uuid, RequestError.requestCancelled())) return;
         this.stopped.promptEnded(uuid, true);
         // The prompt had started: the interrupt stopped its turn.
         if (uuid === this.turnCommand) this.closeTurn();
         return;
       case "discarded":
       case "refused":
-        this.steeredPrompts.delete(uuid);
         this.failPrompt(
           uuid,
           RequestError.internalError(
@@ -1225,7 +1224,6 @@ export class V2Session implements RequestTarget {
             `Claude Code ${frame.state} the prompt before it ran`,
           ),
         );
-        if (!this.cycleOpen) return this.endTurn();
         return;
       case "completed":
         // Claude Code sends it after the result for the prompt that started
@@ -1647,16 +1645,20 @@ export class V2Session implements RequestTarget {
   /** Fails the prompt `uuid` if it is not answered yet. Returns whether it was pending. */
   private failPrompt(uuid: string, error: unknown): boolean {
     const prompt = this.takePrompt(uuid);
-    if (!prompt) return false;
-    this.steeredPrompts.delete(uuid);
-    this.localCommands.delete(uuid);
-    this.fileChanges?.promptFailed(uuid, error);
-    prompt.reject(error);
+    const steered = this.steeredPrompts.delete(uuid);
+    if (prompt) {
+      this.localCommands.delete(uuid);
+      this.fileChanges?.promptFailed(uuid, error);
+      prompt.reject(error);
+    }
+    if (steered && !this.cycleOpen) void this.endTurn();
     this.checkBoundary();
-    return true;
+    return prompt !== undefined;
   }
 
   private failPending(error: unknown): void {
+    // The query's close or failure owns the turn's outcome.
+    this.steeredPrompts.clear();
     for (const uuid of [...this.pending.keys()]) this.failPrompt(uuid, error);
   }
 }

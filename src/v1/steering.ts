@@ -7,14 +7,6 @@ import { PromptRequest, RequestError } from "@agentclientprotocol/sdk/unstable";
  *  `InitializeResponse._meta.steering.supported`. */
 export const STEER_METHOD = "_session/steering";
 
-/** How urgently the SDK delivers a steered message relative to the running
- *  turn — an internal Claude implementation detail, not part of the wire
- *  contract. `now` pre-empts the current generation, while `later` waits for a
- *  pending permission/elicitation callback to settle instead of cancelling its
- *  ACP request and hiding the client's user-input card (IJAI-1191). */
-export const STEER_PRIORITY_NOW = "now" as const;
-export const STEER_PRIORITY_LATER = "later" as const;
-
 /** Request-level steering options. `promptRequired` is opt-in so existing Hosts
  *  keep the established idle fallback behavior. */
 type SteerMeta = {
@@ -27,7 +19,7 @@ type SteerMeta = {
 /** Params of a {@link STEER_METHOD} request. Shaped like the relevant subset of
  *  a `PromptRequest` so the same `promptToClaude` conversion applies. Delivery
  *  priority is deliberately NOT exposed here — it's an internal detail the agent
- *  chooses (see {@link STEER_PRIORITY}). */
+ *  chooses. */
 export type SteerRequest = {
   sessionId: string;
   prompt: PromptRequest["prompt"];

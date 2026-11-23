@@ -6093,56 +6093,60 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
     },
   );
 
-  it("keeps an open permission request while a busy prompt waits", async () => {
-    const permission = Promise.withResolvers<v2.RequestPermissionResponse>();
-    const priorities: unknown[] = [];
-    sdk.run = async function* (prompts, options) {
-      const input = prompts[Symbol.asyncIterator]();
-      const echo = (value: SDKUserMessage) => ({
-        type: "user",
-        message: value.message,
-        uuid: value.uuid,
-        parent_tool_use_id: null,
-        session_id: options.sessionId,
-        isReplay: true,
+  it.each([undefined, "agent-1"])(
+    "keeps an open permission request while a busy prompt waits (%s)",
+    async (agentID) => {
+      const permission = Promise.withResolvers<v2.RequestPermissionResponse>();
+      const priorities: unknown[] = [];
+      sdk.run = async function* (prompts, options) {
+        const input = prompts[Symbol.asyncIterator]();
+        const echo = (value: SDKUserMessage) => ({
+          type: "user",
+          message: value.message,
+          uuid: value.uuid,
+          parent_tool_use_id: null,
+          session_id: options.sessionId,
+          isReplay: true,
+        });
+        yield echo((await input.next()).value);
+        const decision = options.canUseTool!("Bash", { command: "ls" }, {
+          signal: new AbortController().signal,
+          suggestions: [],
+          ...(agentID ? { agentID } : {}),
+          toolUseID: "toolu_ls",
+          requestId: randomUUID(),
+        } as Parameters<NonNullable<Options["canUseTool"]>>[2]);
+        const second = (await input.next()).value;
+        priorities.push(second.priority);
+        await decision;
+        yield result(options);
+        yield echo(second);
+        yield result(options);
+        while (!(await input.next()).done);
+      };
+      const client = v2Client({ answerPermission: () => permission.promise });
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("go") });
+        await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(1));
+        const queued = agent.request(v2.methods.agent.session.prompt, {
+          sessionId,
+          prompt: text("next"),
+        });
+        await vi.waitFor(() => expect(priorities).toEqual(["later"]));
+        expect(client.cancelledRequests).toEqual([]);
+        permission.resolve({ outcome: { outcome: "selected", optionId: "allow-once" } });
+        await queued;
+        await vi.waitFor(() =>
+          expect(
+            turnTrace(client.sessionUpdates).filter((value) => value === "idle end_turn"),
+          ).toHaveLength(2),
+        );
+        await client.authUpdate(1);
       });
-      yield echo((await input.next()).value);
-      const decision = options.canUseTool!("Bash", { command: "ls" }, {
-        signal: new AbortController().signal,
-        suggestions: [],
-        toolUseID: "toolu_ls",
-        requestId: randomUUID(),
-      } as Parameters<NonNullable<Options["canUseTool"]>>[2]);
-      const second = (await input.next()).value;
-      priorities.push(second.priority);
-      await decision;
-      yield result(options);
-      yield echo(second);
-      yield result(options);
-      while (!(await input.next()).done);
-    };
-    const client = v2Client({ answerPermission: () => permission.promise });
-    await client.app.connectWith(connectRouter(), async (agent) => {
-      await initializeV2(agent);
-      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
-      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("go") });
-      await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(1));
-      const queued = agent.request(v2.methods.agent.session.prompt, {
-        sessionId,
-        prompt: text("next"),
-      });
-      await vi.waitFor(() => expect(priorities).toEqual(["later"]));
-      expect(client.cancelledRequests).toEqual([]);
-      permission.resolve({ outcome: { outcome: "selected", optionId: "allow-once" } });
-      await queued;
-      await vi.waitFor(() =>
-        expect(
-          turnTrace(client.sessionUpdates).filter((value) => value === "idle end_turn"),
-        ).toHaveLength(2),
-      );
-      await client.authUpdate(1);
-    });
-  });
+    },
+  );
 
   it("ends a cancelled turn at its result and reports the follow-up after it as a cycle", async () => {
     const interrupted = Promise.withResolvers<void>();

@@ -175,8 +175,6 @@ import {
 } from "./async-task-stop.js";
 import {
   STEER_METHOD,
-  STEER_PRIORITY_LATER,
-  STEER_PRIORITY_NOW,
   parseSteerRequest,
   type SteerRequest,
   type SteerResponse,
@@ -196,6 +194,7 @@ import { McpOverAcp, sdkMcpServers, type UnservedMcpServer } from "../mcp-server
 import { claudeCliPath, cliDelivery } from "../claude-cli.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { randomUUID } from "node:crypto";
+import { steeringPriority } from "../steering-priority.js";
 import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -3064,8 +3063,7 @@ export class ClaudeAcpAgent {
     userMessage.uuid = steeredUuid;
     // Deliver into the running turn rather than queuing behind it as a fresh
     // prompt would.
-    userMessage.priority =
-      (session.openUserInputs?.size ?? 0) > 0 ? STEER_PRIORITY_LATER : STEER_PRIORITY_NOW;
+    userMessage.priority = steeringPriority((session.openUserInputs?.size ?? 0) > 0);
     // Mark before the push and in the same synchronous section as the in-flight
     // check: the interrupt can have the CLI finalizing the aborted cycle by the
     // time the consumer next runs, and an unmarked result would settle the turn

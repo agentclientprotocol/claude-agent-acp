@@ -598,13 +598,18 @@ export class SessionTasks {
     });
   }
 
+  /** Whether a child awaits permission or an elicitation response. */
+  hasOpenRequests(): boolean {
+    return this.agentRequests.size > 0;
+  }
+
   /** Whether a child, terminal, tool task, or child request remains. */
   hasLiveWork(): boolean {
     return (
       this.agents.size > 0 ||
       this.terminals.size > 0 ||
       this.toolCalls.size > 0 ||
-      this.agentRequests.size > 0
+      this.hasOpenRequests()
     );
   }
 

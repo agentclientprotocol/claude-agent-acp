@@ -1488,6 +1488,57 @@ describe("ACP v2 core", () => {
     },
   );
 
+  it.each(["frame-first", "response-first"])(
+    "ends held work when the last steering prompt is withdrawn (%s)",
+    async (order) => {
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const sessionId = response.sessionId;
+        const first = agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: PROMPT });
+        const running = await claude.prompt(0);
+        claude.send(lifecycle(running, "started"));
+        await first;
+        for (const event of textDelta("msg_first", "First reply")) claude.send(event);
+        const controller = new AbortController();
+        const queued = agent
+          .request(
+            v2.methods.agent.session.prompt,
+            { sessionId, prompt: PROMPT },
+            { cancellationSignal: controller.signal },
+          )
+          .catch((error: unknown) => error);
+        const waiting = await claude.prompt(1);
+        expect(waiting.priority).toBe("now");
+        claude.send(result({ user_message_uuids: [running.uuid] }));
+        await vi.waitFor(() =>
+          expect(client.sessionUpdates).toContainEqual(
+            expect.objectContaining({ sessionUpdate: "usage_update", cost: expect.any(Object) }),
+          ),
+        );
+        expect(client.states()).not.toContain("idle");
+        const cancelled = Promise.withResolvers<boolean>();
+        claude.cancelAsyncMessage.mockReturnValue(cancelled.promise);
+        controller.abort();
+        await vi.waitFor(() =>
+          expect(claude.cancelAsyncMessage).toHaveBeenCalledWith(waiting.uuid),
+        );
+        if (order === "frame-first") claude.send(lifecycle(waiting, "cancelled"));
+        else cancelled.resolve(true);
+        expect(await queued).toMatchObject({ code: -32800 });
+        await vi.waitFor(() => expect(client.states().at(-1)).toBe("idle"));
+        if (order === "frame-first") cancelled.resolve(true);
+        else claude.send(lifecycle(waiting, "cancelled"));
+        const next = agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: PROMPT });
+        claude.send(lifecycle(await claude.prompt(2), "started"));
+        await next;
+        claude.send(result());
+        await vi.waitFor(() => expect(client.states().slice(-2)).toEqual(["running", "idle"]));
+        expect(claude.interrupt).not.toHaveBeenCalled();
+      });
+    },
+  );
+
   it("cancels the work and the prompts not inserted yet with one interrupt", async () => {
     const client = v2Client();
     await client.connect(async (agent) => {
