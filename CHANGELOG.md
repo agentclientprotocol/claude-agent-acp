@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.110.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.110.0...v0.110.1) (2026-11-23)
+
+
+### Bug Fixes
+
+* Closing the gaps for the ACP v2 support ([#1542](https://github.com/agentclientprotocol/claude-agent-acp/issues/1542)) ([105e1c3](https://github.com/agentclientprotocol/claude-agent-acp/commit/105e1c38daf76bc832e872e95904be6dabd32372))
+* preserve existing line endings in ACP v2 terminal output ([#1697](https://github.com/agentclientprotocol/claude-agent-acp/issues/1697)) ([9ca8984](https://github.com/agentclientprotocol/claude-agent-acp/commit/9ca8984d55132991b2eec0f87c45acbb820b38a3))
+
 ## [0.110.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.109.1...v0.110.0) (2026-11-23)
 
 
