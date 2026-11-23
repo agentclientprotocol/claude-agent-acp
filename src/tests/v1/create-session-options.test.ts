@@ -353,7 +353,16 @@ describe("createSession options merging", () => {
     };
     const observedAgent = new ClaudeAcpAgent(client);
     await observedAgent.initialize({ protocolVersion: 1, clientCapabilities: { subagents: {} } });
+    const setupPublished = Promise.withResolvers<void>();
+    const publish = observedAgent.publishCurrentSubagentStates.bind(observedAgent);
+    vi.spyOn(observedAgent, "publishCurrentSubagentStates").mockImplementation((sessionId) => {
+      const published = publish(sessionId);
+      setupPublished.resolve(published);
+      return published;
+    });
     const { sessionId } = await observedAgent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    // Let session setup publish its snapshot before the test starts any children.
+    await setupPublished.promise;
     const session = observedAgent.sessions[sessionId]!;
     const runtime = (session.nativeSubagentRuntime = new NativeSubagentRuntime(
       "rfd",
