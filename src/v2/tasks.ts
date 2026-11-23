@@ -1826,7 +1826,7 @@ export class SessionTasks {
     if (text === undefined) return;
     const launchId = results[0]!.tool_use_id;
     const child = this.childByToolUse.get(launchId);
-    if (!child) return;
+    if (!child || child.handedBack.has(launchId)) return;
     if (!child.announced) this.announce(child, output.sessionId);
     this.publishHandback(child, launchId, text, `${launchId}:handback`);
   }
@@ -1837,7 +1837,6 @@ export class SessionTasks {
     text: string,
     messageId: string,
   ): void {
-    if (child.handedBack.has(delegationId)) return;
     child.handedBack.add(delegationId);
     const [outgoing, incoming] = linkedSessionMessages(
       messageId,

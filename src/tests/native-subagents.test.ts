@@ -111,6 +111,70 @@ describe("NativeSubagentRuntime lifecycle", () => {
     },
   );
 
+  it.each(["air", "rfd"] as const)(
+    "publishes each hand-back and omits the duplicate launch report (%s)",
+    async (form) => {
+      const published: AcpSessionNotification[] = [];
+      const runtime = new NativeSubagentRuntime(
+        form,
+        "root",
+        sessionWith(child({ announced: true })),
+        async (update) => {
+          published.push(update);
+        },
+        { log: () => {} },
+      );
+      const reports = ["First report", "Second report"];
+      for (const [index, text] of reports.entries()) {
+        for (const status of ["pending", "completed"] as const) {
+          await runtime.route(
+            {
+              sessionId: "root",
+              update: {
+                sessionUpdate: status === "pending" ? "tool_call" : "tool_call_update",
+                toolCallId: `handback-${index}`,
+                status,
+                ...(status === "pending"
+                  ? { title: "SubagentHandback", rawInput: { message: text } }
+                  : {}),
+                _meta: {
+                  claudeCode: {
+                    parentToolUseId: "agent-tool",
+                    ...(status === "pending" ? { toolName: "SubagentHandback" } : {}),
+                  },
+                },
+              },
+            } as AcpSessionNotification,
+            async () => {},
+          );
+        }
+      }
+      await runtime.toolResult({
+        type: "user",
+        uuid: "00000000-0000-0000-0000-000000000001",
+        session_id: "root",
+        parent_tool_use_id: null,
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "agent-tool", content: "Delivered" }],
+        },
+        tool_use_result: { status: "completed", handbackReport: { text: "Second report" } },
+      } as Parameters<NativeSubagentRuntime["toolResult"]>[0]);
+
+      expect(
+        published.filter(({ sessionId }) => sessionId === "child-1").map(({ update }) => update),
+      ).toEqual(
+        reports.map((text, index) =>
+          expect.objectContaining({
+            sessionUpdate: form === "air" ? "agent_message_chunk" : "session_message",
+            messageId: `handback-${index}`,
+            content: form === "air" ? { type: "text", text } : [{ type: "text", text }],
+          }),
+        ),
+      );
+    },
+  );
+
   it("publishes a raced spawn exactly once", async () => {
     const release = deferred();
     const published: AcpSessionNotification[] = [];

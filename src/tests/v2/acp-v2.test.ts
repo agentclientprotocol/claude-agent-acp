@@ -7415,7 +7415,7 @@ describe("ACP v2 requests that subagents make", () => {
       ]);
     });
 
-    it("sends a SendMessage call's message and a SubagentHandback call's report as session messages, instead of the calls", async () => {
+    it("sends a SendMessage call's message and each SubagentHandback call's report as session messages, instead of the calls", async () => {
       scriptTurns(async function* (options) {
         yield toolUseMessage(options, "toolu_agent-1", "Agent", {
           description: "Explore the project",
@@ -7434,11 +7434,26 @@ describe("ACP v2 requests that subagents make", () => {
           toolResultMessage(options, "toolu_handback", { content: "Delivered" }),
           "toolu_agent-1",
         );
+        yield toolUseMessage(
+          options,
+          "toolu_handback-2",
+          "SubagentHandback",
+          { message: "Checked again." },
+          "toolu_agent-1",
+        );
+        yield childMessage(
+          options,
+          toolResultMessage(options, "toolu_handback-2", { content: "Delivered" }),
+          "toolu_agent-1",
+        );
         yield taskNotification(options, "agent-1", {});
-        // The run handed back its report: its result is no reply.
-        yield toolResultMessage(options, "toolu_agent-1", {
-          content: [{ type: "text", text: "The report was delivered as a message." }],
-        });
+        // The run handed back its reports: its result repeats no report.
+        yield {
+          ...toolResultMessage(options, "toolu_agent-1", {
+            content: [{ type: "text", text: "The report was delivered as a message." }],
+          }),
+          tool_use_result: { status: "completed", handbackReport: { text: "Checked again." } },
+        };
         yield toolUseMessage(options, "toolu_send", "SendMessage", {
           to: "agent-1",
           message: "Look again",
@@ -7465,6 +7480,8 @@ describe("ACP v2 requests that subagents make", () => {
         "agent-1 toolu_agent-1 root -> agent-1 Look around",
         "agent-1 toolu_handback agent-1 -> root Found it.",
         "root toolu_handback agent-1 -> root Found it.",
+        "agent-1 toolu_handback-2 agent-1 -> root Checked again.",
+        "root toolu_handback-2 agent-1 -> root Checked again.",
         "root toolu_send root -> agent-1 Look again",
         "agent-1 toolu_send root -> agent-1 Look again",
       ]);

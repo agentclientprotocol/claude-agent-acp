@@ -831,6 +831,7 @@ export class NativeSubagentRuntime {
     const child = this.childByParentToolUse.get(launchId);
     if (!child) return;
     await this.announce(child);
+    if (child.handedBack?.has(launchId)) return;
     await this.publishHandback(child, launchId, text, `${launchId}:handback`);
   }
 
@@ -840,7 +841,6 @@ export class NativeSubagentRuntime {
     text: string,
     messageId: string,
   ): Promise<void> {
-    if (child.handedBack?.has(delegationId)) return;
     (child.handedBack ??= new Set()).add(delegationId);
     if (this.form === "air") {
       await this.publish({
