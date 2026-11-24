@@ -207,6 +207,8 @@ const CLAUDE_CODE_MCP_META = {
  * headers that mirror its version, method and tool name. A `tools/call` has
  * the id of its tool use (`toolUseId`) and a progress token in `_meta`.
  * `headers` replace the config's own, which carry the server's bearer token.
+ * `abandoned` closes the request's connection, as Claude Code does when it
+ * gives a request up. The promise then rejects.
  *
  * Resolves with the HTTP status and the JSON-RPC messages of the response:
  * the one message of a JSON body, or every message of an event stream. It
@@ -218,6 +220,7 @@ export function claudeCodeMcpRequest(
   params: Record<string, unknown> = {},
   headers: Record<string, string> | undefined = config.headers,
   toolUseId = "toolu_01",
+  abandoned?: AbortSignal,
 ): Promise<{ status: number; messages: Array<Record<string, any>> }> {
   const meta =
     method === "tools/call"
@@ -234,6 +237,7 @@ export function claudeCodeMcpRequest(
       config.url,
       {
         method: "POST",
+        signal: abandoned,
         headers: {
           ...headers,
           accept: "application/json, text/event-stream",
@@ -267,7 +271,7 @@ export function claudeCodeMcpRequest(
 
 /**
  * The message of the JSON-RPC error (`-33002`) that the HTTP bridge of
- * `@agentclientprotocol/sdk` 2.11.0 answers Claude Code with, when the client
+ * `@agentclientprotocol/sdk` 2.12.0 answers Claude Code with, when the client
  * rejected the `mcp/message` request with `-32602` and the message
  * `Invalid params: <reason>`. Claude Code 2.1.330 passes it on as it is: as
  * the `error` of a PostToolUseFailure hook, and as the tool's result, which
