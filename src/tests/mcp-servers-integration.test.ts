@@ -9,6 +9,7 @@ import * as v1 from "@agentclientprotocol/sdk/unstable";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import { McpOverAcp } from "../mcp-servers.js";
 import { acpProtocolRouter } from "../serve.js";
+import { mcpRefusalMessage } from "./helpers.js";
 
 /**
  * The session and tool call that the adapter names in `mcp/message` (see
@@ -386,10 +387,13 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("MCP over ACP with Claude Co
         { method: "tools/call", sessionId: root, toolCallId: "toolu_refused" },
         { method: "tools/call", sessionId: root, toolCallId: "toolu_served" },
       ]);
-      // The tool call fails with the client's reason, and the next one runs.
+      // The tool call fails with the client's reason, in the words of the SDK's
+      // bridge and not as "Invalid params", and the next one runs.
       const refused = updates.filter(({ update }) => update.toolCallId === "toolu_refused").at(-1);
-      expect(refused?.update.status).toBe("failed");
-      expect(JSON.stringify(refused)).toContain("the tools server does not serve this session");
+      expect(refused?.update).toMatchObject({
+        status: "failed",
+        rawOutput: mcpRefusalMessage("the tools server does not serve this session"),
+      });
       expect(statuses(updates, "toolu_served").at(-1)).toBe("completed");
     },
     60_000,

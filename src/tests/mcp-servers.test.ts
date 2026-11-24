@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as acp from "@agentclientprotocol/sdk/unstable";
 import { McpOverAcp, sdkMcpServers } from "../mcp-servers.js";
-import { claudeCodeMcpRequest, runMcpToolHooks } from "./helpers.js";
+import { claudeCodeMcpRequest, mcpRefusalMessage, runMcpToolHooks } from "./helpers.js";
 
 describe("sdkMcpServers", () => {
   it("maps each transport to its SDK config, and leaves out an unknown one", async () => {
@@ -594,14 +594,18 @@ describe("McpOverAcp", () => {
 
     // No hook reported the tool use: the request names no session.
     const rejected = await claudeCodeMcpRequest(config, "tools/call", { name: "echo" });
-    // Not -32602, which would blame the MCP params of Claude Code. Its tool call fails.
+    // Not -32602 or "Invalid params", which would blame the tool arguments of
+    // Claude Code. Its tool call fails with the client's reason.
     expect(rejected).toEqual({
       status: 200,
       messages: [
         {
           jsonrpc: "2.0",
           id: 1,
-          error: { code: -33002, message: "Invalid params: the tools server needs a sessionId" },
+          error: {
+            code: -33002,
+            message: mcpRefusalMessage("the tools server needs a sessionId"),
+          },
         },
       ],
     });

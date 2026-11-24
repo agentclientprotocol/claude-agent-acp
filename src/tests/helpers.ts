@@ -253,6 +253,18 @@ export function claudeCodeMcpRequest(
 }
 
 /**
+ * The message of the JSON-RPC error (`-33002`) that the HTTP bridge of
+ * `@agentclientprotocol/sdk` 2.11.0 answers Claude Code with, when the client
+ * rejected the `mcp/message` request with `-32602` and the message
+ * `Invalid params: <reason>`. Claude Code 2.1.330 passes it on as it is: as
+ * the `error` of a PostToolUseFailure hook, and as the tool's result, which
+ * the adapter reports as the output of the failed tool call.
+ */
+export const mcpRefusalMessage = (reason: string): string =>
+  `The MCP server refused this request before running it. Reason: ${reason}. ` +
+  "Changing the tool arguments will not help.";
+
+/**
  * Runs the hooks of `event` for the tool use `use` of a tool of an MCP server,
  * as Claude Code 2.1.330 runs them: the hooks of each matcher without a
  * pattern, or whose pattern matches the tool's whole name, with the input
@@ -292,7 +304,7 @@ export async function runMcpToolHooks(
     tool_use_id: use.id,
     // The message of the JSON-RPC error that the MCP server answered with.
     ...(event === "PostToolUseFailure"
-      ? { error: "Invalid params: the tools server needs a sessionId", is_interrupt: false }
+      ? { error: mcpRefusalMessage("the tools server needs a sessionId"), is_interrupt: false }
       : {}),
     ...(event !== "PreToolUse" ? { duration_ms: 3 } : {}),
     mcp_server: { name: server, source: "dynamic" },

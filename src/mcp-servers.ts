@@ -473,6 +473,10 @@ export class McpOverAcp {
    * resolves once it is, or names nothing after {@link announcementWaitMs}.
    * It neither throws nor rejects: the bridge would answer Claude Code with
    * HTTP 500 instead of sending the request.
+   *
+   * It does not read `request.connection`. Each agent app (`v1AgentApp`,
+   * `v2AgentApp`) makes its own `McpOverAcp` for its one connection, so every
+   * request and every recorded session is of that connection.
    */
   private attribution({
     serverId,
