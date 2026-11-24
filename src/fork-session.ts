@@ -216,7 +216,7 @@ async function forkTranscript(
     if (upToMessageId === undefined) {
       throw RequestError.invalidParams(
         { cursorId: params.cursorId },
-        `Session ${params.sessionId} has no cursor ${params.cursorId} that a fork can start at. Use a cursor that the session announced with the \`fork\` capability, or send the request without \`cursorId\` to fork the whole session.`,
+        `Session ${params.sessionId} has no cursor ${params.cursorId} that a fork can start at. Use a cursor that the session announced with the fork capability, or send the request without cursorId to fork the whole session.`,
       );
     }
     const forked = await forkClaudeSession(params.sessionId, { upToMessageId });

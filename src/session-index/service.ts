@@ -138,7 +138,7 @@ function archivedFilter(list: Record<string, unknown>): ArchivedFilter {
   if (!ARCHIVED_FILTERS.includes(value as ArchivedFilter)) {
     throw RequestError.invalidParams(
       { archived: value },
-      '`_meta.jetbrains.air.list.archived` must be "unarchived", "archived" or "all"',
+      '_meta.jetbrains.air.list.archived must be "unarchived", "archived" or "all"',
     );
   }
   return value as ArchivedFilter;
@@ -150,7 +150,7 @@ function optionalBoolean(list: Record<string, unknown>, key: string): boolean {
   if (typeof value !== "boolean") {
     throw RequestError.invalidParams(
       { [key]: value },
-      `\`_meta.jetbrains.air.list.${key}\` must be a boolean`,
+      `_meta.jetbrains.air.list.${key} must be a boolean`,
     );
   }
   return value;
@@ -165,7 +165,7 @@ export function parseListOptions(meta: unknown): ListOptions {
   if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1) {
     throw RequestError.invalidParams(
       { limit: raw },
-      "`_meta.jetbrains.air.list.limit` must be an integer of at least 1",
+      "_meta.jetbrains.air.list.limit must be an integer of at least 1",
     );
   }
   return {
