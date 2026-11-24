@@ -337,12 +337,15 @@ describe("McpOverAcp", () => {
           agentId: agent?.id,
           agentType: agent?.type,
         });
-      /** Claude Code sends `method` for the tool use `id`: what its `mcp/message` request named. */
-      const request = async (id: string, method = "tools/call") => {
-        await claudeCodeMcpRequest(config, method, { name: "echo" }, undefined, id);
+      /**
+       * Claude Code sends `method` for the tool use `id`: what its `mcp/message`
+       * request named. It rejects when `abandoned` closes the request first.
+       */
+      const request = async (id: string, method = "tools/call", abandoned?: AbortSignal) => {
+        await claudeCodeMcpRequest(config, method, { name: "echo" }, undefined, id, abandoned);
         return named.at(-1);
       };
-      return { mcp, tools, hook, request };
+      return { mcp, tools, hook, request, named };
     }
     type RootSession = Awaited<ReturnType<typeof rootSession>>;
 
@@ -547,6 +550,21 @@ describe("McpOverAcp", () => {
         expect(await requested).toEqual({});
         const held = mcp as unknown as Record<"toolUses" | "waiting", Map<string, unknown>>;
         expect([held.toolUses.size, held.waiting.size]).toEqual([0, 0]);
+      });
+
+      it("stops waiting, and sends nothing, when Claude Code gives the request up", async () => {
+        const { mcp, hook, request, named } = await rootSession(UNKNOWN_AGENT);
+        await hook("PreToolUse", "toolu_01", { id: "agent-1" });
+        const abandoned = new AbortController();
+
+        const requested = request("toolu_01", "tools/call", abandoned.signal);
+        await vi.waitFor(() => expect(waiting(mcp).size).toBe(1));
+        abandoned.abort();
+
+        await expect(requested).rejects.toThrow();
+        // Not after the minute that the request would wait for an announcement.
+        await vi.waitFor(() => expect(waiting(mcp).size).toBe(0));
+        expect(named).toEqual([]);
       });
     });
 
