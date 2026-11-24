@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.112.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.111.0...v0.112.0) (2026-11-24)
+
+
+### Features
+
+* rewind the same provider session on an edited message ([#1704](https://github.com/agentclientprotocol/claude-agent-acp/issues/1704)) ([f2897d6](https://github.com/agentclientprotocol/claude-agent-acp/commit/f2897d6687f594220c07836c3e3528de552e30ef))
+
+
+### Bug Fixes
+
+* stop holding an MCP request that Claude Code gave up ([#1711](https://github.com/agentclientprotocol/claude-agent-acp/issues/1711)) ([d5be0e5](https://github.com/agentclientprotocol/claude-agent-acp/commit/d5be0e5827fb111e5e95020d76920fe8a59e671b))
+
 ## [0.111.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.110.1...v0.111.0) (2026-11-24)
 
 
