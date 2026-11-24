@@ -6053,6 +6053,201 @@ describe("ACP v2 core", () => {
           return update.sessionUpdate === "session_info_update" && report ? [report] : [];
         });
 
+      it.each([
+        ["frame-first", "next result"],
+        ["response-first", "next result"],
+        ["frame-first", "next withdrawal"],
+        ["response-first", "next withdrawal"],
+        ["frame-first", "session close"],
+        ["frame-first", "next lifecycle ends"],
+      ])(
+        "keeps a pending file report ordered and the session responsive (%s, %s)",
+        async (order, followUp) => {
+          const client = v2Client();
+          await client.connect(async (agent) => {
+            const { response, claude } = await openSession(agent, air("agentFileChangeReport"));
+            const sessionId = response.sessionId;
+            const canFinishReport = Promise.withResolvers<void>();
+            const workspace = await realpath(cwd);
+            const firstPath = path.join(workspace, "first.ts");
+            const nextPath = path.join(workspace, "next.ts");
+            claude.rewindFiles
+              .mockImplementationOnce(async () => {
+                await canFinishReport.promise;
+                return { canRewind: true, filesChanged: [firstPath] };
+              })
+              .mockResolvedValueOnce({ canRewind: true, filesChanged: [nextPath] });
+
+            const first = agent.request(v2.methods.agent.session.prompt, {
+              sessionId,
+              prompt: PROMPT,
+              _meta: requestMeta("first"),
+            });
+            const running = await claude.prompt(0);
+            claude.send(lifecycle(running, "started"));
+            await first;
+            for (const event of textDelta("msg_first", "A's reply")) claude.send(event);
+
+            const controller = new AbortController();
+            const second = agent
+              .request(
+                v2.methods.agent.session.prompt,
+                { sessionId, prompt: PROMPT },
+                { cancellationSignal: controller.signal },
+              )
+              .catch((error: unknown) => error);
+            const waiting = await claude.prompt(1);
+            expect(waiting.priority).toBe("now");
+            claude.send(result({ user_message_uuids: [running.uuid] }));
+            await vi.waitFor(() =>
+              expect(client.sessionUpdates).toContainEqual(
+                expect.objectContaining({
+                  sessionUpdate: "usage_update",
+                  cost: expect.any(Object),
+                }),
+              ),
+            );
+            expect(client.states()).toEqual(["running"]);
+
+            const cancelAck = Promise.withResolvers<boolean>();
+            claude.cancelAsyncMessage.mockReturnValueOnce(cancelAck.promise);
+            controller.abort();
+            await vi.waitFor(() =>
+              expect(claude.cancelAsyncMessage).toHaveBeenCalledWith(waiting.uuid),
+            );
+            if (order === "frame-first") claude.send(lifecycle(waiting, "cancelled"));
+            else cancelAck.resolve(true);
+            expect(await second).toMatchObject({ code: -32800 });
+            await vi.waitFor(() =>
+              expect(claude.rewindFiles).toHaveBeenCalledWith(running.uuid, { dryRun: true }),
+            );
+            if (order === "frame-first") cancelAck.resolve(true);
+            else claude.send(lifecycle(waiting, "cancelled"));
+            expect(client.states()).toEqual(["running"]);
+            expect(claude.interrupt).not.toHaveBeenCalled();
+
+            if (followUp === "session close") {
+              await agent.request(v2.methods.agent.session.close, { sessionId });
+              await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+              expect(reports(client.sessionUpdates)).toEqual([
+                expect.objectContaining({
+                  requestId: "first",
+                  status: "unavailable",
+                  reason: "cancelled",
+                }),
+              ]);
+              expect(client.sessionUpdates.at(-1)).toMatchObject({
+                state: "idle",
+                stopReason: "cancelled",
+              });
+              canFinishReport.resolve();
+              return;
+            }
+
+            const nextController = new AbortController();
+            const third = agent
+              .request(
+                v2.methods.agent.session.prompt,
+                {
+                  sessionId,
+                  prompt: PROMPT,
+                  ...(followUp === "next result" ? { _meta: requestMeta("next") } : {}),
+                },
+                { cancellationSignal: nextController.signal },
+              )
+              .catch((error: unknown) => error);
+            const next = await claude.prompt(2);
+            expect(next.priority).toBe("now");
+            if (followUp === "next withdrawal") {
+              const nextAck = Promise.withResolvers<boolean>();
+              claude.cancelAsyncMessage.mockReturnValueOnce(nextAck.promise);
+              nextController.abort();
+              await vi.waitFor(() =>
+                expect(claude.cancelAsyncMessage).toHaveBeenCalledWith(next.uuid),
+              );
+              claude.send(lifecycle(next, "cancelled"));
+              expect(await third).toMatchObject({ code: -32800 });
+              expect(reports(client.sessionUpdates)).toHaveLength(0);
+              expect(client.states()).toEqual(["running"]);
+              expect(claude.interrupt).not.toHaveBeenCalled();
+              nextAck.resolve(true);
+              canFinishReport.resolve();
+              await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+              expect(reports(client.sessionUpdates)).toEqual([
+                expect.objectContaining({
+                  requestId: "first",
+                  status: "reported",
+                  paths: [firstPath],
+                }),
+              ]);
+              return;
+            }
+            claude.send(lifecycle(next, "started"));
+            if (followUp === "next lifecycle ends") {
+              expect(await third).toEqual({ messageId: next.uuid });
+              claude.send(lifecycle(next, "completed"));
+              await new Promise((resolve) => setImmediate(resolve));
+              expect(client.states()).toEqual(["running"]);
+              canFinishReport.resolve();
+              await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+              expect(reports(client.sessionUpdates)).toEqual([
+                expect.objectContaining({
+                  requestId: "first",
+                  status: "reported",
+                  paths: [firstPath],
+                }),
+              ]);
+              return;
+            }
+            for (const event of textDelta("msg_next", "C's reply")) claude.send(event);
+            claude.send(result({ user_message_uuids: [next.uuid] }));
+            expect(await third).toEqual({ messageId: next.uuid });
+            await vi.waitFor(() =>
+              expect(reports(client.sessionUpdates)).toEqual([
+                expect.objectContaining({
+                  requestId: "next",
+                  status: "reported",
+                  paths: [nextPath],
+                }),
+              ]),
+            );
+            canFinishReport.resolve();
+            await vi.waitFor(() => {
+              expect(client.states()).toEqual(["running", "idle"]);
+              expect(reports(client.sessionUpdates)).toHaveLength(2);
+            });
+
+            const events = client.sessionUpdates.flatMap((update) => {
+              const [report] = reports([update]);
+              if (report) return [`${report.requestId} report`];
+              if (update.sessionUpdate === "state_update") return [update.state];
+              if (update.sessionUpdate === "user_message" && update.messageId === next.uuid)
+                return ["C accepted"];
+              if (update.sessionUpdate === "agent_message_chunk" && update.messageId === "msg_next")
+                return ["C output"];
+              return [];
+            });
+            expect(events).toEqual([
+              "running",
+              "C accepted",
+              "C output",
+              "next report",
+              "first report",
+              "idle",
+            ]);
+            expect(reports(client.sessionUpdates).at(-1)).toMatchObject({
+              requestId: "first",
+              status: "reported",
+              paths: [firstPath],
+            });
+            expect(claude.rewindFiles.mock.calls).toEqual([
+              [running.uuid, { dryRun: true }],
+              [next.uuid, { dryRun: true }],
+            ]);
+          });
+        },
+      );
+
       it("lists the files of the prompt's checkpoint at its turn's end, before the idle", async () => {
         const client = v2Client();
         const changed = path.join(await realpath(cwd), "src", "App.ts");

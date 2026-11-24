@@ -153,6 +153,7 @@ export class V2Session implements RequestTarget {
   private readonly steeredPrompts = new Set<string>();
   /** Whether a turn of Claude Code is open: the session's foreground work. */
   private foreground = false;
+  private turnNumber = 0;
   /** The prompt whose `started` frame came last in the open turn. */
   private turnCommand: string | undefined;
   /**
@@ -1387,9 +1388,16 @@ export class V2Session implements RequestTarget {
       return;
     }
     const { stopReason } = idleOutcome(this.lastEnd, this.cancelledWork, this.turnReport);
+    const reading = this.fileChanges?.reading;
     const reporting = this.fileChanges?.turnEnding(stopReason, this.query);
     if (!reporting) return this.closeTurn();
-    return reporting.then(() => this.closeTurn());
+    const turn = this.turnNumber;
+    const close = reporting.then(() => {
+      if (this.turnNumber === turn && !this.cycleOpen) this.closeTurn();
+    });
+    // A withdrawn prompt already started reading the turn's reports. Later
+    // messages can make progress while idle waits for all the reports.
+    if (!reading) return close;
   }
 
   /**
@@ -1458,7 +1466,7 @@ export class V2Session implements RequestTarget {
       // Cancelled work that ended with the query was still cancelled.
       if (this.cancelledWork) this.output.closeUnfinished(true);
       else this.output.finishUnfinished("failed");
-      this.fileChanges?.turnClosed(this.cancelledWork);
+      this.fileChanges?.turnClosed(this.cancelledWork, true);
       // As `closeTurn`: a compaction still `in_progress` ends before the idle.
       this.reports.turnEnded();
       this.foreground = false;
@@ -1507,6 +1515,7 @@ export class V2Session implements RequestTarget {
     }
     if (this.foreground) return;
     this.foreground = true;
+    this.turnNumber++;
     this.lastEnd = undefined;
     this.reportState();
   }
@@ -1518,6 +1527,13 @@ export class V2Session implements RequestTarget {
    */
   private closeTurn(): void {
     if (!this.foreground || this.clearContext.holdsTurn() || this.steeredPrompts.size > 0) return;
+    if (this.fileChanges?.reading && !this.cancelledWork) {
+      // A lifecycle frame can end the cycle even while the turn must stay
+      // open for its report. A later cycle can still start before it arrives.
+      this.cycleOpen = false;
+      this.cycleCommand = undefined;
+      return;
+    }
     // A subagent's end that still waited for its messages, before the turn's idle.
     this.tasks.turnClosed();
     // v2 asks for a final status of the turn's tool calls before its idle. A
@@ -1535,7 +1551,7 @@ export class V2Session implements RequestTarget {
     this.reportApiError(this.lastEnd);
     this.reports.turnEnded();
     this.elicitations.turnEnded();
-    this.fileChanges?.turnClosed(cancelled);
+    this.fileChanges?.turnClosed(cancelled, cancelled);
     this.foreground = false;
     this.reportState();
     this.cancelledWork = false;

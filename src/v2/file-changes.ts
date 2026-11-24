@@ -28,6 +28,12 @@ export class TurnFileChanges {
   private readonly pending = new Map<string, NativeFileChangeReportTurn>();
   /** The reports of the prompts that the open turn serves. */
   private readonly turn: NativeFileChangeReportTurn[] = [];
+  /** Reports already reading checkpoints, until they publish or the turn is stopped. */
+  private readonly collecting = new Set<NativeFileChangeReportTurn>();
+
+  get reading(): boolean {
+    return this.collecting.size > 0;
+  }
   /** The tool uses of subagents in the open turn, for their file edits. */
   private subagentToolUses: ToolUses = {};
 
@@ -118,7 +124,12 @@ export class TurnFileChanges {
     }
     const reports = this.turn.splice(0);
     this.subagentToolUses = {};
-    return Promise.all(reports.map((report) => this.reporter.report(report, query))).then(() => {});
+    for (const report of reports) this.collecting.add(report);
+    return Promise.all(reports.map((report) => this.reporter.report(report, query)))
+      .then(() => {})
+      .finally(() => {
+        for (const report of reports) this.collecting.delete(report);
+      });
   }
 
   /**
@@ -126,9 +137,13 @@ export class TurnFileChanges {
    * such as of a turn that ended without a result, go out `unavailable`:
    * `cancelled` after a cancel, else `providerError`.
    */
-  turnClosed(cancelled: boolean): void {
+  turnClosed(cancelled: boolean, stopReading = false): void {
     const reason: FileChangeReportUnavailableReason = cancelled ? "cancelled" : "providerError";
     for (const report of this.turn.splice(0)) this.reporter.finish(report.fileChangeReport, reason);
+    if (stopReading) {
+      for (const report of this.collecting) this.reporter.finish(report.fileChangeReport, reason);
+      this.collecting.clear();
+    }
     this.subagentToolUses = {};
   }
 }
