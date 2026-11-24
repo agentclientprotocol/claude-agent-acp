@@ -38,7 +38,12 @@ import {
   v2ConfigOptions,
 } from "../../v2/session-requests.js";
 import { encodeProjectPath } from "../../session-index/project-dirs.js";
-import { claudeCodeMcpRequest, setModelRefusal, startupFailure } from "../helpers.js";
+import {
+  claudeCodeMcpRequest,
+  runMcpToolHooks,
+  setModelRefusal,
+  startupFailure,
+} from "../helpers.js";
 import packageJson from "../../../package.json" with { type: "json" };
 
 const execFileSpy = vi.hoisted(() => vi.fn());
@@ -2175,6 +2180,37 @@ function toolResultMessage(
   };
 }
 
+/** Claude Code's report of the start of the subagent `taskId`, which the call `toolu_<taskId>` launched. */
+function taskStarted(options: Options, taskId: string, fields: Record<string, unknown>) {
+  return {
+    type: "system",
+    subtype: "task_started",
+    task_id: taskId,
+    tool_use_id: `toolu_${taskId}`,
+    description: "Explore the project",
+    subagent_type: "Explore",
+    uuid: randomUUID(),
+    session_id: options.sessionId,
+    ...fields,
+  };
+}
+
+/** Claude Code's report of the end of a run of the subagent `taskId`. */
+function taskNotification(options: Options, taskId: string, fields: Record<string, unknown>) {
+  return {
+    type: "system",
+    subtype: "task_notification",
+    task_id: taskId,
+    tool_use_id: `toolu_${taskId}`,
+    status: "completed",
+    summary: "Done",
+    output_file: "",
+    uuid: randomUUID(),
+    session_id: options.sessionId,
+    ...fields,
+  };
+}
+
 /** How a result ends work that an interrupt stopped while a tool ran. */
 const ABORTED_TOOLS = {
   subtype: "error_during_execution",
@@ -2278,6 +2314,547 @@ describe("MCP servers that the client serves over the ACP connection", () => {
     // The resume of the active session names the same server: it stays connected.
     expect(sdk.setMcpServers).not.toHaveBeenCalled();
     expect(response.messages).toEqual(TOOL_CALL_MESSAGES);
+  });
+
+  describe("the session and tool call that a request names", () => {
+    const ECHO = "mcp__tools__echo";
+    const AGENT_CALL = { description: "Explore the project", prompt: "Look around" };
+
+    /** A client of one protocol version, with the capabilities that it declares. */
+    type Client =
+      | { version: 1; capabilities?: v1.ClientCapabilities }
+      | { version: 2; capabilities?: undefined };
+    const V1: Client = { version: 1 };
+    const V1_SUBAGENTS: Client = { version: 1, capabilities: { subagents: {} } as never };
+    const V1_AIR_SUBAGENTS: Client = {
+      version: 1,
+      capabilities: {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["nativeSubagentSessions"] } } },
+      },
+    };
+    const V2: Client = { version: 2 };
+
+    /** What the `mcp/message` request of each tool use named, by tool use id. */
+    type Named = Record<string, { sessionId?: string; toolCallId?: string }>;
+
+    /**
+     * Sets up a session of `client` with the `tools` server (without it when
+     * `undeclared`: the client only registers the server), prompts it, and
+     * runs `during` while Claude Code works on the prompt. Resolves, once the
+     * turn ended or `during` closed the session, with the root session's id,
+     * what the `mcp/message` requests named, and the session that reported
+     * each tool call.
+     *
+     * The server answers a request once `concurrent` requests wait for an
+     * answer, so that many tool uses are in flight at once.
+     *
+     * A request of the adapter waits a minute for an announcement (see
+     * {@link adapterMcp}), so a case whose request waits when it should not
+     * times out. `announcedBefore` has the child sessions that the client
+     * knew when each request arrived.
+     */
+    async function promptWithTools(
+      client: Client,
+      {
+        concurrent = 1,
+        undeclared = false,
+        during,
+      }: { concurrent?: number; undeclared?: boolean; during?: During } = {},
+    ) {
+      const named: Named = {};
+      const announcedBefore: Record<string, string[]> = {};
+      /** The child sessions that a `subagent_update` announced to the client so far. */
+      let announced: () => string[] = () => [];
+      const waiting: Array<() => void> = [];
+      const handler: v2.McpRequestHandler = async ({ params, sessionId, toolCallId }) => {
+        const meta = params?._meta as Record<string, unknown>;
+        const toolUseId = meta["claudecode/toolUseId"] as string;
+        named[toolUseId] = { sessionId, toolCallId };
+        announcedBefore[toolUseId] = announced();
+        await new Promise<void>((resolve) => {
+          waiting.push(resolve);
+          if (waiting.length >= concurrent) for (const answer of waiting.splice(0)) answer();
+        });
+        return { result: { resultType: "complete", content: [] } };
+      };
+      const reportedOn: Record<string, string> = {};
+      const report = ({ sessionId, update }: { sessionId: string; update: object }) => {
+        const { toolCallId } = update as { toolCallId?: unknown };
+        if (typeof toolCallId === "string") reportedOn[toolCallId] ??= sessionId;
+      };
+      const announcements = (updates: Array<{ update: object }>) =>
+        updates.flatMap(({ update }) => {
+          const { sessionUpdate, sessionId } = update as Record<string, unknown>;
+          return sessionUpdate === "subagent_update" ? [sessionId as string] : [];
+        });
+      let root: string;
+      if (client.version === 1) {
+        const provider = new v1.McpOverAcpProvider();
+        const authUpdate = Promise.withResolvers<void>();
+        const updates: Array<{ update: object }> = [];
+        announced = () => announcements(updates);
+        root = await v1
+          .client({ name: "v1-test-client" })
+          .onNotification(
+            "_auth/status_update",
+            (params) => params,
+            () => authUpdate.resolve(),
+          )
+          .onNotification(v1.methods.client.session.update, ({ params }) => {
+            report(params);
+            updates.push(params);
+          })
+          .onRequest(v1.methods.client.mcp.message, provider.handleRequest)
+          .connectWith(connectRouter() as unknown as v1.Stream, async (agent) => {
+            await agent.request(v1.methods.agent.initialize, {
+              protocolVersion: v1.PROTOCOL_VERSION,
+              clientCapabilities: client.capabilities,
+            });
+            adapterMcp().announcementWaitMs = 60_000;
+            const tools = provider.registerServer(agent, { name: "tools", handler });
+            const setup: v1.NewSessionRequest = {
+              cwd,
+              mcpServers: undeclared ? [] : [tools.declaration],
+            };
+            const { sessionId } = await agent.request(v1.methods.agent.session.new, setup);
+            const turn = agent.request(v1.methods.agent.session.prompt, {
+              sessionId,
+              prompt: text("hi"),
+            });
+            await during?.({
+              sessionId,
+              tools: tools.declaration,
+              named,
+              send: (method, params) => agent.request(method as never, params as never),
+            });
+            await turn;
+            await authUpdate.promise;
+            return sessionId;
+          });
+      } else {
+        const provider = new v2.McpOverAcpProvider();
+        const v2client = v2Client();
+        announced = () => announcements(v2client.sessionUpdates);
+        root = await v2client.app
+          .onRequest(v2.methods.client.mcp.message, provider.handleRequest)
+          .connectWith(connectRouter(), async (agent) => {
+            await initializeV2(agent);
+            adapterMcp().announcementWaitMs = 60_000;
+            const tools = provider.registerServer(agent, { name: "tools", handler });
+            const { sessionId } = await agent.request(v2.methods.agent.session.new, {
+              cwd,
+              mcpServers: undeclared ? [] : [tools.declaration],
+            });
+            await agent.request(v2.methods.agent.session.prompt, {
+              sessionId,
+              prompt: text("hi"),
+            });
+            let closed = false;
+            await during?.({
+              sessionId,
+              tools: tools.declaration,
+              named,
+              send: (method, params) => {
+                closed ||= method === SESSION_CLOSE;
+                return agent.request(method as never, params as never);
+              },
+            });
+            if (!closed) {
+              await vi.waitFor(() =>
+                expect(turnTrace(v2client.sessionUpdates)).toContain("idle end_turn"),
+              );
+            }
+            await v2client.authUpdate(1);
+            return sessionId;
+          });
+        for (const notification of v2client.sessionUpdates) report(notification);
+      }
+      return { root, named, reportedOn, announcedBefore };
+    }
+
+    /** The adapter's `McpOverAcp` of the connection, for its wait and the requests that wait. */
+    const adapterMcp = () =>
+      (
+        agents[0] as unknown as {
+          mcp: { announcementWaitMs: number; waiting: Map<string, unknown> };
+        }
+      ).mcp;
+
+    /** What a test does while Claude Code works on the prompt (see {@link promptWithTools}). */
+    type During = (session: {
+      sessionId: string;
+      /** The declaration of the session's `tools` server. */
+      tools: v1.McpServerAcpDeclaration;
+      named: Named;
+      /** Sends the client's request `method` to the agent, such as {@link SESSION_CLOSE}. */
+      send(method: string, params: Record<string, unknown>): Promise<unknown>;
+    }) => Promise<void>;
+
+    // Both protocol versions name these methods alike.
+    const SESSION_CLOSE = v2.methods.agent.session.close;
+    const SESSION_RESUME = v2.methods.agent.session.resume;
+
+    /** Claude Code sends the `tools/call` of the tool use `id` to the `tools` server. */
+    const toolsCall = (options: Options, id: string) =>
+      claudeCodeMcpRequest(
+        options.mcpServers?.tools as McpHttpServerConfig,
+        "tools/call",
+        TOOL_CALL,
+        undefined,
+        id,
+      );
+
+    /**
+     * Claude Code runs the tool use `id` of the agent `agentId` of the type
+     * `agentType`: its hooks around its request.
+     */
+    async function runEcho(options: Options, id: string, agentId?: string, agentType?: string) {
+      const use = { id, tool: ECHO, agentId, agentType };
+      await runMcpToolHooks(options.hooks, "PreToolUse", use);
+      await toolsCall(options, id);
+      await runMcpToolHooks(options.hooks, "PostToolUse", use);
+    }
+
+    /** The end of the turn, after the subagent `agent-1` returned what its tool use `toolu_child` did. */
+    function* endOfSubagentTurn(options: Options) {
+      yield {
+        ...toolResultMessage(options, "toolu_child", {}),
+        parent_tool_use_id: "toolu_agent-1",
+      };
+      yield taskNotification(options, "agent-1", {});
+      yield toolResultMessage(options, "toolu_agent-1", {});
+      yield result(options);
+      yield idleState(options);
+    }
+
+    it.each([
+      { client: V1, of: "a v1 session", childOn: "root" },
+      { client: V1_SUBAGENTS, of: "a v1 session with child sessions", childOn: "agent-1" },
+      {
+        client: V1_AIR_SUBAGENTS,
+        of: "a v1 session with AIR's child sessions",
+        childOn: undefined,
+      },
+      { client: V2, of: "a v2 session", childOn: "agent-1" },
+    ])(
+      "names the session that reports each of two tool calls of $of that run at once",
+      async ({ client, childOn }) => {
+        scriptTurns(async function* (options) {
+          // The main conversation and a subagent call the tool with the same arguments.
+          yield toolUseMessage(options, "toolu_root", ECHO, TOOL_CALL.arguments);
+          yield toolUseMessage(options, "toolu_agent-1", "Agent", AGENT_CALL);
+          yield taskStarted(options, "agent-1", { prompt: AGENT_CALL.prompt });
+          yield toolUseMessage(options, "toolu_child", ECHO, TOOL_CALL.arguments, "toolu_agent-1");
+          await Promise.all([
+            runEcho(options, "toolu_root"),
+            runEcho(options, "toolu_child", "agent-1"),
+          ]);
+          yield toolResultMessage(options, "toolu_root", {});
+          yield* endOfSubagentTurn(options);
+        });
+
+        const { root, named, reportedOn } = await promptWithTools(client, { concurrent: 2 });
+
+        const session = (name: string | undefined) => (name === "root" ? root : name);
+        expect(named).toEqual({
+          toolu_root: { sessionId: root, toolCallId: "toolu_root" },
+          // AIR's draft announces no child with `subagent_update`.
+          toolu_child:
+            childOn === undefined ? {} : { sessionId: session(childOn), toolCallId: "toolu_child" },
+        });
+        // The session of each named tool call is the one that the client got it on.
+        expect(reportedOn).toMatchObject({
+          toolu_root: root,
+          ...(childOn === undefined ? {} : { toolu_child: session(childOn) }),
+        });
+      },
+    );
+
+    it.each([
+      {
+        // It has no child sessions, and does not know yet that the root reports the tool call.
+        client: V1,
+        names: "the root session of a v1 session, and no tool call, at once",
+        waits: false,
+      },
+      {
+        client: V1_SUBAGENTS,
+        names: "the child session of a v1 session with child sessions, once it is announced,",
+        waits: true,
+      },
+      {
+        client: V2,
+        names: "the child session of a v2 session, once it is announced,",
+        waits: true,
+      },
+    ])(
+      "names $names for a subagent whose start the session has not read",
+      async ({ client, waits }) => {
+        scriptTurns(async function* (options) {
+          yield toolUseMessage(options, "toolu_agent-1", "Agent", AGENT_CALL);
+          // Claude Code runs the subagent's tool before the session reads `task_started`.
+          const use = { id: "toolu_child", tool: ECHO, agentId: "agent-1" };
+          await runMcpToolHooks(options.hooks, "PreToolUse", use);
+          const requested = toolsCall(options, "toolu_child");
+          // The request waits for the announcement, or is answered without one.
+          if (waits) await vi.waitFor(() => expect(adapterMcp().waiting.size).toBe(1));
+          else await requested;
+          yield taskStarted(options, "agent-1", { prompt: AGENT_CALL.prompt });
+          yield toolUseMessage(options, "toolu_child", ECHO, TOOL_CALL.arguments, "toolu_agent-1");
+          await requested;
+          await runMcpToolHooks(options.hooks, "PostToolUse", use);
+          yield* endOfSubagentTurn(options);
+        });
+
+        const { root, named, announcedBefore } = await promptWithTools(client);
+
+        // Not the root session in the place of the child session.
+        expect(named.toolu_child).toEqual(
+          waits ? { sessionId: "agent-1", toolCallId: "toolu_child" } : { sessionId: root },
+        );
+        // The request went out after the `subagent_update` of the child that it names.
+        expect(announcedBefore.toolu_child).toEqual(waits ? ["agent-1"] : []);
+      },
+    );
+
+    it.each([
+      { client: V1, of: "a v1 session" },
+      { client: V1_SUBAGENTS, of: "a v1 session with child sessions" },
+      { client: V1_AIR_SUBAGENTS, of: "a v1 session with AIR's child sessions" },
+      { client: V2, of: "a v2 session" },
+    ])(
+      "names the root session of $of, and no tool call, for an agent that a workflow runs",
+      async ({ client }) => {
+        scriptTurns(async function* (options) {
+          // A workflow's agents send nothing on the stream: no `task_started`,
+          // no tool use. Only their hooks tell of them.
+          await runEcho(options, "toolu_workflow_agent", "a7ffab6216b105cf0", "workflow-subagent");
+          yield result(options);
+          yield idleState(options);
+        });
+
+        const { root, named } = await promptWithTools(client);
+
+        expect(named.toolu_workflow_agent).toEqual({ sessionId: root });
+      },
+    );
+
+    it.each([
+      // Without child sessions, the agent's work is the root's whatever it is.
+      { client: V1, names: "the root session of a v1 session", onRoot: true },
+      {
+        client: V1_SUBAGENTS,
+        names: "no session of a v1 session with child sessions",
+        onRoot: false,
+      },
+      { client: V2, names: "no session of a v2 session", onRoot: false },
+    ])(
+      "names $names for an agent of the workflow agents' type, when the session defines such an agent",
+      async ({ client, onRoot }) => {
+        // The user named an agent of their own `workflow-subagent`: an agent
+        // of that type can be a subagent whose start the session has not read.
+        const custom = { name: "workflow-subagent", description: "My own agent" };
+        sdk.supportedAgents = async () => [...(await sdkDefaults.supportedAgents()), custom];
+        sdk.initializationResult = async () => ({
+          ...(await sdkDefaults.initializationResult()),
+          agents: await sdk.supportedAgents(),
+        });
+        scriptTurns(async function* (options) {
+          await runEcho(options, "toolu_child", "a7ffab6216b105cf0", "workflow-subagent");
+          yield result(options);
+          yield idleState(options);
+        });
+
+        const { root, named } = await promptWithTools(client);
+
+        expect(named.toolu_child).toEqual(onRoot ? { sessionId: root } : {});
+      },
+    );
+
+    it.each([
+      { client: V1_SUBAGENTS, of: "a v1 session with child sessions" },
+      { client: V2, of: "a v2 session" },
+    ])(
+      "names no session of $of for a subagent that a conversation reset made it forget",
+      async ({ client }) => {
+        scriptTurns(async function* (options) {
+          yield toolUseMessage(options, "toolu_agent-1", "Agent", {
+            ...AGENT_CALL,
+            run_in_background: true,
+          });
+          yield taskStarted(options, "agent-1", {
+            prompt: AGENT_CALL.prompt,
+            is_backgrounded: true,
+          });
+          yield toolResultMessage(options, "toolu_agent-1", { content: "Launched." });
+          yield {
+            type: "conversation_reset",
+            new_conversation_id: randomUUID(),
+            uuid: randomUUID(),
+            trigger: "clear",
+            timestamp: new Date().toISOString(),
+            session_id: options.sessionId,
+          };
+          // The subagent goes on unobserved. The client still holds its
+          // session, but no session reports its tool calls any more.
+          await runEcho(options, "toolu_child", "agent-1");
+          yield result(options);
+          yield idleState(options);
+        });
+
+        const { named, reportedOn } = await promptWithTools(client);
+
+        expect(named.toolu_child).toEqual({});
+        expect(reportedOn).not.toHaveProperty("toolu_child");
+      },
+    );
+
+    it.each([
+      { client: V1, of: "a v1 session" },
+      { client: V2, of: "a v2 session" },
+    ])("names $of for each request of a tool use, until the session closes", async ({ client }) => {
+      const ran = Promise.withResolvers<Options>();
+      const closed = Promise.withResolvers<void>();
+      scriptTurns(async function* (options) {
+        // The session has not read the tool use: no tool call's end ends it.
+        await runMcpToolHooks(options.hooks, "PreToolUse", { id: "toolu_root", tool: ECHO });
+        ran.resolve(options);
+        await closed.promise;
+        yield toolUseMessage(options, "toolu_root", ECHO, TOOL_CALL.arguments);
+      });
+      const requests: Named[string][] = [];
+
+      const { root } = await promptWithTools(client, {
+        during: async ({ sessionId, named, send }) => {
+          const options = await ran.promise;
+          const requested = async () => {
+            await toolsCall(options, "toolu_root");
+            requests.push(named.toolu_root);
+          };
+          await requested();
+          // Claude Code sends the request again, as for an input that the tool asked for.
+          await requested();
+          await send(SESSION_CLOSE, { sessionId });
+          await requested();
+          closed.resolve();
+        },
+      });
+
+      const attributed = { sessionId: root, toolCallId: "toolu_root" };
+      expect(requests).toEqual([attributed, attributed, {}]);
+    });
+
+    it("names no session of a v2 session for a server that its resume no longer declares", async () => {
+      const ran = Promise.withResolvers<Options>();
+      const resumed = Promise.withResolvers<void>();
+      scriptTurns(async function* (options) {
+        yield toolUseMessage(options, "toolu_root", ECHO, TOOL_CALL.arguments);
+        await runMcpToolHooks(options.hooks, "PreToolUse", { id: "toolu_root", tool: ECHO });
+        ran.resolve(options);
+        await resumed.promise;
+        yield toolResultMessage(options, "toolu_root", {});
+        yield result(options);
+        yield idleState(options);
+      });
+
+      const { named } = await promptWithTools(V2, {
+        during: async ({ sessionId, send }) => {
+          const options = await ran.promise;
+          await send(SESSION_RESUME, { sessionId, cwd, mcpServers: [] });
+          // Claude Code had sent the request before it took the server away.
+          await toolsCall(options, "toolu_root");
+          resumed.resolve();
+        },
+      });
+
+      expect(named.toolu_root).toEqual({});
+    });
+
+    it("names no session of a v2 session for a server that a resume gave its running query", async () => {
+      sdk.setMcpServers = vi.fn(sdkDefaults.setMcpServers);
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      const started = Promise.withResolvers<void>();
+      const resumed = Promise.withResolvers<McpHttpServerConfig>();
+      scriptTurns(async function* (options) {
+        started.resolve();
+        const tools = await resumed.promise;
+        yield toolUseMessage(options, "toolu_root", ECHO, TOOL_CALL.arguments);
+        // The query started without `acp` servers, so without the hooks.
+        await runMcpToolHooks(options.hooks, "PreToolUse", { id: "toolu_root", tool: ECHO });
+        await claudeCodeMcpRequest(tools, "tools/call", TOOL_CALL, undefined, "toolu_root");
+        yield toolResultMessage(options, "toolu_root", {});
+        yield result(options);
+        yield idleState(options);
+      });
+
+      try {
+        const { named } = await promptWithTools(V2, {
+          undeclared: true,
+          during: async ({ sessionId, tools, send }) => {
+            await started.promise;
+            await send(SESSION_RESUME, { sessionId, cwd, mcpServers: [tools] });
+            const [servers] = vi.mocked(sdk.setMcpServers).mock.calls[0];
+            resumed.resolve(servers.tools as McpHttpServerConfig);
+          },
+        });
+
+        expect(named.toolu_root).toEqual({});
+        expect(log).toHaveBeenCalledWith(
+          expect.stringContaining("the MCP requests of tools name no session"),
+        );
+        // No hook of the query runs for an MCP tool.
+        const matchers = Object.values(sdk.queryOptions[0].hooks ?? {}).flatMap((event) =>
+          (event ?? []).map(({ matcher }) => matcher),
+        );
+        expect(matchers.filter((matcher) => matcher?.startsWith("mcp__"))).toEqual([]);
+      } finally {
+        log.mockRestore();
+      }
+    });
+
+    it("holds a request of a v2 session's subagent while a replay holds its announcement back", async () => {
+      const launched = Promise.withResolvers<void>();
+      const held = Promise.withResolvers<void>();
+      const history = Promise.withResolvers<Awaited<ReturnType<typeof getSessionMessages>>>();
+      scriptTurns(async function* (options) {
+        yield toolUseMessage(options, "toolu_agent-1", "Agent", AGENT_CALL);
+        launched.resolve();
+        await held.promise;
+        // The resume's replay holds what the session sends from here on: the
+        // subagent's `subagent_update`, and its tool call.
+        yield taskStarted(options, "agent-1", { prompt: AGENT_CALL.prompt });
+        yield toolUseMessage(options, "toolu_child", ECHO, TOOL_CALL.arguments, "toolu_agent-1");
+        await runEcho(options, "toolu_child", "agent-1");
+        yield* endOfSubagentTurn(options);
+      });
+
+      const { named, announcedBefore } = await promptWithTools(V2, {
+        during: async ({ sessionId, tools, send }) => {
+          await launched.promise;
+          const reads = vi.mocked(getSessionMessages).mock.calls.length;
+          vi.mocked(getSessionMessages).mockReturnValueOnce(history.promise);
+          const resume = send(SESSION_RESUME, {
+            sessionId,
+            cwd,
+            mcpServers: [tools],
+            replayFrom: { type: "start" },
+          });
+          // The hold began with the request, before the resume reads the history.
+          await vi.waitFor(() =>
+            expect(vi.mocked(getSessionMessages).mock.calls.length).toBeGreaterThan(reads),
+          );
+          held.resolve();
+          // The session announced the child, but the announcement has not gone out.
+          await vi.waitFor(() => expect(adapterMcp().waiting.size).toBe(1));
+          history.resolve([]);
+          await resume;
+        },
+      });
+
+      // Not before the client got the child's `subagent_update`.
+      expect(named.toolu_child).toEqual({ sessionId: "agent-1", toolCallId: "toolu_child" });
+      expect(announcedBefore.toolu_child).toContain("agent-1");
+    });
   });
 });
 
@@ -6671,18 +7248,6 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
 // foreground work: the main conversation's, or a subagent's whose spawning tool
 // call waits on it. A subagent in the background asks without blocking it.
 describe("ACP v2 requests that subagents make", () => {
-  const taskStarted = (options: Options, taskId: string, fields: Record<string, unknown>) => ({
-    type: "system",
-    subtype: "task_started",
-    task_id: taskId,
-    tool_use_id: `toolu_${taskId}`,
-    description: "Explore the project",
-    subagent_type: "Explore",
-    uuid: randomUUID(),
-    session_id: options.sessionId,
-    ...fields,
-  });
-
   /** Asks for permission for a Bash call of the subagent `agentID`, and
    *  resolves once the client answers, or Claude Code aborts `signal`. */
   const askFor = (options: Options, agentID: string, signal = new AbortController().signal) =>
@@ -6823,24 +7388,6 @@ describe("ACP v2 requests that subagents make", () => {
         }
       }
     }
-
-    /** Claude Code's report of the end of a run of the subagent `taskId`. */
-    const taskNotification = (
-      options: Options,
-      taskId: string,
-      fields: Record<string, unknown>,
-    ) => ({
-      type: "system",
-      subtype: "task_notification",
-      task_id: taskId,
-      tool_use_id: `toolu_${taskId}`,
-      status: "completed",
-      summary: "Done",
-      output_file: "",
-      uuid: randomUUID(),
-      session_id: options.sessionId,
-      ...fields,
-    });
 
     /** A message of the subagent that the Agent call `parent` launched. */
     const childMessage = (options: Options, message: Record<string, unknown>, parent: string) => ({

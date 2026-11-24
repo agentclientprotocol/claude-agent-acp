@@ -256,6 +256,9 @@ class V2Agent implements AgentHandle, SessionConnection {
     // Before the client can name the child that a `subagent_update` announces.
     this.children.sending(notification);
     const send = () => {
+      // When the update goes out, after a replay that holds it: an MCP request
+      // names no child session whose `subagent_update` still waits.
+      this.mcp.sending(notification);
       this.ctx.notify(v2.methods.client.session.update, notification).catch((error) => {
         this.logger.error(`Failed to send a ${notification.update.sessionUpdate} update:`, error);
       });
@@ -564,6 +567,14 @@ class V2Agent implements AgentHandle, SessionConnection {
           { ...clientOptions(params._meta)?.mcpServers, ...served.configs },
           served.unserved,
         );
+        const unhooked = this.mcp.sessionServersChanged(sessionId, request.mcpServers);
+        if (unhooked.length > 0) {
+          this.logger.log(
+            `Session ${sessionId}: the MCP requests of ${unhooked.join(", ")} name no session ` +
+              "until the session's query starts again. The running query started without " +
+              "the hooks that report their tool uses.",
+          );
+        }
         this.restarts.track(sessionId, params);
       }
     } else {
@@ -761,6 +772,7 @@ class V2Agent implements AgentHandle, SessionConnection {
     this.restarts.closed(sessionId);
     // After the close's last updates, which name the session's children.
     this.children.rootClosed(sessionId);
+    this.mcp.sessionClosed(sessionId);
     return {};
   }
 
@@ -1025,6 +1037,7 @@ class V2Agent implements AgentHandle, SessionConnection {
     keys.queryStarted(resume !== undefined);
     session.start(q, config, opened.mcpServers, keys, resume !== undefined);
     this.sessions.set(sessionId, session);
+    this.mcp.sessionStarted(sessionId, opened.request.mcpServers);
     this.stopped.delete(sessionId);
     // A route change during the start did not find this session live.
     this.restarts.track(sessionId, params, {
@@ -1133,6 +1146,15 @@ class V2Agent implements AgentHandle, SessionConnection {
     );
     const elicitationOptions = session.elicitations.queryOptions();
     const subagent = subagentHooks((input) => session.tasks.subagentHook(input));
+    // None for a query without `acp` servers. A resume cannot give a running
+    // query these hooks (see `McpOverAcp.sessionServersChanged`).
+    const mcpToolUse = this.mcp.toolUseHooks(sessionId, request.mcpServers, {
+      childSessions: true,
+      reporting: (agentId) => session.tasks.childSession(agentId),
+      // A subagent's child session has its agent id (see `tasks.ts`).
+      childSessionId: (agentId) => agentId,
+      definesAgent: (name) => session.tasks.configs.definesAgent(name),
+    });
     const options: Options = {
       systemPrompt: sessionSystemPrompt(clientPrompt, params._meta?.systemPrompt),
       settingSources: ["user", "project", "local"],
@@ -1192,11 +1214,21 @@ class V2Agent implements AgentHandle, SessionConnection {
         // A subagent's `cwd` (such as its worktree) and configuration, from its hooks.
         SubagentStart: [subagent.SubagentStart],
         SubagentStop: [subagent.SubagentStop],
-        PostToolUseFailure: [subagent.PostToolUseFailure],
-        // An Edit or Write shows its exact patch before it runs.
-        PreToolUse: [subagent.PreToolUse, fileChangePreviewHook(session, this.logger)],
+        PostToolUseFailure: [
+          subagent.PostToolUseFailure,
+          ...(mcpToolUse ? [mcpToolUse.PostToolUseFailure] : []),
+        ],
+        // An Edit or Write shows its exact patch before it runs. The tool use
+        // of an `acp` server's tool is recorded for the `mcp/message` requests
+        // that it sends.
+        PreToolUse: [
+          subagent.PreToolUse,
+          fileChangePreviewHook(session, this.logger),
+          ...(mcpToolUse ? [mcpToolUse.PreToolUse] : []),
+        ],
         PostToolUse: [
           subagent.PostToolUse,
+          ...(mcpToolUse ? [mcpToolUse.PostToolUse] : []),
           {
             hooks: [
               createPostToolUseHook({ onEnterPlanMode: async () => session.modeChanged("plan") }),

@@ -1734,13 +1734,25 @@ export class ClaudeAcpAgent {
     );
   }
 
-  constructor(client: AcpClient, logger?: Logger) {
+  constructor(
+    client: AcpClient,
+    logger?: Logger,
+    /**
+     * Names the session and tool call of the MCP requests that Claude Code
+     * sends to the client's `acp` servers (see `mcp-servers.ts`): the one that
+     * `client` serves those servers with.
+     */
+    private readonly mcp = new McpOverAcp(),
+  ) {
     this.sessions = {};
     this.client = new ChangedMetaClient(
       client,
       () => this.toolCallCapabilities.air.client,
-      // Before the client can name the child that a `subagent_update` announces.
-      (update) => this.announcedChildren.sending(update),
+      (update) => {
+        // Before the client can name the child that a `subagent_update` announces.
+        this.announcedChildren.sending(update);
+        this.mcp.sending(update);
+      },
     );
     this.logger = logger ?? console;
     this.exitPlan = new ExitPlanCoordinator<Session, Turn>({
@@ -7913,6 +7925,7 @@ export class ClaudeAcpAgent {
     await this.teardownSession(sessionId);
     // After the teardown's last updates, which name the children.
     this.announcedChildren.rootClosed(sessionId);
+    this.mcp.sessionClosed(sessionId);
   }
 
   /** Idempotent: a session that is not loaded here is already closed. */
@@ -8992,22 +9005,35 @@ export class ClaudeAcpAgent {
    * the callback beats the spawning Agent/Task frame, the root keeps it; the
    * later frame announces the child with its correct nested lineage. A
    * workflow agent gets no task_started, so the root always keeps its tool use.
+   *
+   * `reportingSessionId` is the session whose updates report the agent's tool
+   * calls as the consumer reads them from the stream: the root session for
+   * the main conversation, a subagent's child session once it is announced,
+   * and the root session for a subagent of a client without child sessions.
+   * Undefined for an agent whose task_started the consumer has not read,
+   * which a workflow agent never gets, and for a child that is not announced.
    */
   private toolUseOwner(
     session: Session,
     sessionId: string,
     agentID: string | undefined,
-  ): { parentToolUseId?: string; toolCallSessionId: string } {
-    const parentToolUseId = agentID
-      ? session.liveBackgroundTasks.get(agentID)?.parentToolUseId
-      : undefined;
+  ): { parentToolUseId?: string; toolCallSessionId: string; reportingSessionId?: string } {
+    const task = agentID ? session.liveBackgroundTasks.get(agentID) : undefined;
+    const childSessions = clientSupportsSubagents(this.clientCapabilities);
     const child =
-      clientSupportsSubagents(this.clientCapabilities) && agentID
-        ? session.nativeSubagentsByTaskId?.get(agentID)
-        : undefined;
+      childSessions && agentID ? session.nativeSubagentsByTaskId?.get(agentID) : undefined;
+    const announced = child?.announced ? child.sessionId : undefined;
+    const reportingSessionId = !agentID
+      ? sessionId
+      : childSessions
+        ? announced
+        : task?.isSubagent
+          ? sessionId
+          : undefined;
     return {
-      ...(parentToolUseId ? { parentToolUseId } : {}),
-      toolCallSessionId: child?.announced ? child.sessionId : sessionId,
+      ...(task?.parentToolUseId ? { parentToolUseId: task.parentToolUseId } : {}),
+      toolCallSessionId: announced ?? sessionId,
+      ...(reportingSessionId !== undefined ? { reportingSessionId } : {}),
     };
   }
 
@@ -10272,6 +10298,21 @@ export class ClaudeAcpAgent {
     const subagentConfigHook = subagentForm(this.clientCapabilities)
       ? this.subagentConfigurationHook(sessionId)
       : undefined;
+    // None for a session without `acp` MCP servers: it has no MCP request to
+    // name a session for, so Claude Code waits on no hook of these.
+    const mcpToolUse = this.mcp.toolUseHooks(sessionId, params.mcpServers, {
+      childSessions: clientSupportsSubagents(this.clientCapabilities),
+      reporting: (agentId) => {
+        const session = this.sessions[sessionId];
+        return session && this.toolUseOwner(session, sessionId, agentId).reportingSessionId;
+      },
+      // In the RFD form, a subagent's child session has its agent id (see
+      // `NativeSubagentRuntime`). AIR's draft announces none with `subagent_update`.
+      childSessionId: (agentId) =>
+        subagentForm(this.clientCapabilities) === "rfd" ? agentId : undefined,
+      definesAgent: (name) =>
+        this.sessions[sessionId]?.agents.some((agent) => agent.name === name) === true,
+    });
     const suggestionForms = {
       meta: this.toolCallCapabilities.air.client,
       update: clientTakesPromptSuggestions(this.clientCapabilities?.session),
@@ -10361,17 +10402,19 @@ export class ClaudeAcpAgent {
                 ...(userProvidedOptions?.hooks?.SubagentStop ?? []),
                 { hooks: [subagentConfigHook] },
               ],
-              PostToolUseFailure: [
-                ...(userProvidedOptions?.hooks?.PostToolUseFailure ?? []),
-                { hooks: [subagentConfigHook] },
-              ],
             }
           : {}),
-        ...(subagentConfigHook
+        ...(subagentConfigHook || mcpToolUse
           ? {
+              PostToolUseFailure: [
+                ...(userProvidedOptions?.hooks?.PostToolUseFailure ?? []),
+                ...(subagentConfigHook ? [{ hooks: [subagentConfigHook] }] : []),
+                ...(mcpToolUse ? [mcpToolUse.PostToolUseFailure] : []),
+              ],
               PreToolUse: [
                 ...(userProvidedOptions?.hooks?.PreToolUse || []),
-                { hooks: [subagentConfigHook] },
+                ...(subagentConfigHook ? [{ hooks: [subagentConfigHook] }] : []),
+                ...(mcpToolUse ? [mcpToolUse.PreToolUse] : []),
               ],
             }
           : {}),
@@ -10388,6 +10431,7 @@ export class ClaudeAcpAgent {
               }),
             ],
           },
+          ...(mcpToolUse ? [mcpToolUse.PostToolUse] : []),
         ],
         // Mirror model switches the adapter didn't drive into the ACP picker
         // and the model-dependent bookkeeping (context window, mode clamping,
@@ -10823,6 +10867,7 @@ export class ClaudeAcpAgent {
         fileChangeReporter,
         promptSuggestions: PromptSuggestions.forClient(suggestionForms),
       };
+      this.mcp.sessionStarted(sessionId, params.mcpServers);
       const registered = this.sessions[sessionId];
       registered.idleCompaction = new IdleCompaction(
         {
@@ -11424,7 +11469,7 @@ export function v1AgentApp(
     };
   const app = acpAgent({ name: "claude-code-acp" })
     .onConnect((connection) => {
-      agent = new ClaudeAcpAgent(new ClientConnection(connection.client, mcp), logger);
+      agent = new ClaudeAcpAgent(new ClientConnection(connection.client, mcp), logger, mcp);
       onAgent(agent);
     })
     .onNotification(methods.agent.mcp.message, mcp.handleNotification)
