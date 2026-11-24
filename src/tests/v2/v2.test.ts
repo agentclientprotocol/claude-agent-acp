@@ -9,7 +9,7 @@
  * `session_state_changed`.
  */
 import { randomUUID } from "node:crypto";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
@@ -25,6 +25,7 @@ import {
 import { McpOverAcp } from "../../mcp-servers.js";
 import { acpProtocolRouter } from "../../serve.js";
 import { validateV2Notification } from "../acp-scenarios/schema.js";
+import { writeRewindPoint } from "../../session-rewind.js";
 import { SettingsManager } from "../../settings.js";
 import type { AgentHandle } from "../../v2/agent.js";
 import { v2ElicitationRequest } from "../../v2/elicitation.js";
@@ -3157,6 +3158,97 @@ describe("ACP v2 core", () => {
         "cursor_update",
       ]);
       expect(replayed.at(-1)).toEqual(cursorOf("u2"));
+    });
+
+    describe("after a rewind", () => {
+      /** `u2` was rewound: it stays in the transcript as the dropped branch. */
+      async function rewound(sessionId: string) {
+        const directory = path.join(tempDir, "claude", "projects", "project");
+        await writeTranscript(directory, sessionId, [
+          transcriptUser("u1", "Build it"),
+          transcriptAssistant("a1", "Built."),
+          transcriptUser("u2", "Test it"),
+        ]);
+        await writeRewindPoint(sessionId, { resumeSessionAt: "a1", droppedPromptUuid: "u2" });
+        return {
+          transcript: path.join(directory, `${sessionId}.jsonl`),
+          point: path.join(directory, sessionId, "rewind.json"),
+        };
+      }
+
+      it("resumes at the rewind point, and replays the history before it with its cursors only", async () => {
+        const sessionId = randomUUID();
+        await rewound(sessionId);
+        vi.mocked(getSessionMessages).mockResolvedValueOnce(twoTurns);
+        const client = v2Client();
+        await client.connect(async (agent) => {
+          await agent.request(v2.methods.agent.initialize, {
+            protocolVersion: v2.PROTOCOL_VERSION,
+            info: { name: "v2-test-client", version: "1.0.0" },
+            capabilities: {},
+          });
+          await agent.request(v2.methods.agent.session.resume, {
+            sessionId,
+            cwd,
+            replayFrom: { type: "start" },
+          });
+        });
+
+        expect(sdk.processes.at(-1)!.options).toMatchObject({
+          resume: sessionId,
+          resumeSessionAt: "a1",
+        });
+        const replayed = client.sessionUpdates.slice(
+          0,
+          client.sessionUpdates.findIndex((update) => update.sessionUpdate === "replay_complete"),
+        );
+        expect(
+          replayed.flatMap((update) =>
+            update.sessionUpdate === "user_message" ? [update.messageId] : [],
+          ),
+        ).toEqual(["u1"]);
+        expect(replayed.map((update) => update.sessionUpdate)).not.toContain("cursor_update");
+      });
+
+      it("rejects a fork at a cursor of the dropped turn", async () => {
+        const client = v2Client();
+        await client.connect(async (agent) => {
+          const { response } = await openSession(agent);
+          const { sessionId } = response;
+          await rewound(sessionId);
+          vi.mocked(getSessionMessages).mockResolvedValueOnce(twoTurns);
+          await expect(
+            agent.request(v2.methods.agent.session.fork, {
+              sessionId,
+              cwd,
+              cursorId: "before:u2",
+            }),
+          ).rejects.toMatchObject({ code: -32602, data: { cursorId: "before:u2" } });
+          expect(forkSession).not.toHaveBeenCalled();
+        });
+      });
+
+      it("is neither read nor changed by a session/options probe", async () => {
+        const sessionId = randomUUID();
+        const files = await rewound(sessionId);
+        const before = await Promise.all([readFile(files.transcript), readFile(files.point)]);
+        const client = v2Client();
+        await client.connect(async (agent) => {
+          await agent.request(v2.methods.agent.initialize, {
+            protocolVersion: v2.PROTOCOL_VERSION,
+            info: { name: "v2-test-client", version: "1.0.0" },
+            capabilities: {},
+          });
+          await agent.request(v2.methods.agent.session.options, { sessionId, cwd });
+        });
+
+        const probe = sdk.processes.at(-1)!;
+        expect(probe.options).toMatchObject({ resume: sessionId, persistSession: false });
+        expect(probe.options.resumeSessionAt).toBeUndefined();
+        expect(await Promise.all([readFile(files.transcript), readFile(files.point)])).toEqual(
+          before,
+        );
+      });
     });
 
     it.each([

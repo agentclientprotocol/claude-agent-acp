@@ -63,6 +63,7 @@ import {
 import { mergeEffortSettings } from "../session-effort.js";
 import { configuredSettings, resolveThinkingConfig } from "../session-env.js";
 import { resolveInitialPermissionMode } from "../session-mode.js";
+import { cutAtRewindPoint, prepareRewoundResume } from "../session-rewind.js";
 import { sanitizeTitle } from "../session-titles.js";
 import { renameSession } from "../session-index/rename.js";
 import {
@@ -519,8 +520,14 @@ class V2Agent implements AgentHandle, SessionConnection {
     const { sessionId, replayFrom } = params;
     // The replay: the messages before each compaction too, unless reading them fails.
     const acrossCompactions = (chain: Promise<SessionMessage[]>, cwd: string) => {
-      const messages = chain.then((read) =>
-        readHistoryAcrossCompactions(sessionId, read, this.logger, cwd),
+      // The rewind cut comes first: the dropped turns get no replay and no cursor.
+      const messages = chain.then(async (read) =>
+        readHistoryAcrossCompactions(
+          sessionId,
+          await cutAtRewindPoint(sessionId, read, this.logger),
+          this.logger,
+          cwd,
+        ),
       );
       // A resume that fails before the replay leaves them unawaited.
       chain.catch(() => {});
@@ -1139,6 +1146,11 @@ class V2Agent implements AgentHandle, SessionConnection {
   ) {
     const request = await validatedSetup(params);
     const client = clientOptions(params._meta);
+    // A resume stops at a pending rewind point, or the dropped turns come back.
+    // The `session/options` probe (`persist: false`) leaves the transcript and
+    // `rewind.json` alone.
+    const resumeSessionAt =
+      resume !== undefined && persist ? await prepareRewoundResume(resume, this.logger) : undefined;
     const served = await this.mcpServersOf(sessionId, request, client, mcpServersRefused);
     const mcpServers = served.configs;
     // After a provider change that is still listing its models.
@@ -1312,6 +1324,7 @@ class V2Agent implements AgentHandle, SessionConnection {
         ...STARTUP_FAILURE_RESULTS_ENV,
       },
       ...(resume !== undefined ? { resume } : { sessionId }),
+      ...(resumeSessionAt !== undefined ? { resumeSessionAt } : {}),
       ...(persist ? {} : { persistSession: false }),
     };
     let q: Query;
@@ -1464,7 +1477,7 @@ async function validatedSetup(
 async function storedPromptIds(sessionId: string, cwd: string, logger: Logger): Promise<string[]> {
   const messages = await readHistoryAcrossCompactions(
     sessionId,
-    await getSessionMessages(sessionId, { dir: cwd }),
+    await cutAtRewindPoint(sessionId, await getSessionMessages(sessionId, { dir: cwd }), logger),
     logger,
     cwd,
   );

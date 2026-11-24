@@ -33,6 +33,7 @@ It describes only this adapter.
 - [Question custom answers](#question-custom-answers)
 - [Load replay end](#load-replay-end)
 - [Session fork point](#session-fork-point)
+- [Session rewind](#session-rewind)
 - [Presentation hints](#presentation-hints)
 - [Removed keys](#removed-keys)
 
@@ -179,6 +180,7 @@ It does not serve the [tool call contract](#tool-call-contract) yet.
 | `sessionRename`          | with `sessionIndex` | Nothing on its own: the agent lists it to tell that it supports `_session/rename`.                              | [Rename](#rename)                                       |
 | `sessionListSubscribe`   | with `sessionIndex` | Nothing on its own: the agent lists it to tell that it supports `_session/list/subscribe`.                      | [List subscription](#list-subscription)                 |
 | `sessionWorktrees`       | with `sessionIndex` | Nothing on its own: the agent lists it to tell that rows carry `agentWorktree` for a worktree Claude Code made. | [List response](#list-response)                         |
+| `sessionRewind`          | on request          | Accepts `_session/rewind`, and announces its session cursors with the `rewind` capability.                      | [Session rewind](#session-rewind)                       |
 | `loadReplayEnd`          | no                  | Sends one `session_info_update` after the whole history replay of a loaded session.                             | [Load replay end](#load-replay-end)                     |
 | `rawInputRendering`      | no                  | Sends no display copy of readable input in `content`. The client renders `rawInput`.                            | [Tool call contract](#tool-call-contract)               |
 
@@ -1889,6 +1891,48 @@ It adds this object to the `session/fork` request:
 - The fork keeps the history up to that message.
 - With or without this object, the forked session runs once the response arrives, so the client can prompt it without `session/load` or `session/resume`.
   A later load replays its history into it, and a later resume returns it. A load or resume with other settings (`cwd`, MCP servers, additional directories, or the session options in `_meta`) restarts it, as for any loaded session.
+
+## Session rewind
+
+AIR edits a user message by removing that message and everything after it from the provider's context, in the same session: same session id, no fork.
+`_session/rewind` asks the agent for that, at a session cursor:
+
+```json
+{ "sessionId": "0f7c…", "cursorId": "before:<uuid of the user message>" }
+```
+
+The response is `{ "rewound": true }`, which means that the cut is live and persisted, or `{ "rewound": false, "reason": "<reason>" }` when the conversation was left as it was.
+The client keeps its own history then.
+
+- ACP v1 only. The agent advertises `sessionRewind` to a client that declares it, and then announces each `cursor_update` with the capabilities `{ "fork": {}, "rewind": {} }`, except a cursor whose resume point is before the newest compaction (`beforeCompaction`) and every cursor of a session whose context was cleared (`clearedContext`): those get `{ "fork": {} }`. Every other client gets `{ "fork": {} }` on all cursors, and the method is not found (`-32601`) for it. ACP v2 does not list `sessionRewind` and has no `_session/rewind`; it only honours a cut that v1 made.
+- `cursorId` is one that the session announced with `rewind`: the cursor before a user message of its history. The first user message has no cursor, since Claude Code has no entry before it to resume at, so a client offers no edit for it.
+- The adapter resumes the stored conversation of the session at the entry before the cursor's message (`resumeSessionAt`). The agent replaces its query with that resume and restores the model, mode, effort, agent and Fast mode as the user left them. Claude Code deletes nothing: the dropped entries stay in the transcript as an orphan branch, and the agent records the cut in `rewind.json` beside the session's `subagents/` directory before it replaces the query, and puts the file back as it was when the cut does not happen (`busy`, `backgroundWork` or `providerRefused` after the file was written). When putting it back fails, the request fails with an internal error instead of `rewound: false`: the rewind did not happen and its point could not be removed, so the next load of the session applies the cut. A failed cut then still resumes the conversation first, so the session can be prompted. A crash between the two leaves the point on disk: the next resume of the session applies the cut, and the client's next load replays the cut history.
+- A live prompt is not reported to the client that sent it, so its cursor is anchored `after` the last entity the client holds. After a rewind it is the entity the client held before the removed message; if the agent holds no such record, the next prompt gets no cursor. When a turn reports no entity (it was cancelled or failed before any output, or it was a slash command), the next prompt's cursor has the same `after <entity>` anchor as the previous prompt's cursor, with a different `cursorId`: the client uses the latest.
+- The cut also removes the cursors at and after it: the session no longer announces them, and a request that names one fails as an unknown cursor.
+- The cut holds until the next prompt stores a branch from it. Until then, the agent applies `rewind.json` wherever it reads or resumes the session: a `session/load` (v1) or `session/resume` with a replay (v2) replays the history before the cut, with its cursors only; a restart of the query, a later load or resume, and a v2 resume continue at the cut; `session/fork` copies the history before it, also without a `cursorId`, and rejects a `cursorId` or `jetbrains.air.fork` message from the removed part with `-32602`. The first resume after that prompt removes the file. `session/options` neither reads nor writes it. When the cut cannot be prepared (the stored history or `rewind.json` cannot be read, or `rewind.json` is not a valid record), the load, resume, replay or fork fails with an internal error instead of using the whole conversation, and the client can retry; the point stays on disk.
+- A rewind keeps the task list and the published session failures of the session. Its token totals start again, as they do after any restart of the query.
+- No file change is reverted. The files stay as the removed turns left them.
+- A prompt sent while the rewind runs waits for it, and runs on the rewound conversation.
+
+| `reason`           | When                                                                                                                                                                                        |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `busy`             | Claude is working, a prompt is queued, Claude Code runs a cycle on its own, or a `/remote-control` command is in flight. AIR stops the turn before it sends the request.                    |
+| `backgroundWork`   | A background task or subagent runs. Closing the query would end it.                                                                                                                         |
+| `beforeCompaction` | The message is before the newest compaction of the conversation: Claude Code resumes from that compaction on and finds no entry before it.                                                  |
+| `clearedContext`   | The session's context was cleared when a plan was accepted: the conversation went on in another Claude Code session.                                                                        |
+| `providerRefused`  | Claude Code refused the cut, or the query could not restart with it. The agent resumed the conversation as it was, once, and the session can be prompted.                                   |
+| `persistFailed`    | `rewind.json` could not be written. The conversation and the rewind point are unchanged: the query was not replaced. The transcript can gain the `last-prompt` line that any resume writes. |
+
+When the removed message is the last user message, Claude Code also checks the removed range and refuses a cut that would remove what the client never saw, such as a message the session absorbed mid-turn.
+The refusal is deterministic, so the agent never retries it.
+If the recovery resume fails too, the request fails with an internal error, the session ends, and the client loads it again. When it fails because the account needs a sign-in, the request fails with `authRequired` and the session stays: the next prompt after the sign-in resumes it.
+
+The request fails with `-32602` for:
+
+- a `cursorId` that the session's history does not hold: an unknown id, an id that is no cursor, the first message, a message before the newest compaction when the history before it cannot be read (the fallback in `src/resumed-session.ts`), or one that an earlier rewind removed;
+- a session id that names a subagent's child session.
+
+A `sessionId` that is not held by the agent fails with `-32002`.
 
 ## Presentation hints
 
