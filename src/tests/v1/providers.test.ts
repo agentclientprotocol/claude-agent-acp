@@ -57,6 +57,7 @@ describe("providers", () => {
     vi.runAllTimers();
     vi.useRealTimers();
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
     vi.resetAllMocks();
   });
 
@@ -666,13 +667,18 @@ describe("providers", () => {
       { value: "haiku", resolvedModel: "claude-haiku-4-5", displayName: "Haiku", description: "" },
     ];
 
-    function mockQueryWithModels(mockQuery: Mock, models: unknown[] = GATEWAY_MODELS): Mock {
+    function mockQueryWithModels(
+      mockQuery: Mock,
+      models: unknown[] = GATEWAY_MODELS,
+      reinitModels: unknown[] = models,
+    ): Mock {
       const setModel = vi.fn();
       mockQuery.mockImplementation(() => ({
         initializationResult: vi.fn().mockResolvedValue({ models }),
+        applyFlagSettings: vi.fn().mockResolvedValue(undefined),
+        reinitialize: vi.fn().mockResolvedValue({ models: reinitModels }),
         setModel,
         setPermissionMode: vi.fn(),
-        applyFlagSettings: vi.fn().mockResolvedValue(undefined),
         supportedCommands: vi.fn().mockResolvedValue([]),
         close: vi.fn(),
         interrupt: vi.fn().mockResolvedValue(undefined),
@@ -716,6 +722,81 @@ describe("providers", () => {
       );
       expect(setModel).toHaveBeenCalledWith("sonnet");
     });
+
+    it.each([
+      {
+        pinned: true,
+        settings: {
+          permissions: { allow: "Bash" },
+          env: { ANTHROPIC_DEFAULT_HAIKU_MODEL: "claude-haiku-4-5" },
+        },
+      },
+      { userEnv: { ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-4-6" }, pinned: false },
+      // A modelOverrides target the gateway does not list.
+      {
+        settings: { modelOverrides: { "claude-sonnet-5-5": "my-gw-sonnet" } },
+        resolved: "my-gw-sonnet",
+        pinned: false,
+      },
+    ])(
+      "runs Sonnet on a listed version when the gateway lacks its default: $userEnv $settings",
+      async ({
+        userEnv,
+        settings,
+        resolved = "claude-sonnet-5-5",
+        pinned,
+      }: {
+        userEnv?: Record<string, string>;
+        settings?: object;
+        resolved?: string;
+        pinned: boolean;
+      }) => {
+        const [agent, mockQuery] = await createAgentMock();
+        const sonnet = { value: "sonnet", displayName: "Sonnet", description: "" };
+        const haiku = {
+          value: "haiku",
+          resolvedModel: "claude-haiku-5-5",
+          displayName: "Haiku",
+          description: "",
+        };
+        mockQueryWithModels(
+          mockQuery,
+          [{ ...sonnet, resolvedModel: resolved }, haiku],
+          [{ ...sonnet, resolvedModel: "claude-sonnet-5" }, haiku],
+        );
+        stubListing(["claude-sonnet-5", "claude-haiku-5-5"]);
+        for (const [key, value] of Object.entries(userEnv ?? {})) vi.stubEnv(key, value);
+        await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+        await agent.unstable_setProvider({
+          providerId: "main",
+          apiType: "anthropic",
+          baseUrl: "https://gateway.example",
+        });
+        const response = await agent.newSession({
+          cwd: process.cwd(),
+          mcpServers: [],
+          ...(settings && { _meta: { claudeCode: { options: { settings } } } }),
+        });
+        const query = mockQuery.mock.results.at(-1)!.value;
+        expect(query.applyFlagSettings).toHaveBeenNthCalledWith(1, {
+          apiKeyHelper: "",
+          env: expect.objectContaining({ ANTHROPIC_BASE_URL: "https://gateway.example" }),
+        });
+        expect(query.applyFlagSettings).toHaveBeenCalledTimes(pinned ? 2 : 1);
+        if (pinned) {
+          expect(modelOptionValues(response)).toEqual(["sonnet", "haiku"]);
+          expect(query.applyFlagSettings).toHaveBeenNthCalledWith(2, {
+            env: expect.objectContaining({
+              ANTHROPIC_BASE_URL: "https://gateway.example",
+              ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-5",
+            }),
+          });
+          expect(query.applyFlagSettings.mock.calls[1][0].env).not.toHaveProperty(
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+          );
+        }
+      },
+    );
 
     it("fails providers/set and keeps the current provider when the listing fails", async () => {
       const [agent, mockQuery] = await createAgentMock();

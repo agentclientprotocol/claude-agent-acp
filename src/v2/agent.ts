@@ -56,6 +56,7 @@ import {
 import { mergeEffortSettings } from "../session-effort.js";
 import { configuredSettings, resolveThinkingConfig } from "../session-env.js";
 import { resolveInitialPermissionMode } from "../session-mode.js";
+import { withGatewayFamilyPins } from "../session-model.js";
 import { sanitizeTitle } from "../session-titles.js";
 import { renameSession } from "../session-index/rename.js";
 import {
@@ -1268,6 +1269,20 @@ class V2Agent implements AgentHandle, SessionConnection {
     session.tasks.configs.configureAgents(customAgents(initialization.agents ?? []));
     let models;
     try {
+      // Pin the families the gateway lacks (`withGatewayFamilyPins`).
+      if (routing.listedModels) {
+        initialization = await withGatewayFamilyPins(
+          q,
+          initialization,
+          routing.listedModels,
+          {
+            env: { ...options.env, ...settings.getSettings().env, ...configured?.env },
+            modelOverrides: settings.getModelSelectionSettings(configured).modelOverrides,
+          },
+          routing.settings?.env,
+          this.logger,
+        );
+      }
       models = await sessionModels(
         q,
         initialization.models,

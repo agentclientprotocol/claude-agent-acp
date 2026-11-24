@@ -58,6 +58,8 @@ export interface SessionRouting {
    * Absent without a gateway login or a provider.
    */
   settings?: ProviderRouteSettings;
+  /** The model ids the provider's gateway listed, if it listed them. */
+  listedModels?: readonly string[];
   /** The models the session offers: those the provider's gateway listed. */
   models(models: ModelInfo[]): ModelInfo[];
   /** Whether {@link models} narrows the models to a gateway's list. */
@@ -246,6 +248,7 @@ export class V2Auth {
     return {
       env,
       ...(config ? { settings: providerRouteSettings(env) } : {}),
+      ...(config?.listedModels ? { listedModels: config.listedModels } : {}),
       models: (models) =>
         config?.listedModels
           ? narrowToGatewayModels(models, config.listedModels, config.bedrockRegionPrefix)

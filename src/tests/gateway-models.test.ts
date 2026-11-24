@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import type { ModelInfo, Query } from "@anthropic-ai/claude-agent-sdk";
+import type {
+  ModelInfo,
+  Query,
+  SDKControlInitializeResponse,
+} from "@anthropic-ai/claude-agent-sdk";
 import {
   bedrockRegionPrefix,
   GatewayListingError,
@@ -10,7 +14,9 @@ import {
 import {
   buildModelConfigOption,
   getAvailableModels,
+  gatewayFamilyPins,
   narrowToGatewayModels,
+  withGatewayFamilyPins,
 } from "../session-model.js";
 
 const logger = { log: vi.fn(), error: vi.fn() };
@@ -211,6 +217,186 @@ describe("selectBedrockRegion", () => {
     expect(selectBedrockRegion(["anthropic.claude-sonnet-5"])).toEqual({
       modelIds: ["anthropic.claude-sonnet-5"],
     });
+  });
+});
+
+describe("gatewayFamilyPins", () => {
+  const sdk = (sonnet: string): ModelInfo[] => [
+    { value: "default", resolvedModel: sonnet, displayName: "Default", description: "" },
+    { value: "sonnet", resolvedModel: sonnet, displayName: "Sonnet", description: "" },
+    { value: "haiku", resolvedModel: "claude-haiku-5-5", displayName: "Haiku", description: "" },
+  ];
+
+  it.each([
+    {
+      name: "the newest older version even when a newer major is listed first",
+      listed: ["claude-sonnet-6", "claude-sonnet-4-6", "claude-sonnet-5-4"],
+      pins: { ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-5-4" },
+    },
+    {
+      name: "nothing when the gateway lists the default, in any spelling",
+      listed: ["claude-sonnet-5-5-20261001", "claude-sonnet-5", "claude-haiku-5-5"],
+      pins: {},
+    },
+    {
+      name: "nothing for a family the gateway lists no version of",
+      listed: ["claude-haiku-5-5"],
+      pins: {},
+    },
+    {
+      name: "the undated spelling, and no -fast or [1m] variant",
+      listed: [
+        "claude-sonnet-5-20260101",
+        "claude-sonnet-5",
+        "claude-sonnet-5-fast",
+        "claude-sonnet-5[1m]",
+        "claude-haiku-5-5",
+      ],
+      pins: { ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-5" },
+    },
+    {
+      name: "the newest older version even when a newer minor is listed last",
+      listed: ["claude-sonnet-5-4", "claude-sonnet-4-6", "claude-sonnet-5-10"],
+      pins: { ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-5-4" },
+    },
+    {
+      name: "the newest version when only newer versions are listed",
+      listed: ["claude-sonnet-6", "claude-sonnet-5-6", "claude-sonnet-6-1"],
+      pins: { ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-6-1" },
+    },
+    {
+      name: "no 1M-context or OpenRouter variant",
+      listed: [
+        "claude-sonnet-5-1-1m",
+        "anthropic/claude-sonnet-5-1:free",
+        "anthropic/claude-sonnet-5-1:batch",
+        "claude-sonnet-5",
+      ],
+      pins: { ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-5" },
+    },
+    {
+      name: "no Bedrock -fast variant",
+      listed: ["eu.anthropic.claude-sonnet-5-1-fast-v1:0", "eu.anthropic.claude-sonnet-5-v1:0"],
+      pins: { ANTHROPIC_DEFAULT_SONNET_MODEL: "eu.anthropic.claude-sonnet-5-v1:0" },
+    },
+    {
+      name: "the id as a Bedrock gateway lists it",
+      listed: ["eu.anthropic.claude-sonnet-5-v1:0", "eu.anthropic.claude-haiku-5-5-v1:0"],
+      pins: { ANTHROPIC_DEFAULT_SONNET_MODEL: "eu.anthropic.claude-sonnet-5-v1:0" },
+    },
+  ])("names $name", ({ listed, pins }) => {
+    expect(gatewayFamilyPins(sdk("claude-sonnet-5-5"), listed, { env: {} })).toEqual(pins);
+  });
+
+  it.each([
+    {
+      name: "a family default",
+      user: { env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-4-6" } },
+    },
+    {
+      // Claude Code resolves `sonnet` to the override target, which the
+      // gateway does not list; a pin would bypass the override.
+      name: "a modelOverrides target",
+      user: { env: {}, modelOverrides: { "claude-sonnet-5-5": "claude-sonnet-4-6" } },
+    },
+  ])("keeps $name the user set", ({ user }) => {
+    expect(gatewayFamilyPins(sdk("claude-sonnet-4-6"), ["claude-sonnet-5"], user)).toEqual({});
+  });
+});
+
+describe("withGatewayFamilyPins", () => {
+  const startup = {
+    models: [
+      {
+        value: "sonnet",
+        resolvedModel: "claude-sonnet-5-5",
+        displayName: "Sonnet",
+        description: "",
+      },
+    ],
+    fast_mode_state: "off",
+  } as unknown as SDKControlInitializeResponse;
+  const pinned = {
+    models: [
+      {
+        value: "sonnet",
+        resolvedModel: "claude-sonnet-5",
+        displayName: "Sonnet 5",
+        description: "",
+      },
+    ],
+    fast_mode_state: "on",
+  } as unknown as SDKControlInitializeResponse;
+  const logger = { log: vi.fn(), error: vi.fn() };
+
+  it("adds the pins to the flag env and returns the fresh initialize response", async () => {
+    const query = {
+      applyFlagSettings: vi.fn(async () => {}),
+      reinitialize: vi.fn(async () => pinned),
+    };
+    await expect(
+      withGatewayFamilyPins(
+        query,
+        startup,
+        ["claude-sonnet-5"],
+        { env: {} },
+        { ANTHROPIC_BASE_URL: "https://gw" },
+        logger,
+      ),
+    ).resolves.toBe(pinned);
+    expect(query.applyFlagSettings).toHaveBeenCalledWith({
+      env: { ANTHROPIC_BASE_URL: "https://gw", ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-5" },
+    });
+  });
+
+  it.each([
+    { name: "makes no call when no pin is needed", listed: ["claude-sonnet-5-5"], fails: false },
+    {
+      name: "keeps the startup response when Claude Code refuses",
+      listed: ["claude-sonnet-5"],
+      fails: true,
+    },
+  ])("$name", async ({ listed, fails }) => {
+    const query = {
+      applyFlagSettings: vi.fn(async () => {
+        if (fails) throw new Error("refused");
+      }),
+      reinitialize: vi.fn(async () => pinned),
+    };
+    await expect(
+      withGatewayFamilyPins(query, startup, listed, { env: {} }, undefined, logger),
+    ).resolves.toBe(startup);
+    expect(query.applyFlagSettings).toHaveBeenCalledTimes(fails ? 1 : 0);
+    expect(query.reinitialize).not.toHaveBeenCalled();
+  });
+
+  it("clears the live pins and restores the original flag env after a failed refresh", async () => {
+    const flagEnv = { ANTHROPIC_BASE_URL: "https://gw", ANTHROPIC_CUSTOM_HEADERS: "X-Route: a" };
+    const query = {
+      applyFlagSettings: vi.fn(async () => {}),
+      reinitialize: vi.fn().mockRejectedValue(new Error("refresh failed")),
+    };
+    await expect(
+      withGatewayFamilyPins(query, startup, ["claude-sonnet-5"], { env: {} }, flagEnv, logger),
+    ).resolves.toBe(startup);
+    expect(query.applyFlagSettings.mock.calls).toEqual([
+      [{ env: { ...flagEnv, ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-5" } }],
+      [{ env: { ...flagEnv, ANTHROPIC_DEFAULT_SONNET_MODEL: "" } }],
+      [{ env: flagEnv }],
+    ]);
+  });
+
+  it("fails session setup if the original flag env cannot be restored", async () => {
+    const query = {
+      applyFlagSettings: vi
+        .fn()
+        .mockResolvedValueOnce(undefined)
+        .mockRejectedValue(new Error("refused")),
+      reinitialize: vi.fn().mockRejectedValue(new Error("refresh failed")),
+    };
+    await expect(
+      withGatewayFamilyPins(query, startup, ["claude-sonnet-5"], { env: {} }, undefined, logger),
+    ).rejects.toThrow("Could not restore the gateway's model settings");
   });
 });
 
