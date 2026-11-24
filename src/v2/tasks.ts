@@ -642,6 +642,17 @@ export class SessionTasks {
   }
 
   /**
+   * The child session of the subagent `agentId`, whose stream reports the
+   * subagent's tool calls: the one that this root announced in its current
+   * conversation (see {@link hasChild}), under the agent's id. Undefined for
+   * an agent without one: its `task_started` has not come, which an agent
+   * inside a workflow never gets, or its child is not announced.
+   */
+  childSession(agentId: string): string | undefined {
+    return this.hasChild(agentId) ? agentId : undefined;
+  }
+
+  /**
    * The session that a permission request of the agent `agentId` goes to:
    * its child session once it is announced, else the root. A request can
    * come before its subagent's `task_started`: it blocks the root's work once

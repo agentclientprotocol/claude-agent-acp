@@ -9,6 +9,7 @@ import {
   type ClientCapabilities,
   type InitializeRequest,
 } from "@agentclientprotocol/sdk/unstable";
+import type { HookCallbackMatcher } from "@anthropic-ai/claude-agent-sdk";
 import { mkdir, writeFile } from "node:fs/promises";
 import { request } from "node:http";
 import path from "node:path";
@@ -191,8 +192,8 @@ const CLAUDE_CODE_MCP_META = {
  * Sends the MCP request `method` to the HTTP server of an SDK config, as
  * Claude Code 2.1.325 sends it: one JSON-RPC request in a POST, with the
  * headers that mirror its version, method and tool name. A `tools/call` has
- * the tool use id and a progress token in `_meta`. `headers` replace the
- * config's own, which carry the server's bearer token.
+ * the id of its tool use (`toolUseId`) and a progress token in `_meta`.
+ * `headers` replace the config's own, which carry the server's bearer token.
  *
  * Resolves with the HTTP status and the JSON-RPC messages of the response:
  * the one message of a JSON body, or every message of an event stream. It
@@ -203,10 +204,11 @@ export function claudeCodeMcpRequest(
   method: string,
   params: Record<string, unknown> = {},
   headers: Record<string, string> | undefined = config.headers,
+  toolUseId = "toolu_01",
 ): Promise<{ status: number; messages: Array<Record<string, any>> }> {
   const meta =
     method === "tools/call"
-      ? { ...CLAUDE_CODE_MCP_META, "claudecode/toolUseId": "toolu_01", progressToken: 1 }
+      ? { ...CLAUDE_CODE_MCP_META, "claudecode/toolUseId": toolUseId, progressToken: 1 }
       : CLAUDE_CODE_MCP_META;
   const body = JSON.stringify({
     jsonrpc: "2.0",
@@ -248,4 +250,59 @@ export function claudeCodeMcpRequest(
     post.on("error", reject);
     post.end(body);
   });
+}
+
+/**
+ * Runs the hooks of `event` for the tool use `use` of a tool of an MCP server,
+ * as Claude Code 2.1.330 runs them: the hooks of each matcher without a
+ * pattern, or whose pattern matches the tool's whole name, with the input
+ * that it sends them. A subagent's tool use also names the subagent
+ * (`agentId`) and its type (`agentType`), which is `workflow-subagent` for an
+ * agent that a workflow runs. `server` is the name that the tool's server was
+ * declared with, when the tool's name has another one for it (`my tools` in
+ * `mcp__my_tools__echo`).
+ */
+export async function runMcpToolHooks(
+  hooks: Partial<Record<string, HookCallbackMatcher[]>> | undefined,
+  event: "PreToolUse" | "PostToolUse" | "PostToolUseFailure",
+  use: {
+    id: string;
+    tool: string;
+    server?: string;
+    input?: unknown;
+    agentId?: string;
+    agentType?: string;
+  },
+): Promise<void> {
+  const server = use.server ?? use.tool.split("__")[1];
+  const input = {
+    session_id: "claude-session",
+    transcript_path: "/claude/projects/workspace/claude-session.jsonl",
+    cwd: "/workspace",
+    prompt_id: "prompt-1",
+    permission_mode: "default",
+    ...(use.agentId !== undefined
+      ? { agent_id: use.agentId, agent_type: use.agentType ?? "general-purpose" }
+      : {}),
+    effort: { level: "medium" },
+    hook_event_name: event,
+    tool_name: use.tool,
+    tool_input: use.input ?? {},
+    ...(event === "PostToolUse" ? { tool_response: [{ type: "text", text: "pong" }] } : {}),
+    tool_use_id: use.id,
+    // The message of the JSON-RPC error that the MCP server answered with.
+    ...(event === "PostToolUseFailure"
+      ? { error: "Invalid params: the tools server needs a sessionId", is_interrupt: false }
+      : {}),
+    ...(event !== "PreToolUse" ? { duration_ms: 3 } : {}),
+    mcp_server: { name: server, source: "dynamic" },
+  };
+  for (const matcher of hooks?.[event] ?? []) {
+    if (matcher.matcher !== undefined && !new RegExp(`^(?:${matcher.matcher})$`).test(use.tool)) {
+      continue;
+    }
+    for (const hook of matcher.hooks) {
+      await hook(input as never, use.id, { signal: new AbortController().signal });
+    }
+  }
 }
