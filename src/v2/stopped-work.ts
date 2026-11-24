@@ -82,8 +82,11 @@ export class StoppedWork {
   }
 
   /** The interrupt failed: Claude Code stops nothing. */
-  interruptFailed(): void {
+  interruptFailed(steers: Iterable<string>): void {
     this.interruptReach = 0;
+    for (const uuid of steers) {
+      if (this.abandoned.delete(uuid) && this.droppingFor === uuid) this.endDropping();
+    }
   }
 
   /** A `status: requesting` frame, with the prompts that the request serves. */

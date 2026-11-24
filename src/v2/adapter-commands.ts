@@ -98,6 +98,10 @@ export class SessionAdapterCommands {
   /** The running command's abort, while one runs. */
   private abortCommand: AbortController | undefined;
 
+  get isRunning(): boolean {
+    return this.abortCommand !== undefined;
+  }
+
   /** Whether `prompt` may be an adapter command, which {@link run} then decides. */
   mayRun(prompt: Parameters<typeof mayBeAdapterCommand>[0]): boolean {
     return mayBeAdapterCommand(prompt);

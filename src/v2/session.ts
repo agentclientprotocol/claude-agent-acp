@@ -79,6 +79,7 @@ import { TurnFileChanges } from "./file-changes.js";
 import { SessionCommands } from "./commands.js";
 import type { SessionConfig } from "./config.js";
 import {
+  combinedEnd,
   idleOutcome,
   isPlaceholderResult,
   ResultUsage,
@@ -153,6 +154,8 @@ export class V2Session implements RequestTarget {
   private readonly pending = new Map<string, PendingPrompt>();
   /** Priority prompts whose reply still belongs to the open foreground work. */
   private readonly steeredPrompts = new Set<string>();
+  /** Extension steers sent to Claude Code but not yet taken in. */
+  private readonly queuedExtensionSteers = new Set<string>();
   /** Whether a turn of Claude Code is open: the session's foreground work. */
   private foreground = false;
   /** The prompt whose `started` frame came last in the open turn. */
@@ -532,6 +535,48 @@ export class V2Session implements RequestTarget {
     return this.keys.once(key, (attempt) => this.submit(params, request, guard, attempt, signal));
   }
 
+  /** The extension acknowledges injection before Claude Code takes the message in. */
+  injectSteer(params: v2.PromptRequest): boolean {
+    if (this.closed) throw RequestError.sessionNotFound(this.sessionId);
+    const request = v1PromptRequest(params);
+    if (!this.foreground) return false;
+    if (
+      this.cancelledWork ||
+      this.interrupting ||
+      (this.lastEnd && !this.cycleOpen && !this.steeredPrompts.size)
+    ) {
+      throw RequestError.invalidRequest(
+        undefined,
+        "Claude is ending the turn. Try again when it ends.",
+      );
+    }
+    if (this.adapterCommands.isRunning) {
+      throw RequestError.invalidRequest(
+        undefined,
+        "An adapter command is running. Try steering when it ends.",
+      );
+    }
+    const uuid = randomUUID();
+    const message = { ...promptToClaude(request), uuid };
+    this.reports.disarmIdleCompaction("steer");
+    this.queuedExtensionSteers.add(uuid);
+    this.pushPrompt(message, true);
+    return true;
+  }
+
+  /** Applies Claude Code priority before sending a follow-up to the running turn. */
+  private pushPrompt(message: SDKUserMessage & { uuid: string }, followUp: boolean): void {
+    if (followUp) {
+      // Interrupting an open input callback would withdraw the client's request.
+      message.priority = steeringPriority(this.requests.size > 0 || this.tasks.hasOpenRequests());
+      if (message.priority === "now" || this.queuedExtensionSteers.has(message.uuid)) {
+        this.steeredPrompts.add(message.uuid);
+      }
+    }
+    this.adapterCommands.pushed(message.uuid);
+    this.input.push(message);
+  }
+
   /**
    * Sends the prompt to Claude Code as the message `attempt.uuid` (see
    * {@link prompt}).
@@ -562,7 +607,7 @@ export class V2Session implements RequestTarget {
       // The notice of a mode fallback at the session's start, which sends it at once.
       void this.config.promptSent();
     };
-    const message: SDKUserMessage = { ...promptToClaude(request), uuid };
+    const message = { ...promptToClaude(request), uuid };
     /** What a prompt that is new to the session registers before it goes to Claude Code. */
     const accept = () => {
       if (!guard) sent();
@@ -651,16 +696,10 @@ export class V2Session implements RequestTarget {
             }
             this.fileChanges?.requested(uuid, params._meta);
           }
-          if (this.foreground || [...this.pending.values()].some((prompt) => prompt.pushed)) {
-            // Interrupting an open input callback would withdraw the client's request.
-            message.priority = steeringPriority(
-              this.requests.size > 0 || this.tasks.hasOpenRequests(),
-            );
-            if (message.priority === "now") this.steeredPrompts.add(uuid);
-          }
+          const followUp =
+            this.foreground || [...this.pending.values()].some((prompt) => prompt.pushed);
           pending.pushed = true;
-          this.adapterCommands.pushed(uuid);
-          this.input.push(message);
+          this.pushPrompt(message, followUp);
           this.reports.promptQueued(request.prompt);
         });
     });
@@ -772,6 +811,7 @@ export class V2Session implements RequestTarget {
   async cancel(): Promise<void> {
     if (this.closed || !this.query) return;
     this.reports.disarmIdleCompaction("cancel");
+    const queuedExtensionSteers = [...this.queuedExtensionSteers];
     this.stopForeground();
     // `cancelQueued` is untyped in the SDK (`Query.interrupt` takes it since
     // the CLI's `interrupt_cancel_queued_v1`): Claude Code then drops the
@@ -787,7 +827,10 @@ export class V2Session implements RequestTarget {
         this.connection.logger.error(`Session ${this.sessionId}: the interrupt failed`, error);
         this.cancelledWork = false;
         this.output.cancelled = false;
-        this.stopped.interruptFailed();
+        this.stopped.interruptFailed(queuedExtensionSteers);
+        if (this.foreground) {
+          for (const uuid of this.queuedExtensionSteers) this.steeredPrompts.add(uuid);
+        }
         this.tasks.foregroundCancelFailed();
         // The withdrawn requests reported no `running`: the work goes on.
         this.reportState();
@@ -807,7 +850,7 @@ export class V2Session implements RequestTarget {
    */
   private stopForeground(): void {
     this.steeredPrompts.clear();
-    const pushed: string[] = [];
+    const pushed = [...this.queuedExtensionSteers];
     for (const [uuid, prompt] of [...this.pending]) {
       if (prompt.pushed) pushed.push(uuid);
       this.failPrompt(uuid, RequestError.requestCancelled());
@@ -1338,6 +1381,7 @@ export class V2Session implements RequestTarget {
    * nothing (see {@link StoppedWork}).
    */
   private promptStarted(uuid: string): void {
+    this.queuedExtensionSteers.delete(uuid);
     if (this.stopped.promptStarted(uuid, this.foreground)) return;
     // Claude Code takes its prompts in order: the work that a cancel stopped
     // has ended, also when the cancel came while it ran nothing.
@@ -1386,12 +1430,20 @@ export class V2Session implements RequestTarget {
     this.idleOwed = true;
     const served =
       message.user_message_uuids ?? (message.user_message_uuid ? [message.user_message_uuid] : []);
-    for (const uuid of served) this.steeredPrompts.delete(uuid);
+    for (const uuid of served) {
+      this.steeredPrompts.delete(uuid);
+      this.queuedExtensionSteers.delete(uuid);
+    }
     // Older CLIs omit the result's prompt list. An accepted priority prompt
     // is answered by the next result that did not abort the preceding cycle.
-    if (served.length === 0 && !isAbortedResult(message)) {
+    if (
+      served.length === 0 &&
+      !isAbortedResult(message) &&
+      !(message.origin && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind))
+    ) {
       for (const uuid of this.steeredPrompts) {
-        if (!this.pending.has(uuid)) this.steeredPrompts.delete(uuid);
+        if (!this.pending.has(uuid) && !this.queuedExtensionSteers.has(uuid))
+          this.steeredPrompts.delete(uuid);
       }
     }
     const { dropped, interrupted } = this.stopped.result(message);
@@ -1424,7 +1476,8 @@ export class V2Session implements RequestTarget {
       return;
     }
     if (disposition === "rejected") this.cancelledWork = true;
-    this.lastEnd = this.clearContext.turnEnd(end);
+    const cycleEnd = this.clearContext.turnEnd(end);
+    this.lastEnd = this.lastEnd ? combinedEnd([this.lastEnd, cycleEnd]) : cycleEnd;
     const local = this.turnLocalCommand;
     if (message.stop_reason === "refusal") {
       // The refused message shows nothing: its explanation answers.
@@ -1733,13 +1786,14 @@ export class V2Session implements RequestTarget {
   /** Fails the prompt `uuid` if it is not answered yet. Returns whether it was pending. */
   private failPrompt(uuid: string, error: unknown): boolean {
     const prompt = this.takePrompt(uuid);
+    const queuedSteer = this.queuedExtensionSteers.delete(uuid);
     const steered = this.steeredPrompts.delete(uuid);
     if (prompt) {
       this.localCommands.delete(uuid);
       this.fileChanges?.promptFailed(uuid, error);
       prompt.reject(error);
     }
-    if (steered && !this.cycleOpen) void this.endTurn();
+    if ((steered || (queuedSteer && this.cancelledWork)) && !this.cycleOpen) void this.endTurn();
     this.checkBoundary();
     return prompt !== undefined;
   }
@@ -1747,6 +1801,7 @@ export class V2Session implements RequestTarget {
   private failPending(error: unknown): void {
     // The query's close or failure owns the turn's outcome.
     this.steeredPrompts.clear();
+    this.queuedExtensionSteers.clear();
     for (const uuid of [...this.pending.keys()]) this.failPrompt(uuid, error);
   }
 }
