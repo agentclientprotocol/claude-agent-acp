@@ -2,6 +2,8 @@ import { describe, it, expect, vi } from "vitest";
 import { ClaudeAcpAgent } from "../../v1/acp-agent.js";
 import type { AcpClient } from "../../acp-client.js";
 import { Pushable } from "../../utils.js";
+import { initializeClient } from "../helpers.js";
+import { AIR_SESSION_REWIND_CAPABILITY } from "../../air-extension.js";
 import { mockSessionState, successfulResultMessage, wrapQuery } from "./session-doubles.js";
 
 const HUMAN = { kind: "human" };
@@ -41,7 +43,7 @@ function createAgent() {
   const userChunks = () =>
     updates.filter((update) => update.sessionUpdate === "user_message_chunk");
   const userTexts = () => userChunks().map((update) => update.content.text);
-  return { agent, userTexts, userChunks };
+  return { agent, updates, userTexts, userChunks };
 }
 
 async function promptWith(messages: (promptUuid: string) => unknown[]) {
@@ -202,5 +204,72 @@ describe("user messages typed in another client of the session", () => {
     ]);
 
     expect(chunks.map((chunk) => chunk.content)).toEqual(expected);
+  });
+});
+
+describe("the cursor of a user message typed in another client", () => {
+  const REWIND_CLIENT = {
+    session: { cursors: {} },
+    _meta: { jetbrains: { air: { version: 1, capabilities: [AIR_SESSION_REWIND_CAPABILITY] } } },
+  };
+  const answer = {
+    type: "assistant",
+    uuid: "answer-1",
+    session_id: "test-session",
+    parent_tool_use_id: null,
+    parent_agent_id: null,
+    message: {
+      id: "msg_answer-1",
+      role: "assistant",
+      model: "claude-sonnet-4",
+      content: [{ type: "text", text: "Answer" }],
+      usage: {},
+    },
+  };
+
+  async function cursorsAfter(messages: unknown[], capabilities: object = REWIND_CLIENT) {
+    const { agent, updates } = createAgent();
+    await initializeClient(agent, capabilities);
+    const input = new Pushable<any>();
+    async function* generator() {
+      const { value: sent } = await input[Symbol.asyncIterator]().next();
+      yield echoOfAdapterMessage(sent.uuid, "typed in Zed");
+      yield* messages;
+      yield successfulResultMessage();
+      yield idle;
+    }
+    agent.sessions["test-session"] = mockSessionState({ query: wrapQuery(generator()), input });
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "typed" }] });
+    return updates.filter((update) => update.sessionUpdate === "cursor_update");
+  }
+
+  it("is announced before the message, with the capabilities of the client", async () => {
+    const cursors = await cursorsAfter([
+      answer,
+      userReplay("phone-1", "typed on the phone", { origin: HUMAN }),
+    ]);
+    expect(cursors).toEqual([
+      {
+        sessionUpdate: "cursor_update",
+        cursorId: "before:phone-1",
+        capabilities: { fork: {}, rewind: {} },
+        anchor: { type: "user_message", messageId: "phone-1", position: "before" },
+      },
+    ]);
+  });
+
+  it.each([
+    ["a message of a subagent", { origin: HUMAN, parent_tool_use_id: "toolu_1" }],
+    ["a slash command", { origin: HUMAN }, "/review"],
+  ])("is not announced for %s", async (_description, extra, text = "typed on the phone") => {
+    const cursors = await cursorsAfter([answer, userReplay("phone-1", text, extra)]);
+    expect(cursors).toEqual([]);
+  });
+
+  it("is not announced for the first message of the session", async () => {
+    const cursors = await cursorsAfter([
+      userReplay("phone-1", "typed on the phone", { origin: HUMAN }),
+    ]);
+    expect(cursors).toEqual([]);
   });
 });

@@ -49,6 +49,13 @@ export const AIR_SESSION_LIST_SUBSCRIBE_CAPABILITY = "sessionListSubscribe";
  */
 export const AIR_SESSION_WORKTREES_CAPABILITY = "sessionWorktrees";
 /**
+ * `_session/rewind`: removes a user message and everything after it from the
+ * context of the same session (see `docs/air-extensions.md#session-rewind`).
+ * The client declares it; the agent advertises it only to such a client, and
+ * then announces its session cursors with the `rewind` capability.
+ */
+export const AIR_SESSION_REWIND_CAPABILITY = "sessionRewind";
+/**
  * The client wants to know when the history replay of a loaded session is
  * whole. After the last replayed update, the agent sends one
  * `session_info_update` with `_meta.jetbrains.air.loadReplayEnd: true` (see

@@ -6,6 +6,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { messageIdForGrouping } from "../../sdk-to-acp.js";
 import { forkSession } from "../../fork-session.js";
+import { writeRewindPoint } from "../../session-rewind.js";
 import { encodeProjectPath } from "../../session-index/project-dirs.js";
 
 // Use the real SDK against temporary transcripts, without starting Claude Code.
@@ -225,5 +226,52 @@ describe("fork at a session cursor", () => {
       message: expect.stringContaining("that a fork can start at"),
     });
     expect(await fs.readdir(path.dirname(sourceFile))).toEqual([path.basename(sourceFile)]);
+  });
+});
+
+describe("fork after a rewind", () => {
+  const fork = (extra: Partial<Parameters<typeof forkSession>[0]>, deps = {}) =>
+    forkSession(
+      { sessionId, cwd: sourceCwd, mcpServers: [], ...extra },
+      { messageIdForGrouping, ...deps },
+    );
+  const messagePoint = (messageId: string) => ({
+    _meta: { jetbrains: { air: { fork: { version: 1, messageId } } } },
+  });
+  let droppedPrompt: string;
+
+  beforeEach(async () => {
+    // The user rewound the follow-up: it and its answers stay in the transcript.
+    const [, firstAnswer, followup] = await getSessionMessages(sessionId, { dir: sourceCwd });
+    droppedPrompt = followup!.uuid;
+    await writeRewindPoint(sessionId, {
+      resumeSessionAt: firstAnswer!.uuid,
+      droppedPromptUuid: droppedPrompt,
+    });
+  });
+
+  it.each([
+    ["the whole session", {}],
+    ["a message of the retained part", messagePoint("msg_first")],
+  ])("copies the retained history for %s", async (_, extra) => {
+    const forked = await getSessionMessages((await fork(extra)).sessionId);
+    expect(forked.map((message) => message.message)).toEqual([
+      { role: "user", content: "First prompt" },
+      expect.objectContaining({ id: "msg_first" }),
+    ]);
+  });
+
+  it.each([
+    ["the dropped prompt's cursor", () => ({ cursorId: `before:${droppedPrompt}` }), "cursorId"],
+    ["an active message of the dropped part", () => messagePoint("msg_active"), "messageId"],
+    ["an inactive message of the dropped part", () => messagePoint("msg_inactive"), "messageId"],
+  ])("rejects %s with -32602 and forks nothing", async (_, request, field) => {
+    await expect(fork(request())).rejects.toMatchObject({
+      code: -32602,
+      data: expect.objectContaining({ [field]: expect.any(String) }),
+    });
+    expect(
+      (await fs.readdir(path.dirname(sourceFile))).filter((name) => name.endsWith(".jsonl")),
+    ).toEqual([path.basename(sourceFile)]);
   });
 });

@@ -87,7 +87,14 @@ local command, keeps its key until `session/close` or the end of the connection.
 The adapter announces a session cursor (`cursor_update`) before each user message that follows
 another entry of the conversation, live and in a replay. `session/fork` with its `cursorId` copies
 the history before that message, and fails with `-32602` for any other `cursorId`. A v1 client gets
-no cursors yet.
+cursors only when it declares `clientCapabilities.session.cursors`. A v1 replay (`session/load`)
+anchors each cursor `before` its replayed user message. A live v1 prompt is not reported to the
+client that sent it, so its cursor is anchored `after` the last agent message, thought, tool call or
+compaction before it, with the same `cursorId` that a later replay issues. A session that was
+resumed without a replay has no such entity, so its live prompts get no cursor until it replays.
+When a v1 turn reports no entity (it was cancelled or failed before any output, or it was a slash
+command), the next prompt's cursor has the same `after <entity>` anchor as the previous prompt's
+cursor, with a different `cursorId`: the client uses the latest.
 
 v2 is served by the v2 agent in `src/v2/`, which runs straight on Claude
 Code instead of translating to v1. A v2 client that declares JetBrains AIR
