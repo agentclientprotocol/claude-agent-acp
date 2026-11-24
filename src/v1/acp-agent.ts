@@ -190,7 +190,15 @@ import {
 } from "../auth-status.js";
 import { AuthStatusReporter, cliLogout } from "../auth-status-reporter.js";
 import { terminalAuthMethods as authMethodsForTerminal } from "../auth-methods.js";
-import { McpOverAcp, sdkMcpServers, type UnservedMcpServer } from "../mcp-servers.js";
+import {
+  McpOverAcp,
+  mcpServerNames,
+  refusedMcpServers,
+  type SdkMcpServers,
+  sdkMcpServers,
+  startAroundRefusedMcpServers,
+  type UnservedMcpServer,
+} from "../mcp-servers.js";
 import { claudeCliPath, cliDelivery } from "../claude-cli.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { randomUUID } from "node:crypto";
@@ -300,7 +308,7 @@ import {
   collapseHookSpeaker,
   informationalNotice,
   MAX_NOTICE_TITLE_LENGTH,
-  mcpServerStartupNotice,
+  mcpServerStartupNotices,
   modelRefusalFallback,
   normalizeNoticeText,
   noticeOrTranscriptUpdate,
@@ -1634,6 +1642,33 @@ function startMcpServerAuthentication(
   );
 }
 
+/** How `ClaudeAcpAgent.createSession` creates a session. */
+type SessionCreation = {
+  resume?: string;
+  forkSession?: boolean;
+  publicSessionId?: string;
+  permissionMode?: PermissionMode;
+  /** Start a NEW conversation, but under this id instead of a random one.
+   *  `resume` continues a stored conversation and fails when the CLI never
+   *  wrote one; this keeps the ACP session id alive with an empty history.
+   *  The SDK accepts a caller-chosen id as long as `resume` is not set. */
+  reuseSessionId?: string;
+  /** Concrete model id from the resumed transcript's last real assistant
+   *  message. Claude Code restores from this same record, so it lets us
+   *  report the live model without a slow getContextUsage control request. */
+  resumedModelHint?: string | Promise<string | undefined>;
+  /** The state that a replay on the same session uses before this record exists. */
+  replayState?: ReplayState;
+  /** A close of this session during startup cancels registration of its replacement. */
+  replacingSession?: Session;
+  /**
+   * `session/options`: the query answers with the modes and config options
+   * and closes. No session is registered, and Claude Code stores nothing
+   * of the query (`persistSession: false`).
+   */
+  optionsOnly?: boolean;
+};
+
 export class ClaudeAcpAgent {
   sessions: {
     [key: string]: Session;
@@ -2780,6 +2815,8 @@ export class ClaudeAcpAgent {
   /** Tells the user about client-provided MCP servers that `system`/init
    *  reports as `failed` or `needs-auth`, and about the ones the query started
    *  without (`session.unservedMcpServers`), once per server per session.
+   *  Servers that failed for the same reason share one notice (see
+   *  `mcpServerStartupNotices`).
    *  Servers from the user's Claude Code settings are left to `/mcp`: they are
    *  the same in every session, so a broken one would be reported in every
    *  session. A `needs-auth` server is reported only when the OAuth flow can't
@@ -2802,15 +2839,18 @@ export class ClaudeAcpAgent {
     if (!notStarted.length) return;
     const oauthAvailable =
       !!this.clientCapabilities?.elicitation?.url && supportsMcpOAuth(session.query);
-    for (const server of notStarted) {
-      if (session.reportedMcpServers?.has(server.name)) continue;
-      const notice = mcpServerStartupNotice(server, oauthAvailable);
-      if (!notice) continue;
-      (session.reportedMcpServers ??= new Set()).add(server.name);
+    const unreported = notStarted.filter((server) => !session.reportedMcpServers?.has(server.name));
+    for (const { servers, status, notice } of mcpServerStartupNotices(unreported, oauthAvailable)) {
+      for (const name of servers) (session.reportedMcpServers ??= new Set()).add(name);
       await sendUpdate({
         sessionId,
         update: noticeOrTranscriptUpdate(notice, supportsNotices, undefined, {
-          claudeCode: { kind: "mcpServerStatus", server: server.name, status: server.status },
+          // `server` for a notice about one server, `servers` for one about several.
+          claudeCode: {
+            kind: "mcpServerStatus",
+            ...(servers.length === 1 ? { server: servers[0] } : { servers }),
+            status,
+          },
         }),
       });
     }
@@ -10060,33 +10100,39 @@ export class ClaudeAcpAgent {
     );
   }
 
-  private async createSession(
+  /**
+   * Creates the session. When Claude Code refuses to start with the session's
+   * MCP servers, the session is created without them (see
+   * `startAroundRefusedMcpServers`).
+   */
+  private createSession(
     params: NewSessionRequest,
-    creationOpts: {
-      resume?: string;
-      forkSession?: boolean;
-      publicSessionId?: string;
-      permissionMode?: PermissionMode;
-      /** Start a NEW conversation, but under this id instead of a random one.
-       *  `resume` continues a stored conversation and fails when the CLI never
-       *  wrote one; this keeps the ACP session id alive with an empty history.
-       *  The SDK accepts a caller-chosen id as long as `resume` is not set. */
-      reuseSessionId?: string;
-      /** Concrete model id from the resumed transcript's last real assistant
-       *  message. Claude Code restores from this same record, so it lets us
-       *  report the live model without a slow getContextUsage control request. */
-      resumedModelHint?: string | Promise<string | undefined>;
-      /** The state that a replay on the same session uses before this record exists. */
-      replayState?: ReplayState;
-      /** A close of this session during startup cancels registration of its replacement. */
-      replacingSession?: Session;
-      /**
-       * `session/options`: the query answers with the modes and config options
-       * and closes. No session is registered, and Claude Code stores nothing
-       * of the query (`persistSession: false`).
-       */
-      optionsOnly?: boolean;
-    } = {},
+    creationOpts: SessionCreation = {},
+  ): Promise<NewSessionResponse> {
+    const names = mcpServerNames(
+      params.mcpServers,
+      (params._meta as NewSessionMeta | undefined)?.claudeCode?.options?.mcpServers,
+    );
+    return startAroundRefusedMcpServers(
+      // A `session/options` probe starts no MCP servers.
+      !creationOpts.optionsOnly && names.length > 0,
+      (withoutMcpServers) =>
+        this.startSession(
+          params,
+          creationOpts,
+          withoutMcpServers ? refusedMcpServers(names) : undefined,
+        ),
+    );
+  }
+
+  /**
+   * One start of {@link createSession}. `refused`: the session's MCP servers
+   * when Claude Code refused to start with them, each unserved.
+   */
+  private async startSession(
+    params: NewSessionRequest,
+    creationOpts: SessionCreation,
+    refused: SdkMcpServers | undefined,
   ): Promise<NewSessionResponse> {
     const createStartedAt = performance.now();
     // Validate `cwd` up front. The ACP spec requires an absolute path, and the
@@ -10137,10 +10183,9 @@ export class ClaudeAcpAgent {
       timing.phase("resume-transcript");
     }
 
-    const { configs: mcpServers, unserved: unservedMcpServers } = await sdkMcpServers(
-      params.mcpServers,
-      (server) => this.client.mcpServerOverAcp(server),
-    );
+    const { configs: mcpServers, unserved: unservedMcpServers } =
+      refused ??
+      (await sdkMcpServers(params.mcpServers, (server) => this.client.mcpServerOverAcp(server)));
     for (const server of unservedMcpServers) {
       this.logger.error(
         `Session ${sessionId} starts without MCP server ${server.name}: ${server.error}`,
@@ -10300,7 +10345,9 @@ export class ClaudeAcpAgent {
       : undefined;
     // None for a session without `acp` MCP servers: it has no MCP request to
     // name a session for, so Claude Code waits on no hook of these.
-    const mcpToolUse = this.mcp.toolUseHooks(sessionId, params.mcpServers, {
+    // The bridge hears of no server that the query starts without.
+    const servedMcpServers = refused ? [] : params.mcpServers;
+    const mcpToolUse = this.mcp.toolUseHooks(sessionId, servedMcpServers, {
       childSessions: clientSupportsSubagents(this.clientCapabilities),
       reporting: (agentId) => {
         const session = this.sessions[sessionId];
@@ -10358,7 +10405,7 @@ export class ClaudeAcpAgent {
       includePartialMessages: true,
       forwardSubagentText,
       mcpServers: {
-        ...(userProvidedOptions?.mcpServers || {}),
+        ...(refused ? {} : userProvidedOptions?.mcpServers),
         ...mcpServers,
       },
       allowDangerouslySkipPermissions: allowBypass,
@@ -10867,7 +10914,7 @@ export class ClaudeAcpAgent {
         fileChangeReporter,
         promptSuggestions: PromptSuggestions.forClient(suggestionForms),
       };
-      this.mcp.sessionStarted(sessionId, params.mcpServers);
+      this.mcp.sessionStarted(sessionId, servedMcpServers);
       const registered = this.sessions[sessionId];
       registered.idleCompaction = new IdleCompaction(
         {

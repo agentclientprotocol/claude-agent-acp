@@ -161,6 +161,44 @@ export function mcpServerStartupNotice(
   return undefined;
 }
 
+/** A notice of {@link mcpServerStartupNotices} with the names of its servers. */
+export type McpServerStartupNotice = { servers: string[]; status: string; notice: SessionNotice };
+
+/**
+ * The notices of the client MCP servers that did not start, in the order of
+ * `servers` (see {@link mcpServerStartupNotice}). Servers that failed with the
+ * same `error` share one notice. Such are the servers that a managed
+ * `disableSideloadFlags` keeps out of a session, and the `acp` servers of a
+ * connection whose local endpoint cannot open.
+ */
+export function mcpServerStartupNotices(
+  servers: Iterable<{ name: string; status: string; error?: string }>,
+  oauthAvailable: boolean,
+): McpServerStartupNotice[] {
+  const notices: McpServerStartupNotice[] = [];
+  const byError = new Map<string, McpServerStartupNotice>();
+  for (const server of servers) {
+    const error = server.status === "failed" ? server.error : undefined;
+    const shared = error === undefined ? undefined : byError.get(error);
+    if (shared && error !== undefined) {
+      shared.servers.push(server.name);
+      const names = shared.servers.map((name) => `"${name}"`);
+      shared.notice = {
+        severity: "warning",
+        title: `${names.length} MCP servers failed to start`,
+        description: `The tools of ${names.slice(0, -1).join(", ")} and ${names.at(-1)} are unavailable in this session. ${error}`,
+      };
+      continue;
+    }
+    const notice = mcpServerStartupNotice(server, oauthAvailable);
+    if (!notice) continue;
+    const entry = { servers: [server.name], status: server.status, notice };
+    notices.push(entry);
+    if (error !== undefined) byError.set(error, entry);
+  }
+  return notices;
+}
+
 /**
  * What Claude Code's `model_refusal_fallback` tells the user: the SDK retried
  * a refused turn on the fallback model.

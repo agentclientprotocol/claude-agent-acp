@@ -222,6 +222,12 @@ export class V2Session implements RequestTarget {
   private turnLocalCommand: { command: McpCommand; abort: AbortController } | undefined;
   /** The JSON of the query's MCP servers. */
   private mcpServers = "";
+  /**
+   * Whether Claude Code refused to start this query with the session's MCP
+   * servers (see `startAroundRefusedMcpServers`). The query then runs without
+   * them, also after a resume of the active session.
+   */
+  mcpServersRefused = false;
   /** The adapter's `/remote-control`, and messages typed in other clients. */
   private readonly remoteControl: SessionRemoteControl;
   /** Who waits for {@link turnBoundary}, with whether it waits for a restart. */
@@ -371,13 +377,14 @@ export class V2Session implements RequestTarget {
    * Starts reading the query. Called once, after its initialization.
    * `mcpServers` are the servers the query started with, and `keys` the
    * record of the session's prompt keys, which outlives this query.
+   * `mcpServersRefused`: see {@link mcpServersRefused}.
    */
   start(
     query: Query,
     config: SessionConfig,
     mcpServers: McpServers,
     keys: PromptKeys,
-    resumed = false,
+    { resumed = false, mcpServersRefused = false } = {},
   ): void {
     this.query = query;
     this.config = config;
@@ -385,6 +392,7 @@ export class V2Session implements RequestTarget {
     this.usage = new ResultUsage(resumed);
     this.hasHistory = resumed;
     this.mcpServers = JSON.stringify(mcpServers);
+    this.mcpServersRefused = mcpServersRefused;
     this.commands = new SessionCommands(query);
     void this.consume(query);
   }

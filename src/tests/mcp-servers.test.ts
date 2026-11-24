@@ -1,7 +1,20 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as acp from "@agentclientprotocol/sdk/unstable";
-import { McpOverAcp, sdkMcpServers } from "../mcp-servers.js";
-import { claudeCodeMcpRequest, mcpRefusalMessage, runMcpToolHooks } from "./helpers.js";
+import {
+  McpOverAcp,
+  mcpServerNames,
+  refusedMcpServers,
+  sdkMcpServers,
+  startAroundRefusedMcpServers,
+} from "../mcp-servers.js";
+import { startupFailureError } from "../startup-failure.js";
+import {
+  claudeCodeMcpRequest,
+  mcpRefusalMessage,
+  runMcpToolHooks,
+  sideloadRefusal,
+  startupFailure,
+} from "./helpers.js";
 
 describe("sdkMcpServers", () => {
   it("maps each transport to its SDK config, and leaves out an unknown one", async () => {
@@ -54,6 +67,80 @@ describe("sdkMcpServers", () => {
     expect(served).toEqual({
       configs: { files: { type: "stdio", command: "/bin/files", args: [], env: {} } },
       unserved: [{ name: "tools", status: "failed", error: "listen EPERM" }],
+    });
+  });
+});
+
+describe("startAroundRefusedMcpServers", () => {
+  /** What a core throws for Claude Code's refusal. */
+  const refusal = startupFailureError(sideloadRefusal())!;
+
+  it("starts again without the MCP servers when Claude Code refuses them", async () => {
+    const starts: boolean[] = [];
+    const session = await startAroundRefusedMcpServers(true, async (withoutMcpServers) => {
+      starts.push(withoutMcpServers);
+      if (!withoutMcpServers) throw refusal;
+      return "session";
+    });
+
+    expect(session).toBe("session");
+    expect(starts).toEqual([false, true]);
+  });
+
+  it.each([
+    { name: "a refused start that has no MCP servers", hasMcpServers: false, error: refusal },
+    {
+      name: "a start that fails for another reason",
+      hasMcpServers: true,
+      error: startupFailureError(startupFailure("proxy_invalid", "Invalid proxy URL"))!,
+    },
+    {
+      name: "a start that fails without a reason",
+      hasMcpServers: true,
+      error: new Error("Claude Code process exited with code 1"),
+    },
+  ])("does not repeat $name", async ({ hasMcpServers, error }) => {
+    const starts: boolean[] = [];
+    await expect(
+      startAroundRefusedMcpServers(hasMcpServers, async (withoutMcpServers) => {
+        starts.push(withoutMcpServers);
+        throw error;
+      }),
+    ).rejects.toBe(error);
+
+    expect(starts).toEqual([false]);
+  });
+
+  it("throws the error of a second start that is refused too", async () => {
+    // As for a client's plugins: "--plugin-dir is disabled by …".
+    const second = startupFailureError(startupFailure("sideload_flags_disabled", "plugins"))!;
+    await expect(
+      startAroundRefusedMcpServers(true, async (withoutMcpServers) => {
+        throw withoutMcpServers ? second : refusal;
+      }),
+    ).rejects.toBe(second);
+  });
+});
+
+describe("refusedMcpServers", () => {
+  it("gives Claude Code no server, and has each of the session's servers unserved once", () => {
+    const names = mcpServerNames(
+      [
+        { name: "files", command: "/bin/files", args: [], env: [] },
+        { type: "acp", name: "tools", serverId: "tools:1" },
+        // A v2 server of an extension transport has no name.
+        { type: "_custom" },
+      ],
+      { linear: { type: "http", url: "https://mcp.linear.app/mcp" }, files: {} },
+    );
+
+    expect(refusedMcpServers(names)).toEqual({
+      configs: {},
+      unserved: ["files", "tools", "linear"].map((name) => ({
+        name,
+        status: "failed",
+        error: expect.stringContaining("disableSideloadFlags"),
+      })),
     });
   });
 });

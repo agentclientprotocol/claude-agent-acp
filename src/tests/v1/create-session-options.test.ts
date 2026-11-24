@@ -15,7 +15,7 @@ import type { AcpClient } from "../../acp-client.js";
 import type { AcpSessionNotification } from "../../acp-subagents.js";
 import { ALLOW_BYPASS } from "../../permissions/modes.js";
 import { NativeSubagentRuntime } from "../../native-subagents.js";
-import { setModelRefusal, startupFailure } from "../helpers.js";
+import { setModelRefusal, sideloadRefusal, startupFailure } from "../helpers.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -32,6 +32,8 @@ let initModels: Record<string, unknown>[] | undefined;
 /** Holds the CLI initialization until the test resolves it. */
 let initGate: Promise<void> | undefined;
 let initError: Error | undefined;
+/** When set, Claude Code refuses a start that has MCP servers with it. */
+let mcpServersRefusal: Error | undefined;
 let missingConversation: string | undefined;
 /** When set, the SDK refuses the query's options with it: `query()` throws. */
 let optionsRefusal: Error | undefined;
@@ -70,6 +72,9 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         initializationResult: async () => {
           await initGate;
           if (initError) throw initError;
+          if (mcpServersRefusal && Object.keys(args.options.mcpServers ?? {}).length > 0) {
+            throw mcpServersRefusal;
+          }
           if (args.options.resume && args.options.resume === missingConversation) {
             throw new Error(`No conversation found with session ID: ${args.options.resume}`);
           }
@@ -134,6 +139,7 @@ describe("createSession options merging", () => {
     initModels = undefined;
     initGate = undefined;
     initError = undefined;
+    mcpServersRefusal = undefined;
     missingConversation = undefined;
     optionsRefusal = undefined;
     setModelImpl = undefined;
@@ -1952,6 +1958,50 @@ describe("createSession options merging", () => {
         data: { startupFailureReason: reason },
       });
       expect(closeSpy).toHaveBeenCalled();
+    });
+
+    it("starts a session without the MCP servers that Claude Code refuses", async () => {
+      mcpServersRefusal = sideloadRefusal();
+
+      const { sessionId } = await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [{ name: "files", command: "/bin/files", args: [], env: [] }],
+        _meta: {
+          claudeCode: {
+            options: {
+              mcpServers: { linear: { type: "http", url: "https://mcp.linear.app/mcp" } },
+            },
+          },
+        },
+      });
+
+      // The refused query is closed, and the session runs on the second one.
+      expect(closeSpy).toHaveBeenCalledOnce();
+      expect(capturedOptions!.mcpServers).toEqual({});
+      expect(agent.sessions[sessionId]!.unservedMcpServers).toEqual(
+        ["files", "linear"].map((name) => ({
+          name,
+          status: "failed",
+          error: expect.stringContaining("disableSideloadFlags"),
+        })),
+      );
+    });
+
+    it("fails a session that Claude Code still refuses without its MCP servers", async () => {
+      // As for a client's plugins.
+      initError = startupFailure("sideload_flags_disabled", "--plugin-dir is disabled.");
+
+      await expect(
+        agent.newSession({
+          cwd: process.cwd(),
+          mcpServers: [{ name: "files", command: "/bin/files", args: [], env: [] }],
+        }),
+      ).rejects.toMatchObject({
+        message: "Internal error: --plugin-dir is disabled.",
+        data: { startupFailureReason: "sideload_flags_disabled" },
+      });
+      expect(closeSpy).toHaveBeenCalledTimes(2);
+      expect(capturedOptions!.mcpServers).toEqual({});
     });
 
     it("passes on an exit error that names no reason", async () => {

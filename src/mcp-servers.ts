@@ -17,6 +17,7 @@ import type {
   McpServerConfig,
 } from "@anthropic-ai/claude-agent-sdk";
 import { AnnouncedChildren } from "./acp-subagents.js";
+import { startupFailureReasonOf } from "./startup-failure.js";
 import { isFinalToolCallStatus } from "./tool-calls/renderer.js";
 
 /**
@@ -129,6 +130,71 @@ export async function sdkMcpServers(
     }
   }
   return { configs, unserved };
+}
+
+/**
+ * What the user is told of each MCP server that a managed
+ * `disableSideloadFlags` keeps out of a session.
+ */
+const NOT_FROM_AN_APPROVED_SOURCE =
+  "Your organization's managed settings (disableSideloadFlags) let Claude Code use MCP servers only from sources that your administrator approved.";
+
+/**
+ * The names of a session's MCP servers: its ACP servers, and the servers of
+ * the client's SDK options (`_meta.claudeCode.options.mcpServers`).
+ */
+export function mcpServerNames(
+  servers: readonly object[] | null | undefined,
+  sdkServers: Record<string, unknown> | undefined,
+): string[] {
+  return [
+    // A v2 server of an extension transport (`type: "_…"`) needs no name.
+    ...(servers ?? []).flatMap((server) =>
+      "name" in server && typeof server.name === "string" ? [server.name] : [],
+    ),
+    ...Object.keys(sdkServers ?? {}),
+  ];
+}
+
+/**
+ * A session's MCP servers when Claude Code refuses to start with them (see
+ * {@link startAroundRefusedMcpServers}): Claude Code gets none, and each is
+ * unserved with the reason. `names` are the session's {@link mcpServerNames}.
+ */
+export function refusedMcpServers(names: Iterable<string>): SdkMcpServers {
+  return {
+    configs: {},
+    unserved: [...new Set(names)].map((name) => ({
+      name,
+      status: "failed",
+      error: NOT_FROM_AN_APPROVED_SOURCE,
+    })),
+  };
+}
+
+/**
+ * Runs `start(false)`, the start of a session's query. With a managed
+ * `disableSideloadFlags`, Claude Code takes MCP servers and plugins only from
+ * sources that the administrator approved, and refuses a start that brings
+ * others (`sideload_flags_disabled`, SDK 0.3.331). When it refuses a start
+ * that has MCP servers, this runs `start(true)`: the same start without them
+ * (see {@link refusedMcpServers}).
+ *
+ * Claude Code decides at every start. The adapter reads no policy of its own,
+ * so a session gets its servers back at its next start once the setting is
+ * gone. The second start can be refused too, e.g. over the client's
+ * `plugins`: that error is thrown.
+ */
+export async function startAroundRefusedMcpServers<T>(
+  hasMcpServers: boolean,
+  start: (withoutMcpServers: boolean) => Promise<T>,
+): Promise<T> {
+  try {
+    return await start(false);
+  } catch (error) {
+    if (!hasMcpServers || startupFailureReasonOf(error) !== "sideload_flags_disabled") throw error;
+    return start(true);
+  }
 }
 
 /**
