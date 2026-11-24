@@ -32,7 +32,7 @@ export function v1PromptRequest({
   ...request
 }: v2.PromptRequest): PromptRequest {
   if (prompt.length === 0) {
-    throw RequestError.invalidParams({ prompt }, "`prompt` must hold at least one content block");
+    throw RequestError.invalidParams({ prompt }, "prompt must hold at least one content block");
   }
   return {
     ...request,

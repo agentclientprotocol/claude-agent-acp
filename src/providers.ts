@@ -300,13 +300,13 @@ export function validatedGatewayAuthRequest(params: AuthenticateRequest): Gatewa
     if (typeof gateway !== "object" || !isValidBaseUrl(gateway.baseUrl)) {
       throw RequestError.invalidParams(
         { baseUrl: (gateway as { baseUrl?: unknown }).baseUrl },
-        "`_meta.gateway.baseUrl` must be a non-empty absolute http(s) URL.",
+        "_meta.gateway.baseUrl must be a non-empty absolute http(s) URL.",
       );
     }
     if (gateway.headers !== undefined && typeof gateway.headers !== "object") {
       throw RequestError.invalidParams(
         undefined,
-        "`_meta.gateway.headers` must be an object of header names to values.",
+        "_meta.gateway.headers must be an object of header names to values.",
       );
     }
   }
@@ -395,7 +395,7 @@ export function providerConfigFromSetRequest(params: SetProviderRequest): Provid
     ) {
       throw RequestError.invalidParams(
         undefined,
-        "vertex apiType requires non-empty `_meta.claudeCode.vertex.projectId` and `_meta.claudeCode.vertex.region`.",
+        "vertex apiType requires non-empty _meta.claudeCode.vertex.projectId and _meta.claudeCode.vertex.region.",
       );
     }
     config.vertex = { projectId: vertex.projectId, region: vertex.region };

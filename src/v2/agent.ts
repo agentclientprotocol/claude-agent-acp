@@ -644,7 +644,7 @@ class V2Agent implements AgentHandle, SessionConnection {
 
   async listSessions(params: v2.ListSessionsRequest): Promise<v2.ListSessionsResponse> {
     if (params.cwd != null && !path.isAbsolute(params.cwd)) {
-      throw RequestError.invalidParams({ cwd: params.cwd }, "`cwd` must be an absolute path");
+      throw RequestError.invalidParams({ cwd: params.cwd }, "cwd must be an absolute path");
     }
     const offset = listOffset(params.cursor);
     // One more than a page tells whether a next page exists.
@@ -1378,11 +1378,11 @@ async function validatedSetup(
   clientSystemPrompt(request.systemPrompt);
   const { cwd } = request;
   if (!path.isAbsolute(cwd)) {
-    throw RequestError.invalidParams({ cwd }, `\`cwd\` must be an absolute path, not ${cwd}`);
+    throw RequestError.invalidParams({ cwd }, `cwd must be an absolute path, not ${cwd}`);
   }
   const stat = await fs.stat(cwd).catch(() => undefined);
   if (!stat?.isDirectory()) {
-    throw RequestError.invalidParams({ cwd }, `\`cwd\` is not a directory: ${cwd}`);
+    throw RequestError.invalidParams({ cwd }, `cwd is not a directory: ${cwd}`);
   }
   for (const directory of request.additionalDirectories ?? []) {
     if (!path.isAbsolute(directory)) {
@@ -1416,7 +1416,7 @@ function assertCwdOf(session: V2Session, cwd: string, action: string): void {
   if (cwd === session.cwd) return;
   throw RequestError.invalidParams(
     { cwd },
-    `Session ${session.sessionId} works in ${session.cwd}: ${action} with that \`cwd\``,
+    `Session ${session.sessionId} works in ${session.cwd}: ${action} with that cwd`,
   );
 }
 
