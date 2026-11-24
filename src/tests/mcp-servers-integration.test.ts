@@ -7,6 +7,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as v1 from "@agentclientprotocol/sdk/unstable";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
+import { McpOverAcp } from "../mcp-servers.js";
 import { acpProtocolRouter } from "../serve.js";
 
 /**
@@ -77,6 +78,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("MCP over ACP with Claude Co
     for (const close of closing.splice(0).reverse()) await close();
     model.closeAllConnections();
     model.close();
+    vi.restoreAllMocks();
     vi.unstubAllEnvs();
     await rm(home, { recursive: true, force: true, maxRetries: 10 });
   });
@@ -268,42 +270,76 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("MCP over ACP with Claude Co
       update.toolCallId === toolCallId && typeof update.status === "string" ? [update.status] : [],
     );
 
+  /**
+   * Prompts a session of `client` so that the main conversation and two
+   * subagents, which run at once, each call `ping`, and checks what the three
+   * requests named. `children` is the number of child sessions that the
+   * client gets for the two subagents.
+   */
+  async function rootAndTwoSubagentsPing(client: Client, children: number) {
+    const { root, requests, updates, prompt } = await sessionWithTools(client);
+
+    expect(await prompt("PING_root DELEGATE")).toBe("end_turn");
+
+    const ids = ["toolu_root", "toolu_left", "toolu_right"];
+    const on = reportedOn(updates);
+    const announced = updates.flatMap(({ update }) =>
+      update.sessionUpdate === "subagent_update" ? [update.sessionId] : [],
+    );
+    expect(new Set(announced).size).toBe(children);
+    // The root reports its own tool call, and each child session its subagent's.
+    expect(on.toolu_root).toBe(root);
+    expect(new Set([on.toolu_left, on.toolu_right])).toEqual(
+      new Set(children ? announced : [root]),
+    );
+    // Each request names the session and tool call that the client got the report on.
+    const calls = requests.filter(({ method }) => method === "tools/call");
+    expect(calls).toHaveLength(ids.length);
+    expect(calls).toEqual(
+      expect.arrayContaining(
+        ids.map((id) => ({ method: "tools/call", sessionId: on[id], toolCallId: id })),
+      ),
+    );
+    // Claude Code's requests outside a tool use name none.
+    const others = requests.filter(({ method }) => method !== "tools/call");
+    expect(new Set(others.map(({ method }) => method))).toEqual(
+      new Set(["server/discover", "tools/list"]),
+    );
+    expect(others.filter(({ sessionId, toolCallId }) => sessionId ?? toolCallId)).toEqual([]);
+  }
+
   it.each([
     { client: V1, of: "a v1 session, which reports them itself", children: 0 },
     { client: V1_SUBAGENTS, of: "a v1 session with child sessions", children: 2 },
     { client: V2, of: "a v2 session", children: 2 },
   ])(
     "names the session and tool call of the root and of two subagents of $of that call one tool",
-    async ({ client, children }) => {
-      const { root, requests, updates, prompt } = await sessionWithTools(client);
+    ({ client, children }) => rootAndTwoSubagentsPing(client, children),
+    60_000,
+  );
 
-      expect(await prompt("PING_root DELEGATE")).toBe("end_turn");
+  it.each([
+    { client: V1_SUBAGENTS, of: "a v1 session with child sessions" },
+    { client: V2, of: "a v2 session" },
+  ])(
+    "holds the requests of two subagents of $of until it knows their announcements went out",
+    async ({ client }) => {
+      // The session reads Claude Code's stream ahead of Claude Code's requests
+      // here, so nothing waits. The lag is made up: the adapter's record gets
+      // each session update 100 ms after it went out, well within its wait.
+      const sending = McpOverAcp.prototype.sending;
+      vi.spyOn(McpOverAcp.prototype, "sending").mockImplementation(function (
+        this: McpOverAcp,
+        notification,
+      ) {
+        setTimeout(() => sending.call(this, notification), 100);
+      });
+      const held = vi.spyOn(McpOverAcp.prototype as never, "held");
 
-      const ids = ["toolu_root", "toolu_left", "toolu_right"];
-      const on = reportedOn(updates);
-      const announced = updates.flatMap(({ update }) =>
-        update.sessionUpdate === "subagent_update" ? [update.sessionId] : [],
-      );
-      expect(new Set(announced).size).toBe(children);
-      // The root reports its own tool call, and each child session its subagent's.
-      expect(on.toolu_root).toBe(root);
-      expect(new Set([on.toolu_left, on.toolu_right])).toEqual(
-        new Set(children ? announced : [root]),
-      );
-      // Each request names the session and tool call that the client got the report on.
-      const calls = requests.filter(({ method }) => method === "tools/call");
-      expect(calls).toHaveLength(ids.length);
-      expect(calls).toEqual(
-        expect.arrayContaining(
-          ids.map((id) => ({ method: "tools/call", sessionId: on[id], toolCallId: id })),
-        ),
-      );
-      // Claude Code's requests outside a tool use name none.
-      const others = requests.filter(({ method }) => method !== "tools/call");
-      expect(new Set(others.map(({ method }) => method))).toEqual(
-        new Set(["server/discover", "tools/list"]),
-      );
-      expect(others.filter(({ sessionId, toolCallId }) => sessionId ?? toolCallId)).toEqual([]);
+      await rootAndTwoSubagentsPing(client, 2);
+
+      // The root's request named its session at once.
+      expect(held).toHaveBeenCalledTimes(2);
     },
     60_000,
   );

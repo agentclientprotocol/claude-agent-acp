@@ -2347,6 +2347,11 @@ describe("MCP servers that the client serves over the ACP connection", () => {
      *
      * The server answers a request once `concurrent` requests wait for an
      * answer, so that many tool uses are in flight at once.
+     *
+     * A request of the adapter waits a minute for an announcement (see
+     * {@link adapterMcp}), so a case whose request waits when it should not
+     * times out. `announcedBefore` has the child sessions that the client
+     * knew when each request arrived.
      */
     async function promptWithTools(
       client: Client,
@@ -2357,10 +2362,15 @@ describe("MCP servers that the client serves over the ACP connection", () => {
       }: { concurrent?: number; undeclared?: boolean; during?: During } = {},
     ) {
       const named: Named = {};
+      const announcedBefore: Record<string, string[]> = {};
+      /** The child sessions that a `subagent_update` announced to the client so far. */
+      let announced: () => string[] = () => [];
       const waiting: Array<() => void> = [];
       const handler: v2.McpRequestHandler = async ({ params, sessionId, toolCallId }) => {
         const meta = params?._meta as Record<string, unknown>;
-        named[meta["claudecode/toolUseId"] as string] = { sessionId, toolCallId };
+        const toolUseId = meta["claudecode/toolUseId"] as string;
+        named[toolUseId] = { sessionId, toolCallId };
+        announcedBefore[toolUseId] = announced();
         await new Promise<void>((resolve) => {
           waiting.push(resolve);
           if (waiting.length >= concurrent) for (const answer of waiting.splice(0)) answer();
@@ -2372,10 +2382,17 @@ describe("MCP servers that the client serves over the ACP connection", () => {
         const { toolCallId } = update as { toolCallId?: unknown };
         if (typeof toolCallId === "string") reportedOn[toolCallId] ??= sessionId;
       };
+      const announcements = (updates: Array<{ update: object }>) =>
+        updates.flatMap(({ update }) => {
+          const { sessionUpdate, sessionId } = update as Record<string, unknown>;
+          return sessionUpdate === "subagent_update" ? [sessionId as string] : [];
+        });
       let root: string;
       if (client.version === 1) {
         const provider = new v1.McpOverAcpProvider();
         const authUpdate = Promise.withResolvers<void>();
+        const updates: Array<{ update: object }> = [];
+        announced = () => announcements(updates);
         root = await v1
           .client({ name: "v1-test-client" })
           .onNotification(
@@ -2383,13 +2400,17 @@ describe("MCP servers that the client serves over the ACP connection", () => {
             (params) => params,
             () => authUpdate.resolve(),
           )
-          .onNotification(v1.methods.client.session.update, ({ params }) => report(params))
+          .onNotification(v1.methods.client.session.update, ({ params }) => {
+            report(params);
+            updates.push(params);
+          })
           .onRequest(v1.methods.client.mcp.message, provider.handleRequest)
           .connectWith(connectRouter() as unknown as v1.Stream, async (agent) => {
             await agent.request(v1.methods.agent.initialize, {
               protocolVersion: v1.PROTOCOL_VERSION,
               clientCapabilities: client.capabilities,
             });
+            adapterMcp().announcementWaitMs = 60_000;
             const tools = provider.registerServer(agent, { name: "tools", handler });
             const setup: v1.NewSessionRequest = {
               cwd,
@@ -2413,10 +2434,12 @@ describe("MCP servers that the client serves over the ACP connection", () => {
       } else {
         const provider = new v2.McpOverAcpProvider();
         const v2client = v2Client();
+        announced = () => announcements(v2client.sessionUpdates);
         root = await v2client.app
           .onRequest(v2.methods.client.mcp.message, provider.handleRequest)
           .connectWith(connectRouter(), async (agent) => {
             await initializeV2(agent);
+            adapterMcp().announcementWaitMs = 60_000;
             const tools = provider.registerServer(agent, { name: "tools", handler });
             const { sessionId } = await agent.request(v2.methods.agent.session.new, {
               cwd,
@@ -2446,8 +2469,16 @@ describe("MCP servers that the client serves over the ACP connection", () => {
           });
         for (const notification of v2client.sessionUpdates) report(notification);
       }
-      return { root, named, reportedOn };
+      return { root, named, reportedOn, announcedBefore };
     }
+
+    /** The adapter's `McpOverAcp` of the connection, for its wait and the requests that wait. */
+    const adapterMcp = () =>
+      (
+        agents[0] as unknown as {
+          mcp: { announcementWaitMs: number; waiting: Map<string, unknown> };
+        }
+      ).mcp;
 
     /** What a test does while Claude Code works on the prompt (see {@link promptWithTools}). */
     type During = (session: {
@@ -2543,31 +2574,46 @@ describe("MCP servers that the client serves over the ACP connection", () => {
       {
         // It has no child sessions, and does not know yet that the root reports the tool call.
         client: V1,
-        names: "the root session of a v1 session, and no tool call,",
-        onRoot: true,
+        names: "the root session of a v1 session, and no tool call, at once",
+        waits: false,
       },
-      // Not the root session in the place of the child session.
       {
         client: V1_SUBAGENTS,
-        names: "no session of a v1 session with child sessions",
-        onRoot: false,
+        names: "the child session of a v1 session with child sessions, once it is announced,",
+        waits: true,
       },
-      { client: V2, names: "no session of a v2 session", onRoot: false },
+      {
+        client: V2,
+        names: "the child session of a v2 session, once it is announced,",
+        waits: true,
+      },
     ])(
       "names $names for a subagent whose start the session has not read",
-      async ({ client, onRoot }) => {
+      async ({ client, waits }) => {
         scriptTurns(async function* (options) {
           yield toolUseMessage(options, "toolu_agent-1", "Agent", AGENT_CALL);
           // Claude Code runs the subagent's tool before the session reads `task_started`.
-          await runEcho(options, "toolu_child", "agent-1");
+          const use = { id: "toolu_child", tool: ECHO, agentId: "agent-1" };
+          await runMcpToolHooks(options.hooks, "PreToolUse", use);
+          const requested = toolsCall(options, "toolu_child");
+          // The request waits for the announcement, or is answered without one.
+          if (waits) await vi.waitFor(() => expect(adapterMcp().waiting.size).toBe(1));
+          else await requested;
           yield taskStarted(options, "agent-1", { prompt: AGENT_CALL.prompt });
           yield toolUseMessage(options, "toolu_child", ECHO, TOOL_CALL.arguments, "toolu_agent-1");
+          await requested;
+          await runMcpToolHooks(options.hooks, "PostToolUse", use);
           yield* endOfSubagentTurn(options);
         });
 
-        const { root, named } = await promptWithTools(client);
+        const { root, named, announcedBefore } = await promptWithTools(client);
 
-        expect(named.toolu_child).toEqual(onRoot ? { sessionId: root } : {});
+        // Not the root session in the place of the child session.
+        expect(named.toolu_child).toEqual(
+          waits ? { sessionId: "agent-1", toolCallId: "toolu_child" } : { sessionId: root },
+        );
+        // The request went out after the `subagent_update` of the child that it names.
+        expect(announcedBefore.toolu_child).toEqual(waits ? ["agent-1"] : []);
       },
     );
 
@@ -2766,11 +2812,9 @@ describe("MCP servers that the client serves over the ACP connection", () => {
       }
     });
 
-    it("names no child session of a v2 session while a replay holds its announcement back", async () => {
+    it("holds a request of a v2 session's subagent while a replay holds its announcement back", async () => {
       const launched = Promise.withResolvers<void>();
       const held = Promise.withResolvers<void>();
-      const requested = Promise.withResolvers<void>();
-      const replayed = Promise.withResolvers<void>();
       const history = Promise.withResolvers<Awaited<ReturnType<typeof getSessionMessages>>>();
       scriptTurns(async function* (options) {
         yield toolUseMessage(options, "toolu_agent-1", "Agent", AGENT_CALL);
@@ -2780,21 +2824,12 @@ describe("MCP servers that the client serves over the ACP connection", () => {
         // subagent's `subagent_update`, and its tool call.
         yield taskStarted(options, "agent-1", { prompt: AGENT_CALL.prompt });
         yield toolUseMessage(options, "toolu_child", ECHO, TOOL_CALL.arguments, "toolu_agent-1");
-        await runMcpToolHooks(options.hooks, "PreToolUse", {
-          id: "toolu_child",
-          tool: ECHO,
-          agentId: "agent-1",
-        });
-        await toolsCall(options, "toolu_child");
-        requested.resolve();
-        await replayed.promise;
-        await toolsCall(options, "toolu_child");
+        await runEcho(options, "toolu_child", "agent-1");
         yield* endOfSubagentTurn(options);
       });
-      const requests: Named[string][] = [];
 
-      const { named } = await promptWithTools(V2, {
-        during: async ({ sessionId, tools, named, send }) => {
+      const { named, announcedBefore } = await promptWithTools(V2, {
+        during: async ({ sessionId, tools, send }) => {
           await launched.promise;
           const reads = vi.mocked(getSessionMessages).mock.calls.length;
           vi.mocked(getSessionMessages).mockReturnValueOnce(history.promise);
@@ -2809,19 +2844,16 @@ describe("MCP servers that the client serves over the ACP connection", () => {
             expect(vi.mocked(getSessionMessages).mock.calls.length).toBeGreaterThan(reads),
           );
           held.resolve();
-          await requested.promise;
-          requests.push(named.toolu_child);
+          // The session announced the child, but the announcement has not gone out.
+          await vi.waitFor(() => expect(adapterMcp().waiting.size).toBe(1));
           history.resolve([]);
           await resume;
-          replayed.resolve();
         },
       });
 
-      // Once the announcement went out, a request of the same tool use names the child.
-      expect([...requests, named.toolu_child]).toEqual([
-        {},
-        { sessionId: "agent-1", toolCallId: "toolu_child" },
-      ]);
+      // Not before the client got the child's `subagent_update`.
+      expect(named.toolu_child).toEqual({ sessionId: "agent-1", toolCallId: "toolu_child" });
+      expect(announcedBefore.toolu_child).toContain("agent-1");
     });
   });
 });

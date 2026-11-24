@@ -1151,6 +1151,8 @@ class V2Agent implements AgentHandle, SessionConnection {
     const mcpToolUse = this.mcp.toolUseHooks(sessionId, request.mcpServers, {
       childSessions: true,
       reporting: (agentId) => session.tasks.childSession(agentId),
+      // A subagent's child session has its agent id (see `tasks.ts`).
+      childSessionId: (agentId) => agentId,
       definesAgent: (name) => session.tasks.configs.definesAgent(name),
     });
     const options: Options = {

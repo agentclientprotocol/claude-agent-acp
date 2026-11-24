@@ -36,6 +36,26 @@ const TOOL_USE_ID_META = "claudecode/toolUseId";
 const WORKFLOW_AGENT_TYPE = "workflow-subagent";
 
 /**
+ * How long an MCP request of a subagent waits for the `subagent_update` of
+ * the subagent's child session, before it goes out without a session (see
+ * {@link McpOverAcp.announcementWaitMs}).
+ *
+ * The wait covers a session that reads Claude Code's stream after the
+ * request arrives. With a scripted model, which answers at once, a session
+ * sent the report of a subagent's tool call 1.5 to 12 ms before the request
+ * of that tool use arrived (15 runs with Claude Code 2.1.330 on one machine),
+ * and it sends the child's announcement before that report. So the session
+ * is ahead by milliseconds when it is not busy. 500 ms is about 40 times the
+ * largest of these gaps, as room for a session that is.
+ *
+ * A longer wait would cost more where it cannot help: a replay can hold an
+ * announcement for longer than any wait, and an agent that the adapter
+ * cannot tell from a subagent, but that never gets a child session, waits
+ * this long for each of its tool uses.
+ */
+const ANNOUNCEMENT_WAIT_MS = 500;
+
+/**
  * The hook matcher of the tools of the MCP servers `names`. Claude Code
  * (2.1.330) matches it against the whole name of a tool, which is
  * `mcp__<server>__<tool>` with `_` for each character of the server's name
@@ -147,9 +167,15 @@ export async function sdkMcpServers(
  *   it does, and no tool call, since no session reports one. These are an
  *   agent that a workflow runs, and any agent of a client without child
  *   sessions that the core does not know as a subagent;
- * - any other agent: nothing. Its child session is not announced yet, or its
- *   core does not know it. The root session never stands in for a child
- *   session.
+ * - a subagent whose child session is not announced yet, because the session
+ *   has not read its start or a replay holds its `subagent_update`: the
+ *   request waits for that announcement, for at most
+ *   {@link announcementWaitMs}, and then names the child session and the tool
+ *   call. When the time passes first, it names nothing;
+ * - any other agent: nothing, without a wait. The core forgot its child
+ *   session, or no `subagent_update` announces one for it.
+ *
+ * The root session never stands in for a child session.
  *
  * A request names neither when one of these holds:
  *
@@ -160,7 +186,9 @@ export async function sdkMcpServers(
  * - the client closed the root session, or its last setup request did not
  *   declare the request's server;
  * - the session of the agent is a child session that no `subagent_update`
- *   announced to the client, such as one of AIR's draft;
+ *   announced to the client: one of AIR's draft, one that a conversation
+ *   reset made the core forget, or one whose announcement did not go out
+ *   within {@link announcementWaitMs};
  * - the agent has the type of a workflow's agents, the client gets child
  *   sessions, and the session defines an agent of that name: the agent can
  *   be a subagent whose child session is not announced yet.
@@ -186,6 +214,16 @@ export class McpOverAcp {
    * status, by tool call id (see {@link sending}).
    */
   private readonly toolCalls = new Map<string, string>();
+  /**
+   * The requests that wait for the announcement of their agent's child
+   * session, by tool use id: what ends each one's wait (see {@link held}).
+   */
+  private readonly waiting = new Map<string, Set<() => void>>();
+  /**
+   * How long a request waits for the announcement of its agent's child
+   * session (see {@link ANNOUNCEMENT_WAIT_MS}). Mutable so tests can change it.
+   */
+  announcementWaitMs: number = ANNOUNCEMENT_WAIT_MS;
 
   /**
    * Hands an `mcp/message` notification of the client (such as the progress
@@ -273,7 +311,9 @@ export class McpOverAcp {
    */
   sessionClosed(sessionId: string): void {
     for (const [toolUseId, toolUse] of this.toolUses) {
-      if (toolUse.rootSessionId === sessionId) this.toolUses.delete(toolUseId);
+      if (toolUse.rootSessionId !== sessionId) continue;
+      this.toolUses.delete(toolUseId);
+      this.release(toolUseId);
     }
     for (const [toolCallId, session] of this.toolCalls) {
       if (this.rootOf(session) === sessionId) this.toolCalls.delete(toolCallId);
@@ -287,7 +327,9 @@ export class McpOverAcp {
    * announces a child session. A `tool_call`, or a `tool_call_update` with a
    * status, reports a tool call of its session, which is kept until an update
    * of that session or of another one under the same root gives the tool call
-   * a final status. That update also ends the tool use of the same id.
+   * a final status. That update also ends the tool use of the same id. An
+   * announcement, and a tool call's report, end the wait of the requests
+   * that they let name a session (see {@link held}).
    *
    * Only the tool calls of an active session with `acp` servers
    * ({@link sessionStarted}) and of its announced child sessions are kept. The
@@ -298,6 +340,11 @@ export class McpOverAcp {
     this.children.sending(notification);
     const { sessionId, update } = notification;
     const { sessionUpdate, toolCallId, status } = update;
+    if (sessionUpdate === "subagent_update") {
+      for (const toolUseId of [...this.waiting.keys()]) {
+        if (this.toolUses.get(toolUseId)?.awaits === update.sessionId) this.release(toolUseId);
+      }
+    }
     if (sessionUpdate !== "tool_call" && sessionUpdate !== "tool_call_update") return;
     if (typeof toolCallId !== "string") return;
     const root = this.rootOf(sessionId);
@@ -305,6 +352,8 @@ export class McpOverAcp {
       this.toolEnded(toolCallId, root);
     } else if ((sessionUpdate === "tool_call" || status != null) && this.sessions.has(root)) {
       this.toolCalls.set(toolCallId, sessionId);
+      // A request that waits can name the session of this report.
+      this.release(toolCallId);
     }
   }
 
@@ -338,7 +387,7 @@ export class McpOverAcp {
           if (toolUseId !== undefined) {
             this.toolUses.set(toolUseId, {
               rootSessionId: sessionId,
-              ...agentSession(sessionId, input, agents),
+              ...agentSession(sessionId, input, agents, (child) => this.children.has(child)),
             });
           }
           return { continue: true };
@@ -364,31 +413,95 @@ export class McpOverAcp {
 
   /**
    * Forgets the tool use `id` and its tool call, when they are of the root
-   * session `root`. A fork replays the tool calls of its original under their
-   * ids: its updates leave those of the original alone.
+   * session `root`, and ends the wait of the tool use's requests. A fork
+   * replays the tool calls of its original under their ids: its updates
+   * leave those of the original alone.
    */
   private toolEnded(id: string, root: string): void {
-    if (this.toolUses.get(id)?.rootSessionId === root) this.toolUses.delete(id);
+    if (this.toolUses.get(id)?.rootSessionId === root) {
+      this.toolUses.delete(id);
+      this.release(id);
+    }
     const reportedIn = this.toolCalls.get(id);
     if (reportedIn !== undefined && this.rootOf(reportedIn) === root) this.toolCalls.delete(id);
   }
 
   /**
+   * Resolves when a request of the tool use `toolUseId` need wait no longer
+   * for the announcement of its agent's child session: {@link release} ended
+   * the wait, or {@link announcementWaitMs} passed. It never rejects.
+   *
+   * Nothing that an announcement needs waits for the request. The hook that
+   * recorded the tool use has answered. The session reads Claude Code's
+   * stream whatever its tools do, and Claude Code wrote the subagent's start
+   * to that stream before it ran the subagent's tool. A replay ends without
+   * the request too.
+   */
+  private held(toolUseId: string): Promise<void> {
+    return new Promise((resolve) => {
+      const waiters = this.waiting.get(toolUseId) ?? new Set<() => void>();
+      this.waiting.set(toolUseId, waiters);
+      const end = () => {
+        clearTimeout(timer);
+        waiters.delete(end);
+        if (waiters.size === 0 && this.waiting.get(toolUseId) === waiters) {
+          this.waiting.delete(toolUseId);
+        }
+        resolve();
+      };
+      const timer = setTimeout(end, this.announcementWaitMs);
+      // The request's HTTP connection keeps the process alive, not this timer.
+      timer.unref();
+      waiters.add(end);
+    });
+  }
+
+  /**
+   * Ends the wait of the requests of the tool use `toolUseId` ({@link held}):
+   * its agent's child session is announced, its tool call is reported, or it
+   * ended, also with the close of its session. Each request then names what
+   * it can.
+   */
+  private release(toolUseId: string): void {
+    for (const end of [...(this.waiting.get(toolUseId) ?? [])]) end();
+  }
+
+  /**
    * The session and tool call that the `mcp/message` request of the MCP
    * request `request` names, or undefined when it names none (see the class
-   * doc). It does not throw: the bridge would answer Claude Code with HTTP
-   * 500 instead of sending the request.
+   * doc). A request of a subagent whose child session is not announced yet
+   * resolves once it is, or names nothing after {@link announcementWaitMs}.
+   * It neither throws nor rejects: the bridge would answer Claude Code with
+   * HTTP 500 instead of sending the request.
    */
   private attribution({
     serverId,
     params,
-  }: McpHttpRequestInfo): McpHttpRequestAttribution | undefined {
+  }: McpHttpRequestInfo):
+    McpHttpRequestAttribution | undefined | Promise<McpHttpRequestAttribution | undefined> {
     const meta = params?._meta;
     const toolUseId =
       typeof meta === "object" && meta !== null
         ? (meta as Record<string, unknown>)[TOOL_USE_ID_META]
         : undefined;
     if (typeof toolUseId !== "string") return undefined;
+    const now = this.named(toolUseId, serverId);
+    if (now !== "unannounced") return now;
+    return this.held(toolUseId).then(() => {
+      const then = this.named(toolUseId, serverId);
+      return then === "unannounced" ? undefined : then;
+    });
+  }
+
+  /**
+   * What a request of the tool use `toolUseId` to the server `serverId` names
+   * now, or `unannounced` when it names nothing because the child session of
+   * its agent, which a `subagent_update` announces, is not announced yet.
+   */
+  private named(
+    toolUseId: string,
+    serverId: string,
+  ): McpHttpRequestAttribution | undefined | "unannounced" {
     const toolUse = this.toolUses.get(toolUseId);
     if (!toolUse) return undefined;
     const root = toolUse.rootSessionId;
@@ -399,10 +512,16 @@ export class McpOverAcp {
     if (reportedIn !== undefined && this.rootOf(reportedIn) === root) {
       return { sessionId: reportedIn, toolCallId: toolUseId };
     }
-    const { sessionId } = toolUse;
-    // Not the root, and no announced child of it: an unannounced child session.
-    if (sessionId === undefined || this.rootOf(sessionId) !== root) return undefined;
-    return toolUse.reportsToolCall ? { sessionId, toolCallId: toolUseId } : { sessionId };
+    const { sessionId, awaits } = toolUse;
+    if (sessionId !== undefined && this.rootOf(sessionId) === root) {
+      return toolUse.reportsToolCall ? { sessionId, toolCallId: toolUseId } : { sessionId };
+    }
+    // Not the root, and no announced child of it. Once the child session of
+    // its agent is announced, that session reports the agent's tool calls.
+    if (awaits === undefined) return undefined;
+    return this.rootOf(awaits) === root
+      ? { sessionId: awaits, toolCallId: toolUseId }
+      : "unannounced";
   }
 }
 
@@ -425,36 +544,62 @@ export type SessionAgents = {
    * one whose child session is not announced.
    */
   reporting(agentId: string): string | undefined;
+  /**
+   * The id of the child session that a `subagent_update` announces for the
+   * subagent `agentId`, whether it went out yet or not. Undefined for a
+   * client that gets no child session from a `subagent_update`: one without
+   * child sessions, or with those of AIR's draft.
+   */
+  childSessionId(agentId: string): string | undefined;
   /** Whether the session had an agent definition of the name `name` when its query started. */
   definesAgent(name: string): boolean;
 };
 
 /**
  * The session of the agent that runs the tool use of the PreToolUse hook
- * `input`, for a query of the root session `root`, and whether that session
- * reports the tool use as a tool call (see the class doc of
- * {@link McpOverAcp}).
+ * `input`, for a query of the root session `root`, whether that session
+ * reports the tool use as a tool call, and the child session whose
+ * announcement a request of the tool use waits for (see the class doc of
+ * {@link McpOverAcp}). `announced` says whether a `subagent_update` announced
+ * a child session.
  */
 function agentSession(
   root: string,
   input: { agent_id?: string; agent_type?: string },
   agents: SessionAgents,
-): Pick<ToolUse, "sessionId" | "reportsToolCall"> {
+  announced: (child: string) => boolean,
+): Pick<ToolUse, "sessionId" | "reportsToolCall" | "awaits"> {
   // A session reports the tool calls of the messages that it reads, but for
   // the work that a cancel stopped: it drops that work's tool uses, and its
   // tool can run all the same. Nothing tells that at this point, so the
   // request of such a tool use names a tool call that the client never gets.
   if (input.agent_id === undefined) return { sessionId: root, reportsToolCall: true };
   const reporting = agents.reporting(input.agent_id);
-  if (reporting !== undefined) return { sessionId: reporting, reportsToolCall: true };
+  const child = agents.childSessionId(input.agent_id);
+  if (reporting !== undefined) {
+    // A child session whose `subagent_update` has not gone out, as a replay
+    // can hold it: a request waits for it.
+    return {
+      sessionId: reporting,
+      reportsToolCall: true,
+      ...(reporting === child ? { awaits: child } : {}),
+    };
+  }
   // No session reports the tool calls of this agent. Its work is the root's
   // when it cannot be a child session: the client gets none, or a workflow
   // runs it. An agent definition of the workflow agents' type makes that
   // type say nothing: its agent can be a child that is not announced yet.
-  const rootWork =
-    !agents.childSessions ||
-    (input.agent_type === WORKFLOW_AGENT_TYPE && !agents.definesAgent(WORKFLOW_AGENT_TYPE));
-  return { sessionId: rootWork ? root : undefined, reportsToolCall: false };
+  const workflowType = input.agent_type === WORKFLOW_AGENT_TYPE;
+  if (!agents.childSessions || (workflowType && !agents.definesAgent(WORKFLOW_AGENT_TYPE))) {
+    return { sessionId: root, reportsToolCall: false };
+  }
+  // The core does not know the agent as a subagent. One whose start it has
+  // not read yet gets its child session next: a request waits for it. Not an
+  // agent of the workflow agents' type, which mostly gets none, and not one
+  // whose child session was announced before: the core forgot that child at
+  // a conversation reset, and reports nothing of it any more.
+  const awaits = child !== undefined && !workflowType && !announced(child) ? child : undefined;
+  return { sessionId: undefined, reportsToolCall: false, ...(awaits ? { awaits } : {}) };
 }
 
 /** The `acp` servers of an active session. */
@@ -473,6 +618,11 @@ type ToolUse = {
   sessionId: string | undefined;
   /** Whether that session reports it as a tool call, under its id. */
   reportsToolCall: boolean;
+  /**
+   * The child session of its agent that a request of it waits for while no
+   * `subagent_update` has announced it, and names once one has.
+   */
+  awaits?: string;
 };
 
 /** A session update that goes to the client, as far as {@link McpOverAcp.sending} reads it. */

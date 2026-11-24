@@ -193,28 +193,43 @@ describe("McpOverAcp", () => {
       update: { sessionUpdate: "tool_call", toolCallId, status: "pending" },
     });
 
-    /** A core of a client with child sessions: each subagent's child session has its agent id. */
+    /**
+     * A core of a client with child sessions that `subagent_update` announces:
+     * each subagent's child session has its agent id, and the core has
+     * announced it.
+     */
     const CHILD_SESSIONS: Agents = {
       childSessions: true,
       reporting: (agentId) => agentId,
+      childSessionId: (agentId) => agentId,
       definesAgent: () => false,
     };
-    /** That core, for an agent whose `task_started` it has not read. */
+    /** That core, for an agent that it does not know: it has not read its `task_started`. */
     const UNKNOWN_AGENT: Agents = { ...CHILD_SESSIONS, reporting: () => undefined };
+    /** A core of a client with the child sessions of AIR's draft, which no `subagent_update` announces. */
+    const AIR_DRAFT: Agents = { ...CHILD_SESSIONS, childSessionId: () => undefined };
     /** A core of a client without child sessions, for a subagent that it knows or not. */
     const noChildSessions = (known: boolean): Agents => ({
       ...CHILD_SESSIONS,
       childSessions: false,
       reporting: () => (known ? ROOT : undefined),
+      childSessionId: () => undefined,
     });
     const WORKFLOW_AGENT: Agent = { id: "agent-w", type: "workflow-subagent" };
 
+    /** The requests that wait for an announcement, by tool use id. */
+    const waiting = (mcp: McpOverAcp) =>
+      (mcp as unknown as { waiting: Map<string, unknown> }).waiting;
+
     /**
      * A connection with the active session {@link ROOT}, whose query started
-     * with the `tools` server, and the core `agents` behind it.
+     * with the `tools` server, and the core `agents` behind it. A request
+     * waits a minute for an announcement, so a case whose request waits when
+     * it should not, or for an announcement that does not come, times out.
      */
     async function rootSession(agents: Agents = CHILD_SESSIONS) {
       const { mcp, agent, serve } = connect();
+      mcp.announcementWaitMs = 60_000;
       const named: Array<{ sessionId?: string; toolCallId?: string }> = [];
       const tools = serve("tools", ({ sessionId, toolCallId }) => {
         named.push({ sessionId, toolCallId });
@@ -333,14 +348,13 @@ describe("McpOverAcp", () => {
         },
       },
       {
-        // Not the root session in its place.
-        of: "a subagent whose child session is not announced",
-        toolUse: ({ hook }) => hook("PreToolUse", "toolu_01", { id: "agent-1" }),
-      },
-      {
-        of: "a subagent that the session's core does not know",
+        // The core forgot the child at a conversation reset: nothing reports its tool calls.
+        of: "a subagent whose announced child session the core no longer knows",
         agents: UNKNOWN_AGENT,
-        toolUse: ({ hook }) => hook("PreToolUse", "toolu_01", { id: "agent-1" }),
+        toolUse: async ({ mcp, hook }) => {
+          mcp.sending(announcement(ROOT, "agent-1"));
+          await hook("PreToolUse", "toolu_01", { id: "agent-1" });
+        },
       },
       {
         // Its agent can be a child session that is not announced yet.
@@ -350,6 +364,7 @@ describe("McpOverAcp", () => {
       },
       {
         of: "a child session of AIR's draft, which no subagent_update announces",
+        agents: AIR_DRAFT,
         toolUse: async ({ mcp, hook }) => {
           mcp.sending({
             sessionId: ROOT,
@@ -359,11 +374,93 @@ describe("McpOverAcp", () => {
           mcp.sending(toolCall("agent-1", "toolu_01"));
         },
       },
-    ])("names no session for $of", async ({ agents, toolUse, method }) => {
+    ])("names no session, without a wait, for $of", async ({ agents, toolUse, method }) => {
       const session = await rootSession(agents);
       await toolUse(session);
 
       expect(await session.request("toolu_01", method)).toEqual({});
+    });
+
+    describe("of a subagent whose child session is not announced yet", () => {
+      it.each<{
+        subagent: string;
+        agents: Agents;
+        sending: Sent[];
+        named: { sessionId: string; toolCallId: string };
+      }>([
+        {
+          subagent: "one whose start the core has not read, once its child is announced",
+          agents: UNKNOWN_AGENT,
+          // The announcement of another child ends no wait.
+          sending: [announcement(ROOT, "agent-2"), announcement(ROOT, "agent-1")],
+          named: { sessionId: "agent-1", toolCallId: "toolu_01" },
+        },
+        {
+          subagent: "one whose announcement a replay holds, once it goes out",
+          agents: CHILD_SESSIONS,
+          sending: [announcement(ROOT, "agent-1")],
+          named: { sessionId: "agent-1", toolCallId: "toolu_01" },
+        },
+        {
+          // An agent that stays unexposed: the root reports its tool calls.
+          subagent: "one whose tool call another session reports, once it is reported",
+          agents: UNKNOWN_AGENT,
+          sending: [toolCall(ROOT, "toolu_01")],
+          named: { sessionId: ROOT, toolCallId: "toolu_01" },
+        },
+      ])("waits, and names the session of $subagent", async ({ agents, sending, named }) => {
+        const { mcp, hook, request } = await rootSession(agents);
+        await hook("PreToolUse", "toolu_01", { id: "agent-1" });
+
+        const requested = request("toolu_01");
+        await vi.waitFor(() => expect([...waiting(mcp).keys()]).toEqual(["toolu_01"]));
+        for (const notification of sending.slice(0, -1)) {
+          mcp.sending(notification);
+          await new Promise((resolve) => setImmediate(resolve));
+          expect(waiting(mcp).size).toBe(1);
+        }
+        mcp.sending(sending.at(-1)!);
+
+        expect(await requested).toEqual(named);
+        expect(waiting(mcp).size).toBe(0);
+      });
+
+      it("names no session when the announcement does not go out in time", async () => {
+        const { mcp, hook, request } = await rootSession(UNKNOWN_AGENT);
+        mcp.announcementWaitMs = 30;
+        await hook("PreToolUse", "toolu_01", { id: "agent-1" });
+
+        const started = performance.now();
+        // Not the root session in the child's place.
+        expect(await request("toolu_01")).toEqual({});
+
+        expect(performance.now() - started).toBeGreaterThanOrEqual(25);
+        expect(waiting(mcp).size).toBe(0);
+        // A later announcement finds no request to release.
+        mcp.sending(announcement(ROOT, "agent-1"));
+        expect(await request("toolu_01")).toEqual({ sessionId: "agent-1", toolCallId: "toolu_01" });
+      });
+
+      it.each<{ ended: string; end: (session: RootSession) => Promise<void> }>([
+        {
+          // As when Claude Code gives the request up.
+          ended: "its tool use ends",
+          end: ({ hook }) => hook("PostToolUseFailure", "toolu_01", { id: "agent-1" }),
+        },
+        { ended: "the client closes its session", end: async ({ mcp }) => mcp.sessionClosed(ROOT) },
+      ])("stops waiting, and names no session, when $ended", async ({ end }) => {
+        const session = await rootSession(UNKNOWN_AGENT);
+        const { mcp, hook, request } = session;
+        await hook("PreToolUse", "toolu_01", { id: "agent-1" });
+
+        const requested = request("toolu_01");
+        await vi.waitFor(() => expect(waiting(mcp).size).toBe(1));
+        await end(session);
+
+        expect(await requested).toEqual({});
+        const held = mcp as unknown as Record<"toolUses" | "waiting", Map<string, unknown>>;
+        expect([held.toolUses.size, held.waiting.size]).toEqual([0, 0]);
+      });
     });
 
     it.each<{ ended: string; end: (session: RootSession) => Promise<void> }>([
@@ -428,7 +525,12 @@ describe("McpOverAcp", () => {
   });
 
   describe("the hooks of a query", () => {
-    const AGENTS = { childSessions: true, reporting: () => undefined, definesAgent: () => false };
+    const AGENTS = {
+      childSessions: true,
+      reporting: () => undefined,
+      childSessionId: () => undefined,
+      definesAgent: () => false,
+    };
     const TOOLS = { type: "acp" as const, name: "my tools.v2", serverId: "tools:1" };
     const DOCS = { type: "acp" as const, name: "docs", serverId: "docs:1" };
     const FILES = { name: "files", command: "/bin/files", args: [], env: [] };
@@ -508,6 +610,7 @@ describe("McpOverAcp", () => {
     const hooks = mcp.toolUseHooks("session-root", [tools], {
       childSessions: true,
       reporting: () => undefined,
+      childSessionId: () => undefined,
       definesAgent: () => false,
     })!;
     await runMcpToolHooks({ PreToolUse: [hooks.PreToolUse] }, "PreToolUse", {

@@ -10306,6 +10306,10 @@ export class ClaudeAcpAgent {
         const session = this.sessions[sessionId];
         return session && this.toolUseOwner(session, sessionId, agentId).reportingSessionId;
       },
+      // In the RFD form, a subagent's child session has its agent id (see
+      // `NativeSubagentRuntime`). AIR's draft announces none with `subagent_update`.
+      childSessionId: (agentId) =>
+        subagentForm(this.clientCapabilities) === "rfd" ? agentId : undefined,
       definesAgent: (name) =>
         this.sessions[sessionId]?.agents.some((agent) => agent.name === name) === true,
     });
