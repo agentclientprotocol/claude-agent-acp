@@ -314,6 +314,37 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("v2 core with Claude Code", 
     }
   }, 180_000);
 
+  it("starts a session without the MCP servers that managed settings keep out, and says so", async () => {
+    const { sessionId } = await agent.request(v2.methods.agent.session.new, {
+      cwd,
+      mcpServers: [
+        { type: "stdio", name: "files", command: "/bin/cat", args: [], env: [] },
+        { type: "stdio", name: "search", command: "/bin/cat", args: [], env: [] },
+      ],
+      _meta: {
+        claudeCode: {
+          // As an administrator's managed settings: Claude Code refuses a start with MCP servers.
+          options: { model: "haiku", managedSettings: { disableSideloadFlags: true } },
+        },
+      },
+    });
+    await prompt(sessionId, "Reply with exactly the single word: pong");
+    await until(() => states(sessionId).some((update) => update.state === "idle"));
+
+    const notices = updates.flatMap(({ update }) =>
+      update.sessionUpdate === "notice" ? [update] : [],
+    );
+    expect(notices).toEqual([
+      {
+        sessionUpdate: "notice",
+        severity: "warning",
+        title: "2 MCP servers failed to start",
+        description: expect.stringContaining('"files" and "search"'),
+      },
+    ]);
+    expect(states(sessionId).at(-1)).toMatchObject({ state: "idle", stopReason: "end_turn" });
+  }, 180_000);
+
   it("reports requires_action while a permission request waits", async () => {
     const sessionId = await newSession("default");
     await prompt(

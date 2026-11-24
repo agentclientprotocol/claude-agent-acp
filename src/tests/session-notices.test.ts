@@ -3,6 +3,7 @@ import {
   clientSupportsNotices,
   collapseHookSpeaker,
   MAX_NOTICE_TITLE_LENGTH,
+  mcpServerStartupNotices,
   normalizeNoticeText,
   noticeOrTranscriptUpdate,
   noticePlainText,
@@ -93,6 +94,40 @@ describe("session notices", () => {
     expect(normalizeNoticeText("  a\r\nb  c\n")).toBe("a b c");
     expect(sentenceCase("not available on the free plan")).toBe("Not available on the free plan");
     expect(sentenceCase("")).toBe("");
+  });
+
+  it("gives the MCP servers that failed for the same reason one notice", () => {
+    const notices = mcpServerStartupNotices(
+      [
+        { name: "files", status: "failed", error: "listen EPERM" },
+        // Of the `system/init` list: no error, so a notice of its own.
+        { name: "plugin", status: "failed" },
+        { name: "tools", status: "failed", error: "listen EPERM" },
+        { name: "search", status: "failed", error: "listen EPERM" },
+        { name: "other", status: "failed", error: "no such command" },
+        { name: "linear", status: "needs-auth" },
+        { name: "ok", status: "connected" },
+      ],
+      false,
+    );
+
+    expect(notices.map(({ servers, status }) => ({ servers, status }))).toEqual([
+      { servers: ["files", "tools", "search"], status: "failed" },
+      { servers: ["plugin"], status: "failed" },
+      { servers: ["other"], status: "failed" },
+      { servers: ["linear"], status: "needs-auth" },
+    ]);
+    expect(notices[0].notice).toEqual({
+      severity: "warning",
+      title: "3 MCP servers failed to start",
+      description:
+        'The tools of "files", "tools" and "search" are unavailable in this session. listen EPERM',
+    });
+    expect(notices[2].notice).toEqual({
+      severity: "warning",
+      title: 'MCP server "other" failed to start',
+      description: "Its tools are unavailable in this session. no such command",
+    });
   });
 
   it("shapes free-form text into a standalone title", () => {

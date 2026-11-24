@@ -40,7 +40,14 @@ import { clientSystemPrompt, sessionSystemPrompt } from "../client-system-prompt
 import type { ElicitationSupport } from "../elicitation.js";
 import { forkSession } from "../fork-session.js";
 import { supportsMcpOAuth } from "../mcp-oauth.js";
-import { McpOverAcp, sdkMcpServers } from "../mcp-servers.js";
+import {
+  McpOverAcp,
+  mcpServerNames,
+  refusedMcpServers,
+  type SdkMcpServers,
+  sdkMcpServers,
+  startAroundRefusedMcpServers,
+} from "../mcp-servers.js";
 import { ALLOW_BYPASS, autoModeDisabled } from "../permissions/modes.js";
 import {
   clientTakesPromptSuggestions,
@@ -562,12 +569,17 @@ class V2Agent implements AgentHandle, SessionConnection {
           );
         }
       } else {
-        const served = await this.sdkMcpServers(sessionId, request.mcpServers);
-        await session.setMcpServers(
-          { ...clientOptions(params._meta)?.mcpServers, ...served.configs },
-          served.unserved,
+        const served = await this.mcpServersOf(
+          sessionId,
+          request,
+          clientOptions(params._meta),
+          session.mcpServersRefused,
         );
-        const unhooked = this.mcp.sessionServersChanged(sessionId, request.mcpServers);
+        await session.setMcpServers(served.configs, served.unserved);
+        const unhooked = this.mcp.sessionServersChanged(
+          sessionId,
+          session.mcpServersRefused ? [] : request.mcpServers,
+        );
         if (unhooked.length > 0) {
           this.logger.log(
             `Session ${sessionId}: the MCP requests of ${unhooked.join(", ")} name no session ` +
@@ -1035,9 +1047,13 @@ class V2Agent implements AgentHandle, SessionConnection {
       this.promptKeys.set(sessionId, keys);
     }
     keys.queryStarted(resume !== undefined);
-    session.start(q, config, opened.mcpServers, keys, resume !== undefined);
+    session.start(q, config, opened.mcpServers, keys, {
+      resumed: resume !== undefined,
+      mcpServersRefused: opened.mcpServersRefused,
+    });
     this.sessions.set(sessionId, session);
-    this.mcp.sessionStarted(sessionId, opened.request.mcpServers);
+    // The bridge hears of no server that the query started without.
+    this.mcp.sessionStarted(sessionId, opened.mcpServersRefused ? [] : opened.request.mcpServers);
     this.stopped.delete(sessionId);
     // A route change during the start did not find this session live.
     this.restarts.track(sessionId, params, {
@@ -1063,6 +1079,26 @@ class V2Agent implements AgentHandle, SessionConnection {
   }
 
   /**
+   * The MCP servers that a query of the session gets for a setup request: the
+   * request's servers (see {@link sdkMcpServers}) and the ones of the client's
+   * SDK options. `refused`: Claude Code refused to start the session's query
+   * with MCP servers, so it gets none, at its start and at a later resume of
+   * the active session (see `refusedMcpServers`).
+   */
+  private async mcpServersOf(
+    sessionId: string,
+    request: { mcpServers: readonly McpServer[] },
+    client: ReturnType<typeof clientOptions>,
+    refused: boolean,
+  ): Promise<SdkMcpServers> {
+    if (refused) {
+      return refusedMcpServers(mcpServerNames(request.mcpServers, client?.mcpServers));
+    }
+    const served = await this.sdkMcpServers(sessionId, request.mcpServers);
+    return { configs: { ...client?.mcpServers, ...served.configs }, unserved: served.unserved };
+  }
+
+  /**
    * Starts the query of a session and builds its config. Its options are the
    * client's `_meta.claudeCode.options` under the ones this core controls.
    * The session is not active yet, and nothing of it goes out. The caller
@@ -1071,6 +1107,9 @@ class V2Agent implements AgentHandle, SessionConnection {
    * `resume`: the stored session that the query resumes, `sessionId` itself
    * but for a `session/options` probe. Without `persist`, Claude Code stores
    * nothing of the query (see {@link sessionOptions}).
+   *
+   * When Claude Code refuses to start with the session's MCP servers, the
+   * query starts without them (see `startAroundRefusedMcpServers`).
    */
   private async openQuery(
     sessionId: string,
@@ -1080,10 +1119,28 @@ class V2Agent implements AgentHandle, SessionConnection {
     history?: Promise<SessionMessage[]>,
     { persist = true } = {},
   ) {
+    const names = mcpServerNames(params.mcpServers, clientOptions(params._meta)?.mcpServers);
+    return startAroundRefusedMcpServers(names.length > 0, (withoutMcpServers) =>
+      this.startQuery(sessionId, params, resume, history, persist, withoutMcpServers),
+    );
+  }
+
+  /**
+   * One start of {@link openQuery}. `mcpServersRefused`: Claude Code refused
+   * the start with the session's MCP servers, so this one is without them.
+   */
+  private async startQuery(
+    sessionId: string,
+    params: v2.NewSessionRequest | v2.ResumeSessionRequest | v2.ForkSessionRequest,
+    resume: string | undefined,
+    history: Promise<SessionMessage[]> | undefined,
+    persist: boolean,
+    mcpServersRefused: boolean,
+  ) {
     const request = await validatedSetup(params);
     const client = clientOptions(params._meta);
-    const served = await this.sdkMcpServers(sessionId, request.mcpServers);
-    const mcpServers = { ...client?.mcpServers, ...served.configs };
+    const served = await this.mcpServersOf(sessionId, request, client, mcpServersRefused);
+    const mcpServers = served.configs;
     // After a provider change that is still listing its models.
     await this.auth.routeSettled();
     // The resumed transcript's last model and mode.
@@ -1148,13 +1205,17 @@ class V2Agent implements AgentHandle, SessionConnection {
     const subagent = subagentHooks((input) => session.tasks.subagentHook(input));
     // None for a query without `acp` servers. A resume cannot give a running
     // query these hooks (see `McpOverAcp.sessionServersChanged`).
-    const mcpToolUse = this.mcp.toolUseHooks(sessionId, request.mcpServers, {
-      childSessions: true,
-      reporting: (agentId) => session.tasks.childSession(agentId),
-      // A subagent's child session has its agent id (see `tasks.ts`).
-      childSessionId: (agentId) => agentId,
-      definesAgent: (name) => session.tasks.configs.definesAgent(name),
-    });
+    const mcpToolUse = this.mcp.toolUseHooks(
+      sessionId,
+      mcpServersRefused ? [] : request.mcpServers,
+      {
+        childSessions: true,
+        reporting: (agentId) => session.tasks.childSession(agentId),
+        // A subagent's child session has its agent id (see `tasks.ts`).
+        childSessionId: (agentId) => agentId,
+        definesAgent: (name) => session.tasks.configs.definesAgent(name),
+      },
+    );
     const options: Options = {
       systemPrompt: sessionSystemPrompt(clientPrompt, params._meta?.systemPrompt),
       settingSources: ["user", "project", "local"],
@@ -1359,6 +1420,7 @@ class V2Agent implements AgentHandle, SessionConnection {
       request,
       mcpServers,
       unservedMcpServers: served.unserved,
+      mcpServersRefused,
       routeGeneration,
     };
   }

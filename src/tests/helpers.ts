@@ -66,6 +66,19 @@ export function startupFailure(reason: string, cliMessage: string): Error {
 }
 
 /**
+ * The {@link startupFailure} of Claude Code 2.1.331 for a start with MCP
+ * servers under a managed `disableSideloadFlags`.
+ */
+export function sideloadRefusal(): Error {
+  return startupFailure(
+    "sideload_flags_disabled",
+    "--mcp-config is disabled by your organization's managed settings (disableSideloadFlags). " +
+      "Plugins, custom agents, and MCP servers can only be loaded from sources your administrator has approved. " +
+      "Ask your administrator to remove disableSideloadFlags from managed settings, or use an approved marketplace / settings file instead.",
+  );
+}
+
+/**
  * The error `setModel()` rejects with when Claude Code refuses the switch, as
  * SDK 0.3.325 builds it from the CLI's answer: `errorCode` is the answer's
  * `error_code`, such as `not_found` for "Model 'gpt-4' not found".
