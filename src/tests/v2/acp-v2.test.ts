@@ -1,8 +1,7 @@
 /**
  * The experimental draft ACP v2 surface, driven through the protocol router
- * with the SDK's own v1 and v2 client apps. The v2 client app validates every
- * response, session update, and elicitation it receives against the v2
- * schema, so a malformed v2 message fails the test.
+ * with the SDK's own v1 and v2 client apps. Raw v2 notifications are checked
+ * against the v2 schema before the SDK handles them.
  */
 import { randomUUID } from "node:crypto";
 import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -20,6 +19,7 @@ import {
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { AuthStatusUpdateNotification } from "../../auth-status.js";
+import { validateV2Notification } from "../acp-scenarios/schema.js";
 import { clearContextWindowCache } from "../../context-window.js";
 import { v2DiffContent } from "../../diff.js";
 import { type AcpProtocols, acpProtocolRouter, acpProtocolsFromEnv } from "../../serve.js";
@@ -32,12 +32,18 @@ import { v2SessionUpdate } from "../../v2/session-update.js";
 import type { AgentHandle } from "../../v2/agent.js";
 import {
   v1ForkSessionRequest,
+  initialConfigRequests,
   v1NewSessionRequest,
   v1SetSessionConfigOptionRequest,
   v2ConfigOptions,
 } from "../../v2/session-requests.js";
 import { encodeProjectPath } from "../../session-index/project-dirs.js";
-import { claudeCodeMcpRequest, setModelRefusal, startupFailure } from "../helpers.js";
+import {
+  claudeCodeMcpRequest,
+  runMcpToolHooks,
+  setModelRefusal,
+  startupFailure,
+} from "../helpers.js";
 import packageJson from "../../../package.json" with { type: "json" };
 
 const execFileSpy = vi.hoisted(() => vi.fn());
@@ -191,11 +197,13 @@ const CLI_SUBSCRIPTION = JSON.stringify({
 const V2_CLIENT_INFO = { name: "v2-test-client", version: "1.0.0" };
 
 const agents: AgentHandle[] = [];
+const notificationErrors: string[] = [];
 /** An empty Claude config directory and a session cwd, so no test reads the real ones. */
 let tempDir: string;
 let cwd: string;
 
 beforeEach(async () => {
+  notificationErrors.length = 0;
   // `claude auth status --json` reports a subscription, `claude auth logout` succeeds.
   execFileSpy.mockImplementation((...invocation: unknown[]) => {
     const args = invocation[1] as string[];
@@ -214,12 +222,27 @@ afterEach(async () => {
   vi.mocked(getSessionInfo).mockReset();
   vi.unstubAllEnvs();
   await rm(tempDir, { recursive: true, force: true, maxRetries: 10 });
+  expect(notificationErrors).toEqual([]);
 });
 
 /** Connects a fresh router to a client, and returns the client end of the stream. */
 function connectRouter(protocols?: AcpProtocols): v2.Stream {
-  const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
-  const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
+  let v2Connection = false;
+  const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>({
+    transform(message, controller) {
+      if ("method" in message && message.method === v2.methods.agent.initialize) {
+        const params = message.params as { protocolVersion?: unknown } | undefined;
+        v2Connection = params?.protocolVersion === v2.PROTOCOL_VERSION;
+      }
+      controller.enqueue(message);
+    },
+  });
+  const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>({
+    transform(message, controller) {
+      if (v2Connection) notificationErrors.push(...validateV2Notification(message));
+      controller.enqueue(message);
+    },
+  });
   acpProtocolRouter(undefined, (agent) => agents.push(agent), protocols, {
     onV2Agent: (agent) => agents.push(agent),
   }).connect({
@@ -258,7 +281,9 @@ function v2Client({
   answerPermission = () => ({ outcome: { outcome: "cancelled" } }),
   answerElicitation = () => ({ action: "accept" }),
 }: {
-  answerPermission?: (request: v2.RequestPermissionRequest) => v2.RequestPermissionResponse;
+  answerPermission?: (
+    request: v2.RequestPermissionRequest,
+  ) => v2.RequestPermissionResponse | Promise<v2.RequestPermissionResponse>;
   answerElicitation?: (
     request: v2.CreateElicitationRequest,
   ) => v2.CreateElicitationResponse | Promise<v2.CreateElicitationResponse>;
@@ -413,6 +438,7 @@ describe("ACP protocol routing", () => {
       title: {},
     });
     expect(response.capabilities?.providers).toEqual({});
+    expect(response.capabilities?._meta ?? {}).not.toHaveProperty("claudeCode.promptQueueing");
     // Not `_session/steering`, which v1 advertises in the top-level `_meta`.
     expect(response._meta?.steering).toBeUndefined();
     expect(response.authMethods?.length).toBeGreaterThan(0);
@@ -582,6 +608,86 @@ describe("ACP v2 sessions", () => {
     expect(client.updates("available_commands_update")).toEqual([
       { sessionUpdate: "available_commands_update", availableCommands: SESSION_COMMANDS },
     ]);
+  });
+
+  it("starts Remote Control after the response when Claude Code asks for it", async () => {
+    const initialization = sdkDefaults.initializationResult;
+    sdk.initializationResult = async () => ({
+      ...(await initialization()),
+      remote_control_auto_enable: true,
+    });
+    const enableRemoteControl = vi.fn(async () => ({
+      session_url: "https://claude.ai/code/session_123",
+    }));
+    sdk.enableRemoteControl = enableRemoteControl;
+    // The query stream stays open, as Claude Code's does.
+    sdk.run = async function* () {
+      await new Promise<never>(() => {});
+      yield* [];
+    };
+    const client = v2Client();
+    const noticesAtResponse = await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      await agent.request(v2.methods.agent.session.new, { cwd });
+      const atResponse = client.updates("notice").length;
+      await vi.waitFor(() => expect(client.updates("notice")).toHaveLength(1));
+      await client.authUpdate(1);
+      return atResponse;
+    });
+
+    expect(noticesAtResponse).toBe(0);
+    expect(enableRemoteControl).toHaveBeenCalledExactlyOnceWith(true);
+    expect(client.updates("notice")).toEqual([
+      {
+        sessionUpdate: "notice",
+        severity: "info",
+        title: "Remote Control connected",
+        description:
+          "Continue this session from claude.ai/code or the Claude mobile app: https://claude.ai/code/session_123\nRun /remote-control off to disconnect.",
+      },
+    ]);
+  });
+
+  it("holds a prompt back until the notice of Remote Control at session start is sent", async () => {
+    const initialization = sdkDefaults.initializationResult;
+    sdk.initializationResult = async () => ({
+      ...(await initialization()),
+      remote_control_auto_enable: true,
+    });
+    let connect!: () => void;
+    const enableRemoteControl = vi.fn(
+      () =>
+        new Promise<{ session_url?: string }>((resolve) => {
+          connect = () => resolve({ session_url: "https://claude.ai/code/session_123" });
+        }),
+    );
+    sdk.enableRemoteControl = enableRemoteControl;
+    const echoed = scriptTurns(async function* (options) {
+      yield assistantText(options, "Done.");
+      yield result(options);
+      yield idleState(options);
+    });
+    const client = v2Client();
+    const echoedWhileConnecting = await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalled());
+      const prompted = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("hi"),
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const whileConnecting = echoed.length;
+      connect();
+      await prompted;
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      await client.authUpdate(1);
+      return whileConnecting;
+    });
+
+    expect(echoedWhileConnecting).toBe(0);
+    expect(echoed).toHaveLength(1);
+    expect(client.updates("notice")).toHaveLength(1);
   });
 
   it("rejects session/new with the reason Claude Code gave for not starting", async () => {
@@ -1034,6 +1140,86 @@ describe("ACP v2 sessions", () => {
       options: [{ value: "default" }, { value: "fable", name: "Fable 5.2" }],
     });
     expect(setModel).not.toHaveBeenCalled();
+  });
+
+  it("preserves a pending request when changed-root resume is refused, and accepts an MCP update", async () => {
+    const answer = Promise.withResolvers<v2.RequestPermissionResponse>();
+    const client = v2Client({
+      answerPermission: () => answer.promise as unknown as v2.RequestPermissionResponse,
+    });
+    scriptTurns(
+      async function* (options) {
+        yield toolUseMessage(options, "toolu_wait", "Bash", { command: "ls" });
+        await options.canUseTool!(
+          "Bash",
+          { command: "ls" },
+          {
+            signal: new AbortController().signal,
+            suggestions: [],
+            toolUseID: "toolu_wait",
+            requestId: randomUUID(),
+          },
+        );
+        yield toolResultMessage(options, "toolu_wait", {});
+        yield result(options);
+      },
+      async function* (options) {
+        yield result(options);
+      },
+    );
+    sdk.setMcpServers = vi.fn(sdkDefaults.setMcpServers);
+    const extra = await mkdtemp(path.join(tempDir, "extra-"));
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("work") });
+      await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(1));
+      const session = v2Session(sessionId);
+      const request = client.permissionRequests[0];
+      await expect(
+        agent.request(v2.methods.agent.session.resume, {
+          sessionId,
+          cwd,
+          additionalDirectories: [extra],
+        }),
+      ).rejects.toMatchObject({ code: -32602 });
+      expect(v2Session(sessionId)).toBe(session);
+      expect(sdk.queryOptions).toHaveLength(1);
+      expect(client.cancelledRequests).toEqual([]);
+      const before = client.sessionUpdates.length;
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+        mcpServers: [{ type: "http", name: "github", url: "https://github.dev/mcp" }],
+      });
+      expect(client.sessionUpdates.slice(before).at(-1)).toMatchObject({
+        sessionId,
+        update: { sessionUpdate: "state_update", state: "requires_action", background: [] },
+      });
+      expect(sdk.setMcpServers).toHaveBeenCalledExactlyOnceWith({
+        github: expect.objectContaining({ type: "http" }),
+      });
+      expect(client.permissionRequests).toEqual([request]);
+      answer.resolve({
+        outcome: {
+          outcome: "selected",
+          optionId: request!.options.find((option) => option.kind === "allow_once")!.optionId,
+        },
+      });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates).at(-1)).toBe("idle end_turn"));
+      const states = client.updates("state_update").length;
+      await agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("follow up"),
+      });
+      await vi.waitFor(() =>
+        expect(client.updates("state_update").slice(states).at(-1)).toMatchObject({
+          state: "idle",
+          stopReason: "end_turn",
+        }),
+      );
+    });
   });
 
   it("keeps the running turn of the active session that a resume gives other MCP servers", async () => {
@@ -2074,6 +2260,37 @@ function toolResultMessage(
   };
 }
 
+/** Claude Code's report of the start of the subagent `taskId`, which the call `toolu_<taskId>` launched. */
+function taskStarted(options: Options, taskId: string, fields: Record<string, unknown>) {
+  return {
+    type: "system",
+    subtype: "task_started",
+    task_id: taskId,
+    tool_use_id: `toolu_${taskId}`,
+    description: "Explore the project",
+    subagent_type: "Explore",
+    uuid: randomUUID(),
+    session_id: options.sessionId,
+    ...fields,
+  };
+}
+
+/** Claude Code's report of the end of a run of the subagent `taskId`. */
+function taskNotification(options: Options, taskId: string, fields: Record<string, unknown>) {
+  return {
+    type: "system",
+    subtype: "task_notification",
+    task_id: taskId,
+    tool_use_id: `toolu_${taskId}`,
+    status: "completed",
+    summary: "Done",
+    output_file: "",
+    uuid: randomUUID(),
+    session_id: options.sessionId,
+    ...fields,
+  };
+}
+
 /** How a result ends work that an interrupt stopped while a tool ran. */
 const ABORTED_TOOLS = {
   subtype: "error_during_execution",
@@ -2178,6 +2395,547 @@ describe("MCP servers that the client serves over the ACP connection", () => {
     expect(sdk.setMcpServers).not.toHaveBeenCalled();
     expect(response.messages).toEqual(TOOL_CALL_MESSAGES);
   });
+
+  describe("the session and tool call that a request names", () => {
+    const ECHO = "mcp__tools__echo";
+    const AGENT_CALL = { description: "Explore the project", prompt: "Look around" };
+
+    /** A client of one protocol version, with the capabilities that it declares. */
+    type Client =
+      | { version: 1; capabilities?: v1.ClientCapabilities }
+      | { version: 2; capabilities?: undefined };
+    const V1: Client = { version: 1 };
+    const V1_SUBAGENTS: Client = { version: 1, capabilities: { subagents: {} } as never };
+    const V1_AIR_SUBAGENTS: Client = {
+      version: 1,
+      capabilities: {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["nativeSubagentSessions"] } } },
+      },
+    };
+    const V2: Client = { version: 2 };
+
+    /** What the `mcp/message` request of each tool use named, by tool use id. */
+    type Named = Record<string, { sessionId?: string; toolCallId?: string }>;
+
+    /**
+     * Sets up a session of `client` with the `tools` server (without it when
+     * `undeclared`: the client only registers the server), prompts it, and
+     * runs `during` while Claude Code works on the prompt. Resolves, once the
+     * turn ended or `during` closed the session, with the root session's id,
+     * what the `mcp/message` requests named, and the session that reported
+     * each tool call.
+     *
+     * The server answers a request once `concurrent` requests wait for an
+     * answer, so that many tool uses are in flight at once.
+     *
+     * A request of the adapter waits a minute for an announcement (see
+     * {@link adapterMcp}), so a case whose request waits when it should not
+     * times out. `announcedBefore` has the child sessions that the client
+     * knew when each request arrived.
+     */
+    async function promptWithTools(
+      client: Client,
+      {
+        concurrent = 1,
+        undeclared = false,
+        during,
+      }: { concurrent?: number; undeclared?: boolean; during?: During } = {},
+    ) {
+      const named: Named = {};
+      const announcedBefore: Record<string, string[]> = {};
+      /** The child sessions that a `subagent_update` announced to the client so far. */
+      let announced: () => string[] = () => [];
+      const waiting: Array<() => void> = [];
+      const handler: v2.McpRequestHandler = async ({ params, sessionId, toolCallId }) => {
+        const meta = params?._meta as Record<string, unknown>;
+        const toolUseId = meta["claudecode/toolUseId"] as string;
+        named[toolUseId] = { sessionId, toolCallId };
+        announcedBefore[toolUseId] = announced();
+        await new Promise<void>((resolve) => {
+          waiting.push(resolve);
+          if (waiting.length >= concurrent) for (const answer of waiting.splice(0)) answer();
+        });
+        return { result: { resultType: "complete", content: [] } };
+      };
+      const reportedOn: Record<string, string> = {};
+      const report = ({ sessionId, update }: { sessionId: string; update: object }) => {
+        const { toolCallId } = update as { toolCallId?: unknown };
+        if (typeof toolCallId === "string") reportedOn[toolCallId] ??= sessionId;
+      };
+      const announcements = (updates: Array<{ update: object }>) =>
+        updates.flatMap(({ update }) => {
+          const { sessionUpdate, sessionId } = update as Record<string, unknown>;
+          return sessionUpdate === "subagent_update" ? [sessionId as string] : [];
+        });
+      let root: string;
+      if (client.version === 1) {
+        const provider = new v1.McpOverAcpProvider();
+        const authUpdate = Promise.withResolvers<void>();
+        const updates: Array<{ update: object }> = [];
+        announced = () => announcements(updates);
+        root = await v1
+          .client({ name: "v1-test-client" })
+          .onNotification(
+            "_auth/status_update",
+            (params) => params,
+            () => authUpdate.resolve(),
+          )
+          .onNotification(v1.methods.client.session.update, ({ params }) => {
+            report(params);
+            updates.push(params);
+          })
+          .onRequest(v1.methods.client.mcp.message, provider.handleRequest)
+          .connectWith(connectRouter() as unknown as v1.Stream, async (agent) => {
+            await agent.request(v1.methods.agent.initialize, {
+              protocolVersion: v1.PROTOCOL_VERSION,
+              clientCapabilities: client.capabilities,
+            });
+            adapterMcp().announcementWaitMs = 60_000;
+            const tools = provider.registerServer(agent, { name: "tools", handler });
+            const setup: v1.NewSessionRequest = {
+              cwd,
+              mcpServers: undeclared ? [] : [tools.declaration],
+            };
+            const { sessionId } = await agent.request(v1.methods.agent.session.new, setup);
+            const turn = agent.request(v1.methods.agent.session.prompt, {
+              sessionId,
+              prompt: text("hi"),
+            });
+            await during?.({
+              sessionId,
+              tools: tools.declaration,
+              named,
+              send: (method, params) => agent.request(method as never, params as never),
+            });
+            await turn;
+            await authUpdate.promise;
+            return sessionId;
+          });
+      } else {
+        const provider = new v2.McpOverAcpProvider();
+        const v2client = v2Client();
+        announced = () => announcements(v2client.sessionUpdates);
+        root = await v2client.app
+          .onRequest(v2.methods.client.mcp.message, provider.handleRequest)
+          .connectWith(connectRouter(), async (agent) => {
+            await initializeV2(agent);
+            adapterMcp().announcementWaitMs = 60_000;
+            const tools = provider.registerServer(agent, { name: "tools", handler });
+            const { sessionId } = await agent.request(v2.methods.agent.session.new, {
+              cwd,
+              mcpServers: undeclared ? [] : [tools.declaration],
+            });
+            await agent.request(v2.methods.agent.session.prompt, {
+              sessionId,
+              prompt: text("hi"),
+            });
+            let closed = false;
+            await during?.({
+              sessionId,
+              tools: tools.declaration,
+              named,
+              send: (method, params) => {
+                closed ||= method === SESSION_CLOSE;
+                return agent.request(method as never, params as never);
+              },
+            });
+            if (!closed) {
+              await vi.waitFor(() =>
+                expect(turnTrace(v2client.sessionUpdates)).toContain("idle end_turn"),
+              );
+            }
+            await v2client.authUpdate(1);
+            return sessionId;
+          });
+        for (const notification of v2client.sessionUpdates) report(notification);
+      }
+      return { root, named, reportedOn, announcedBefore };
+    }
+
+    /** The adapter's `McpOverAcp` of the connection, for its wait and the requests that wait. */
+    const adapterMcp = () =>
+      (
+        agents[0] as unknown as {
+          mcp: { announcementWaitMs: number; waiting: Map<string, unknown> };
+        }
+      ).mcp;
+
+    /** What a test does while Claude Code works on the prompt (see {@link promptWithTools}). */
+    type During = (session: {
+      sessionId: string;
+      /** The declaration of the session's `tools` server. */
+      tools: v1.McpServerAcpDeclaration;
+      named: Named;
+      /** Sends the client's request `method` to the agent, such as {@link SESSION_CLOSE}. */
+      send(method: string, params: Record<string, unknown>): Promise<unknown>;
+    }) => Promise<void>;
+
+    // Both protocol versions name these methods alike.
+    const SESSION_CLOSE = v2.methods.agent.session.close;
+    const SESSION_RESUME = v2.methods.agent.session.resume;
+
+    /** Claude Code sends the `tools/call` of the tool use `id` to the `tools` server. */
+    const toolsCall = (options: Options, id: string) =>
+      claudeCodeMcpRequest(
+        options.mcpServers?.tools as McpHttpServerConfig,
+        "tools/call",
+        TOOL_CALL,
+        undefined,
+        id,
+      );
+
+    /**
+     * Claude Code runs the tool use `id` of the agent `agentId` of the type
+     * `agentType`: its hooks around its request.
+     */
+    async function runEcho(options: Options, id: string, agentId?: string, agentType?: string) {
+      const use = { id, tool: ECHO, agentId, agentType };
+      await runMcpToolHooks(options.hooks, "PreToolUse", use);
+      await toolsCall(options, id);
+      await runMcpToolHooks(options.hooks, "PostToolUse", use);
+    }
+
+    /** The end of the turn, after the subagent `agent-1` returned what its tool use `toolu_child` did. */
+    function* endOfSubagentTurn(options: Options) {
+      yield {
+        ...toolResultMessage(options, "toolu_child", {}),
+        parent_tool_use_id: "toolu_agent-1",
+      };
+      yield taskNotification(options, "agent-1", {});
+      yield toolResultMessage(options, "toolu_agent-1", {});
+      yield result(options);
+      yield idleState(options);
+    }
+
+    it.each([
+      { client: V1, of: "a v1 session", childOn: "root" },
+      { client: V1_SUBAGENTS, of: "a v1 session with child sessions", childOn: "agent-1" },
+      {
+        client: V1_AIR_SUBAGENTS,
+        of: "a v1 session with AIR's child sessions",
+        childOn: undefined,
+      },
+      { client: V2, of: "a v2 session", childOn: "agent-1" },
+    ])(
+      "names the session that reports each of two tool calls of $of that run at once",
+      async ({ client, childOn }) => {
+        scriptTurns(async function* (options) {
+          // The main conversation and a subagent call the tool with the same arguments.
+          yield toolUseMessage(options, "toolu_root", ECHO, TOOL_CALL.arguments);
+          yield toolUseMessage(options, "toolu_agent-1", "Agent", AGENT_CALL);
+          yield taskStarted(options, "agent-1", { prompt: AGENT_CALL.prompt });
+          yield toolUseMessage(options, "toolu_child", ECHO, TOOL_CALL.arguments, "toolu_agent-1");
+          await Promise.all([
+            runEcho(options, "toolu_root"),
+            runEcho(options, "toolu_child", "agent-1"),
+          ]);
+          yield toolResultMessage(options, "toolu_root", {});
+          yield* endOfSubagentTurn(options);
+        });
+
+        const { root, named, reportedOn } = await promptWithTools(client, { concurrent: 2 });
+
+        const session = (name: string | undefined) => (name === "root" ? root : name);
+        expect(named).toEqual({
+          toolu_root: { sessionId: root, toolCallId: "toolu_root" },
+          // AIR's draft announces no child with `subagent_update`.
+          toolu_child:
+            childOn === undefined ? {} : { sessionId: session(childOn), toolCallId: "toolu_child" },
+        });
+        // The session of each named tool call is the one that the client got it on.
+        expect(reportedOn).toMatchObject({
+          toolu_root: root,
+          ...(childOn === undefined ? {} : { toolu_child: session(childOn) }),
+        });
+      },
+    );
+
+    it.each([
+      {
+        // It has no child sessions, and does not know yet that the root reports the tool call.
+        client: V1,
+        names: "the root session of a v1 session, and no tool call, at once",
+        waits: false,
+      },
+      {
+        client: V1_SUBAGENTS,
+        names: "the child session of a v1 session with child sessions, once it is announced,",
+        waits: true,
+      },
+      {
+        client: V2,
+        names: "the child session of a v2 session, once it is announced,",
+        waits: true,
+      },
+    ])(
+      "names $names for a subagent whose start the session has not read",
+      async ({ client, waits }) => {
+        scriptTurns(async function* (options) {
+          yield toolUseMessage(options, "toolu_agent-1", "Agent", AGENT_CALL);
+          // Claude Code runs the subagent's tool before the session reads `task_started`.
+          const use = { id: "toolu_child", tool: ECHO, agentId: "agent-1" };
+          await runMcpToolHooks(options.hooks, "PreToolUse", use);
+          const requested = toolsCall(options, "toolu_child");
+          // The request waits for the announcement, or is answered without one.
+          if (waits) await vi.waitFor(() => expect(adapterMcp().waiting.size).toBe(1));
+          else await requested;
+          yield taskStarted(options, "agent-1", { prompt: AGENT_CALL.prompt });
+          yield toolUseMessage(options, "toolu_child", ECHO, TOOL_CALL.arguments, "toolu_agent-1");
+          await requested;
+          await runMcpToolHooks(options.hooks, "PostToolUse", use);
+          yield* endOfSubagentTurn(options);
+        });
+
+        const { root, named, announcedBefore } = await promptWithTools(client);
+
+        // Not the root session in the place of the child session.
+        expect(named.toolu_child).toEqual(
+          waits ? { sessionId: "agent-1", toolCallId: "toolu_child" } : { sessionId: root },
+        );
+        // The request went out after the `subagent_update` of the child that it names.
+        expect(announcedBefore.toolu_child).toEqual(waits ? ["agent-1"] : []);
+      },
+    );
+
+    it.each([
+      { client: V1, of: "a v1 session" },
+      { client: V1_SUBAGENTS, of: "a v1 session with child sessions" },
+      { client: V1_AIR_SUBAGENTS, of: "a v1 session with AIR's child sessions" },
+      { client: V2, of: "a v2 session" },
+    ])(
+      "names the root session of $of, and no tool call, for an agent that a workflow runs",
+      async ({ client }) => {
+        scriptTurns(async function* (options) {
+          // A workflow's agents send nothing on the stream: no `task_started`,
+          // no tool use. Only their hooks tell of them.
+          await runEcho(options, "toolu_workflow_agent", "a7ffab6216b105cf0", "workflow-subagent");
+          yield result(options);
+          yield idleState(options);
+        });
+
+        const { root, named } = await promptWithTools(client);
+
+        expect(named.toolu_workflow_agent).toEqual({ sessionId: root });
+      },
+    );
+
+    it.each([
+      // Without child sessions, the agent's work is the root's whatever it is.
+      { client: V1, names: "the root session of a v1 session", onRoot: true },
+      {
+        client: V1_SUBAGENTS,
+        names: "no session of a v1 session with child sessions",
+        onRoot: false,
+      },
+      { client: V2, names: "no session of a v2 session", onRoot: false },
+    ])(
+      "names $names for an agent of the workflow agents' type, when the session defines such an agent",
+      async ({ client, onRoot }) => {
+        // The user named an agent of their own `workflow-subagent`: an agent
+        // of that type can be a subagent whose start the session has not read.
+        const custom = { name: "workflow-subagent", description: "My own agent" };
+        sdk.supportedAgents = async () => [...(await sdkDefaults.supportedAgents()), custom];
+        sdk.initializationResult = async () => ({
+          ...(await sdkDefaults.initializationResult()),
+          agents: await sdk.supportedAgents(),
+        });
+        scriptTurns(async function* (options) {
+          await runEcho(options, "toolu_child", "a7ffab6216b105cf0", "workflow-subagent");
+          yield result(options);
+          yield idleState(options);
+        });
+
+        const { root, named } = await promptWithTools(client);
+
+        expect(named.toolu_child).toEqual(onRoot ? { sessionId: root } : {});
+      },
+    );
+
+    it.each([
+      { client: V1_SUBAGENTS, of: "a v1 session with child sessions" },
+      { client: V2, of: "a v2 session" },
+    ])(
+      "names no session of $of for a subagent that a conversation reset made it forget",
+      async ({ client }) => {
+        scriptTurns(async function* (options) {
+          yield toolUseMessage(options, "toolu_agent-1", "Agent", {
+            ...AGENT_CALL,
+            run_in_background: true,
+          });
+          yield taskStarted(options, "agent-1", {
+            prompt: AGENT_CALL.prompt,
+            is_backgrounded: true,
+          });
+          yield toolResultMessage(options, "toolu_agent-1", { content: "Launched." });
+          yield {
+            type: "conversation_reset",
+            new_conversation_id: randomUUID(),
+            uuid: randomUUID(),
+            trigger: "clear",
+            timestamp: new Date().toISOString(),
+            session_id: options.sessionId,
+          };
+          // The subagent goes on unobserved. The client still holds its
+          // session, but no session reports its tool calls any more.
+          await runEcho(options, "toolu_child", "agent-1");
+          yield result(options);
+          yield idleState(options);
+        });
+
+        const { named, reportedOn } = await promptWithTools(client);
+
+        expect(named.toolu_child).toEqual({});
+        expect(reportedOn).not.toHaveProperty("toolu_child");
+      },
+    );
+
+    it.each([
+      { client: V1, of: "a v1 session" },
+      { client: V2, of: "a v2 session" },
+    ])("names $of for each request of a tool use, until the session closes", async ({ client }) => {
+      const ran = Promise.withResolvers<Options>();
+      const closed = Promise.withResolvers<void>();
+      scriptTurns(async function* (options) {
+        // The session has not read the tool use: no tool call's end ends it.
+        await runMcpToolHooks(options.hooks, "PreToolUse", { id: "toolu_root", tool: ECHO });
+        ran.resolve(options);
+        await closed.promise;
+        yield toolUseMessage(options, "toolu_root", ECHO, TOOL_CALL.arguments);
+      });
+      const requests: Named[string][] = [];
+
+      const { root } = await promptWithTools(client, {
+        during: async ({ sessionId, named, send }) => {
+          const options = await ran.promise;
+          const requested = async () => {
+            await toolsCall(options, "toolu_root");
+            requests.push(named.toolu_root);
+          };
+          await requested();
+          // Claude Code sends the request again, as for an input that the tool asked for.
+          await requested();
+          await send(SESSION_CLOSE, { sessionId });
+          await requested();
+          closed.resolve();
+        },
+      });
+
+      const attributed = { sessionId: root, toolCallId: "toolu_root" };
+      expect(requests).toEqual([attributed, attributed, {}]);
+    });
+
+    it("names no session of a v2 session for a server that its resume no longer declares", async () => {
+      const ran = Promise.withResolvers<Options>();
+      const resumed = Promise.withResolvers<void>();
+      scriptTurns(async function* (options) {
+        yield toolUseMessage(options, "toolu_root", ECHO, TOOL_CALL.arguments);
+        await runMcpToolHooks(options.hooks, "PreToolUse", { id: "toolu_root", tool: ECHO });
+        ran.resolve(options);
+        await resumed.promise;
+        yield toolResultMessage(options, "toolu_root", {});
+        yield result(options);
+        yield idleState(options);
+      });
+
+      const { named } = await promptWithTools(V2, {
+        during: async ({ sessionId, send }) => {
+          const options = await ran.promise;
+          await send(SESSION_RESUME, { sessionId, cwd, mcpServers: [] });
+          // Claude Code had sent the request before it took the server away.
+          await toolsCall(options, "toolu_root");
+          resumed.resolve();
+        },
+      });
+
+      expect(named.toolu_root).toEqual({});
+    });
+
+    it("names no session of a v2 session for a server that a resume gave its running query", async () => {
+      sdk.setMcpServers = vi.fn(sdkDefaults.setMcpServers);
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      const started = Promise.withResolvers<void>();
+      const resumed = Promise.withResolvers<McpHttpServerConfig>();
+      scriptTurns(async function* (options) {
+        started.resolve();
+        const tools = await resumed.promise;
+        yield toolUseMessage(options, "toolu_root", ECHO, TOOL_CALL.arguments);
+        // The query started without `acp` servers, so without the hooks.
+        await runMcpToolHooks(options.hooks, "PreToolUse", { id: "toolu_root", tool: ECHO });
+        await claudeCodeMcpRequest(tools, "tools/call", TOOL_CALL, undefined, "toolu_root");
+        yield toolResultMessage(options, "toolu_root", {});
+        yield result(options);
+        yield idleState(options);
+      });
+
+      try {
+        const { named } = await promptWithTools(V2, {
+          undeclared: true,
+          during: async ({ sessionId, tools, send }) => {
+            await started.promise;
+            await send(SESSION_RESUME, { sessionId, cwd, mcpServers: [tools] });
+            const [servers] = vi.mocked(sdk.setMcpServers).mock.calls[0];
+            resumed.resolve(servers.tools as McpHttpServerConfig);
+          },
+        });
+
+        expect(named.toolu_root).toEqual({});
+        expect(log).toHaveBeenCalledWith(
+          expect.stringContaining("the MCP requests of tools name no session"),
+        );
+        // No hook of the query runs for an MCP tool.
+        const matchers = Object.values(sdk.queryOptions[0].hooks ?? {}).flatMap((event) =>
+          (event ?? []).map(({ matcher }) => matcher),
+        );
+        expect(matchers.filter((matcher) => matcher?.startsWith("mcp__"))).toEqual([]);
+      } finally {
+        log.mockRestore();
+      }
+    });
+
+    it("holds a request of a v2 session's subagent while a replay holds its announcement back", async () => {
+      const launched = Promise.withResolvers<void>();
+      const held = Promise.withResolvers<void>();
+      const history = Promise.withResolvers<Awaited<ReturnType<typeof getSessionMessages>>>();
+      scriptTurns(async function* (options) {
+        yield toolUseMessage(options, "toolu_agent-1", "Agent", AGENT_CALL);
+        launched.resolve();
+        await held.promise;
+        // The resume's replay holds what the session sends from here on: the
+        // subagent's `subagent_update`, and its tool call.
+        yield taskStarted(options, "agent-1", { prompt: AGENT_CALL.prompt });
+        yield toolUseMessage(options, "toolu_child", ECHO, TOOL_CALL.arguments, "toolu_agent-1");
+        await runEcho(options, "toolu_child", "agent-1");
+        yield* endOfSubagentTurn(options);
+      });
+
+      const { named, announcedBefore } = await promptWithTools(V2, {
+        during: async ({ sessionId, tools, send }) => {
+          await launched.promise;
+          const reads = vi.mocked(getSessionMessages).mock.calls.length;
+          vi.mocked(getSessionMessages).mockReturnValueOnce(history.promise);
+          const resume = send(SESSION_RESUME, {
+            sessionId,
+            cwd,
+            mcpServers: [tools],
+            replayFrom: { type: "start" },
+          });
+          // The hold began with the request, before the resume reads the history.
+          await vi.waitFor(() =>
+            expect(vi.mocked(getSessionMessages).mock.calls.length).toBeGreaterThan(reads),
+          );
+          held.resolve();
+          // The session announced the child, but the announcement has not gone out.
+          await vi.waitFor(() => expect(adapterMcp().waiting.size).toBe(1));
+          history.resolve([]);
+          await resume;
+        },
+      });
+
+      // Not before the client got the child's `subagent_update`.
+      expect(named.toolu_child).toEqual({ sessionId: "agent-1", toolCallId: "toolu_child" });
+      expect(announcedBefore.toolu_child).toContain("agent-1");
+    });
+  });
 });
 
 describe("ACP v2 prompts", () => {
@@ -2228,6 +2986,69 @@ describe("ACP v2 prompts", () => {
       state: "idle",
       stopReason: "end_turn",
       usage: { inputTokens: 3, outputTokens: 2 },
+    });
+  });
+
+  it.each([true, false])("keeps custom answers beside their questions for AIR=%s", async (air) => {
+    let answer: unknown;
+    scriptTurns(async function* (options) {
+      const input = {
+        questions: [false, true].map((multiSelect) => ({
+          question: multiSelect ? "Which features?" : "Which package?",
+          header: multiSelect ? "Features" : "Package",
+          options: [
+            { label: "core", description: "Core" },
+            { label: "cli", description: "CLI" },
+          ],
+          multiSelect,
+        })),
+      };
+      yield toolUseMessage(options, "toolu_question", "AskUserQuestion", input);
+      answer = await options.canUseTool!("AskUserQuestion", input, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "toolu_question",
+        requestId: randomUUID(),
+      } as Parameters<NonNullable<Options["canUseTool"]>>[2]);
+      yield toolResultMessage(options, "toolu_question", {});
+      yield result(options);
+    });
+    const client = v2Client({
+      answerElicitation: () => ({
+        action: "accept",
+        content: {
+          question_0: "core",
+          question_0_custom: "A note",
+          question_1_custom: "My feature",
+        },
+      }),
+    });
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent, {
+        elicitation: { form: {} },
+        ...(air ? { _meta: { jetbrains: { air: { version: 1, capabilities: [] } } } } : {}),
+      });
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("Ask me") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+    });
+
+    expect(client.elicitations).toHaveLength(1);
+    expect(client.elicitations[0]._meta).toEqual(
+      air
+        ? {
+            jetbrains: {
+              air: { version: 1, customAnswerFields: ["question_0_custom", "question_1_custom"] },
+            },
+          }
+        : undefined,
+    );
+    expect(answer).toMatchObject({
+      behavior: "allow",
+      updatedInput: {
+        answers: { "Which package?": "core", "Which features?": "My feature" },
+        annotations: { "Which package?": { notes: "A note" } },
+      },
     });
   });
 
@@ -2724,11 +3545,36 @@ describe("ACP v2 prompts", () => {
             role: "user",
             content: [{ type: "tool_result", tool_use_id: "toolu_handback", content: "Delivered" }],
           }),
+          response("cf1", "c3", "claude-haiku-4-5", [
+            {
+              type: "tool_use",
+              id: "toolu_failed",
+              name: "SubagentHandback",
+              input: { message: "Failed report" },
+            },
+            {
+              type: "tool_use",
+              id: "toolu_unfinished",
+              name: "SubagentHandback",
+              input: { message: "Unfinished report" },
+            },
+          ]),
+          transcriptRecord(sessionId, "cf2", "cf1", {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_failed",
+                is_error: true,
+                content: "Not delivered",
+              },
+            ],
+          }),
           // Claude Code frames a SendMessage call's message for the child's model.
           transcriptRecord(
             sessionId,
             "c4",
-            "c3",
+            "cf2",
             {
               role: "user",
               content:
@@ -2803,7 +3649,12 @@ describe("ACP v2 prompts", () => {
       "abc123 toolu_send root -> abc123",
       "root toolu_send root -> abc123",
     ]);
-    expect(client.updates("tool_call_update")).toEqual([]);
+    expect(
+      client.updates("tool_call_update").map(({ toolCallId, status }) => [toolCallId, status]),
+    ).toEqual([
+      ["toolu_failed", "pending"],
+      ["toolu_failed", "failed"],
+    ]);
     // The client cannot fork a child, so the messages a child received get no cursor.
     expect(client.updates("cursor_update")).toEqual([]);
   });
@@ -3205,7 +4056,7 @@ describe("ACP v2 prompts", () => {
     });
   });
 
-  it("answers a queued prompt once Claude Code takes it in, after the turn before it", async () => {
+  it("answers a priority prompt once Claude Code takes it in, without ending the foreground work", async () => {
     const firstAnswer = Promise.withResolvers<void>();
     const echoed = scriptTurns(
       async function* (options) {
@@ -3232,7 +4083,7 @@ describe("ACP v2 prompts", () => {
       expect(await queued).toEqual({ messageId: echoed[1] });
       await vi.waitFor(() =>
         expect(turnTrace(client.sessionUpdates).filter((s) => s === "idle end_turn")).toHaveLength(
-          2,
+          1,
         ),
       );
       await client.authUpdate(1);
@@ -3241,9 +4092,7 @@ describe("ACP v2 prompts", () => {
     expect(turnTrace(client.sessionUpdates)).toEqual([
       "user_message",
       "running",
-      "idle end_turn",
       "user_message",
-      "running",
       "idle end_turn",
     ]);
     expect(client.updates("user_message").map((update) => update.messageId)).toEqual(echoed);
@@ -4377,7 +5226,7 @@ describe("ACP v2 prompts", () => {
       await client.authUpdate(1);
     });
 
-    expect(turnTrace(client.sessionUpdates)).toEqual(["user_message", "running", "idle end_turn"]);
+    expect(turnTrace(client.sessionUpdates)).toEqual(["user_message", "running", "idle error"]);
   });
 
   it("gives a messageId to the chunks that the agent builds from a command's output and a result", async () => {
@@ -5800,6 +6649,162 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
     terminal_reason: "aborted_streaming",
   };
 
+  it.each([
+    { markers: true, streamReply: true },
+    { markers: false, streamReply: true },
+    { markers: true, streamReply: false },
+    { markers: false, streamReply: false },
+  ])(
+    "steers a busy prompt without an idle between the replies (%o)",
+    async ({ markers, streamReply }) => {
+      const reply = Promise.withResolvers<void>();
+      const priorities: unknown[] = [];
+      sdk.run = async function* (prompts, options) {
+        const input = prompts[Symbol.asyncIterator]();
+        const first = (await input.next()).value;
+        const echo = (value: SDKUserMessage) => ({
+          type: "user",
+          message: value.message,
+          uuid: value.uuid,
+          parent_tool_use_id: null,
+          session_id: options.sessionId,
+          isReplay: true,
+        });
+        yield markersInit(options);
+        yield echo(first);
+        yield assistantText(options, "First reply", "msg_first");
+        const second = (await input.next()).value;
+        priorities.push(second.priority);
+        yield result(options, {
+          ...ABORTED,
+          ...(markers ? { user_message_uuids: [first.uuid] } : {}),
+        });
+        yield idleState(options);
+        yield echo(second);
+        if (streamReply) yield assistantText(options, "Stopped", "msg_second");
+        await reply.promise;
+        yield result(options, {
+          result: "Stopped",
+          uuid: "msg_second",
+          ...(markers ? { user_message_uuids: [second.uuid] } : {}),
+        });
+        yield idleState(options);
+        while (!(await input.next()).done);
+      };
+      const client = await promptAndWait(1, async (agent, sessionId, client) => {
+        await vi.waitFor(() =>
+          expect(turnTrace(client.sessionUpdates)).toContain("agent_message_chunk"),
+        );
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("stop") });
+        if (streamReply)
+          await vi.waitFor(() => expect(client.updates("agent_message_chunk")).toHaveLength(2));
+        expect(turnTrace(client.sessionUpdates)).not.toContain("idle end_turn");
+        expect(turnTrace(client.sessionUpdates)).not.toContain("idle error");
+        reply.resolve();
+      });
+      expect(priorities).toEqual(["now"]);
+      expect(turnTrace(client.sessionUpdates)).toEqual([
+        "user_message",
+        "running",
+        "agent_message_chunk",
+        "user_message",
+        "agent_message_chunk",
+        "idle end_turn",
+      ]);
+      expect(client.updates("agent_message_chunk").map((update) => update.messageId)).toEqual([
+        "msg_first",
+        "msg_second",
+      ]);
+    },
+  );
+
+  it.each(["refused", "cancelled"])(
+    "ends the foreground work when a waiting priority prompt is %s",
+    async (state) => {
+      sdk.run = async function* (prompts, options) {
+        const input = prompts[Symbol.asyncIterator]();
+        const first = (await input.next()).value;
+        yield {
+          type: "user",
+          message: first.message,
+          uuid: first.uuid,
+          parent_tool_use_id: null,
+          session_id: options.sessionId,
+          isReplay: true,
+        };
+        yield assistantText(options, "First reply", "msg_first");
+        const second = (await input.next()).value;
+        yield result(options, { user_message_uuids: [first.uuid] });
+        yield { type: "command_lifecycle", command_uuid: second.uuid, state };
+        while (!(await input.next()).done);
+      };
+      await promptAndWait(1, async (agent, sessionId, client) => {
+        await vi.waitFor(() => expect(client.updates("agent_message_chunk")).toHaveLength(1));
+        await expect(
+          agent.request(v2.methods.agent.session.prompt, {
+            sessionId,
+            prompt: text("stop"),
+          }),
+        ).rejects.toMatchObject({ code: state === "cancelled" ? -32800 : -32603 });
+      });
+    },
+  );
+
+  it.each([undefined, "agent-1"])(
+    "keeps an open permission request while a busy prompt waits (%s)",
+    async (agentID) => {
+      const permission = Promise.withResolvers<v2.RequestPermissionResponse>();
+      const priorities: unknown[] = [];
+      sdk.run = async function* (prompts, options) {
+        const input = prompts[Symbol.asyncIterator]();
+        const echo = (value: SDKUserMessage) => ({
+          type: "user",
+          message: value.message,
+          uuid: value.uuid,
+          parent_tool_use_id: null,
+          session_id: options.sessionId,
+          isReplay: true,
+        });
+        yield echo((await input.next()).value);
+        const decision = options.canUseTool!("Bash", { command: "ls" }, {
+          signal: new AbortController().signal,
+          suggestions: [],
+          ...(agentID ? { agentID } : {}),
+          toolUseID: "toolu_ls",
+          requestId: randomUUID(),
+        } as Parameters<NonNullable<Options["canUseTool"]>>[2]);
+        const second = (await input.next()).value;
+        priorities.push(second.priority);
+        await decision;
+        yield result(options);
+        yield echo(second);
+        yield result(options);
+        while (!(await input.next()).done);
+      };
+      const client = v2Client({ answerPermission: () => permission.promise });
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("go") });
+        await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(1));
+        const queued = agent.request(v2.methods.agent.session.prompt, {
+          sessionId,
+          prompt: text("next"),
+        });
+        await vi.waitFor(() => expect(priorities).toEqual(["later"]));
+        expect(client.cancelledRequests).toEqual([]);
+        permission.resolve({ outcome: { outcome: "selected", optionId: "allow-once" } });
+        await queued;
+        await vi.waitFor(() =>
+          expect(
+            turnTrace(client.sessionUpdates).filter((value) => value === "idle end_turn"),
+          ).toHaveLength(2),
+        );
+        await client.authUpdate(1);
+      });
+    },
+  );
+
   it("ends a cancelled turn at its result and reports the follow-up after it as a cycle", async () => {
     const interrupted = Promise.withResolvers<void>();
     sdk.interrupt = async () => interrupted.resolve();
@@ -6323,18 +7328,6 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
 // foreground work: the main conversation's, or a subagent's whose spawning tool
 // call waits on it. A subagent in the background asks without blocking it.
 describe("ACP v2 requests that subagents make", () => {
-  const taskStarted = (options: Options, taskId: string, fields: Record<string, unknown>) => ({
-    type: "system",
-    subtype: "task_started",
-    task_id: taskId,
-    tool_use_id: `toolu_${taskId}`,
-    description: "Explore the project",
-    subagent_type: "Explore",
-    uuid: randomUUID(),
-    session_id: options.sessionId,
-    ...fields,
-  });
-
   /** Asks for permission for a Bash call of the subagent `agentID`, and
    *  resolves once the client answers, or Claude Code aborts `signal`. */
   const askFor = (options: Options, agentID: string, signal = new AbortController().signal) =>
@@ -6475,24 +7468,6 @@ describe("ACP v2 requests that subagents make", () => {
         }
       }
     }
-
-    /** Claude Code's report of the end of a run of the subagent `taskId`. */
-    const taskNotification = (
-      options: Options,
-      taskId: string,
-      fields: Record<string, unknown>,
-    ) => ({
-      type: "system",
-      subtype: "task_notification",
-      task_id: taskId,
-      tool_use_id: `toolu_${taskId}`,
-      status: "completed",
-      summary: "Done",
-      output_file: "",
-      uuid: randomUUID(),
-      session_id: options.sessionId,
-      ...fields,
-    });
 
     /** A message of the subagent that the Agent call `parent` launched. */
     const childMessage = (options: Options, message: Record<string, unknown>, parent: string) => ({
@@ -7067,7 +8042,7 @@ describe("ACP v2 requests that subagents make", () => {
       ]);
     });
 
-    it("sends a SendMessage call's message and a SubagentHandback call's report as session messages, instead of the calls", async () => {
+    it("sends a SendMessage call's message and each SubagentHandback call's report as session messages, instead of the calls", async () => {
       scriptTurns(async function* (options) {
         yield toolUseMessage(options, "toolu_agent-1", "Agent", {
           description: "Explore the project",
@@ -7086,11 +8061,26 @@ describe("ACP v2 requests that subagents make", () => {
           toolResultMessage(options, "toolu_handback", { content: "Delivered" }),
           "toolu_agent-1",
         );
+        yield toolUseMessage(
+          options,
+          "toolu_handback-2",
+          "SubagentHandback",
+          { message: "Checked again." },
+          "toolu_agent-1",
+        );
+        yield childMessage(
+          options,
+          toolResultMessage(options, "toolu_handback-2", { content: "Delivered" }),
+          "toolu_agent-1",
+        );
         yield taskNotification(options, "agent-1", {});
-        // The run handed back its report: its result is no reply.
-        yield toolResultMessage(options, "toolu_agent-1", {
-          content: [{ type: "text", text: "The report was delivered as a message." }],
-        });
+        // The run handed back its reports: its result repeats no report.
+        yield {
+          ...toolResultMessage(options, "toolu_agent-1", {
+            content: [{ type: "text", text: "The report was delivered as a message." }],
+          }),
+          tool_use_result: { status: "completed", handbackReport: { text: "Checked again." } },
+        };
         yield toolUseMessage(options, "toolu_send", "SendMessage", {
           to: "agent-1",
           message: "Look again",
@@ -7117,8 +8107,40 @@ describe("ACP v2 requests that subagents make", () => {
         "agent-1 toolu_agent-1 root -> agent-1 Look around",
         "agent-1 toolu_handback agent-1 -> root Found it.",
         "root toolu_handback agent-1 -> root Found it.",
+        "agent-1 toolu_handback-2 agent-1 -> root Checked again.",
+        "root toolu_handback-2 agent-1 -> root Checked again.",
         "root toolu_send root -> agent-1 Look again",
         "agent-1 toolu_send root -> agent-1 Look again",
+      ]);
+      expect(shownToolCalls(client)).toEqual([]);
+    });
+
+    it("keeps a structured hand-back report when Claude Code sends no child stream", async () => {
+      scriptTurns(async function* (options) {
+        yield toolUseMessage(options, "toolu_agent-1", "Agent", {
+          description: "Explore the project",
+          prompt: "Look around",
+        });
+        yield taskStarted(options, "agent-1", { prompt: "Look around" });
+        yield taskNotification(options, "agent-1", {});
+        yield {
+          ...toolResultMessage(options, "toolu_agent-1", {
+            content: "The report was delivered as a message.",
+          }),
+          tool_use_result: { status: "completed", handbackReport: { text: "Found it." } },
+        };
+        yield result(options);
+        yield idleState(options);
+      });
+      const client = await promptToIdle(v2Client());
+      const root = client.sessionUpdates.find(
+        ({ update }) => update.sessionUpdate === "user_message",
+      )!.sessionId;
+      expect(sessionMessages(client, root)).toEqual([
+        "root toolu_agent-1 root -> agent-1 Look around",
+        "agent-1 toolu_agent-1 root -> agent-1 Look around",
+        "agent-1 toolu_agent-1:handback agent-1 -> root Found it.",
+        "root toolu_agent-1:handback agent-1 -> root Found it.",
       ]);
       expect(shownToolCalls(client)).toEqual([]);
     });
@@ -7926,6 +8948,49 @@ describe("ACP v2 requests that subagents make", () => {
     ]);
   });
 
+  it.each(["root", "child"])(
+    "keeps running while a tool can progress beside a blocked %s request",
+    async (owner) => {
+      const answer = Promise.withResolvers<v2.RequestPermissionResponse>();
+      const client = v2Client({
+        answerPermission: () => answer.promise as unknown as v2.RequestPermissionResponse,
+      });
+      let whileRunning: string | undefined;
+      scriptTurns(async function* (options) {
+        yield toolUseMessage(options, "toolu_running", "Bash", { command: "sleep 10" });
+        if (owner === "child") {
+          yield taskStarted(options, "agent-1", { is_backgrounded: false });
+        } else {
+          yield toolUseMessage(options, "toolu_wait", "Bash", { command: "ls" });
+        }
+        const asking =
+          owner === "child"
+            ? askFor(options, "agent-1")
+            : options.canUseTool!(
+                "Bash",
+                { command: "ls" },
+                {
+                  signal: new AbortController().signal,
+                  suggestions: [],
+                  toolUseID: "toolu_wait",
+                  requestId: randomUUID(),
+                },
+              );
+        await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(1));
+        whileRunning = turnTrace(client.sessionUpdates).at(-1);
+        yield toolResultMessage(options, "toolu_running", {});
+        await vi.waitFor(() =>
+          expect(turnTrace(client.sessionUpdates).at(-1)).toBe("requires_action"),
+        );
+        answer.resolve({ outcome: { outcome: "cancelled" } });
+        await asking;
+        yield result(options);
+      });
+      await promptToIdle(client);
+      expect(whileRunning).toBe("running");
+    },
+  );
+
   it("reports requires_action while a foreground subagent's request is open", async () => {
     turnWithRequest([["agent-1", { is_backgrounded: false }]], "agent-1");
     const client = await promptToIdle(v2Client());
@@ -7986,6 +9051,73 @@ describe("ACP v2 requests that subagents make", () => {
 
     expect(beforeTaskStarted).toEqual(["user_message", "running", "agent_message_chunk"]);
     expect(atAnswer).toEqual(["user_message", "running", "agent_message_chunk", "requires_action"]);
+  });
+
+  it("preserves an ended child's pending request when changed-root resume is refused", async () => {
+    const answer = Promise.withResolvers<v2.RequestPermissionResponse>();
+    const client = v2Client({
+      answerPermission: () => answer.promise as unknown as v2.RequestPermissionResponse,
+    });
+    let answered: unknown;
+    scriptTurns(async function* (options) {
+      yield toolUseMessage(options, "toolu_agent-1", "Agent", {
+        description: "Explore the project",
+        prompt: "Look around",
+        run_in_background: true,
+      });
+      yield taskStarted(options, "agent-1", { is_backgrounded: true });
+      const asking = askFor(options, "agent-1").then((result) => {
+        answered = result;
+      });
+      await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(1));
+      yield {
+        type: "system",
+        subtype: "task_updated",
+        task_id: "agent-1",
+        patch: { status: "completed" },
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield result(options);
+      await asking;
+    });
+    const extra = await mkdtemp(path.join(tempDir, "extra-"));
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("work") });
+      await vi.waitFor(() =>
+        expect(
+          turnTrace(client.sessionUpdates.filter((update) => update.sessionId === sessionId)).at(
+            -1,
+          ),
+        ).toBe("idle end_turn"),
+      );
+      const session = v2Session(sessionId);
+      expect(session.canReplaceRoots()).toBe(false);
+      await expect(
+        agent.request(v2.methods.agent.session.resume, {
+          sessionId,
+          cwd,
+          additionalDirectories: [extra],
+        }),
+      ).rejects.toMatchObject({ code: -32602 });
+      await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+      expect(v2Session(sessionId)).toBe(session);
+      expect(sdk.queryOptions).toHaveLength(1);
+      expect(client.cancelledRequests).toEqual([]);
+      expect(client.permissionRequests[0]?.sessionId).toBe("agent-1");
+      answer.resolve({
+        outcome: {
+          outcome: "selected",
+          optionId: client.permissionRequests[0]!.options.find(
+            (option) => option.kind === "allow_once",
+          )!.optionId,
+        },
+      });
+      await vi.waitFor(() => expect(answered).toMatchObject({ behavior: "allow" }));
+      await vi.waitFor(() => expect(session.canReplaceRoots()).toBe(true));
+    });
   });
 
   it("stops waiting for a request once its foreground subagent settles", async () => {
@@ -9055,25 +10187,42 @@ describe("ACP v2 terminal of a command in the background", () => {
         ambient: true,
       };
       const workflow = { task_id: "wf1", task_type: "local_workflow", description: "Review" };
+      /** A Monitor's task as the CLI reports it: the type of a shell command, not ambient. */
+      const localBashMonitor = {
+        task_id: "mon1",
+        task_type: "local_bash",
+        description: "Watch the logs",
+      };
       /** A Monitor call whose task `mon1` runs on after the call returns. The
        *  tool starts the task, which joins the level before its
        *  `task_started`, and returns. */
-      async function* monitorStarts(options: Options, task: typeof monitor = monitor) {
+      async function* monitorStarts(
+        options: Options,
+        task: typeof monitor = monitor,
+        resultFirst = false,
+      ) {
         yield toolUseMessage(options, "toolu_mon", "Monitor", { command: "tail -f app.log" });
-        yield level(options, [task]);
-        yield taskEvent(options, "task_started", { ...task, tool_use_id: "toolu_mon" });
-        yield {
+        const result = {
           ...toolResultMessage(options, "toolu_mon", { content: "Monitor started (task mon1)." }),
           tool_use_result: { taskId: "mon1", timeoutMs: 0, persistent: true },
         };
+        if (resultFirst) {
+          yield result;
+          yield level(options, [task]);
+          yield taskEvent(options, "task_started", { ...task, tool_use_id: "toolu_mon" });
+          return;
+        }
+        yield level(options, [task]);
+        yield taskEvent(options, "task_started", { ...task, tool_use_id: "toolu_mon" });
+        yield result;
       }
       const monitorEvent = (options: Options, subtype: string, fields: Record<string, unknown>) =>
         taskEvent(options, subtype, { ...fields, task_id: "mon1" });
 
-      /** The states with their lists, and the Monitor call's statuses and capability. */
-      const toolCallTrace = (client: ReturnType<typeof v2Client>) =>
+      /** The states with their lists, and one call's statuses and capability. */
+      const toolCallTrace = (client: ReturnType<typeof v2Client>, toolCallId = "toolu_mon") =>
         client.sessionUpdates.flatMap(({ update }) => {
-          if (update.sessionUpdate === "tool_call_update" && update.toolCallId === "toolu_mon") {
+          if (update.sessionUpdate === "tool_call_update" && update.toolCallId === toolCallId) {
             const capabilities = update.capabilities as { cancel?: unknown } | null | undefined;
             return [
               ...(update.status ? [String(update.status)] : []),
@@ -9130,11 +10279,6 @@ describe("ACP v2 terminal of a command in the background", () => {
         // What Claude Code sends for a requested Monitor in practice: the task
         // type of a shell command and no `ambient` flag. The call, not a
         // terminal, is the task's entity, as `Monitor` is in TASK_TOOLS.
-        const localBashMonitor = {
-          task_id: "mon1",
-          task_type: "local_bash",
-          description: "Watch the logs",
-        };
         scriptTurns(async function* (options) {
           yield* monitorStarts(options, localBashMonitor);
           yield result(options);
@@ -9160,6 +10304,197 @@ describe("ACP v2 terminal of a command in the background", () => {
           "completed",
           "no cancel",
           "idle []",
+        ]);
+      });
+
+      // Claude Code can name a task in `background_tasks_changed` only after
+      // the tool call that started it returned. The call is the task's entity
+      // either way, so it must not fall back to a `task_<taskId>` card.
+      type TaskAfterResult = {
+        toolCallId: string;
+        taskId: string;
+        starts: TurnScript;
+      };
+      async function* workflowStartsAfterResult(options: Options) {
+        yield toolUseMessage(options, "toolu_wf", "Workflow", { script: "review" });
+        yield {
+          ...toolResultMessage(options, "toolu_wf", { content: "Workflow launched." }),
+          tool_use_result: {
+            status: "async_launched",
+            taskId: workflow.task_id,
+            taskType: workflow.task_type,
+          },
+        };
+        yield level(options, [workflow]);
+        yield taskEvent(options, "task_started", { ...workflow, tool_use_id: "toolu_wf" });
+      }
+      const taskAfterResultSpecs: Array<[string, TaskAfterResult]> = [
+        [
+          "Monitor",
+          {
+            toolCallId: "toolu_mon",
+            taskId: localBashMonitor.task_id,
+            starts: (options) => monitorStarts(options, localBashMonitor, true),
+          },
+        ],
+        [
+          "Workflow",
+          {
+            toolCallId: "toolu_wf",
+            taskId: workflow.task_id,
+            starts: workflowStartsAfterResult,
+          },
+        ],
+      ];
+
+      it.each(taskAfterResultSpecs)(
+        "keeps a %s call in_progress when its task joins the live set after the result",
+        async (_tool, spec) => {
+          const ended = Promise.withResolvers<void>();
+          scriptTurns(async function* (options) {
+            yield* spec.starts(options);
+            yield result(options);
+            yield idleState(options);
+            await ended.promise;
+            yield taskEvent(options, "task_notification", {
+              tool_use_id: spec.toolCallId,
+              status: "completed",
+              output_file: `/tmp/tasks/${spec.taskId}.output`,
+              summary: "Done",
+            });
+            yield level(options, []);
+          });
+          const client = await promptUntil(
+            `idle end_turn [${spec.toolCallId}]`,
+            async (_agent, _sessionId, seen) => {
+              ended.resolve();
+              await vi.waitFor(() => expect(backgroundTrace(seen)).toContain("idle []"));
+            },
+          );
+
+          expect(toolCallTrace(client, spec.toolCallId)).toEqual([
+            "running []",
+            "pending",
+            "in_progress",
+            "cancel",
+            `running [${spec.toolCallId}]`,
+            `idle end_turn [${spec.toolCallId}]`,
+            "completed",
+            "no cancel",
+            "idle []",
+          ]);
+        },
+      );
+
+      it.each([
+        ["with a task_notification", true],
+        ["without a task_notification", false],
+      ])(
+        "stays completed when its task ends before the result names it, %s",
+        async (_name, notify) => {
+          scriptTurns(async function* (options) {
+            yield toolUseMessage(options, "toolu_mon", "Monitor", { command: "tail -f app.log" });
+            // With a notification, the task never joins a level: only `taskEnded` records its end.
+            if (!notify) yield level(options, [localBashMonitor]);
+            yield taskEvent(options, "task_started", {
+              ...localBashMonitor,
+              tool_use_id: "toolu_mon",
+            });
+            if (notify) {
+              yield monitorEvent(options, "task_notification", {
+                tool_use_id: "toolu_mon",
+                status: "completed",
+                output_file: "/tmp/tasks/mon1.output",
+                summary: "Done",
+              });
+            }
+            if (!notify) yield level(options, []);
+            yield {
+              ...toolResultMessage(options, "toolu_mon", {
+                content: "Monitor started (task mon1).",
+              }),
+              tool_use_result: { taskId: "mon1", timeoutMs: 0, persistent: true },
+            };
+            yield result(options);
+            yield idleState(options);
+          });
+          const client = await promptUntil("idle end_turn []");
+
+          expect(toolCallTrace(client, "toolu_mon")).toEqual([
+            "running []",
+            "pending",
+            "completed",
+            "idle end_turn []",
+          ]);
+          expect(backgroundTrace(client).join(" ")).not.toContain("task_mon1");
+        },
+      );
+
+      it.each([
+        ["with task_type at task_started", "local_bash"],
+        ["without task_type at task_started", undefined],
+      ])(
+        "ends a PowerShell call with a local_bash task completed, %s",
+        async (_name, startedType) => {
+          scriptTurns(async function* (options) {
+            yield toolUseMessage(options, "toolu_ps", "PowerShell", { command: "Start-Job" });
+            yield taskEvent(options, "task_started", {
+              task_id: "ps1",
+              ...(startedType ? { task_type: startedType } : {}),
+              description: "PowerShell job",
+              tool_use_id: "toolu_ps",
+            });
+            yield {
+              ...toolResultMessage(options, "toolu_ps", { content: "job started" }),
+              tool_use_result: { taskId: "ps1" },
+            };
+            yield level(options, [
+              { task_id: "ps1", task_type: "local_bash", description: "PowerShell job" },
+            ]);
+            yield result(options);
+            yield idleState(options);
+          });
+          const client = await promptUntil("idle end_turn []");
+
+          expect(toolCallTrace(client, "toolu_ps")).toEqual(
+            startedType
+              ? ["running []", "pending", "completed", "idle end_turn []"]
+              : ["running []", "pending", "in_progress", "completed", "idle end_turn []"],
+          );
+          expect(backgroundTrace(client).join(" ")).not.toContain("task_ps1");
+        },
+      );
+
+      it("keeps a paused call paused when the task paused before the level named it", async () => {
+        scriptTurns(async function* (options) {
+          yield toolUseMessage(options, "toolu_wf", "Workflow", { script: "review" });
+          yield {
+            ...toolResultMessage(options, "toolu_wf", { content: "Workflow launched." }),
+            tool_use_result: {
+              status: "async_launched",
+              taskId: workflow.task_id,
+              taskType: workflow.task_type,
+            },
+          };
+          yield taskEvent(options, "task_started", { ...workflow, tool_use_id: "toolu_wf" });
+          yield taskEvent(options, "task_updated", {
+            task_id: workflow.task_id,
+            patch: { status: "paused" },
+          });
+          yield level(options, [workflow]);
+          yield result(options);
+          yield idleState(options);
+        });
+        const client = await promptUntil("idle end_turn [toolu_wf]");
+
+        expect(toolCallTrace(client, "toolu_wf")).toEqual([
+          "running []",
+          "pending",
+          "in_progress",
+          "paused",
+          "cancel",
+          "running [toolu_wf]",
+          "idle end_turn [toolu_wf]",
         ]);
       });
 
@@ -9673,6 +11008,155 @@ describe("ACP v2 terminal of a command in the background", () => {
       expect(rejected).toMatchObject({ code: -32602 });
     });
 
+    it.each(["terminal", "tool_call"])(
+      "preserves an idle %s when a resume changes roots, then activates roots after completion",
+      async (kind) => {
+        const finish = Promise.withResolvers<void>();
+        const workflow = { task_id: "wf1", task_type: "local_workflow", description: "Review" };
+        const item =
+          kind === "terminal"
+            ? { type: "terminal", terminalId: "toolu_bg" }
+            : { type: "tool_call", toolCallId: "task_wf1" };
+        scriptTurns(async function* (options) {
+          if (kind === "terminal") {
+            yield level(options, [{}]);
+            yield taskStarted(options);
+            yield bashUse(options);
+            yield backgrounded(options);
+          } else {
+            yield level(options, [workflow]);
+            yield taskEvent(options, "task_started", workflow);
+          }
+          yield result(options);
+          yield idleState(options);
+          await finish.promise;
+          if (kind === "terminal") yield* taskEnded(options);
+          else
+            yield taskEvent(options, "task_updated", {
+              task_id: "wf1",
+              patch: { status: "completed" },
+            });
+          yield level(options, []);
+        });
+        const extra = await mkdtemp(path.join(tempDir, "extra-"));
+        sdk.setMcpServers = vi.fn(sdkDefaults.setMcpServers);
+        sdk.close = vi.fn();
+        await promptUntil(
+          `idle end_turn [${kind === "terminal" ? "toolu_bg" : "task_wf1"}]`,
+          async (agent, sessionId, client) => {
+            const original = v2Session(sessionId);
+            await expect(
+              agent.request(v2.methods.agent.session.resume, {
+                sessionId,
+                cwd,
+                additionalDirectories: [extra],
+                mcpServers: [{ type: "http", name: "github", url: "https://github.dev/mcp" }],
+              }),
+            ).rejects.toMatchObject({ code: -32602 });
+            expect(sdk.queryOptions).toHaveLength(1);
+            expect(sdk.close).not.toHaveBeenCalled();
+            expect(sdk.setMcpServers).not.toHaveBeenCalled();
+            expect(v2Session(sessionId)).toBe(original);
+            expect(original.atTurnBoundary(true)).toBe(true);
+            expect(original.canReplaceRoots()).toBe(false);
+            await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+            expect(client.updates("state_update").at(-1)).toMatchObject({
+              state: "idle",
+              background: [item],
+            });
+            finish.resolve();
+            await vi.waitFor(() => expect(backgroundTrace(client)).toContain("idle []"));
+            scriptTurns(async function* (options) {
+              yield result(options);
+            });
+            await agent.request(v2.methods.agent.session.resume, {
+              sessionId,
+              cwd,
+              additionalDirectories: [extra],
+            });
+            expect(sdk.queryOptions).toHaveLength(2);
+            expect(v2Session(sessionId).additionalDirectories).toEqual([extra]);
+            const before = client.updates("state_update").length;
+            await agent.request(v2.methods.agent.session.prompt, {
+              sessionId,
+              prompt: text("follow up"),
+            });
+            await vi.waitFor(() =>
+              expect(client.updates("state_update").slice(before).at(-1)).toMatchObject({
+                state: "idle",
+                stopReason: "end_turn",
+              }),
+            );
+          },
+        );
+      },
+    );
+
+    it.each(["terminal", "tool_call"])(
+      "retires an idle background %s when the provider is disabled",
+      async (kind) => {
+        scriptTurns(
+          async function* (options) {
+            if (kind === "terminal") {
+              yield level(options, [{}]);
+              yield taskStarted(options);
+              yield bashUse(options);
+              yield backgrounded(options);
+            } else {
+              yield level(options, [
+                { task_id: "wf1", task_type: "local_workflow", description: "Review" },
+              ]);
+              yield taskEvent(options, "task_started", {
+                task_id: "wf1",
+                task_type: "local_workflow",
+                description: "Review",
+              });
+            }
+            yield result(options);
+            yield idleState(options);
+          },
+          async function* (options) {
+            yield result(options);
+          },
+        );
+        sdk.close = vi.fn();
+        const client = v2Client();
+        await client.app.connectWith(connectRouter(), async (agent) => {
+          await initializeV2(agent);
+          await agent.request(v2.methods.agent.providers.set, {
+            providerId: "main",
+            apiType: "anthropic",
+            baseUrl: "https://gateway.example.com",
+          });
+          const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+          await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("work") });
+          await vi.waitFor(() =>
+            expect(client.updates("state_update").at(-1)).toMatchObject({
+              state: "idle",
+              background: [expect.objectContaining({ type: kind })],
+            }),
+          );
+          scriptTurns(async function* (options) {
+            yield result(options);
+          });
+          await agent.request(v2.methods.agent.providers.disable, { providerId: "main" });
+          expect(sdk.queryOptions).toHaveLength(2);
+          expect(sdk.close).toHaveBeenCalledOnce();
+          expect(sdk.queryOptions[1]).toMatchObject({ resume: sessionId });
+          expect(sdk.queryOptions[1].env?.ANTHROPIC_BASE_URL).toBeUndefined();
+          const before = client.updates("state_update").length;
+          await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("next") });
+          await vi.waitFor(() =>
+            expect(client.updates("state_update").slice(before).at(-1)).toMatchObject({
+              state: "idle",
+              stopReason: "end_turn",
+              background: [],
+            }),
+          );
+        });
+      },
+    );
+
     it("sends each listed terminal's current state before the state snapshot of session/resume", async () => {
       scriptTurns(async function* (options) {
         yield level(options, [{}]);
@@ -9981,6 +11465,39 @@ describe("ACP v2 session translation", () => {
     );
   });
 
+  it.each([
+    {
+      option: {
+        configId: "model",
+        type: "id" as const,
+        value: "sonnet",
+        _meta: { source: "client" },
+      },
+      expected: { configId: "model", value: "sonnet", _meta: { source: "client" } },
+    },
+    {
+      option: { configId: "fast", type: "boolean" as const, value: true },
+      expected: { configId: "fast", type: "boolean", value: true },
+    },
+  ])(
+    "applies an initial $option.type config value after the session starts",
+    ({ option, expected }) => {
+      expect(
+        v1NewSessionRequest({ cwd: "/workspace", configOptions: [option] }).configOptions,
+      ).toBeUndefined();
+      const requests = initialConfigRequests("s", [option]);
+      expect(requests.map(v1SetSessionConfigOptionRequest)).toEqual([
+        { sessionId: "s", ...expected },
+      ]);
+    },
+  );
+
+  it("rejects an initial config value that the shared setup cannot express", () => {
+    expect(() =>
+      initialConfigRequests("s", [{ configId: "range", type: "_range", value: 3 }]),
+    ).toThrow("Config option values of type _range are not supported");
+  });
+
   it("rejects a config option value type that v1 cannot express", () => {
     expect(() =>
       v1SetSessionConfigOptionRequest({
@@ -10234,30 +11751,39 @@ describe("ACP v2 session translation", () => {
     expect(terminals.split("s", hook)).toEqual({ terminal: [], report: hook });
   });
 
-  it("sends piped output with each line feed as CR LF, as a PTY would", () => {
+  it("adds CR only to bare line feeds in terminal chunks and snapshots", () => {
     const terminals = new V2Terminals();
-    const decoded = (data: unknown) => Buffer.from(String(data), "base64").toString();
     terminals.split("s", {
       sessionUpdate: "tool_call",
       toolCallId: "toolu_bash",
       title: "Terminal",
       _meta: { terminal_info: { terminal_id: "term" } },
     });
-    const [chunk] = terminals.split("s", {
-      sessionUpdate: "tool_call_update",
-      toolCallId: "toolu_bash",
-      _meta: { terminal_output_delta: { terminal_id: "term", data: "a\nb\n" } },
-    }).terminal;
-    expect(chunk).toMatchObject({ sessionUpdate: "terminal_output_chunk" });
-    expect(decoded((chunk as { data: string }).data)).toBe("a\r\nb\r\n");
-    // The line discipline adds a CR before every LF, also one that a CR precedes.
-    const [snapshot] = terminals.split("s", {
-      sessionUpdate: "tool_call_update",
-      toolCallId: "toolu_bash",
-      _meta: { terminal_output: { terminal_id: "term", data: "a\nb\r\n" } },
-    }).terminal;
-    expect(snapshot).toMatchObject({ sessionUpdate: "terminal_update" });
-    expect(decoded((snapshot as { output: { data: string } }).output.data)).toBe("a\r\nb\r\r\n");
+    const emit = (key: "terminal_output" | "terminal_output_delta", data: string) =>
+      terminals.split("s", {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "toolu_bash",
+        _meta: { [key]: { terminal_id: "term", data } },
+      }).terminal[0];
+    const chunk = (text: string, expected: string) =>
+      expect(emit("terminal_output_delta", text)).toMatchObject({
+        sessionUpdate: "terminal_output_chunk",
+        data: Buffer.from(expected).toString("base64"),
+      });
+    const snapshot = (text: string, expected: string) =>
+      expect(emit("terminal_output", text)).toMatchObject({
+        sessionUpdate: "terminal_update",
+        output: { data: Buffer.from(expected).toString("base64") },
+      });
+
+    chunk("a\nb\r\n10%\r20%\r", "a\r\nb\r\n10%\r20%\r");
+    chunk("", "");
+    chunk("\nend\r", "\nend\r");
+    // A snapshot replaces the preceding bytes, including their trailing CR.
+    snapshot("\ndone\r\n", "\r\ndone\r\n");
+    chunk("\n", "\r\n");
+    snapshot("waiting\r", "waiting\r");
+    chunk("\n", "\n");
   });
 
   it("leaves an exit code that the agent does not know out of the terminal's exit", () => {
@@ -11074,27 +12600,93 @@ describe("ACP v2 subscription guard (--hide-claude-auth)", () => {
     expect(client.updates("user_message")).toEqual([]);
   });
 
-  it("starts the query again after a sign-out, and refuses the next prompt on the account it finds", async () => {
-    accountsAtStart(API_KEY, SUBSCRIPTION);
+  it.each([false, true])(
+    "restarts after a sign-out and checks the new account with background work: %s",
+    async (background) => {
+      accountsAtStart(API_KEY, SUBSCRIPTION);
+      sdk.accountInfo = async () => API_KEY;
+      scriptTurns(async function* (options) {
+        if (background) {
+          yield {
+            type: "system",
+            subtype: "background_tasks_changed",
+            uuid: randomUUID(),
+            session_id: options.sessionId,
+            tasks: [{ task_id: "wf1", task_type: "local_workflow", description: "Review" }],
+          };
+          yield {
+            type: "system",
+            subtype: "task_started",
+            task_id: "wf1",
+            task_type: "local_workflow",
+            description: "Review",
+            uuid: randomUUID(),
+            session_id: options.sessionId,
+          };
+        }
+        yield result(options, { is_error: true, result: "Not logged in · Please run /login" });
+      });
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+        await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle error"));
+        expect(client.updates("state_update").at(-1)?.background).toEqual(
+          background ? [{ type: "tool_call", toolCallId: "task_wf1" }] : [],
+        );
+        await expect(
+          agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("again") }),
+        ).rejects.toMatchObject(NOT_SUPPORTED);
+        expect(sdk.queryOptions).toHaveLength(2);
+        expect(sdk.queryOptions[1]).toMatchObject({ resume: sessionId });
+        await client.authUpdate(1);
+      });
+
+      expect(client.updates("user_message")).toHaveLength(1);
+    },
+  );
+
+  it("starts Remote Control again on a sign-out's new query, before the prompt that waits for it", async () => {
+    accountsAtStart(API_KEY);
     sdk.accountInfo = async () => API_KEY;
-    scriptTurns(async function* (options) {
-      yield result(options, { is_error: true, result: "Not logged in · Please run /login" });
+    const initialization = sdk.initializationResult;
+    sdk.initializationResult = async () => ({
+      ...(await initialization()),
+      remote_control_auto_enable: true,
     });
+    const enableRemoteControl = vi.fn(async () => ({
+      session_url: "https://claude.ai/code/session_123",
+    }));
+    sdk.enableRemoteControl = enableRemoteControl;
+    let turns = 0;
+    scriptTurns(async function* (options) {
+      turns += 1;
+      if (turns === 1) {
+        yield result(options, { is_error: true, result: "Not logged in · Please run /login" });
+        return;
+      }
+      // The prompt that waited for the restart keeps its turn open.
+      await new Promise<never>(() => {});
+    });
+    const connected = () =>
+      client.updates("notice").filter((notice) => notice.title === "Remote Control connected");
     const client = v2Client();
     await client.app.connectWith(connectRouter(), async (agent) => {
       await initializeV2(agent);
       const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await vi.waitFor(() => expect(connected()).toHaveLength(1));
       await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
       await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle error"));
-      await expect(
-        agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("again") }),
-      ).rejects.toMatchObject(NOT_SUPPORTED);
-      expect(sdk.queryOptions).toHaveLength(2);
-      expect(sdk.queryOptions[1]).toMatchObject({ resume: sessionId });
+      // This prompt waits for the account restart that the sign-out started.
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("again") });
+      await vi.waitFor(() => expect(connected()).toHaveLength(2));
       await client.authUpdate(1);
     });
 
-    expect(client.updates("user_message")).toHaveLength(1);
+    expect(sdk.queryOptions).toHaveLength(2);
+    expect(enableRemoteControl).toHaveBeenCalledTimes(2);
+    expect(enableRemoteControl).toHaveBeenLastCalledWith(true);
   });
 
   it("restarts the query for a provider change only after the account restart that runs", async () => {

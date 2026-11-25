@@ -4,14 +4,18 @@ import {
   RequestError,
   SessionNotification,
 } from "@agentclientprotocol/sdk/unstable";
-import type { ClientCapabilities, SystemPrompt } from "@agentclientprotocol/sdk/unstable";
+import type {
+  ClientCapabilities,
+  SessionConfigOption,
+  SystemPrompt,
+} from "@agentclientprotocol/sdk/unstable";
 import { forkSession, getSessionMessages, type Options } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../../v1/acp-agent.js";
 import type { AcpClient } from "../../acp-client.js";
 import type { AcpSessionNotification } from "../../acp-subagents.js";
 import { ALLOW_BYPASS } from "../../permissions/modes.js";
 import { NativeSubagentRuntime } from "../../native-subagents.js";
-import { setModelRefusal, startupFailure } from "../helpers.js";
+import { setModelRefusal, sideloadRefusal, startupFailure } from "../helpers.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -28,6 +32,8 @@ let initModels: Record<string, unknown>[] | undefined;
 /** Holds the CLI initialization until the test resolves it. */
 let initGate: Promise<void> | undefined;
 let initError: Error | undefined;
+/** When set, Claude Code refuses a start that has MCP servers with it. */
+let mcpServersRefusal: Error | undefined;
 let missingConversation: string | undefined;
 /** When set, the SDK refuses the query's options with it: `query()` throws. */
 let optionsRefusal: Error | undefined;
@@ -40,6 +46,11 @@ let mcpAuthenticateImpl: (serverName: string) => Promise<{
   requiresUserAction: boolean;
   callbackExpected: boolean;
 }>;
+/** `remote_control_auto_enable` of the `initialize` result; left out when unset. */
+let remoteControlAutoEnable: boolean | undefined;
+/** The query's `enableRemoteControl`; left off the query when unset. */
+let enableRemoteControlImpl:
+  ((enabled: boolean, name?: string) => Promise<{ session_url?: string }>) | undefined;
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   const actual = await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
     "@anthropic-ai/claude-agent-sdk",
@@ -66,6 +77,9 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         initializationResult: async () => {
           await initGate;
           if (initError) throw initError;
+          if (mcpServersRefusal && Object.keys(args.options.mcpServers ?? {}).length > 0) {
+            throw mcpServersRefusal;
+          }
           if (args.options.resume && args.options.resume === missingConversation) {
             throw new Error(`No conversation found with session ID: ${args.options.resume}`);
           }
@@ -78,6 +92,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         },
         mcpServerStatus: () => mcpServerStatusResult(),
         mcpAuthenticate: (serverName: string) => mcpAuthenticateImpl(serverName),
+        ...(enableRemoteControlImpl ? { enableRemoteControl: enableRemoteControlImpl } : {}),
       });
     },
     getSessionMessages: vi.fn(() => sessionMessagesResult()),
@@ -95,6 +110,9 @@ function initializationResponse() {
         supportsAutoMode: true,
       },
     ],
+    ...(remoteControlAutoEnable === undefined
+      ? {}
+      : { remote_control_auto_enable: remoteControlAutoEnable }),
   };
 }
 
@@ -130,6 +148,7 @@ describe("createSession options merging", () => {
     initModels = undefined;
     initGate = undefined;
     initError = undefined;
+    mcpServersRefusal = undefined;
     missingConversation = undefined;
     optionsRefusal = undefined;
     setModelImpl = undefined;
@@ -140,6 +159,8 @@ describe("createSession options merging", () => {
       requiresUserAction: false,
       callbackExpected: false,
     });
+    remoteControlAutoEnable = undefined;
+    enableRemoteControlImpl = undefined;
 
     vi.resetModules();
     const acpAgent = await import("../../v1/acp-agent.js");
@@ -349,7 +370,16 @@ describe("createSession options merging", () => {
     };
     const observedAgent = new ClaudeAcpAgent(client);
     await observedAgent.initialize({ protocolVersion: 1, clientCapabilities: { subagents: {} } });
+    const setupPublished = Promise.withResolvers<void>();
+    const publish = observedAgent.publishCurrentSubagentStates.bind(observedAgent);
+    vi.spyOn(observedAgent, "publishCurrentSubagentStates").mockImplementation((sessionId) => {
+      const published = publish(sessionId);
+      setupPublished.resolve(published);
+      return published;
+    });
     const { sessionId } = await observedAgent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    // Let session setup publish its snapshot before the test starts any children.
+    await setupPublished.promise;
     const session = observedAgent.sessions[sessionId]!;
     const runtime = (session.nativeSubagentRuntime = new NativeSubagentRuntime(
       "rfd",
@@ -1782,6 +1812,76 @@ describe("createSession options merging", () => {
       },
     );
 
+    describe("model reasoning efforts", () => {
+      const AIR_CLIENT = {
+        _meta: { jetbrains: { air: { version: 1, capabilities: [] } } },
+      } as ClientCapabilities;
+      const efforts = (values: string[], recommended: string) => ({
+        jetbrains: { air: { version: 1, reasoningEfforts: { values, recommended } } },
+      });
+      const entryMetas = (response: { configOptions?: SessionConfigOption[] | null }) => {
+        const model = response.configOptions?.find((option) => option.id === "model");
+        return Object.fromEntries(
+          (model?.type === "select" ? model.options : []).flatMap((entry) =>
+            "value" in entry ? [[entry.value, entry._meta]] : [],
+          ),
+        );
+      };
+      const expected = {
+        "claude-sonnet-4-6": efforts(["low", "medium", "high"], "medium"),
+        "claude-haiku-4-5": efforts(["low", "medium"], "medium"),
+      };
+
+      it("names each model's efforts in every answer to an AIR client, without a capability", async () => {
+        await agent.initialize({ protocolVersion: 1, clientCapabilities: AIR_CLIENT });
+        const created = await agent.newSession({ cwd, mcpServers: [] });
+        expect(entryMetas(created)).toEqual(expected);
+
+        const set = await agent.setSessionConfigOption({
+          sessionId: created.sessionId,
+          configId: "model",
+          value: "claude-haiku-4-5",
+        });
+        expect(entryMetas(set)).toEqual(expected);
+        const effort = await agent.setSessionConfigOption({
+          sessionId: created.sessionId,
+          configId: "effort",
+          value: "low",
+        });
+        expect(entryMetas(effort)).toEqual(expected);
+
+        const sessionId = "7f1c5b0e-3c53-4c0c-9d0a-0d6c1f0a2b11";
+        expect(entryMetas(await agent.loadSession({ sessionId, cwd, mcpServers: [] }))).toEqual(
+          expected,
+        );
+        expect(
+          entryMetas(await agent.resumeSession({ sessionId: "resumed", cwd, mcpServers: [] })),
+        ).toEqual(expected);
+        expect(
+          entryMetas(await agent.unstable_forkSession({ sessionId, cwd, mcpServers: [] })),
+        ).toEqual(expected);
+        // The fork's command list goes out after the response. Wait for it, so
+        // that it does not reach the updates of the next test.
+        await vi.waitFor(() =>
+          expect(
+            updates.some(
+              (u) =>
+                u.sessionId === FORK_ID && u.update.sessionUpdate === "available_commands_update",
+            ),
+          ).toBe(true),
+        );
+      });
+
+      it("names no efforts to a client that is not AIR", async () => {
+        await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+        const created = await agent.newSession({ cwd, mcpServers: [] });
+        expect(entryMetas(created)).toEqual({
+          "claude-sonnet-4-6": undefined,
+          "claude-haiku-4-5": undefined,
+        });
+      });
+    });
+
     it("sets the configOptions of a session/fork on the fork, without an update", async () => {
       const response = await agent.unstable_forkSession({
         sessionId: "7f1c5b0e-3c53-4c0c-9d0a-0d6c1f0a2b11",
@@ -1869,6 +1969,50 @@ describe("createSession options merging", () => {
         data: { startupFailureReason: reason },
       });
       expect(closeSpy).toHaveBeenCalled();
+    });
+
+    it("starts a session without the MCP servers that Claude Code refuses", async () => {
+      mcpServersRefusal = sideloadRefusal();
+
+      const { sessionId } = await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [{ name: "files", command: "/bin/files", args: [], env: [] }],
+        _meta: {
+          claudeCode: {
+            options: {
+              mcpServers: { linear: { type: "http", url: "https://mcp.linear.app/mcp" } },
+            },
+          },
+        },
+      });
+
+      // The refused query is closed, and the session runs on the second one.
+      expect(closeSpy).toHaveBeenCalledOnce();
+      expect(capturedOptions!.mcpServers).toEqual({});
+      expect(agent.sessions[sessionId]!.unservedMcpServers).toEqual(
+        ["files", "linear"].map((name) => ({
+          name,
+          status: "failed",
+          error: expect.stringContaining("disableSideloadFlags"),
+        })),
+      );
+    });
+
+    it("fails a session that Claude Code still refuses without its MCP servers", async () => {
+      // As for a client's plugins.
+      initError = startupFailure("sideload_flags_disabled", "--plugin-dir is disabled.");
+
+      await expect(
+        agent.newSession({
+          cwd: process.cwd(),
+          mcpServers: [{ name: "files", command: "/bin/files", args: [], env: [] }],
+        }),
+      ).rejects.toMatchObject({
+        message: "Internal error: --plugin-dir is disabled.",
+        data: { startupFailureReason: "sideload_flags_disabled" },
+      });
+      expect(closeSpy).toHaveBeenCalledTimes(2);
+      expect(capturedOptions!.mcpServers).toEqual({});
     });
 
     it("passes on an exit error that names no reason", async () => {
@@ -2025,6 +2169,131 @@ describe("createSession options merging", () => {
 
       expect(closed).toBe("closed");
       expect(closeSpy).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe("Remote Control at session start", () => {
+    it("starts after the session/new response when Claude Code asks for it", async () => {
+      remoteControlAutoEnable = true;
+      const enableRemoteControl = vi.fn(async () => ({
+        session_url: "https://claude.ai/code/session_123",
+      }));
+      enableRemoteControlImpl = enableRemoteControl;
+
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      const startedAtResponse = enableRemoteControl.mock.calls.length;
+      await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalled());
+
+      expect(startedAtResponse).toBe(0);
+      expect(enableRemoteControl).toHaveBeenCalledExactlyOnceWith(true);
+    });
+
+    it("starts again on the new query of a provider switch, and not at a later resume", async () => {
+      remoteControlAutoEnable = true;
+      const enableRemoteControl = vi.fn(async () => ({
+        session_url: "https://claude.ai/code/session_123",
+      }));
+      enableRemoteControlImpl = enableRemoteControl;
+      const sessionUpdate = vi.spyOn(agent.client, "sessionUpdate");
+      const notices = () =>
+        sessionUpdate.mock.calls.filter(([{ update }]) =>
+          JSON.stringify(update).includes("Remote Control connected"),
+        );
+      const params = { cwd: process.cwd(), mcpServers: [] };
+      const { sessionId } = await agent.newSession(params);
+      await vi.waitFor(() => expect(notices()).toHaveLength(1));
+
+      // Closing the old query ends its Remote Control.
+      await agent.unstable_setProvider({
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gw.example",
+        headers: {},
+      });
+      await vi.waitFor(() => expect(notices()).toHaveLength(2));
+      await agent.resumeSession({ sessionId, ...params });
+      // Past the timer of the resume's setup response, which runs the connect.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(enableRemoteControl).toHaveBeenCalledTimes(2);
+      expect(enableRemoteControl).toHaveBeenLastCalledWith(true);
+      expect(notices()).toHaveLength(2);
+    });
+
+    it.each<[string, (agent: ClaudeAcpAgentType, sessionId: string) => Promise<unknown>]>([
+      [
+        "a provider switch",
+        (agent) =>
+          agent.unstable_setProvider({
+            providerId: "main",
+            apiType: "anthropic",
+            baseUrl: "https://gw.example",
+            headers: {},
+          }),
+      ],
+      [
+        "a resume that changes its options",
+        (agent, sessionId) =>
+          agent.resumeSession({
+            sessionId,
+            cwd: process.cwd(),
+            mcpServers: [],
+            _meta: { claudeCode: { options: { maxTurns: 10 } } },
+          }),
+      ],
+    ])(
+      "keeps Remote Control off on the new query of %s after /remote-control off",
+      async (_case, restart) => {
+        remoteControlAutoEnable = true;
+        const enableRemoteControl = vi.fn(async () => ({
+          session_url: "https://claude.ai/code/session_123",
+        }));
+        enableRemoteControlImpl = enableRemoteControl;
+        const { sessionId } = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+        await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalledOnce());
+        await agent.prompt({ sessionId, prompt: [{ type: "text", text: "/remote-control off" }] });
+        const optionsBefore = capturedOptions;
+
+        await restart(agent, sessionId);
+        // Past the timer of a setup response, which connects a new query.
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        expect(capturedOptions).not.toBe(optionsBefore);
+        expect(enableRemoteControl.mock.calls).toEqual([[true], [false]]);
+      },
+    );
+
+    it("keeps Remote Control off on the new query of a provider switch while /remote-control off is still out", async () => {
+      remoteControlAutoEnable = true;
+      let turnOff!: () => void;
+      const enableRemoteControl = vi.fn(async (enabled: boolean) => {
+        // The off request is still out when the provider switch restarts the query.
+        if (!enabled) await new Promise<void>((resolve) => (turnOff = resolve));
+        return { session_url: "https://claude.ai/code/session_123" };
+      });
+      enableRemoteControlImpl = enableRemoteControl;
+      const { sessionId } = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalledOnce());
+      const off = agent.prompt({
+        sessionId,
+        prompt: [{ type: "text", text: "/remote-control off" }],
+      });
+      await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalledTimes(2));
+      const optionsBefore = capturedOptions;
+
+      await agent.unstable_setProvider({
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gw.example",
+        headers: {},
+      });
+      turnOff();
+      await off;
+      // Past the timers of the restart's setup work.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(capturedOptions).not.toBe(optionsBefore);
+      expect(enableRemoteControl.mock.calls).toEqual([[true], [false]]);
     });
   });
 

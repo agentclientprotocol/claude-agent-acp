@@ -40,3 +40,11 @@ export function startupFailureError(error: unknown): RequestError | undefined {
   }
   return RequestError.internalError(data, message);
 }
+
+/** The reason that {@link startupFailureError} put into `error`, if it made `error`. */
+export function startupFailureReasonOf(error: unknown): string | undefined {
+  if (!(error instanceof RequestError)) return undefined;
+  const reason = (error.data as { startupFailureReason?: unknown } | undefined)
+    ?.startupFailureReason;
+  return typeof reason === "string" ? reason : undefined;
+}

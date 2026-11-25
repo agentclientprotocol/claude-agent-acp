@@ -49,6 +49,13 @@ export const AIR_SESSION_LIST_SUBSCRIBE_CAPABILITY = "sessionListSubscribe";
  */
 export const AIR_SESSION_WORKTREES_CAPABILITY = "sessionWorktrees";
 /**
+ * `_session/rewind`: removes a user message and everything after it from the
+ * context of the same session (see `docs/air-extensions.md#session-rewind`).
+ * The client declares it; the agent advertises it only to such a client, and
+ * then announces its session cursors with the `rewind` capability.
+ */
+export const AIR_SESSION_REWIND_CAPABILITY = "sessionRewind";
+/**
  * The client wants to know when the history replay of a loaded session is
  * whole. After the last replayed update, the agent sends one
  * `session_info_update` with `_meta.jetbrains.air.loadReplayEnd: true` (see
@@ -69,6 +76,14 @@ export const AIR_KIND_KEY = "kind";
 export const AIR_SKILL_PATH_KEY = "skillPath";
 export const AIR_PERMISSION_KEY = "permission";
 export const AIR_CUSTOM_ANSWER_KEY = "customAnswer";
+/**
+ * The `_meta.jetbrains.air` key of a `model` option entry: the effort levels
+ * of the model and the recommended one, `{values, recommended}`. Every AIR
+ * client gets it, without a capability: the key only adds data.
+ */
+export const AIR_REASONING_EFFORTS_KEY = "reasoningEfforts";
+/** The companion field keys in an ACP form elicitation request. */
+export const AIR_CUSTOM_ANSWER_FIELDS_KEY = "customAnswerFields";
 /** The `_meta.jetbrains.air` key of the update that ends a whole history replay. */
 export const AIR_LOAD_REPLAY_END_KEY = "loadReplayEnd";
 /**

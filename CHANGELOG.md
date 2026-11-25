@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.112.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.111.0...v0.112.0) (2026-11-24)
+
+
+### Features
+
+* rewind the same provider session on an edited message ([#1704](https://github.com/agentclientprotocol/claude-agent-acp/issues/1704)) ([f2897d6](https://github.com/agentclientprotocol/claude-agent-acp/commit/f2897d6687f594220c07836c3e3528de552e30ef))
+
+
+### Bug Fixes
+
+* stop holding an MCP request that Claude Code gave up ([#1711](https://github.com/agentclientprotocol/claude-agent-acp/issues/1711)) ([d5be0e5](https://github.com/agentclientprotocol/claude-agent-acp/commit/d5be0e5827fb111e5e95020d76920fe8a59e671b))
+
+## [0.111.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.110.1...v0.111.0) (2026-11-24)
+
+
+### Features
+
+* name the session and tool call of MCP requests sent over ACP ([#1705](https://github.com/agentclientprotocol/claude-agent-acp/issues/1705)) ([fa02bc2](https://github.com/agentclientprotocol/claude-agent-acp/commit/fa02bc239ff3f3557b1797d1137a9bc34bd4d339))
+
+
+### Bug Fixes
+
+* start a session without the MCP servers that Claude Code refuses ([#1708](https://github.com/agentclientprotocol/claude-agent-acp/issues/1708)) ([f6525de](https://github.com/agentclientprotocol/claude-agent-acp/commit/f6525de507f9f628d4e3e8781eb61488f965b7de))
+* update to @anthropic-ai/claude-agent-sdk 0.3.331 ([#1707](https://github.com/agentclientprotocol/claude-agent-acp/issues/1707)) ([9062779](https://github.com/agentclientprotocol/claude-agent-acp/commit/9062779cda651aaeaf8a07a8ea2c8edeb76924fa))
+* write error messages as plain text ([#1709](https://github.com/agentclientprotocol/claude-agent-acp/issues/1709)) ([2c37f97](https://github.com/agentclientprotocol/claude-agent-acp/commit/2c37f979b60e0db2a069f99fdc85da3c8822dc1e))
+
+## [0.110.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.110.0...v0.110.1) (2026-11-23)
+
+
+### Bug Fixes
+
+* Closing the gaps for the ACP v2 support ([#1542](https://github.com/agentclientprotocol/claude-agent-acp/issues/1542)) ([105e1c3](https://github.com/agentclientprotocol/claude-agent-acp/commit/105e1c38daf76bc832e872e95904be6dabd32372))
+* preserve existing line endings in ACP v2 terminal output ([#1697](https://github.com/agentclientprotocol/claude-agent-acp/issues/1697)) ([9ca8984](https://github.com/agentclientprotocol/claude-agent-acp/commit/9ca8984d55132991b2eec0f87c45acbb820b38a3))
+
+## [0.110.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.109.1...v0.110.0) (2026-11-23)
+
+
+### Features
+
+* name each model's effort levels in its model option entry for AIR ([#1692](https://github.com/agentclientprotocol/claude-agent-acp/issues/1692)) ([130fbbc](https://github.com/agentclientprotocol/claude-agent-acp/commit/130fbbc02ab4771443b2f365f2af1659ceb0c591))
+
 ## [0.109.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.109.0...v0.109.1) (2026-11-21)
 
 

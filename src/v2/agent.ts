@@ -34,13 +34,21 @@ import packageJson from "../../package.json" with { type: "json" };
 import { messageIdForGrouping } from "../sdk-to-acp.js";
 import type { Logger } from "../logger.js";
 import { customAgents } from "../session-config-options.js";
+import { startsWithRemoteControl } from "../remote-control.js";
 import { AnnouncedChildren, restrictedChild } from "../acp-subagents.js";
 import { claudeCliPath, cliDelivery } from "../claude-cli.js";
 import { clientSystemPrompt, sessionSystemPrompt } from "../client-system-prompt.js";
 import type { ElicitationSupport } from "../elicitation.js";
 import { forkSession } from "../fork-session.js";
 import { supportsMcpOAuth } from "../mcp-oauth.js";
-import { McpOverAcp, sdkMcpServers } from "../mcp-servers.js";
+import {
+  McpOverAcp,
+  mcpServerNames,
+  refusedMcpServers,
+  type SdkMcpServers,
+  sdkMcpServers,
+  startAroundRefusedMcpServers,
+} from "../mcp-servers.js";
 import { ALLOW_BYPASS, autoModeDisabled } from "../permissions/modes.js";
 import {
   clientTakesPromptSuggestions,
@@ -56,6 +64,7 @@ import {
 import { mergeEffortSettings } from "../session-effort.js";
 import { configuredSettings, resolveThinkingConfig } from "../session-env.js";
 import { resolveInitialPermissionMode } from "../session-mode.js";
+import { cutAtRewindPoint, prepareRewoundResume } from "../session-rewind.js";
 import { sanitizeTitle } from "../session-titles.js";
 import { renameSession } from "../session-index/rename.js";
 import {
@@ -143,7 +152,9 @@ export function v2AgentApp(
       .onRequest(v2.methods.agent.session.setConfigOption, ({ params }) =>
         agent.setConfigOption(params),
       )
-      .onRequest(v2.methods.agent.session.prompt, ({ params }) => agent.prompt(params))
+      .onRequest(v2.methods.agent.session.prompt, ({ params, signal }) =>
+        agent.prompt(params, signal),
+      )
       .onRequest(v2.methods.agent.terminal.cancel, ({ params }) =>
         agent.cancelItem(params.sessionId, { terminalId: params.terminalId }),
       )
@@ -254,6 +265,9 @@ class V2Agent implements AgentHandle, SessionConnection {
     // Before the client can name the child that a `subagent_update` announces.
     this.children.sending(notification);
     const send = () => {
+      // When the update goes out, after a replay that holds it: an MCP request
+      // names no child session whose `subagent_update` still waits.
+      this.mcp.sending(notification);
       this.ctx.notify(v2.methods.client.session.update, notification).catch((error) => {
         this.logger.error(`Failed to send a ${notification.update.sessionUpdate} update:`, error);
       });
@@ -378,8 +392,7 @@ class V2Agent implements AgentHandle, SessionConnection {
         // `providers/list`, `set`, and `disable`, served for every client.
         providers: {},
         auth,
-        // A prompt that comes while Claude works waits in Claude Code's queue.
-        _meta: { claudeCode: { promptQueueing: true }, ..._meta },
+        _meta,
       },
       authMethods,
     };
@@ -399,9 +412,9 @@ class V2Agent implements AgentHandle, SessionConnection {
    * order but the number of promise hops (v2 allows either), and the golden
    * files of the scenarios (`acp-scenarios-v2.test.ts`) hold it.
    */
-  prompt(params: v2.PromptRequest): Promise<v2.PromptResponse> {
+  prompt(params: v2.PromptRequest, signal: AbortSignal): Promise<v2.PromptResponse> {
     const prompt = () =>
-      this.session(params.sessionId, "prompt").prompt(params, (query) =>
+      this.session(params.sessionId, "prompt").prompt(params, signal, (query) =>
         this.guard.beforePrompt(params.sessionId, query),
       );
     try {
@@ -508,8 +521,14 @@ class V2Agent implements AgentHandle, SessionConnection {
     const { sessionId, replayFrom } = params;
     // The replay: the messages before each compaction too, unless reading them fails.
     const acrossCompactions = (chain: Promise<SessionMessage[]>, cwd: string) => {
-      const messages = chain.then((read) =>
-        readHistoryAcrossCompactions(sessionId, read, this.logger, cwd),
+      // The rewind cut comes first: the dropped turns get no replay and no cursor.
+      const messages = chain.then(async (read) =>
+        readHistoryAcrossCompactions(
+          sessionId,
+          await cutAtRewindPoint(sessionId, read, this.logger),
+          this.logger,
+          cwd,
+        ),
       );
       // A resume that fails before the replay leaves them unawaited.
       chain.catch(() => {});
@@ -538,17 +557,44 @@ class V2Agent implements AgentHandle, SessionConnection {
       // session's.
       const request = await validatedSetup(params);
       assertCwdOf(session, request.cwd, "resume it");
-      const served = await this.sdkMcpServers(sessionId, request.mcpServers);
-      await session.setMcpServers(
-        { ...clientOptions(params._meta)?.mcpServers, ...served.configs },
-        served.unserved,
-      );
       if (!sameDirectories(request.additionalDirectories ?? [], session.additionalDirectories)) {
-        // The SDK cannot change them on a running query: it restarts with
-        // them at its next turn boundary (see `restarts.ts`).
-        this.restarts.rootsChanged(sessionId, params);
+        // Claude Code cannot replace launch roots while work or requests remain.
+        if (!session.canReplaceRoots()) {
+          throw RequestError.invalidParams(
+            { additionalDirectories: request.additionalDirectories ?? [] },
+            "Workspace roots cannot change while work or input requests remain. Resume with the current roots, or try again after work ends.",
+          );
+        }
+        await this.restarts.rootsChanged(sessionId, params);
+        session = this.sessions.get(sessionId);
+        if (
+          !session ||
+          !sameDirectories(request.additionalDirectories ?? [], session.additionalDirectories)
+        ) {
+          throw RequestError.internalError(
+            { sessionId },
+            "The session could not activate the workspace roots. Try resuming it again.",
+          );
+        }
       } else {
-        // A restart of its query starts with these servers.
+        const served = await this.mcpServersOf(
+          sessionId,
+          request,
+          clientOptions(params._meta),
+          session.mcpServersRefused,
+        );
+        await session.setMcpServers(served.configs, served.unserved);
+        const unhooked = this.mcp.sessionServersChanged(
+          sessionId,
+          session.mcpServersRefused ? [] : request.mcpServers,
+        );
+        if (unhooked.length > 0) {
+          this.logger.log(
+            `Session ${sessionId}: the MCP requests of ${unhooked.join(", ")} name no session ` +
+              "until the session's query starts again. The running query started without " +
+              "the hooks that report their tool uses.",
+          );
+        }
         this.restarts.track(sessionId, params);
       }
     } else {
@@ -618,7 +664,7 @@ class V2Agent implements AgentHandle, SessionConnection {
 
   async listSessions(params: v2.ListSessionsRequest): Promise<v2.ListSessionsResponse> {
     if (params.cwd != null && !path.isAbsolute(params.cwd)) {
-      throw RequestError.invalidParams({ cwd: params.cwd }, "`cwd` must be an absolute path");
+      throw RequestError.invalidParams({ cwd: params.cwd }, "cwd must be an absolute path");
     }
     const offset = listOffset(params.cursor);
     // One more than a page tells whether a next page exists.
@@ -746,6 +792,7 @@ class V2Agent implements AgentHandle, SessionConnection {
     this.restarts.closed(sessionId);
     // After the close's last updates, which name the session's children.
     this.children.rootClosed(sessionId);
+    this.mcp.sessionClosed(sessionId);
     return {};
   }
 
@@ -1008,8 +1055,13 @@ class V2Agent implements AgentHandle, SessionConnection {
       this.promptKeys.set(sessionId, keys);
     }
     keys.queryStarted(resume !== undefined);
-    session.start(q, config, opened.mcpServers, keys, resume !== undefined);
+    session.start(q, config, opened.mcpServers, keys, {
+      resumed: resume !== undefined,
+      mcpServersRefused: opened.mcpServersRefused,
+    });
     this.sessions.set(sessionId, session);
+    // The bridge hears of no server that the query started without.
+    this.mcp.sessionStarted(sessionId, opened.mcpServersRefused ? [] : opened.request.mcpServers);
     this.stopped.delete(sessionId);
     // A route change during the start did not find this session live.
     this.restarts.track(sessionId, params, {
@@ -1035,6 +1087,26 @@ class V2Agent implements AgentHandle, SessionConnection {
   }
 
   /**
+   * The MCP servers that a query of the session gets for a setup request: the
+   * request's servers (see {@link sdkMcpServers}) and the ones of the client's
+   * SDK options. `refused`: Claude Code refused to start the session's query
+   * with MCP servers, so it gets none, at its start and at a later resume of
+   * the active session (see `refusedMcpServers`).
+   */
+  private async mcpServersOf(
+    sessionId: string,
+    request: { mcpServers: readonly McpServer[] },
+    client: ReturnType<typeof clientOptions>,
+    refused: boolean,
+  ): Promise<SdkMcpServers> {
+    if (refused) {
+      return refusedMcpServers(mcpServerNames(request.mcpServers, client?.mcpServers));
+    }
+    const served = await this.sdkMcpServers(sessionId, request.mcpServers);
+    return { configs: { ...client?.mcpServers, ...served.configs }, unserved: served.unserved };
+  }
+
+  /**
    * Starts the query of a session and builds its config. Its options are the
    * client's `_meta.claudeCode.options` under the ones this core controls.
    * The session is not active yet, and nothing of it goes out. The caller
@@ -1043,6 +1115,9 @@ class V2Agent implements AgentHandle, SessionConnection {
    * `resume`: the stored session that the query resumes, `sessionId` itself
    * but for a `session/options` probe. Without `persist`, Claude Code stores
    * nothing of the query (see {@link sessionOptions}).
+   *
+   * When Claude Code refuses to start with the session's MCP servers, the
+   * query starts without them (see `startAroundRefusedMcpServers`).
    */
   private async openQuery(
     sessionId: string,
@@ -1052,10 +1127,33 @@ class V2Agent implements AgentHandle, SessionConnection {
     history?: Promise<SessionMessage[]>,
     { persist = true } = {},
   ) {
+    const names = mcpServerNames(params.mcpServers, clientOptions(params._meta)?.mcpServers);
+    return startAroundRefusedMcpServers(names.length > 0, (withoutMcpServers) =>
+      this.startQuery(sessionId, params, resume, history, persist, withoutMcpServers),
+    );
+  }
+
+  /**
+   * One start of {@link openQuery}. `mcpServersRefused`: Claude Code refused
+   * the start with the session's MCP servers, so this one is without them.
+   */
+  private async startQuery(
+    sessionId: string,
+    params: v2.NewSessionRequest | v2.ResumeSessionRequest | v2.ForkSessionRequest,
+    resume: string | undefined,
+    history: Promise<SessionMessage[]> | undefined,
+    persist: boolean,
+    mcpServersRefused: boolean,
+  ) {
     const request = await validatedSetup(params);
     const client = clientOptions(params._meta);
-    const served = await this.sdkMcpServers(sessionId, request.mcpServers);
-    const mcpServers = { ...client?.mcpServers, ...served.configs };
+    // A resume stops at a pending rewind point, or the dropped turns come back.
+    // The `session/options` probe (`persist: false`) leaves the transcript and
+    // `rewind.json` alone.
+    const resumeSessionAt =
+      resume !== undefined && persist ? await prepareRewoundResume(resume, this.logger) : undefined;
+    const served = await this.mcpServersOf(sessionId, request, client, mcpServersRefused);
+    const mcpServers = served.configs;
     // After a provider change that is still listing its models.
     await this.auth.routeSettled();
     // The resumed transcript's last model and mode.
@@ -1118,6 +1216,19 @@ class V2Agent implements AgentHandle, SessionConnection {
     );
     const elicitationOptions = session.elicitations.queryOptions();
     const subagent = subagentHooks((input) => session.tasks.subagentHook(input));
+    // None for a query without `acp` servers. A resume cannot give a running
+    // query these hooks (see `McpOverAcp.sessionServersChanged`).
+    const mcpToolUse = this.mcp.toolUseHooks(
+      sessionId,
+      mcpServersRefused ? [] : request.mcpServers,
+      {
+        childSessions: true,
+        reporting: (agentId) => session.tasks.childSession(agentId),
+        // A subagent's child session has its agent id (see `tasks.ts`).
+        childSessionId: (agentId) => agentId,
+        definesAgent: (name) => session.tasks.configs.definesAgent(name),
+      },
+    );
     const options: Options = {
       systemPrompt: sessionSystemPrompt(clientPrompt, params._meta?.systemPrompt),
       settingSources: ["user", "project", "local"],
@@ -1177,11 +1288,21 @@ class V2Agent implements AgentHandle, SessionConnection {
         // A subagent's `cwd` (such as its worktree) and configuration, from its hooks.
         SubagentStart: [subagent.SubagentStart],
         SubagentStop: [subagent.SubagentStop],
-        PostToolUseFailure: [subagent.PostToolUseFailure],
-        // An Edit or Write shows its exact patch before it runs.
-        PreToolUse: [subagent.PreToolUse, fileChangePreviewHook(session, this.logger)],
+        PostToolUseFailure: [
+          subagent.PostToolUseFailure,
+          ...(mcpToolUse ? [mcpToolUse.PostToolUseFailure] : []),
+        ],
+        // An Edit or Write shows its exact patch before it runs. The tool use
+        // of an `acp` server's tool is recorded for the `mcp/message` requests
+        // that it sends.
+        PreToolUse: [
+          subagent.PreToolUse,
+          fileChangePreviewHook(session, this.logger),
+          ...(mcpToolUse ? [mcpToolUse.PreToolUse] : []),
+        ],
         PostToolUse: [
           subagent.PostToolUse,
+          ...(mcpToolUse ? [mcpToolUse.PostToolUse] : []),
           {
             hooks: [
               createPostToolUseHook({ onEnterPlanMode: async () => session.modeChanged("plan") }),
@@ -1204,6 +1325,7 @@ class V2Agent implements AgentHandle, SessionConnection {
         ...STARTUP_FAILURE_RESULTS_ENV,
       },
       ...(resume !== undefined ? { resume } : { sessionId }),
+      ...(resumeSessionAt !== undefined ? { resumeSessionAt } : {}),
       ...(persist ? {} : { persistSession: false }),
     };
     let q: Query;
@@ -1251,6 +1373,9 @@ class V2Agent implements AgentHandle, SessionConnection {
     }
     // For the description of a child's agent type in its configuration.
     session.tasks.configs.configureAgents(customAgents(initialization.agents ?? []));
+    // Read again for every query, so a restart's new query starts it too,
+    // unless the user turned it off (`restarts.ts` carries that over).
+    session.setRemoteControlAtStartup(startsWithRemoteControl(initialization));
     let models;
     try {
       models = await sessionModels(
@@ -1290,6 +1415,7 @@ class V2Agent implements AgentHandle, SessionConnection {
           client,
           effortSettings: () => mergeEffortSettings(settings.getSettings(), configured),
           recommendedValue: this.air.recommendedValue,
+          airClient: this.air.client,
           narrowsModels: routing.narrowsModels,
         },
         (notification) => session.output.emitV1([notification]),
@@ -1311,6 +1437,7 @@ class V2Agent implements AgentHandle, SessionConnection {
       request,
       mcpServers,
       unservedMcpServers: served.unserved,
+      mcpServersRefused,
       routeGeneration,
     };
   }
@@ -1330,11 +1457,11 @@ async function validatedSetup(
   clientSystemPrompt(request.systemPrompt);
   const { cwd } = request;
   if (!path.isAbsolute(cwd)) {
-    throw RequestError.invalidParams({ cwd }, `\`cwd\` must be an absolute path, not ${cwd}`);
+    throw RequestError.invalidParams({ cwd }, `cwd must be an absolute path, not ${cwd}`);
   }
   const stat = await fs.stat(cwd).catch(() => undefined);
   if (!stat?.isDirectory()) {
-    throw RequestError.invalidParams({ cwd }, `\`cwd\` is not a directory: ${cwd}`);
+    throw RequestError.invalidParams({ cwd }, `cwd is not a directory: ${cwd}`);
   }
   for (const directory of request.additionalDirectories ?? []) {
     if (!path.isAbsolute(directory)) {
@@ -1354,7 +1481,7 @@ async function validatedSetup(
 async function storedPromptIds(sessionId: string, cwd: string, logger: Logger): Promise<string[]> {
   const messages = await readHistoryAcrossCompactions(
     sessionId,
-    await getSessionMessages(sessionId, { dir: cwd }),
+    await cutAtRewindPoint(sessionId, await getSessionMessages(sessionId, { dir: cwd }), logger),
     logger,
     cwd,
   );
@@ -1368,7 +1495,7 @@ function assertCwdOf(session: V2Session, cwd: string, action: string): void {
   if (cwd === session.cwd) return;
   throw RequestError.invalidParams(
     { cwd },
-    `Session ${session.sessionId} works in ${session.cwd}: ${action} with that \`cwd\``,
+    `Session ${session.sessionId} works in ${session.cwd}: ${action} with that cwd`,
   );
 }
 

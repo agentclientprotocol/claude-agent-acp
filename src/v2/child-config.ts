@@ -44,6 +44,11 @@ export class ChildConfigurations {
     this.agents = agents;
   }
 
+  /** Whether the session's custom agents have one named `name`. */
+  definesAgent(name: string): boolean {
+    return this.agents.some((agent) => agent.name === name);
+  }
+
   /** The options that a hook of a subagent reports of it. */
   hookOptions(input: HookInput): SessionConfigOption[] {
     return subagentHookOptions(input, {

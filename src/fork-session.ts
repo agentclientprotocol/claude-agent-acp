@@ -9,8 +9,14 @@ import {
   type SessionStoreEntry,
 } from "@anthropic-ai/claude-agent-sdk";
 import { createHash } from "node:crypto";
-import { loadFullSessionHistory, readHistoryAcrossCompactions } from "./resumed-session.js";
+import { loadFullSessionHistory } from "./resumed-session.js";
 import { forkPointOf } from "./session-cursors.js";
+import {
+  cutAtRewindPoint,
+  loadRewindableHistory,
+  pendingRewindEnd,
+  withoutRewoundBranch,
+} from "./session-rewind.js";
 import { assistantMessageText } from "./session-failure-extension.js";
 import { SessionTiming } from "./session-timing.js";
 
@@ -206,17 +212,15 @@ async function forkTranscript(
 ): Promise<ForkSessionResponse> {
   const timing = new SessionTiming(dependencies.logger, "fork", params.sessionId);
   if (params.cursorId != null) {
-    // The history as a replay reads it, which announces the cursors.
-    const history = await readHistoryAcrossCompactions(
-      params.sessionId,
-      await getSessionMessages(params.sessionId),
-    );
+    // The history as a replay reads it, which announces the cursors: cut at a
+    // pending rewind, so a cursor of a dropped turn is no cursor.
+    const { visible: history } = await loadRewindableHistory(params.sessionId);
     const upToMessageId = forkPointOf(params.cursorId, history);
     timing.phase("cursor", ` resolution=${upToMessageId ? "found" : "missing"}`);
     if (upToMessageId === undefined) {
       throw RequestError.invalidParams(
         { cursorId: params.cursorId },
-        `Session ${params.sessionId} has no cursor ${params.cursorId} that a fork can start at. Use a cursor that the session announced with the \`fork\` capability, or send the request without \`cursorId\` to fork the whole session.`,
+        `Session ${params.sessionId} has no cursor ${params.cursorId} that a fork can start at. Use a cursor that the session announced with the fork capability, or send the request without cursorId to fork the whole session.`,
       );
     }
     const forked = await forkClaudeSession(params.sessionId, { upToMessageId });
@@ -227,7 +231,12 @@ async function forkTranscript(
   // SDK `dir` scopes source lookup, not the fork's working directory. Search
   // all projects: params.cwd can name a different workspace for the new session.
   if (!point) {
-    const forked = await forkClaudeSession(params.sessionId);
+    // A pending rewind ends the conversation at its point, not at the newest leaf.
+    const rewoundEnd = await pendingRewindEnd(params.sessionId);
+    const forked = await forkClaudeSession(
+      params.sessionId,
+      ...(rewoundEnd ? [{ upToMessageId: rewoundEnd }] : []),
+    );
     timing.phase("sdk-fork", " resolution=latest");
     return { sessionId: forked.sessionId };
   }
@@ -236,7 +245,9 @@ async function forkTranscript(
   const liveUuid = candidateIds
     .map((candidateId) => dependencies.liveMessageIdToUuid?.get(candidateId))
     .find(Boolean);
-  const history = liveUuid ? undefined : await getSessionMessages(params.sessionId);
+  const history = liveUuid
+    ? undefined
+    : await cutAtRewindPoint(params.sessionId, await getSessionMessages(params.sessionId));
   timing.phase("active-history", ` resolution=${liveUuid ? "live" : "pending"}`);
   const messageUuid =
     liveUuid ??
@@ -253,7 +264,10 @@ async function forkTranscript(
   const fullHistoryUuid = messageUuid
     ? undefined
     : resolveFromFullHistory(
-        await loadFullSessionHistory(params.sessionId),
+        await withoutRewoundBranch(
+          params.sessionId,
+          await loadFullSessionHistory(params.sessionId),
+        ),
         candidateIds,
         point,
         dependencies.messageIdForGrouping,

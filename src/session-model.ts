@@ -10,6 +10,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY, withAirMeta } from "./air-extension.js";
 import { bedrockRegionPrefix } from "./gateway-models.js";
+import { modelReasoningEffortsMeta } from "./session-effort.js";
 
 export const MODEL_CONFIG_ID = "model";
 
@@ -262,8 +263,17 @@ export function buildModelConfigOption(
   models: SessionModelState,
   modelInfos: ModelInfo[],
   useRecommendedValue: boolean,
+  /** The client is AIR: each entry names its model's effort levels (see
+   *  {@link modelReasoningEffortsMeta}). A client that is not AIR gets no AIR key. */
+  airClient = false,
 ): SessionConfigOption {
   const defaultInfo = modelInfos.find((model) => model.value === "default");
+  // The listed model that the `default` row runs, which names the row.
+  const defaultTarget = defaultInfo?.resolvedModel
+    ? modelInfos.find(
+        (info) => info.value !== "default" && info.resolvedModel === defaultInfo.resolvedModel,
+      )
+    : undefined;
   const selectableIds = new Set(models.availableModels.map((model) => model.modelId));
   const concreteInfos = modelInfos.filter(
     (model) => model.value !== "default" && selectableIds.has(model.value),
@@ -287,25 +297,25 @@ export function buildModelConfigOption(
     concreteRecommendation && models.currentModelId === "default"
       ? recommended.value
       : models.currentModelId;
-  const options: Array<{ value: string; name: string; description?: string }> = available.map(
-    (model) => {
-      if (model.modelId === "default" && defaultInfo?.resolvedModel) {
-        const named = modelInfos.find(
-          (info) => info.value !== "default" && info.resolvedModel === defaultInfo.resolvedModel,
-        );
-        return {
-          value: model.modelId,
-          name: model.name,
-          description: named?.displayName ?? defaultInfo.resolvedModel,
-        };
-      }
+  const options: Array<{
+    value: string;
+    name: string;
+    description?: string;
+    _meta?: Record<string, unknown>;
+  }> = available.map((model) => {
+    if (model.modelId === "default" && defaultInfo?.resolvedModel) {
       return {
         value: model.modelId,
         name: model.name,
-        description: model.description ?? undefined,
+        description: defaultTarget?.displayName ?? defaultInfo.resolvedModel,
       };
-    },
-  );
+    }
+    return {
+      value: model.modelId,
+      name: model.name,
+      description: model.description ?? undefined,
+    };
+  });
   // ACP requires `currentValue` to be one of `options`. A session can run a
   // model the picker does not list: resumed onto a model excluded by the
   // `availableModels` allowlist, or switched by a refusal fallback. List that
@@ -318,6 +328,18 @@ export function buildModelConfigOption(
       name: info?.displayName || currentValue,
       description: info?.description || undefined,
     });
+  }
+  if (airClient) {
+    // The `default` row runs the model it resolves to; without one, it
+    // names no efforts.
+    for (const option of options) {
+      const meta = modelReasoningEffortsMeta(
+        option.value === "default"
+          ? defaultTarget
+          : modelInfos.find((info) => info.value === option.value),
+      );
+      if (meta) option._meta = meta;
+    }
   }
 
   return {

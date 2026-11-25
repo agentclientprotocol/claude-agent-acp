@@ -28,7 +28,7 @@ export function initialConfigOptions<E extends { configId: string }>(
     if (seen.has(configId)) {
       throw RequestError.invalidParams(
         { configId },
-        `\`configOptions\` sets ${configId} more than once. Send one entry for each config option.`,
+        `configOptions sets ${configId} more than once. Send one entry for each config option.`,
       );
     }
     seen.add(configId);

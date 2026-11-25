@@ -1,7 +1,7 @@
 /**
  * The ACP v2 core (`src/v2/`), driven through the protocol
- * router with the SDK's v2 client app, which validates every response and
- * session update against the v2 schema.
+ * router with the SDK's v2 client app. Raw notifications are checked against
+ * the v2 schema before the SDK handles them.
  *
  * Claude Code is a double that the test drives message by message (see
  * {@link FakeClaudeCode}), shaped like what the bundled CLI sends: prompt
@@ -9,7 +9,7 @@
  * `session_state_changed`.
  */
 import { randomUUID } from "node:crypto";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
@@ -24,6 +24,8 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { McpOverAcp } from "../../mcp-servers.js";
 import { acpProtocolRouter } from "../../serve.js";
+import { validateV2Notification } from "../acp-scenarios/schema.js";
+import { writeRewindPoint } from "../../session-rewind.js";
 import { SettingsManager } from "../../settings.js";
 import type { AgentHandle } from "../../v2/agent.js";
 import { v2ElicitationRequest } from "../../v2/elicitation.js";
@@ -34,6 +36,7 @@ import {
   transcriptCompactSummary,
   transcriptUser,
   writeTranscript,
+  sideloadRefusal,
 } from "../helpers.js";
 
 /** One Claude Code process: the prompts it reads and the messages it sends. */
@@ -48,11 +51,13 @@ type FakeClaudeCode = {
   /** Ends the stream, with `error` as a crash. */
   end(error?: Error): void;
   interrupt: ReturnType<typeof vi.fn>;
+  cancelAsyncMessage: ReturnType<typeof vi.fn>;
   setPermissionMode: ReturnType<typeof vi.fn>;
   setModel: ReturnType<typeof vi.fn>;
   stopTask: ReturnType<typeof vi.fn>;
   close: ReturnType<typeof vi.fn>;
   applyFlagSettings: ReturnType<typeof vi.fn>;
+  setMcpServers: ReturnType<typeof vi.fn>;
   /** The dry-run rewind of a prompt's checkpoint: the files it changed. */
   rewindFiles: ReturnType<typeof vi.fn>;
 };
@@ -73,6 +78,8 @@ const sdk = vi.hoisted(() => ({
   previewGate: undefined as Promise<void> | undefined,
   /** When set, Claude Code fails to start with it. */
   startFailure: undefined as Error | undefined,
+  /** When set, Claude Code refuses a start that has MCP servers with it. */
+  mcpServersRefusal: undefined as Error | undefined,
   /** When set, the SDK refuses the query's options with it: `query()` throws. */
   optionsRefusal: undefined as Error | undefined,
   /** When set, Claude Code refuses flag settings with it: `applyFlagSettings` rejects. */
@@ -81,6 +88,8 @@ const sdk = vi.hoisted(() => ({
   startGate: undefined as Promise<void> | undefined,
   /** When set, the query serves Remote Control with it (`enableRemoteControl`). */
   enableRemoteControl: undefined as ((...args: unknown[]) => Promise<unknown>) | undefined,
+  /** Whether Claude Code asks at `initialize` for Remote Control to start with the query. */
+  remoteControlAtStartup: false,
 }));
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
@@ -117,6 +126,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         send: (message) => push({ value: message, done: false }),
         end: (error) => push(error ?? { value: undefined, done: true }),
         interrupt: vi.fn(async () => undefined),
+        cancelAsyncMessage: vi.fn(async (_uuid: string) => true),
         setPermissionMode: vi.fn(async () => {}),
         setModel: vi.fn(async () => {}),
         stopTask: vi.fn(async () => {}),
@@ -125,6 +135,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
           if (sdk.flagRefusal) throw sdk.flagRefusal;
         }),
         rewindFiles: vi.fn(async () => ({ canRewind: true, filesChanged: [] })),
+        setMcpServers: vi.fn(async () => ({ added: [], removed: [], errors: {} })),
       };
       sdk.processes.push(fake);
       const messages: AsyncGenerator<Record<string, unknown>> = {
@@ -149,12 +160,19 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         initializationResult: async () => {
           await sdk.startGate;
           if (sdk.startFailure) throw sdk.startFailure;
-          return { models: sdk.models };
+          if (sdk.mcpServersRefusal && Object.keys(options.mcpServers ?? {}).length > 0) {
+            throw sdk.mcpServersRefusal;
+          }
+          return {
+            models: sdk.models,
+            ...(sdk.remoteControlAtStartup ? { remote_control_auto_enable: true } : {}),
+          };
         },
         supportedCommands: async () => [
           { name: "review", description: "Review a change", argumentHint: "<pull request>" },
         ],
         interrupt: fake.interrupt,
+        cancelAsyncMessage: fake.cancelAsyncMessage,
         setPermissionMode: fake.setPermissionMode,
         setModel: fake.setModel,
         stopTask: fake.stopTask,
@@ -163,7 +181,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         rewindFiles: fake.rewindFiles,
         mcpServerStatus: async () => sdk.mcpServers,
         ...(sdk.enableRemoteControl ? { enableRemoteControl: sdk.enableRemoteControl } : {}),
-        setMcpServers: async () => ({ added: [], removed: [], errors: {} }),
+        setMcpServers: fake.setMcpServers,
         // A server that needs OAuth: Claude Code returns its authorization URL.
         mcpAuthenticate: async () => ({
           authUrl: "https://mcp.example.com/authorize",
@@ -213,10 +231,12 @@ vi.mock("node:child_process", async () => ({
 }));
 
 const agents: AgentHandle[] = [];
+const notificationErrors: string[] = [];
 let tempDir: string;
 let cwd: string;
 
 beforeEach(async () => {
+  notificationErrors.length = 0;
   tempDir = await mkdtemp(path.join(os.tmpdir(), "acp-v2-"));
   cwd = await mkdtemp(path.join(tempDir, "project-"));
   vi.stubEnv("CLAUDE_CONFIG_DIR", path.join(tempDir, "claude"));
@@ -226,10 +246,12 @@ beforeEach(async () => {
   sdk.subagents = new Map();
   sdk.previewGate = undefined;
   sdk.startFailure = undefined;
+  sdk.mcpServersRefusal = undefined;
   sdk.optionsRefusal = undefined;
   sdk.flagRefusal = undefined;
   sdk.startGate = undefined;
   sdk.enableRemoteControl = undefined;
+  sdk.remoteControlAtStartup = false;
   vi.mocked(forkSession).mockClear();
 });
 
@@ -237,6 +259,7 @@ afterEach(async () => {
   await Promise.all(agents.splice(0).map((agent) => agent.dispose()));
   vi.unstubAllEnvs();
   await rm(tempDir, { recursive: true, force: true, maxRetries: 10 });
+  expect(notificationErrors).toEqual([]);
 });
 
 /** A v2 client of the v2 core that records the session updates it receives. */
@@ -277,7 +300,12 @@ function v2Client({
       completedElicitations.push(params.elicitationId);
     });
   const toAgent = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
-  const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>();
+  const toClient = new TransformStream<v2.AnyMessage, v2.AnyMessage>({
+    transform(message, controller) {
+      notificationErrors.push(...validateV2Notification(message));
+      controller.enqueue(message);
+    },
+  });
   acpProtocolRouter(undefined, () => {}, "v2", {
     onV2Agent: (agent) => agents.push(agent),
   }).connect({ readable: toAgent.readable, writable: toClient.writable });
@@ -1024,6 +1052,51 @@ describe("ACP v2 core", () => {
       });
     });
 
+    it("starts Remote Control again on the new query of a restart, as the old one's ended", async () => {
+      sdk.remoteControlAtStartup = true;
+      const enableRemoteControl = vi.fn(async () => ({
+        session_url: "https://claude.ai/code/session_123",
+      }));
+      sdk.enableRemoteControl = enableRemoteControl;
+      const client = v2Client();
+      const notices = () =>
+        client.sessionUpdates.filter((update) => update.sessionUpdate === "notice");
+      await client.connect(async (agent) => {
+        await openSession(agent);
+        await vi.waitFor(() => expect(notices()).toHaveLength(1));
+        await setProvider(agent);
+        await vi.waitFor(() => expect(notices()).toHaveLength(2));
+      });
+
+      expect(sdk.processes).toHaveLength(2);
+      expect(enableRemoteControl).toHaveBeenCalledTimes(2);
+      expect(enableRemoteControl).toHaveBeenLastCalledWith(true);
+      expect(notices()[1]).toMatchObject({ title: "Remote Control connected" });
+    });
+
+    it("keeps Remote Control off on the new query of a restart after /remote-control off", async () => {
+      sdk.remoteControlAtStartup = true;
+      const enableRemoteControl = vi.fn(async () => ({
+        session_url: "https://claude.ai/code/session_123",
+      }));
+      sdk.enableRemoteControl = enableRemoteControl;
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { response } = await openSession(agent);
+        await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalledOnce());
+        await agent.request(v2.methods.agent.session.prompt, {
+          sessionId: response.sessionId,
+          prompt: [{ type: "text", text: "/remote-control off" }],
+        });
+        await setProvider(agent);
+        // Past the timer of the restart's setup work.
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+
+      expect(sdk.processes).toHaveLength(2);
+      expect(enableRemoteControl.mock.calls).toEqual([[true], [false]]);
+    });
+
     it("preserves an incompatible provider restart error and resumes after recovery", async () => {
       sdk.models = [
         {
@@ -1416,6 +1489,117 @@ describe("ACP v2 core", () => {
     expect(error).toMatchObject({ code });
   });
 
+  it.each([true, false])(
+    "withdraws only the queued prompt when Claude Code cancels it: %s",
+    async (cancelled) => {
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const sessionId = response.sessionId;
+        const completedSignal = new AbortController();
+        const first = agent.request(
+          v2.methods.agent.session.prompt,
+          { sessionId, prompt: PROMPT },
+          {
+            cancellationSignal: completedSignal.signal,
+          },
+        );
+        const running = await claude.prompt(0);
+        claude.send(sessionState("running"));
+        claude.send(lifecycle(running, "started"));
+        await first;
+        completedSignal.abort();
+        expect(claude.cancelAsyncMessage).not.toHaveBeenCalled();
+        const controller = new AbortController();
+        const queued = agent
+          .request(
+            v2.methods.agent.session.prompt,
+            { sessionId, prompt: PROMPT },
+            {
+              cancellationSignal: controller.signal,
+            },
+          )
+          .catch((error: unknown) => error);
+        const waiting = await claude.prompt(1);
+        claude.cancelAsyncMessage.mockResolvedValue(cancelled);
+        controller.abort();
+        await vi.waitFor(() =>
+          expect(claude.cancelAsyncMessage).toHaveBeenCalledWith(waiting.uuid),
+        );
+        if (cancelled) {
+          expect(await queued).toMatchObject({ code: -32800 });
+          claude.send(lifecycle(waiting, "cancelled"));
+        } else {
+          claude.send(lifecycle(waiting, "started"));
+          expect(await queued).toEqual({ messageId: waiting.uuid });
+        }
+        expect(claude.interrupt).not.toHaveBeenCalled();
+        expect(client.states()).toEqual(["running"]);
+        expect(
+          client.sessionUpdates.filter((update) => update.sessionUpdate === "user_message"),
+        ).toHaveLength(cancelled ? 1 : 2);
+        claude.send(result());
+        claude.send(sessionState("idle"));
+        await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+        expect(client.sessionUpdates.at(-1)).toMatchObject({
+          state: "idle",
+          stopReason: "end_turn",
+        });
+      });
+    },
+  );
+
+  it.each(["frame-first", "response-first"])(
+    "ends held work when the last steering prompt is withdrawn (%s)",
+    async (order) => {
+      const client = v2Client();
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const sessionId = response.sessionId;
+        const first = agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: PROMPT });
+        const running = await claude.prompt(0);
+        claude.send(lifecycle(running, "started"));
+        await first;
+        for (const event of textDelta("msg_first", "First reply")) claude.send(event);
+        const controller = new AbortController();
+        const queued = agent
+          .request(
+            v2.methods.agent.session.prompt,
+            { sessionId, prompt: PROMPT },
+            { cancellationSignal: controller.signal },
+          )
+          .catch((error: unknown) => error);
+        const waiting = await claude.prompt(1);
+        expect(waiting.priority).toBe("now");
+        claude.send(result({ user_message_uuids: [running.uuid] }));
+        await vi.waitFor(() =>
+          expect(client.sessionUpdates).toContainEqual(
+            expect.objectContaining({ sessionUpdate: "usage_update", cost: expect.any(Object) }),
+          ),
+        );
+        expect(client.states()).not.toContain("idle");
+        const cancelled = Promise.withResolvers<boolean>();
+        claude.cancelAsyncMessage.mockReturnValue(cancelled.promise);
+        controller.abort();
+        await vi.waitFor(() =>
+          expect(claude.cancelAsyncMessage).toHaveBeenCalledWith(waiting.uuid),
+        );
+        if (order === "frame-first") claude.send(lifecycle(waiting, "cancelled"));
+        else cancelled.resolve(true);
+        expect(await queued).toMatchObject({ code: -32800 });
+        await vi.waitFor(() => expect(client.states().at(-1)).toBe("idle"));
+        if (order === "frame-first") cancelled.resolve(true);
+        else claude.send(lifecycle(waiting, "cancelled"));
+        const next = agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: PROMPT });
+        claude.send(lifecycle(await claude.prompt(2), "started"));
+        await next;
+        claude.send(result());
+        await vi.waitFor(() => expect(client.states().slice(-2)).toEqual(["running", "idle"]));
+        expect(claude.interrupt).not.toHaveBeenCalled();
+      });
+    },
+  );
+
   it("cancels the work and the prompts not inserted yet with one interrupt", async () => {
     const client = v2Client();
     await client.connect(async (agent) => {
@@ -1597,6 +1781,51 @@ describe("ACP v2 core", () => {
         }),
       );
     });
+  });
+
+  it("starts a session without the MCP servers that Claude Code refuses, and says so once", async () => {
+    sdk.mcpServersRefusal = sideloadRefusal();
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      await agent.request(v2.methods.agent.initialize, {
+        protocolVersion: v2.PROTOCOL_VERSION,
+        info: { name: "v2-test-client", version: "1.0.0" },
+        capabilities: {},
+      });
+      const mcpServers: v2.McpServer[] = [
+        { type: "stdio", name: "files", command: "/usr/local/bin/mcp-files" },
+        { type: "stdio", name: "search", command: "/usr/local/bin/mcp-search" },
+      ];
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd, mcpServers });
+      // The refused query is closed, and the session runs on a second one without servers.
+      expect(sdk.processes).toHaveLength(2);
+      expect(sdk.processes[0].close).toHaveBeenCalledOnce();
+      const claude = sdk.processes[1];
+      expect(claude.options.mcpServers).toEqual({});
+      const turn = () => {
+        claude.send({ type: "system", subtype: "init", uuid: randomUUID(), mcp_servers: [] });
+        claude.send(result());
+      };
+      turn();
+      await vi.waitFor(() => expect(client.states()).toEqual(["running", "idle"]));
+      // A resume of the active session does not hand the servers to the query either.
+      await agent.request(v2.methods.agent.session.resume, { sessionId, cwd, mcpServers });
+      expect(claude.setMcpServers).not.toHaveBeenCalled();
+      turn();
+      await vi.waitFor(() => expect(client.states().slice(-2)).toEqual(["running", "idle"]));
+    });
+
+    expect(client.sessionUpdates.filter((update) => update.sessionUpdate === "notice")).toEqual([
+      {
+        sessionUpdate: "notice",
+        severity: "warning",
+        title: "2 MCP servers failed to start",
+        description:
+          'The tools of "files" and "search" are unavailable in this session. Your organization\'s ' +
+          "managed settings (disableSideloadFlags) let Claude Code use MCP servers only from " +
+          "sources that your administrator approved.",
+      },
+    ]);
   });
 
   it("reports a client MCP server that failed to start as a notice, once", async () => {
@@ -2030,6 +2259,85 @@ describe("ACP v2 core", () => {
     ).toEqual([]);
   });
 
+  it.each([
+    ["tool_use", "cancelled"],
+    ["null", "error"],
+  ] as const)(
+    "handles a rejected plan diagnostic with stop_reason=%s",
+    async (reason, expected) => {
+      const client = v2Client({
+        answerPermission: () => ({ outcome: { outcome: "selected", optionId: "reject" } }),
+      });
+      await client.connect(async (agent) => {
+        const { response, claude } = await openSession(agent);
+        const sessionId = response.sessionId;
+        const prompted = agent.request(v2.methods.agent.session.prompt, {
+          sessionId,
+          prompt: PROMPT,
+        });
+        claude.send(echo(await claude.prompt(0)));
+        await prompted;
+        claude.send(
+          assistant("msg_plan", [
+            { type: "tool_use", id: "toolu_plan", name: "ExitPlanMode", input: { plan: "Do it" } },
+          ]),
+        );
+        const decision = await askPermission(
+          claude,
+          "ExitPlanMode",
+          { plan: "Do it" },
+          { toolUseID: "toolu_plan" },
+        );
+        expect(decision).toMatchObject({ behavior: "deny", interrupt: true });
+        claude.send({
+          type: "user",
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_plan",
+                content: "The user rejected this plan.",
+                is_error: true,
+              },
+            ],
+          },
+          tool_result_meta: [{ id: "toolu_plan", non_execution_kind: "user-rejected" }],
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+        });
+        claude.send(
+          result({
+            subtype: "error_during_execution",
+            is_error: true,
+            stop_reason: null,
+            errors: [
+              `[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=${reason}`,
+            ],
+          }),
+        );
+        await vi.waitFor(() => expect(client.states().at(-1)).toBe("idle"));
+        expect(client.sessionUpdates.at(-1)).toMatchObject({ state: "idle", stopReason: expected });
+        if (expected === "cancelled")
+          expect(client.sessionUpdates.at(-1)).not.toHaveProperty("error");
+
+        const followup = agent.request(v2.methods.agent.session.prompt, {
+          sessionId,
+          prompt: PROMPT,
+        });
+        claude.send(echo(await claude.prompt(1)));
+        await followup;
+        claude.send(result());
+        await vi.waitFor(() =>
+          expect(client.sessionUpdates.at(-1)).toMatchObject({
+            state: "idle",
+            stopReason: "end_turn",
+          }),
+        );
+      });
+    },
+  );
+
   it("ends a turn cancelled when a cancel comes while an approved plan waits for its fresh context", async () => {
     const client = v2Client({
       answerPermission: () => ({
@@ -2108,6 +2416,57 @@ describe("ACP v2 core", () => {
     expect(client.states()).toEqual(["running", "requires_action", "running", "idle"]);
     // No plan's prompt went out after the cancel.
     expect(sdk.processes[0].prompts).toHaveLength(2);
+  });
+
+  it("starts no Remote Control with a query that Claude Code is already working in", async () => {
+    sdk.remoteControlAtStartup = true;
+    const enableRemoteControl = vi.fn(async () => ({
+      session_url: "https://claude.ai/code/session_123",
+    }));
+    sdk.enableRemoteControl = enableRemoteControl;
+    const started = Promise.withResolvers<void>();
+    sdk.startGate = started.promise;
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      await agent.request(v2.methods.agent.initialize, {
+        protocolVersion: v2.PROTOCOL_VERSION,
+        info: { name: "v2-test-client", version: "1.0.0" },
+        capabilities: {},
+      });
+      const created = agent.request(v2.methods.agent.session.new, { cwd });
+      await vi.waitFor(() => expect(sdk.processes).toHaveLength(1));
+      // Claude Code starts a cycle of its own before the setup answers.
+      sdk.processes[0].send(cycleStart());
+      started.resolve();
+      await created;
+      await vi.waitFor(() => expect(client.states()).toEqual(["running"]));
+      // Past the timer of the setup response, which runs the connect.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      sdk.processes[0].send(result());
+      await vi.waitFor(() => expect(client.states().at(-1)).toBe("idle"));
+    });
+
+    expect(enableRemoteControl).not.toHaveBeenCalled();
+    expect(client.sessionUpdates.filter((update) => update.sessionUpdate === "notice")).toEqual([]);
+  });
+
+  it("starts Remote Control once per query, so a resume of the live session starts nothing", async () => {
+    sdk.remoteControlAtStartup = true;
+    const enableRemoteControl = vi.fn(async () => ({
+      session_url: "https://claude.ai/code/session_123",
+    }));
+    sdk.enableRemoteControl = enableRemoteControl;
+    const client = v2Client();
+    await client.connect(async (agent) => {
+      const { response } = await openSession(agent);
+      await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalledOnce());
+      await agent.request(v2.methods.agent.session.resume, { sessionId: response.sessionId, cwd });
+      // Past the timer of the resume's setup response.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+
+    expect(sdk.processes).toHaveLength(1);
+    expect(enableRemoteControl).toHaveBeenCalledExactlyOnceWith(true);
   });
 
   it("continues an approved plan in its fresh context while a /remote-control waits for the turn", async () => {
@@ -2429,6 +2788,58 @@ describe("ACP v2 core", () => {
           supportedEffortLevels: ["low", "medium"],
         },
       ];
+    });
+
+    it("names each model's efforts in every answer to an AIR client, without a capability", async () => {
+      sdk.models = [
+        { ...sdk.models[0], resolvedModel: "claude-opus-5" },
+        { ...sdk.models[0], value: "opus", displayName: "Opus", resolvedModel: "claude-opus-5" },
+        sdk.models[1],
+        { value: "sonnet", displayName: "Sonnet", description: "Balanced", supportsEffort: false },
+      ];
+      const efforts = (values: string[]) => ({
+        jetbrains: { air: { version: 1, reasoningEfforts: { values, recommended: "medium" } } },
+      });
+      const expected = {
+        default: efforts(["low", "medium", "high"]),
+        opus: efforts(["low", "medium", "high"]),
+        haiku: efforts(["low", "medium"]),
+        sonnet: undefined,
+      };
+      const entryMetas = (options: v2.SessionConfigOption[] | undefined) => {
+        const model = options?.find((option) => option.configId === "model") as
+          { options: Array<{ value: string; _meta?: unknown }> } | undefined;
+        return Object.fromEntries(
+          (model?.options ?? []).map((entry) => [entry.value, entry._meta]),
+        );
+      };
+      const client = v2Client();
+      const answers = await client.connect(async (agent) => {
+        await agent.request(v2.methods.agent.initialize, {
+          protocolVersion: v2.PROTOCOL_VERSION,
+          info: { name: "v2-test-client", version: "1.0.0" },
+          capabilities: { _meta: { jetbrains: { air: { version: 1, capabilities: [] } } } },
+        });
+        const created = await agent.request(v2.methods.agent.session.new, { cwd });
+        const set = await agent.request(v2.methods.agent.session.setConfigOption, {
+          sessionId: created.sessionId,
+          configId: "model",
+          type: "id",
+          value: "haiku",
+        });
+        const resumed = await agent.request(v2.methods.agent.session.resume, {
+          sessionId: STORED,
+          cwd,
+        });
+        const fork = await agent.request(v2.methods.agent.session.fork, { sessionId: STORED, cwd });
+        return [created, set, resumed, fork].map((answer) => answer.configOptions);
+      });
+
+      for (const options of answers) expect(entryMetas(options)).toEqual(expected);
+      const update = client.sessionUpdates.find(
+        (candidate) => candidate.sessionUpdate === "config_option_update",
+      ) as { configOptions: v2.SessionConfigOption[] } | undefined;
+      expect(entryMetas(update?.configOptions)).toEqual(expected);
     });
 
     it("answers session/options with what session/new returns, from a query that it closes", async () => {
@@ -2849,6 +3260,97 @@ describe("ACP v2 core", () => {
         "cursor_update",
       ]);
       expect(replayed.at(-1)).toEqual(cursorOf("u2"));
+    });
+
+    describe("after a rewind", () => {
+      /** `u2` was rewound: it stays in the transcript as the dropped branch. */
+      async function rewound(sessionId: string) {
+        const directory = path.join(tempDir, "claude", "projects", "project");
+        await writeTranscript(directory, sessionId, [
+          transcriptUser("u1", "Build it"),
+          transcriptAssistant("a1", "Built."),
+          transcriptUser("u2", "Test it"),
+        ]);
+        await writeRewindPoint(sessionId, { resumeSessionAt: "a1", droppedPromptUuid: "u2" });
+        return {
+          transcript: path.join(directory, `${sessionId}.jsonl`),
+          point: path.join(directory, sessionId, "rewind.json"),
+        };
+      }
+
+      it("resumes at the rewind point, and replays the history before it with its cursors only", async () => {
+        const sessionId = randomUUID();
+        await rewound(sessionId);
+        vi.mocked(getSessionMessages).mockResolvedValueOnce(twoTurns);
+        const client = v2Client();
+        await client.connect(async (agent) => {
+          await agent.request(v2.methods.agent.initialize, {
+            protocolVersion: v2.PROTOCOL_VERSION,
+            info: { name: "v2-test-client", version: "1.0.0" },
+            capabilities: {},
+          });
+          await agent.request(v2.methods.agent.session.resume, {
+            sessionId,
+            cwd,
+            replayFrom: { type: "start" },
+          });
+        });
+
+        expect(sdk.processes.at(-1)!.options).toMatchObject({
+          resume: sessionId,
+          resumeSessionAt: "a1",
+        });
+        const replayed = client.sessionUpdates.slice(
+          0,
+          client.sessionUpdates.findIndex((update) => update.sessionUpdate === "replay_complete"),
+        );
+        expect(
+          replayed.flatMap((update) =>
+            update.sessionUpdate === "user_message" ? [update.messageId] : [],
+          ),
+        ).toEqual(["u1"]);
+        expect(replayed.map((update) => update.sessionUpdate)).not.toContain("cursor_update");
+      });
+
+      it("rejects a fork at a cursor of the dropped turn", async () => {
+        const client = v2Client();
+        await client.connect(async (agent) => {
+          const { response } = await openSession(agent);
+          const { sessionId } = response;
+          await rewound(sessionId);
+          vi.mocked(getSessionMessages).mockResolvedValueOnce(twoTurns);
+          await expect(
+            agent.request(v2.methods.agent.session.fork, {
+              sessionId,
+              cwd,
+              cursorId: "before:u2",
+            }),
+          ).rejects.toMatchObject({ code: -32602, data: { cursorId: "before:u2" } });
+          expect(forkSession).not.toHaveBeenCalled();
+        });
+      });
+
+      it("is neither read nor changed by a session/options probe", async () => {
+        const sessionId = randomUUID();
+        const files = await rewound(sessionId);
+        const before = await Promise.all([readFile(files.transcript), readFile(files.point)]);
+        const client = v2Client();
+        await client.connect(async (agent) => {
+          await agent.request(v2.methods.agent.initialize, {
+            protocolVersion: v2.PROTOCOL_VERSION,
+            info: { name: "v2-test-client", version: "1.0.0" },
+            capabilities: {},
+          });
+          await agent.request(v2.methods.agent.session.options, { sessionId, cwd });
+        });
+
+        const probe = sdk.processes.at(-1)!;
+        expect(probe.options).toMatchObject({ resume: sessionId, persistSession: false });
+        expect(probe.options.resumeSessionAt).toBeUndefined();
+        expect(await Promise.all([readFile(files.transcript), readFile(files.point)])).toEqual(
+          before,
+        );
+      });
     });
 
     it.each([
@@ -6089,6 +6591,7 @@ describe("v2ElicitationRequest", () => {
       mode: "form" as const,
       sessionId: "s1",
       message: "Which release?",
+      _meta: { jetbrains: { air: { version: 1, existing: true } } },
       requestedSchema: {
         type: "object" as const,
         required: ["tag"],
@@ -6097,6 +6600,13 @@ describe("v2ElicitationRequest", () => {
           // A property that is named `pattern` is no keyword.
           pattern: { type: "string" as const, enum: ["a", "b"] },
           count: { type: "integer" as const, minimum: 1 },
+          note: {
+            type: "string" as const,
+            _meta: {
+              _askUserQuestionCustomAnswer: { questionId: "pattern", isCustomAnswer: true },
+              jetbrains: { air: { customAnswer: true } },
+            },
+          },
         },
       },
     };

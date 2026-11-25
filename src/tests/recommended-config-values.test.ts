@@ -7,6 +7,7 @@ import {
   orderedConfigOptions,
 } from "../session-config-options.js";
 import { AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY } from "../air-extension.js";
+import { recommendedEffortLevel } from "../session-effort.js";
 
 const MODES = {
   currentModeId: "default",
@@ -282,6 +283,215 @@ describe("buildConfigOptions recommended values presentation", () => {
       currentValue: "high",
       _meta: recommendedMeta("high"),
     });
+  });
+});
+
+describe("model reasoning efforts", () => {
+  const AIR_RECOMMENDED = { useRecommendedValue: true, airClient: true };
+  const EFFORTS_PRESENTATION = { useRecommendedValue: false, airClient: true };
+
+  function effortsMeta(values: string[], recommended: string) {
+    return { jetbrains: { air: { version: 1, reasoningEfforts: { values, recommended } } } };
+  }
+
+  function entries(options: ReturnType<typeof buildConfigOptions>) {
+    return selectOption(options, "model").options as Array<{
+      value: string;
+      _meta?: Record<string, unknown>;
+    }>;
+  }
+
+  function entry(options: ReturnType<typeof buildConfigOptions>, value: string) {
+    return entries(options).find((candidate) => candidate.value === value);
+  }
+
+  it("recommends medium when offered, else the first level", () => {
+    expect(recommendedEffortLevel(["low", "medium", "high"])).toBe("medium");
+    expect(recommendedEffortLevel(["high", "max"])).toBe("high");
+    expect(recommendedEffortLevel([])).toBeUndefined();
+  });
+
+  it("names each model's levels in SDK order with the recommended one", () => {
+    const infos = MODEL_INFOS.map((model) =>
+      model.value === "opus"
+        ? {
+            ...model,
+            supportedEffortLevels: [
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max",
+            ] as ModelInfo["supportedEffortLevels"],
+          }
+        : model.value === "sonnet"
+          ? {
+              ...model,
+              supportedEffortLevels: ["high", "max"] as ModelInfo["supportedEffortLevels"],
+            }
+          : model,
+    );
+    const options = buildConfigOptions(
+      MODES,
+      MODELS,
+      infos,
+      undefined,
+      [],
+      "default",
+      undefined,
+      EFFORTS_PRESENTATION,
+    );
+    expect(entry(options, "opus")?._meta).toEqual(
+      effortsMeta(["low", "medium", "high", "xhigh", "max"], "medium"),
+    );
+    expect(entry(options, "sonnet")?._meta).toEqual(effortsMeta(["high", "max"], "high"));
+  });
+
+  it("gives a model without effort support no metadata", () => {
+    const options = buildConfigOptions(
+      MODES,
+      MODELS,
+      [
+        ...MODEL_INFOS.filter((model) => model.value !== "opus"),
+        { ...MODEL_INFOS[1], supportsEffort: false },
+      ],
+      undefined,
+      [],
+      "default",
+      undefined,
+      EFFORTS_PRESENTATION,
+    );
+    expect(entry(options, "haiku")).not.toHaveProperty("_meta");
+    expect(entry(options, "opus")).not.toHaveProperty("_meta");
+  });
+
+  it("gives the default row the efforts of the model it resolves to", () => {
+    const options = buildConfigOptions(
+      MODES,
+      MODELS,
+      MODEL_INFOS,
+      undefined,
+      [],
+      "default",
+      undefined,
+      EFFORTS_PRESENTATION,
+    );
+    expect(entry(options, "default")?._meta).toEqual(
+      effortsMeta(["low", "medium", "high"], "medium"),
+    );
+    // The effort option's levels have a `default` row; the entry has none.
+    const effort = selectOption(options, "effort");
+    expect(effort.options).toEqual(
+      expect.arrayContaining([expect.objectContaining({ value: "default" })]),
+    );
+  });
+
+  it("gives the default row no metadata when it resolves to no listed model", () => {
+    const options = buildConfigOptions(
+      MODES,
+      MODELS,
+      MODEL_INFOS.map((model) =>
+        model.value === "default" ? { ...model, resolvedModel: "claude-sonnet-9" } : model,
+      ),
+      undefined,
+      [],
+      "default",
+      undefined,
+      EFFORTS_PRESENTATION,
+    );
+    expect(entry(options, "default")).not.toHaveProperty("_meta");
+    expect(entry(options, "opus")?._meta).toEqual(effortsMeta(["low", "medium", "high"], "medium"));
+  });
+
+  it("gives a running model that the picker does not list its efforts", () => {
+    const options = buildConfigOptions(
+      MODES,
+      {
+        currentModelId: "opus",
+        availableModels: MODELS.availableModels.filter((model) => model.modelId !== "opus"),
+      },
+      MODEL_INFOS,
+      undefined,
+      [],
+      "default",
+      undefined,
+      EFFORTS_PRESENTATION,
+    );
+    expect(entry(options, "opus")?._meta).toEqual(effortsMeta(["low", "medium", "high"], "medium"));
+  });
+
+  it("matches the effort option's recommendation for the current model", () => {
+    const infos = MODEL_INFOS.map((model) =>
+      model.value === "opus"
+        ? { ...model, supportedEffortLevels: ["high", "max"] as ModelInfo["supportedEffortLevels"] }
+        : model,
+    );
+    for (const currentModelId of ["opus", "sonnet"]) {
+      const options = buildConfigOptions(
+        MODES,
+        { ...MODELS, currentModelId },
+        infos,
+        undefined,
+        [],
+        "default",
+        undefined,
+        AIR_RECOMMENDED,
+      );
+      const recommended = (
+        entry(options, currentModelId)?._meta as {
+          jetbrains: { air: { reasoningEfforts: { recommended: string } } };
+        }
+      ).jetbrains.air.reasoningEfforts.recommended;
+      expect(selectOption(options, "effort")._meta).toEqual(recommendedMeta(recommended));
+    }
+  });
+
+  it("keeps both recommendations next to each other", () => {
+    const options = buildConfigOptions(
+      MODES,
+      MODELS,
+      MODEL_INFOS,
+      undefined,
+      [],
+      "default",
+      undefined,
+      AIR_RECOMMENDED,
+    );
+    const model = selectOption(options, "model");
+    expect(model._meta).toEqual(recommendedMeta("sonnet"));
+    expect(entries(options).map((candidate) => candidate.value)).toEqual([
+      "opus",
+      "sonnet",
+      "haiku",
+    ]);
+    expect(entry(options, "sonnet")?._meta).toEqual(
+      effortsMeta(["low", "medium", "high"], "medium"),
+    );
+  });
+
+  it.each([
+    ["with recommendedValue", AIR_RECOMMENDED, true],
+    ["for a client that is not AIR", undefined, false],
+    ["for a client that is not AIR, with recommendedValue", RECOMMENDED_PRESENTATION, false],
+  ])("names the efforts only for an AIR client, %s", (_name, presentation, airClient) => {
+    const options = buildConfigOptions(
+      MODES,
+      MODELS,
+      MODEL_INFOS,
+      undefined,
+      [],
+      "default",
+      undefined,
+      presentation,
+    );
+    if (airClient) {
+      expect(entry(options, "opus")?._meta).toEqual(
+        effortsMeta(["low", "medium", "high"], "medium"),
+      );
+    } else {
+      for (const candidate of entries(options)) expect(candidate).not.toHaveProperty("_meta");
+    }
+    expect(entry(options, "haiku")).not.toHaveProperty("_meta");
   });
 });
 

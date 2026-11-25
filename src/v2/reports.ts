@@ -40,7 +40,7 @@ import type { UnservedMcpServer } from "../mcp-servers.js";
 import { PromptSuggestions, type PromptSuggestionForms } from "../prompt-suggestions.js";
 import {
   informationalNotice,
-  mcpServerStartupNotice,
+  mcpServerStartupNotices,
   normalizeNoticeText,
   noticeUpdate,
   splitNoticeText,
@@ -606,20 +606,18 @@ export class SessionReports {
   }
 
   /**
-   * A notice for each client MCP server that did not start, once per server:
-   * the ones that `servers`, the list of `system/init`, has as not started,
-   * and the ones the query started without.
+   * The notices of the client MCP servers that did not start, once per server
+   * (see `mcpServerStartupNotices`): the ones that `servers`, the list of
+   * `system/init`, has as not started, and the ones the query started without.
    */
   private mcpStartupFailures(servers: Array<{ name: string; status: string }> | undefined): void {
     const notStarted = [
       ...this.unservedMcpServers,
       ...(servers ?? []).filter((server) => this.clientMcpServers.has(server.name)),
     ];
-    for (const server of notStarted) {
-      if (this.reportedMcpServers.has(server.name)) continue;
-      const notice = mcpServerStartupNotice(server, this.mcpOAuth);
-      if (!notice) continue;
-      this.reportedMcpServers.add(server.name);
+    const unreported = notStarted.filter((server) => !this.reportedMcpServers.has(server.name));
+    for (const { servers, notice } of mcpServerStartupNotices(unreported, this.mcpOAuth)) {
+      for (const name of servers) this.reportedMcpServers.add(name);
       this.host.emit([{ sessionId: this.host.sessionId, update: noticeUpdate(notice) }]);
     }
   }

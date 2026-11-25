@@ -314,6 +314,37 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("v2 core with Claude Code", 
     }
   }, 180_000);
 
+  it("starts a session without the MCP servers that managed settings keep out, and says so", async () => {
+    const { sessionId } = await agent.request(v2.methods.agent.session.new, {
+      cwd,
+      mcpServers: [
+        { type: "stdio", name: "files", command: "/bin/cat", args: [], env: [] },
+        { type: "stdio", name: "search", command: "/bin/cat", args: [], env: [] },
+      ],
+      _meta: {
+        claudeCode: {
+          // As an administrator's managed settings: Claude Code refuses a start with MCP servers.
+          options: { model: "haiku", managedSettings: { disableSideloadFlags: true } },
+        },
+      },
+    });
+    await prompt(sessionId, "Reply with exactly the single word: pong");
+    await until(() => states(sessionId).some((update) => update.state === "idle"));
+
+    const notices = updates.flatMap(({ update }) =>
+      update.sessionUpdate === "notice" ? [update] : [],
+    );
+    expect(notices).toEqual([
+      {
+        sessionUpdate: "notice",
+        severity: "warning",
+        title: "2 MCP servers failed to start",
+        description: expect.stringContaining('"files" and "search"'),
+      },
+    ]);
+    expect(states(sessionId).at(-1)).toMatchObject({ state: "idle", stopReason: "end_turn" });
+  }, 180_000);
+
   it("reports requires_action while a permission request waits", async () => {
     const sessionId = await newSession("default");
     await prompt(
@@ -437,20 +468,38 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("v2 core with Claude Code", 
     const sessionId = await newSession("bypassPermissions");
     await prompt(
       sessionId,
-      "Use the Bash tool in the foreground (not run_in_background) to run exactly: ping -c 30 127.0.0.1 > /dev/null . Then reply with just: woke",
+      `Use the Bash tool in the foreground (not run_in_background) to run exactly: printf "cancel-ready\\n"; sleep 30. Then reply with just: woke`,
     );
+    // Wait for the command's stdout, so it is running when the prompt is queued.
+    // Output that is not UTF-8 arrives as a `terminal_update` snapshot, not a chunk.
     await until(() =>
-      updates.some(
-        ({ update }) =>
-          update.sessionUpdate === "terminal_update" &&
-          /ping/.test((update as v2.TerminalUpdate).command ?? ""),
-      ),
+      updates.some(({ sessionId: id, update }) => {
+        if (id !== sessionId) return false;
+        const data =
+          update.sessionUpdate === "terminal_output_chunk"
+            ? (update as v2.TerminalOutputChunk).data
+            : update.sessionUpdate === "terminal_update"
+              ? (update as v2.TerminalUpdate).output?.data
+              : undefined;
+        return (
+          data !== undefined && Buffer.from(data, "base64").toString().includes("cancel-ready")
+        );
+      }),
     );
-    // Claude Code takes in a prompt sent while it works only at its next
-    // step, so this one is still queued at the cancel.
-    // It answers when Claude Code starts it, so the cancel fails it instead.
+    // Claude Code takes in a prompt sent while it works only at its next step,
+    // here the end of the Bash call, so this one is still queued at the cancel.
+    // It answers when Claude Code starts it, so the cancel fails it with -32800.
     const queued = prompt(sessionId, "Reply with just: queued");
     await new Promise((resolve) => setTimeout(resolve, 500));
+    // The tool result also sends the output as a snapshot, just before the exit.
+    expect(
+      updates.some(
+        ({ sessionId: id, update }) =>
+          id === sessionId &&
+          update.sessionUpdate === "terminal_update" &&
+          (update as v2.TerminalUpdate).exitStatus,
+      ),
+    ).toBe(false);
     await agent.notify(v2.methods.agent.session.cancel, { sessionId });
     await expect(queued).rejects.toMatchObject({ code: -32800 });
     await until(() => states(sessionId).some((update) => update.state === "idle"));

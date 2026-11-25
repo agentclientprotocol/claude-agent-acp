@@ -22,6 +22,7 @@ It describes only this adapter.
 - [Goal](#goal)
 - [Predicted follow-up prompt](#predicted-follow-up-prompt)
 - [Recommended config values](#recommended-config-values)
+- [Model reasoning efforts](#model-reasoning-efforts)
 - [Async tasks](#async-tasks)
 - [Agent file-change report](#agent-file-change-report)
 - [Session failure](#session-failure)
@@ -32,6 +33,7 @@ It describes only this adapter.
 - [Question custom answers](#question-custom-answers)
 - [Load replay end](#load-replay-end)
 - [Session fork point](#session-fork-point)
+- [Session rewind](#session-rewind)
 - [Presentation hints](#presentation-hints)
 - [Removed keys](#removed-keys)
 
@@ -147,6 +149,12 @@ The response to a client that is not AIR has no `_meta.jetbrains` key.
 
 ### ACP v2
 
+A busy `session/prompt` steers the current turn on ACP v2.
+It waits while a root or child permission request or elicitation is open.
+The adapter does not advertise `claudeCode.promptQueueing` on v2.
+On ACP v1, an ordinary `session/prompt` queues behind the current turn.
+The separate `_session/steering` request steers that turn.
+
 The v2 core (`src/v2/`) serves an AIR client only the extensions that ACP v2 does not cover.
 Its `initialize` response lists `agentFileChangeReport` and `recommendedValue`.
 It also serves the [permission presentation](#permission-presentation), the [question custom answers](#question-custom-answers), the [predicted follow-up prompt](#predicted-follow-up-prompt), and [load replay end](#load-replay-end).
@@ -172,6 +180,7 @@ It does not serve the [tool call contract](#tool-call-contract) yet.
 | `sessionRename`          | with `sessionIndex` | Nothing on its own: the agent lists it to tell that it supports `_session/rename`.                              | [Rename](#rename)                                       |
 | `sessionListSubscribe`   | with `sessionIndex` | Nothing on its own: the agent lists it to tell that it supports `_session/list/subscribe`.                      | [List subscription](#list-subscription)                 |
 | `sessionWorktrees`       | with `sessionIndex` | Nothing on its own: the agent lists it to tell that rows carry `agentWorktree` for a worktree Claude Code made. | [List response](#list-response)                         |
+| `sessionRewind`          | on request          | Accepts `_session/rewind`, and announces its session cursors with the `rewind` capability.                      | [Session rewind](#session-rewind)                       |
 | `loadReplayEnd`          | no                  | Sends one `session_info_update` after the whole history replay of a loaded session.                             | [Load replay end](#load-replay-end)                     |
 | `rawInputRendering`      | no                  | Sends no display copy of readable input in `content`. The client renders `rawInput`.                            | [Tool call contract](#tool-call-contract)               |
 
@@ -195,6 +204,7 @@ The adapter sends these keys only to an AIR client. "AIR" in the Gate column mea
 | `diffPatch`                    | tool call and permission request `content[]` of type `diff`, `_meta.jetbrains.air`    | `{version: 1, format: "git_patch", text}`                              | `diffPatch`                                                                            |
 | `permission`                   | `session/request_permission` request `_meta.jetbrains.air`                            | `{version: 1, title, description?, defaultToNo?}`                      | AIR                                                                                    |
 | `recommendedValue`             | `model` and effort config options, `_meta.jetbrains.air`                              | option value string                                                    | `recommendedValue`                                                                     |
+| `reasoningEfforts`             | entry of the `model` config option, `_meta.jetbrains.air`                             | `{values: string[], recommended: string}`                              | AIR                                                                                    |
 | `asyncTasks`                   | Bash `tool_call_update._meta.jetbrains.air`                                           | `{backgrounded: true}`                                                 | `asyncTasks`                                                                           |
 | `agentFileChangeReportRequest` | `session/prompt` request `_meta.jetbrains.air` (client to agent)                      | `{version: 1, requestId}`                                              | `agentFileChangeReport`                                                                |
 | `agentFileChangeReport`        | `session_info_update._meta.jetbrains.air`                                             | report object                                                          | `agentFileChangeReport`                                                                |
@@ -205,6 +215,7 @@ The adapter sends these keys only to an AIR client. "AIR" in the Gate column mea
 | `mcp`                          | MCP tool call `_meta.jetbrains.air`                                                   | `{server, tool}`                                                       | AIR                                                                                    |
 | `contextCompaction`            | compaction tool call or `compaction_update`, `_meta.jetbrains.air`                    | `{version: 1, trigger?, preTokens?, postTokens?, durationMs?, error?}` | AIR                                                                                    |
 | `customAnswer`                 | elicitation schema property `_meta.jetbrains.air`                                     | `{questionId, isCustomAnswer: true}`                                   | AIR, when the client supports form elicitation                                         |
+| `customAnswerFields`           | elicitation request `_meta.jetbrains.air`                                             | companion field keys                                                   | AIR, when the client supports form elicitation                                         |
 | `kind`                         | session mode `_meta.jetbrains.air` and mode config option value `_meta.jetbrains.air` | `standard`, `plan`, `auto_review`, or `full_access`                    | AIR                                                                                    |
 | `kind`                         | available command `_meta.jetbrains.air` of a skill                                    | `skill`                                                                | AIR, when the skill's `SKILL.md` is found; not for a built-in command or an MCP prompt |
 | `skillPath`                    | available command `_meta.jetbrains.air` of a skill                                    | absolute path of the skill's `SKILL.md`                                | AIR, together with `kind: "skill"`                                                     |
@@ -984,6 +995,58 @@ RUN_INTEGRATION_TESTS=true npx vitest run src/tests/model-presentation.test.ts
 Review the changes to the Opus entries and labels before you update the version guard.
 The live test only initializes the SDK. It sends no model prompt.
 
+## Model reasoning efforts
+
+The `reasoningEfforts` key lets a client show the effort levels of a model before the client selects that model.
+The effort option shows only the levels of the current model.
+
+### Activation
+
+The adapter sends the key to every AIR client.
+The key has no capability, because it only adds data.
+A client that is not AIR gets no `reasoningEfforts`.
+The key does not depend on `recommendedValue`.
+
+### Entry metadata
+
+Each entry of the `model` option gets the levels of its model at `_meta.jetbrains.air.reasoningEfforts`:
+
+```json
+{
+  "value": "claude-opus-5-5",
+  "name": "Opus 5.5",
+  "_meta": {
+    "jetbrains": {
+      "air": {
+        "version": 1,
+        "reasoningEfforts": {
+          "values": ["low", "medium", "high", "xhigh", "max"],
+          "recommended": "medium"
+        }
+      }
+    }
+  }
+}
+```
+
+`values` are the `supportedEffortLevels` of the SDK `ModelInfo` of the entry, in the SDK order.
+The effort option lists the same levels in the same order.
+`values` never contain the `default` row of the effort option.
+
+`recommended` is `medium` when the model offers it, else the first level.
+The SDK names no recommended effort, so the adapter uses the rule of the effort option.
+For the current model, `recommended` is the `recommendedValue` of the effort option.
+
+The adapter finds the `ModelInfo` of an entry by its value.
+The `default` entry gets the levels of the listed model that its `resolvedModel` names.
+When no listed model has that `resolvedModel`, the `default` entry gets no `reasoningEfforts`.
+A running model that the picker does not list gets its own entry, with the same lookup.
+A model without effort support, or with no levels, gets no `reasoningEfforts`.
+
+The entries carry the metadata in each answer that carries config options, on ACP v1 and v2.
+These are `session/new`, `session/load` on v1, `session/resume`, `session/fork`, `session/set_config_option`, and `config_option_update`.
+The `model` option of a subagent's session has no `reasoningEfforts`.
+
 ## Async tasks
 
 Claude can run work in the background, for example a backgrounded Bash command or a workflow.
@@ -1755,6 +1818,18 @@ For AIR, the companion field also carries the same value under the root key `_me
 Released AIR versions read only that key.
 A client that is not AIR gets neither key.
 
+For AIR on both protocol versions, the request also lists the companion field keys in `_meta.jetbrains.air.customAnswerFields`:
+
+```json
+{ "jetbrains": { "air": { "version": 1, "customAnswerFields": ["question_0_custom"] } } }
+```
+
+The Kotlin ACP SDK property models do not retain `_meta`.
+The TypeScript v2 schema supports property metadata.
+AIR reads the request list to show the companion with its question.
+The field keys and the response content stay the same in both versions.
+A client that is not AIR gets no `customAnswerFields` key.
+
 ## Load replay end
 
 ACP v1 has no signal that the history replay of `session/load` is over, other than the response.
@@ -1816,6 +1891,48 @@ It adds this object to the `session/fork` request:
 - The fork keeps the history up to that message.
 - With or without this object, the forked session runs once the response arrives, so the client can prompt it without `session/load` or `session/resume`.
   A later load replays its history into it, and a later resume returns it. A load or resume with other settings (`cwd`, MCP servers, additional directories, or the session options in `_meta`) restarts it, as for any loaded session.
+
+## Session rewind
+
+AIR edits a user message by removing that message and everything after it from the provider's context, in the same session: same session id, no fork.
+`_session/rewind` asks the agent for that, at a session cursor:
+
+```json
+{ "sessionId": "0f7c…", "cursorId": "before:<uuid of the user message>" }
+```
+
+The response is `{ "rewound": true }`, which means that the cut is live and persisted, or `{ "rewound": false, "reason": "<reason>" }` when the conversation was left as it was.
+The client keeps its own history then.
+
+- ACP v1 only. The agent advertises `sessionRewind` to a client that declares it, and then announces each `cursor_update` with the capabilities `{ "fork": {}, "rewind": {} }`, except a cursor whose resume point is before the newest compaction (`beforeCompaction`) and every cursor of a session whose context was cleared (`clearedContext`): those get `{ "fork": {} }`. Every other client gets `{ "fork": {} }` on all cursors, and the method is not found (`-32601`) for it. ACP v2 does not list `sessionRewind` and has no `_session/rewind`; it only honours a cut that v1 made.
+- `cursorId` is one that the session announced with `rewind`: the cursor before a user message of its history. The first user message has no cursor, since Claude Code has no entry before it to resume at, so a client offers no edit for it.
+- The adapter resumes the stored conversation of the session at the entry before the cursor's message (`resumeSessionAt`). The agent replaces its query with that resume and restores the model, mode, effort, agent and Fast mode as the user left them. Claude Code deletes nothing: the dropped entries stay in the transcript as an orphan branch, and the agent records the cut in `rewind.json` beside the session's `subagents/` directory before it replaces the query, and puts the file back as it was when the cut does not happen (`busy`, `backgroundWork` or `providerRefused` after the file was written). When putting it back fails, the request fails with an internal error instead of `rewound: false`: the rewind did not happen and its point could not be removed, so the next load of the session applies the cut. A failed cut then still resumes the conversation first, so the session can be prompted. A crash between the two leaves the point on disk: the next resume of the session applies the cut, and the client's next load replays the cut history.
+- A live prompt is not reported to the client that sent it, so its cursor is anchored `after` the last entity the client holds. After a rewind it is the entity the client held before the removed message; if the agent holds no such record, the next prompt gets no cursor. When a turn reports no entity (it was cancelled or failed before any output, or it was a slash command), the next prompt's cursor has the same `after <entity>` anchor as the previous prompt's cursor, with a different `cursorId`: the client uses the latest.
+- The cut also removes the cursors at and after it: the session no longer announces them, and a request that names one fails as an unknown cursor.
+- The cut holds until the next prompt stores a branch from it. Until then, the agent applies `rewind.json` wherever it reads or resumes the session: a `session/load` (v1) or `session/resume` with a replay (v2) replays the history before the cut, with its cursors only; a restart of the query, a later load or resume, and a v2 resume continue at the cut; `session/fork` copies the history before it, also without a `cursorId`, and rejects a `cursorId` or `jetbrains.air.fork` message from the removed part with `-32602`. The first resume after that prompt removes the file. `session/options` neither reads nor writes it. When the cut cannot be prepared (the stored history or `rewind.json` cannot be read, or `rewind.json` is not a valid record), the load, resume, replay or fork fails with an internal error instead of using the whole conversation, and the client can retry; the point stays on disk.
+- A rewind keeps the task list and the published session failures of the session. Its token totals start again, as they do after any restart of the query.
+- No file change is reverted. The files stay as the removed turns left them.
+- A prompt sent while the rewind runs waits for it, and runs on the rewound conversation.
+
+| `reason`           | When                                                                                                                                                                                        |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `busy`             | Claude is working, a prompt is queued, Claude Code runs a cycle on its own, or a `/remote-control` command is in flight. AIR stops the turn before it sends the request.                    |
+| `backgroundWork`   | A background task or subagent runs. Closing the query would end it.                                                                                                                         |
+| `beforeCompaction` | The message is before the newest compaction of the conversation: Claude Code resumes from that compaction on and finds no entry before it.                                                  |
+| `clearedContext`   | The session's context was cleared when a plan was accepted: the conversation went on in another Claude Code session.                                                                        |
+| `providerRefused`  | Claude Code refused the cut, or the query could not restart with it. The agent resumed the conversation as it was, once, and the session can be prompted.                                   |
+| `persistFailed`    | `rewind.json` could not be written. The conversation and the rewind point are unchanged: the query was not replaced. The transcript can gain the `last-prompt` line that any resume writes. |
+
+When the removed message is the last user message, Claude Code also checks the removed range and refuses a cut that would remove what the client never saw, such as a message the session absorbed mid-turn.
+The refusal is deterministic, so the agent never retries it.
+If the recovery resume fails too, the request fails with an internal error, the session ends, and the client loads it again. When it fails because the account needs a sign-in, the request fails with `authRequired` and the session stays: the next prompt after the sign-in resumes it.
+
+The request fails with `-32602` for:
+
+- a `cursorId` that the session's history does not hold: an unknown id, an id that is no cursor, the first message, a message before the newest compaction when the history before it cannot be read (the fallback in `src/resumed-session.ts`), or one that an earlier rewind removed;
+- a session id that names a subagent's child session.
+
+A `sessionId` that is not held by the agent fails with `-32002`.
 
 ## Presentation hints
 

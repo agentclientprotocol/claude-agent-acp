@@ -16,7 +16,7 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 - Nested subagent transcripts
 - Interactive (and background) terminals
 - Custom [Slash commands](https://docs.anthropic.com/en/docs/claude-code/slash-commands)
-- Client MCP servers, including the ones that the client serves over the ACP connection ([MCP-over-ACP](https://agentclientprotocol.com/rfds/mcp-over-acp), `"type": "acp"`)
+- Client MCP servers, including the ones that the client serves over the ACP connection ([MCP-over-ACP](https://agentclientprotocol.com/rfds/mcp-over-acp), `"type": "acp"`). Where an organization's managed settings (`disableSideloadFlags`) keep them out, a session starts without them and says so in a notice
 - An Ultracode session config option, which turns on Claude Code's dynamic workflows for every task. It appears when dynamic workflows are enabled and the model supports ultracode (any model with `xhigh` effort)
 - `/mcp` in the chat: the MCP server status as a list. The adapter runs `/mcp reconnect`, `/mcp enable`, and `/mcp disable` through the SDK control API, because Claude Code refuses them in SDK mode. A reconnect of an ACP server that needs authentication starts MCP OAuth through URL elicitation
 - Prompt suggestions: the prompt that Claude Code predicts the user sends next, as ACP's unstable `prompt_suggestions_update`, for a client that advertises `session.promptSuggestions`
@@ -87,7 +87,14 @@ local command, keeps its key until `session/close` or the end of the connection.
 The adapter announces a session cursor (`cursor_update`) before each user message that follows
 another entry of the conversation, live and in a replay. `session/fork` with its `cursorId` copies
 the history before that message, and fails with `-32602` for any other `cursorId`. A v1 client gets
-no cursors yet.
+cursors only when it declares `clientCapabilities.session.cursors`. A v1 replay (`session/load`)
+anchors each cursor `before` its replayed user message. A live v1 prompt is not reported to the
+client that sent it, so its cursor is anchored `after` the last agent message, thought, tool call or
+compaction before it, with the same `cursorId` that a later replay issues. A session that was
+resumed without a replay has no such entity, so its live prompts get no cursor until it replays.
+When a v1 turn reports no entity (it was cancelled or failed before any output, or it was a slash
+command), the next prompt's cursor has the same `after <entity>` anchor as the previous prompt's
+cursor, with a different `cursorId`: the client uses the latest.
 
 v2 is served by the v2 agent in `src/v2/`, which runs straight on Claude
 Code instead of translating to v1. A v2 client that declares JetBrains AIR
