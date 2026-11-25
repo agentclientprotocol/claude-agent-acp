@@ -46,6 +46,11 @@ let mcpAuthenticateImpl: (serverName: string) => Promise<{
   requiresUserAction: boolean;
   callbackExpected: boolean;
 }>;
+/** `remote_control_auto_enable` of the `initialize` result; left out when unset. */
+let remoteControlAutoEnable: boolean | undefined;
+/** The query's `enableRemoteControl`; left off the query when unset. */
+let enableRemoteControlImpl:
+  ((enabled: boolean, name?: string) => Promise<{ session_url?: string }>) | undefined;
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   const actual = await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
     "@anthropic-ai/claude-agent-sdk",
@@ -87,6 +92,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         },
         mcpServerStatus: () => mcpServerStatusResult(),
         mcpAuthenticate: (serverName: string) => mcpAuthenticateImpl(serverName),
+        ...(enableRemoteControlImpl ? { enableRemoteControl: enableRemoteControlImpl } : {}),
       });
     },
     getSessionMessages: vi.fn(() => sessionMessagesResult()),
@@ -104,6 +110,9 @@ function initializationResponse() {
         supportsAutoMode: true,
       },
     ],
+    ...(remoteControlAutoEnable === undefined
+      ? {}
+      : { remote_control_auto_enable: remoteControlAutoEnable }),
   };
 }
 
@@ -150,6 +159,8 @@ describe("createSession options merging", () => {
       requiresUserAction: false,
       callbackExpected: false,
     });
+    remoteControlAutoEnable = undefined;
+    enableRemoteControlImpl = undefined;
 
     vi.resetModules();
     const acpAgent = await import("../../v1/acp-agent.js");
@@ -2158,6 +2169,131 @@ describe("createSession options merging", () => {
 
       expect(closed).toBe("closed");
       expect(closeSpy).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe("Remote Control at session start", () => {
+    it("starts after the session/new response when Claude Code asks for it", async () => {
+      remoteControlAutoEnable = true;
+      const enableRemoteControl = vi.fn(async () => ({
+        session_url: "https://claude.ai/code/session_123",
+      }));
+      enableRemoteControlImpl = enableRemoteControl;
+
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      const startedAtResponse = enableRemoteControl.mock.calls.length;
+      await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalled());
+
+      expect(startedAtResponse).toBe(0);
+      expect(enableRemoteControl).toHaveBeenCalledExactlyOnceWith(true);
+    });
+
+    it("starts again on the new query of a provider switch, and not at a later resume", async () => {
+      remoteControlAutoEnable = true;
+      const enableRemoteControl = vi.fn(async () => ({
+        session_url: "https://claude.ai/code/session_123",
+      }));
+      enableRemoteControlImpl = enableRemoteControl;
+      const sessionUpdate = vi.spyOn(agent.client, "sessionUpdate");
+      const notices = () =>
+        sessionUpdate.mock.calls.filter(([{ update }]) =>
+          JSON.stringify(update).includes("Remote Control connected"),
+        );
+      const params = { cwd: process.cwd(), mcpServers: [] };
+      const { sessionId } = await agent.newSession(params);
+      await vi.waitFor(() => expect(notices()).toHaveLength(1));
+
+      // Closing the old query ends its Remote Control.
+      await agent.unstable_setProvider({
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gw.example",
+        headers: {},
+      });
+      await vi.waitFor(() => expect(notices()).toHaveLength(2));
+      await agent.resumeSession({ sessionId, ...params });
+      // Past the timer of the resume's setup response, which runs the connect.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(enableRemoteControl).toHaveBeenCalledTimes(2);
+      expect(enableRemoteControl).toHaveBeenLastCalledWith(true);
+      expect(notices()).toHaveLength(2);
+    });
+
+    it.each<[string, (agent: ClaudeAcpAgentType, sessionId: string) => Promise<unknown>]>([
+      [
+        "a provider switch",
+        (agent) =>
+          agent.unstable_setProvider({
+            providerId: "main",
+            apiType: "anthropic",
+            baseUrl: "https://gw.example",
+            headers: {},
+          }),
+      ],
+      [
+        "a resume that changes its options",
+        (agent, sessionId) =>
+          agent.resumeSession({
+            sessionId,
+            cwd: process.cwd(),
+            mcpServers: [],
+            _meta: { claudeCode: { options: { maxTurns: 10 } } },
+          }),
+      ],
+    ])(
+      "keeps Remote Control off on the new query of %s after /remote-control off",
+      async (_case, restart) => {
+        remoteControlAutoEnable = true;
+        const enableRemoteControl = vi.fn(async () => ({
+          session_url: "https://claude.ai/code/session_123",
+        }));
+        enableRemoteControlImpl = enableRemoteControl;
+        const { sessionId } = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+        await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalledOnce());
+        await agent.prompt({ sessionId, prompt: [{ type: "text", text: "/remote-control off" }] });
+        const optionsBefore = capturedOptions;
+
+        await restart(agent, sessionId);
+        // Past the timer of a setup response, which connects a new query.
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        expect(capturedOptions).not.toBe(optionsBefore);
+        expect(enableRemoteControl.mock.calls).toEqual([[true], [false]]);
+      },
+    );
+
+    it("keeps Remote Control off on the new query of a provider switch while /remote-control off is still out", async () => {
+      remoteControlAutoEnable = true;
+      let turnOff!: () => void;
+      const enableRemoteControl = vi.fn(async (enabled: boolean) => {
+        // The off request is still out when the provider switch restarts the query.
+        if (!enabled) await new Promise<void>((resolve) => (turnOff = resolve));
+        return { session_url: "https://claude.ai/code/session_123" };
+      });
+      enableRemoteControlImpl = enableRemoteControl;
+      const { sessionId } = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalledOnce());
+      const off = agent.prompt({
+        sessionId,
+        prompt: [{ type: "text", text: "/remote-control off" }],
+      });
+      await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalledTimes(2));
+      const optionsBefore = capturedOptions;
+
+      await agent.unstable_setProvider({
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gw.example",
+        headers: {},
+      });
+      turnOff();
+      await off;
+      // Past the timers of the restart's setup work.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(capturedOptions).not.toBe(optionsBefore);
+      expect(enableRemoteControl.mock.calls).toEqual([[true], [false]]);
     });
   });
 
