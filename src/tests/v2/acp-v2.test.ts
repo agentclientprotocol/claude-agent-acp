@@ -8891,13 +8891,14 @@ describe("ACP v2 terminal of a command in the background", () => {
 
       it.each([
         ["with a task_notification", true],
-        ["without a task event", false],
+        ["without a task_notification", false],
       ])(
         "stays completed when its task ends before the result names it, %s",
         async (_name, notify) => {
           scriptTurns(async function* (options) {
             yield toolUseMessage(options, "toolu_mon", "Monitor", { command: "tail -f app.log" });
-            yield level(options, [localBashMonitor]);
+            // With a notification, the task never joins a level: only `taskEnded` records its end.
+            if (!notify) yield level(options, [localBashMonitor]);
             yield taskEvent(options, "task_started", {
               ...localBashMonitor,
               tool_use_id: "toolu_mon",
@@ -8910,7 +8911,7 @@ describe("ACP v2 terminal of a command in the background", () => {
                 summary: "Done",
               });
             }
-            yield level(options, []);
+            if (!notify) yield level(options, []);
             yield {
               ...toolResultMessage(options, "toolu_mon", {
                 content: "Monitor started (task mon1).",
