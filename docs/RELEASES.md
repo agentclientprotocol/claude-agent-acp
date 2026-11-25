@@ -211,9 +211,23 @@ and only re-dispatches the registry update.
 ### The release has no executables
 
 `build-binaries` and `upload-binaries` don't gate npm, so a failed build only
-leaves the release without archives. Re-run the failed jobs of that publish run
-(`gh run rerun <run-id> --failed`); the upload uses `--clobber`, so archives
-already attached are replaced rather than duplicated.
+leaves the release without archives. It attaches none of them, not the ones that
+built: the registry needs every platform's archive, so `upload-binaries` fails
+with a "`v<version>` has no binaries" error and `trigger-registry-update` is
+skipped until the archives are attached.
+
+[`retry-binaries.yml`](../.github/workflows/retry-binaries.yml) re-runs the
+failed jobs of that run up to twice, as long as nothing but the binary builds
+failed. That covers the usual causes: no macOS arm64 runner picking up the job
+within 15 minutes, and a transient network error in a setup step. Re-running
+the failed jobs also re-runs the upload and then the registry update.
+
+If the release still has no archives after that, fix the cause and re-run the
+failed jobs of the publish run yourself (`gh run rerun <run-id> --failed`). The
+upload uses `--clobber`, so archives already attached are replaced rather than
+duplicated. The build artifacts are kept for 7 days. After that, a re-run of
+the failed jobs finds only the archives it rebuilt, and the upload refuses to
+attach fewer than all 8.
 
 ### A preview published but the commit was not tagged
 
