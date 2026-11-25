@@ -208,6 +208,15 @@ npm versions are immutable. If the package already published and only the
 registry update failed, pass `-f publish_npm=false` so the run skips publishing
 and only re-dispatches the registry update.
 
+Either way, the run also checks the release's
+[executables](#the-release-has-no-executables) before it dispatches. If the
+release has all 8 archives, it leaves them alone: the registry may already have
+their sha256, and a rebuild would not match it. Otherwise it builds all 8 from
+the tagged commit and attaches them, then dispatches. Pass the tag as `ref`, as
+above: when the archives need building, a `ref` that is not the tag's commit
+fails rather than attach archives built from a different commit. A version with
+no GitHub release fails until the release is created.
+
 ### The release has no executables
 
 `build-binaries` and `upload-binaries` don't gate npm, so a failed build only
@@ -227,7 +236,12 @@ failed jobs of the publish run yourself (`gh run rerun <run-id> --failed`). The
 upload uses `--clobber`, so archives already attached are replaced rather than
 duplicated. The build artifacts are kept for 7 days. After that, a re-run of
 the failed jobs finds only the archives it rebuilt, and the upload refuses to
-attach fewer than all 8.
+attach fewer than all 8. Run the publish workflow against the tag instead,
+which builds all 8 and then updates the registry:
+
+```sh
+gh workflow run publish.yml -f ref="v<version>" -f publish_npm=false
+```
 
 ### A preview published but the commit was not tagged
 

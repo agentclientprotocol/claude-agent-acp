@@ -88,29 +88,88 @@ jobs:
           npm publish
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-  # Standalone executables for the GitHub release, stable releases only. They
+  # A manual stable run has no release-please output to say which release it
+  # is for, or whether that release still needs its archives. This finds the
+  # release for the version at `ref` and counts the archives attached to it,
+  # so a hand-made release (docs/RELEASES.md, "The release PR merged but
+  # nothing was tagged") gets them, and a complete one is never rebuilt: the
+  # registry may already hold the attached archives' sha256, and a rebuild is
+  # not byte-identical (newer Bun, new archive timestamps), so it would not
+  # match them.
+  find-release:
+    name: Find the release's archives
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.channel == 'stable' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.find.outputs.tag }}
+      build: ${{ steps.find.outputs.build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Count the archives on the release
+        id: find
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF: ${{ inputs.ref }}
+        #language=bash
+        run: |
+          tag="v$(node -p "require('./package.json').version")"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if ! count="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '[.assets[].name | select(startswith("claude-agent-acp-"))] | length')"; then
+            echo "::error title=No release $tag::'$REF' is version ${tag#v}, which has no GitHub release. Create it first (docs/RELEASES.md, 'The release PR merged but nothing was tagged')."
+            exit 1
+          fi
+
+          # One archive per entry of the build matrix in binaries.yml.
+          if [ "$count" -eq 8 ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "$tag already has all 8 archives; not rebuilding them." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # The archives are built from `ref` and attached to the tag's
+          # release, so both must be the same commit.
+          tagged="$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha)"
+          if [ "$(git rev-parse HEAD)" != "$tagged" ]; then
+            echo "::error title=$tag needs its archives::'$REF' is not the commit $tag points to ($tagged). Run again with ref=$tag to build them."
+            exit 1
+          fi
+          echo "build=true" >> "$GITHUB_OUTPUT"
+          echo "$tag has $count of 8 archives; building all of them." >> "$GITHUB_STEP_SUMMARY"
+
+  # Standalone executables for the GitHub release: every stable release from
+  # release-please, and a manual stable run whose release lacks them. They
   # don't gate the npm publish: a failed build leaves the release without
   # binaries, fails upload-binaries and holds back the registry update.
   # retry-binaries.yml re-runs the failed jobs, which attaches them.
   build-binaries:
     name: Build binaries
-    needs: [release-please]
-    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    needs: [release-please, find-release]
+    # !cancelled(): on a manual run release-please is skipped, which would skip
+    # this job too by default.
+    if: ${{ !cancelled() && (needs.release-please.outputs.release_created == 'true' || needs.find-release.outputs.build == 'true') }}
     # The called workflow only reads the repository; upload-binaries does the write.
     permissions:
       contents: read
     uses: ./.github/workflows/binaries.yml
     with:
       upload: true
+      # Empty on a push, which builds the release merge commit the run is for.
+      ref: ${{ needs.find-release.outputs.tag }}
 
   upload-binaries:
     name: Attach binaries to the release
     runs-on: ubuntu-latest
-    needs: [release-please, build-binaries]
+    needs: [release-please, find-release, build-binaries]
     # Also runs when a build failed, to fail where it shows instead of being
     # skipped. It then attaches nothing: the registry needs every platform's
     # archive, so a partial set would not unblock it either.
-    if: ${{ !cancelled() && needs.release-please.outputs.release_created == 'true' }}
+    if: ${{ !cancelled() && (needs.release-please.outputs.release_created == 'true' || needs.find-release.outputs.build == 'true') }}
     permissions:
       contents: write
     timeout-minutes: 15
@@ -118,7 +177,7 @@ jobs:
       - name: Check that every platform built
         if: ${{ needs.build-binaries.result != 'success' }}
         env:
-          TAG: ${{ needs.release-please.outputs.tag_name }}
+          TAG: ${{ needs.release-please.outputs.tag_name || needs.find-release.outputs.tag }}
           RESULT: ${{ needs.build-binaries.result }}
         run: |
           echo "::error title=$TAG has no binaries::A Build binaries job ended in '$RESULT', so nothing was attached to $TAG and the registry was not updated. retry-binaries.yml re-runs the failed jobs up to twice; after that, run: gh run rerun $GITHUB_RUN_ID --failed --repo $GITHUB_REPOSITORY"
@@ -130,7 +189,7 @@ jobs:
       - name: Upload to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.release-please.outputs.tag_name }}
+          TAG: ${{ needs.release-please.outputs.tag_name || needs.find-release.outputs.tag }}
         run: |
           # One archive per entry of the build matrix in binaries.yml. A re-run
           # more than 7 days later finds only the archives it rebuilt, since
@@ -254,13 +313,12 @@ jobs:
           echo "Tagged \`v$VERSION\` at \`$SHA\`" >> "$GITHUB_STEP_SUMMARY"
 
   trigger-registry-update:
-    # A stable release dispatches only once upload-binaries attached every
-    # archive: the registry takes each archive's sha256 from the release assets
-    # when it bumps the version, and rejects the update while one is missing.
-    # upload-binaries is skipped on every preview, which is npm-only, and on a
-    # manual stable run, which builds no binaries and dispatches once npm has
-    # the version; that release must already have its archives.
-    needs: [publish-npm, publish-npm-preview, upload-binaries]
+    # A stable release dispatches only once its release has every archive:
+    # upload-binaries attached them, or find-release found all 8 already there.
+    # The registry takes each archive's sha256 from the release assets when it
+    # bumps the version, and rejects the update while one is missing. Previews
+    # are npm-only and dispatch without archives.
+    needs: [publish-npm, publish-npm-preview, find-release, upload-binaries]
     # Both channels dispatch this: the registry has its own handling for preview
     # versions. The two never fire together — a release merge publishes stable and
     # skips the preview, and every other push does the reverse — so the registry sees
@@ -269,10 +327,12 @@ jobs:
     if: >-
       ${{
         always() && (
-          (needs.publish-npm.result == 'success'
-            && (github.event_name == 'workflow_dispatch' || needs.upload-binaries.result == 'success'))
-          || needs.publish-npm-preview.outputs.published == 'true'
-          || (github.event_name == 'workflow_dispatch' && inputs.channel == 'stable' && !inputs.publish_npm)
+          needs.publish-npm-preview.outputs.published == 'true'
+          || (
+            (needs.publish-npm.result == 'success'
+              || (github.event_name == 'workflow_dispatch' && inputs.channel == 'stable' && !inputs.publish_npm))
+            && (needs.upload-binaries.result == 'success' || needs.find-release.outputs.build == 'false')
+          )
         )
       }}
     runs-on: ubuntu-latest
