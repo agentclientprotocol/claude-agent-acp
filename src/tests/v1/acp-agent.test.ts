@@ -11505,8 +11505,18 @@ describe("runPromptWithCancellation", () => {
     const promptResult = deferred<PromptResponse>();
     const cancel = vi.fn(async () => {});
     const agent = {
-      prompt: vi.fn(() => promptResult.promise),
+      prompt: vi.fn(
+        (
+          _params: unknown,
+          _origin: unknown,
+          onQueued?: (uuid: string, behind: boolean) => void,
+        ) => {
+          onQueued?.("prompt-1", false); // the foreground prompt
+          return promptResult.promise;
+        },
+      ),
       cancel,
+      withdrawQueuedPrompt: vi.fn(async () => "taken"), // Claude Code is running it
       logger: { log: () => {}, error: () => {} },
     } as any;
 
@@ -11519,11 +11529,40 @@ describe("runPromptWithCancellation", () => {
 
     // Client sends $/cancel_request -> the SDK aborts this request's signal.
     controller.abort();
-    expect(cancel).toHaveBeenCalledWith({ sessionId: "session-1" });
+    await vi.waitFor(() => expect(cancel).toHaveBeenCalledWith({ sessionId: "session-1" }));
 
     // The prompt settles "cancelled" through the normal cancel path.
     promptResult.resolve({ stopReason: "cancelled" });
     await expect(pending).resolves.toEqual({ stopReason: "cancelled" });
+  });
+
+  it("does not cancel when the prompt answered while its withdrawal was pending", async () => {
+    const promptResult = deferred<PromptResponse>();
+    const withdrawal = deferred<string>();
+    const cancel = vi.fn(async () => {});
+    const agent = {
+      prompt: vi.fn(
+        (_p: unknown, _o: unknown, onQueued?: (uuid: string, behind: boolean) => void) => {
+          onQueued?.("prompt-1", false);
+          return promptResult.promise;
+        },
+      ),
+      cancel,
+      withdrawQueuedPrompt: vi.fn(() => withdrawal.promise),
+      logger: { log: () => {}, error: () => {} },
+    } as any;
+    const controller = new AbortController();
+    const pending = runPromptWithCancellation(
+      agent,
+      { sessionId: "session-1", prompt: [] } as any,
+      controller.signal,
+    );
+    controller.abort();
+    promptResult.resolve({ stopReason: "end_turn" });
+    await pending;
+    withdrawal.resolve("taken");
+    await new Promise((r) => setTimeout(r, 10));
+    expect(cancel).not.toHaveBeenCalled();
   });
 
   it("does not cancel after the prompt settles normally", async () => {

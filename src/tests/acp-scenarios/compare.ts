@@ -44,6 +44,10 @@
  *   `agentCapabilities.mcpCapabilities.acp`, which origin/main did not: the
  *   agent now takes MCP servers that the client serves over the ACP
  *   connection (`"type": "acp"`).
+ * - The `initialize` response also advertises
+ *   `agentCapabilities._meta.claudeCode.queuedPromptCancel`, which origin/main
+ *   did not: `$/cancel_request` on a queued `session/prompt` now withdraws
+ *   that prompt alone.
  * - A SandboxNetworkAccess tool call is settled by a `tool_call_update` with
  *   only its final `status` once its permission request is answered. The
  *   callback runs nothing, so origin/main never settled the call (see
@@ -274,6 +278,23 @@ function withoutSessionCapabilities(record: Recorded, keys: readonly string[]): 
   } as Recorded;
 }
 
+/** `record` without `agentCapabilities._meta.claudeCode.<key>`, when it is an `initialize` response. */
+function withoutClaudeCodeCapability(record: Recorded, key: string): Recorded {
+  if (record.kind !== "initialize") return record;
+  const payload = record.payload as Json;
+  const agent = payload.agentCapabilities as Json | undefined;
+  const meta = agent?._meta as Json | undefined;
+  const claudeCode = meta?.claudeCode as Json | undefined;
+  if (!claudeCode || !(key in claudeCode)) return record;
+  return {
+    ...record,
+    payload: {
+      ...payload,
+      agentCapabilities: { ...agent, _meta: { ...meta, claudeCode: without(claudeCode, key) } },
+    },
+  } as Recorded;
+}
+
 /** `record` without `agentCapabilities.<group>.<key>`, when it is an `initialize` response. */
 function withoutAgentCapability(record: Recorded, group: string, key: string): Recorded {
   if (record.kind !== "initialize") return record;
@@ -303,14 +324,17 @@ export function compareWithBaseline(baseline: Recorded[], traffic: Recorded[]): 
     });
   const current = withoutSandboxNetworkSettlements(
     traffic.map((record) =>
-      withoutAgentCapability(
+      withoutClaudeCodeCapability(
         withoutAgentCapability(
-          withoutSessionCapabilities(record, ["systemPrompt", "status", "title", "options"]),
-          "auth",
-          "status",
+          withoutAgentCapability(
+            withoutSessionCapabilities(record, ["systemPrompt", "status", "title", "options"]),
+            "auth",
+            "status",
+          ),
+          "mcpCapabilities",
+          "acp",
         ),
-        "mcpCapabilities",
-        "acp",
+        "queuedPromptCancel",
       ),
     ),
   );
