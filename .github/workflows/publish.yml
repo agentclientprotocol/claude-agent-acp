@@ -106,10 +106,9 @@ jobs:
     outputs:
       tag: ${{ steps.find.outputs.tag }}
       build: ${{ steps.find.outputs.build }}
+    # Reads `ref` through the API rather than checking it out, so nothing from
+    # it lands on the runner. Only the tag's commit is ever built.
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ inputs.ref }}
       - name: Count the archives on the release
         id: find
         env:
@@ -117,7 +116,9 @@ jobs:
           REF: ${{ inputs.ref }}
         #language=bash
         run: |
-          tag="v$(node -p "require('./package.json').version")"
+          version="$(gh api --method GET "repos/$GITHUB_REPOSITORY/contents/package.json" \
+            -H "Accept: application/vnd.github.raw+json" -f ref="$REF" --jq .version)"
+          tag="v$version"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           if ! count="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets \
             --jq '[.assets[].name | select(startswith("claude-agent-acp-"))] | length')"; then
@@ -132,10 +133,10 @@ jobs:
             exit 0
           fi
 
-          # The archives are built from `ref` and attached to the tag's
-          # release, so both must be the same commit.
+          # binaries.yml builds the tag. A `ref` naming another commit would
+          # get archives of a commit it didn't ask for, so refuse it.
           tagged="$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha)"
-          if [ "$(git rev-parse HEAD)" != "$tagged" ]; then
+          if [ "$(gh api "repos/$GITHUB_REPOSITORY/commits/$REF" --jq .sha)" != "$tagged" ]; then
             echo "::error title=$tag needs its archives::'$REF' is not the commit $tag points to ($tagged). Run again with ref=$tag to build them."
             exit 1
           fi
