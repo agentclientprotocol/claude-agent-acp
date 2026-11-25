@@ -495,7 +495,12 @@ export class McpOverAcp {
   /**
    * Resolves when a request of the tool use `toolUseId` need wait no longer
    * for the announcement of its agent's child session: {@link release} ended
-   * the wait, or {@link announcementWaitMs} passed. It never rejects.
+   * the wait, {@link announcementWaitMs} passed, or `abandoned` aborted. It
+   * never rejects.
+   *
+   * `abandoned` is the bridge's signal for the request. It aborts when Claude
+   * Code closes the request's HTTP connection or the ACP connection closes.
+   * The bridge then sends nothing, whatever the request names.
    *
    * Nothing that an announcement needs waits for the request. The hook that
    * recorded the tool use has answered. The session reads Claude Code's
@@ -503,12 +508,14 @@ export class McpOverAcp {
    * to that stream before it ran the subagent's tool. A replay ends without
    * the request too.
    */
-  private held(toolUseId: string): Promise<void> {
+  private held(toolUseId: string, abandoned: AbortSignal): Promise<void> {
+    if (abandoned.aborted) return Promise.resolve();
     return new Promise((resolve) => {
       const waiters = this.waiting.get(toolUseId) ?? new Set<() => void>();
       this.waiting.set(toolUseId, waiters);
       const end = () => {
         clearTimeout(timer);
+        abandoned.removeEventListener("abort", end);
         waiters.delete(end);
         if (waiters.size === 0 && this.waiting.get(toolUseId) === waiters) {
           this.waiting.delete(toolUseId);
@@ -518,6 +525,7 @@ export class McpOverAcp {
       const timer = setTimeout(end, this.announcementWaitMs);
       // The request's HTTP connection keeps the process alive, not this timer.
       timer.unref();
+      abandoned.addEventListener("abort", end, { once: true });
       waiters.add(end);
     });
   }
@@ -547,6 +555,7 @@ export class McpOverAcp {
   private attribution({
     serverId,
     params,
+    signal,
   }: McpHttpRequestInfo):
     McpHttpRequestAttribution | undefined | Promise<McpHttpRequestAttribution | undefined> {
     const meta = params?._meta;
@@ -557,7 +566,7 @@ export class McpOverAcp {
     if (typeof toolUseId !== "string") return undefined;
     const now = this.named(toolUseId, serverId);
     if (now !== "unannounced") return now;
-    return this.held(toolUseId).then(() => {
+    return this.held(toolUseId, signal).then(() => {
       const then = this.named(toolUseId, serverId);
       return then === "unannounced" ? undefined : then;
     });
