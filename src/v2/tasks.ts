@@ -42,10 +42,12 @@
  * - A task that a tool call started, such as a `Monitor` or `Workflow` call,
  *   is that tool call, kept `in_progress` (or `paused`) until the task ends.
  *   A workflow's `task_progress` shows on its call (`workflowCard`).
- * - Any other background task, such as one that a hook started or one that
- *   started after its tool call returned, gets a tool call that the adapter
- *   starts for it (`task_<taskId>`), as v2 lists background work only by an
- *   entity the client knows.
+ * - Any other background task, such as one that a hook started, gets a tool
+ *   call that the adapter starts for it (`task_<taskId>`), as v2 lists
+ *   background work only by an entity the client knows. A Monitor or Workflow
+ *   call, or a call whose `task_started` came before its result, stays its
+ *   task's entity also when the task joins the live set after the result (see
+ *   `toolResults` and `levelChanged`).
  *
  * Claude Code's interrupt spares background tasks (`perTaskStopAffordance`),
  * so `session/cancel` leaves listed work running, as v2 asks. A session
@@ -264,6 +266,18 @@ type StartedTask = { toolUseId?: string; parentTaskId?: string; taskType?: strin
 /** The tools whose structured result names the task that the call started. */
 const TASK_TOOLS = new Set(["Monitor", "Workflow"]);
 
+/**
+ * Whether the call of `toolUseName` is the entity of `task` in the list, rather
+ * than the display terminal of a command. Claude Code reports a Monitor's task
+ * as `local_bash`, like a shell command's: a command is its terminal, while the
+ * call of a tool that starts a task is that task.
+ */
+function keepsTaskCall(toolUseName: string, taskType: string | undefined): boolean {
+  if (taskType === "local_agent") return false;
+  if (taskType === "local_bash" && !TASK_TOOLS.has(toolUseName)) return false;
+  return true;
+}
+
 /** The most messages that wait for the announcement of one child. */
 const MAX_PENDING_MESSAGES = 256;
 
@@ -340,10 +354,18 @@ export class SessionTasks {
       toolUse?: { name: string; input: unknown };
       title?: string;
       paused: boolean;
+      /** The level did not name the call's task yet: the task can join it later. */
+      unleveled?: boolean;
     }
   >();
   /** The tool calls that returned: their tasks no longer hold their work. */
   private readonly returned = new Set<string>();
+  /**
+   * The tasks that already ended, by task id. A task can end before the call
+   * that started it returns: remembering the end keeps that call from being
+   * kept in progress for a task no later level can name.
+   */
+  private readonly endedTasks = new Set<string>();
   /** What a subagent's hooks reported before the child was announced, by agent id. */
   private readonly startedHooks = new Map<string, { cwd?: string; agentType?: string }>();
   /** The children's configurations (see `child-config.ts`). */
@@ -542,13 +564,30 @@ export class SessionTasks {
       const taskId =
         (TASK_TOOLS.has(toolUse.name) ? structuredTaskId : undefined) ??
         [...this.started].find(([, task]) => task.toolUseId === toolCallId)?.[0];
-      const task = taskId === undefined ? undefined : this.level.get(taskId);
-      if (!task || task.taskType === "local_agent") continue;
-      // Claude Code reports a Monitor's task as `local_bash`, like a shell
-      // command's. A command is its display terminal; the call of a tool that
-      // starts a task is the entity of that task, so it is kept.
-      if (task.taskType === "local_bash" && !TASK_TOOLS.has(toolUse.name)) continue;
-      this.toolCalls.set(taskId!, {
+      if (taskId === undefined) continue;
+      const task = this.level.get(taskId);
+      // A call outside TASK_TOOLS finds its task only through `this.started`.
+      // When task_started gave the task's type, a call that is not its task's
+      // entity ends with its result. Otherwise `levelChanged` ends it once a
+      // level gives the type.
+      if (!keepsTaskCall(toolUse.name, task?.taskType ?? this.started.get(taskId)?.taskType))
+        continue;
+      if (!task) {
+        // A task that already ended ends its call with the result: no later
+        // level can name it. Any other task can join the level after this
+        // result, so keep the call unleveled until `levelChanged` names it.
+        if (this.endedTasks.has(taskId)) continue;
+        this.toolCalls.set(taskId, {
+          toolCallId,
+          output,
+          toolUse: { name: toolUse.name, input: toolUse.input },
+          paused: false,
+          unleveled: true,
+        });
+        runningToolCalls.add(toolCallId);
+        continue;
+      }
+      this.toolCalls.set(taskId, {
         toolCallId,
         output,
         toolUse: { name: toolUse.name, input: toolUse.input },
@@ -1289,6 +1328,7 @@ export class SessionTasks {
     const commandToolCall = this.started.get(taskId)?.toolUseId;
     if (commandToolCall !== undefined) this.foreground.get(commandToolCall)?.stop();
     this.started.delete(taskId);
+    this.endedTasks.add(taskId);
     const terminal = this.terminals.get(taskId);
     if (terminal && !terminal.ending) {
       terminal.ending = true;
@@ -1304,8 +1344,9 @@ export class SessionTasks {
   }
 
   /**
-   * Claude Code's live background task set changed. Terminals and tool calls
-   * whose tasks it no longer holds ended, without saying how.
+   * Claude Code's live background task set changed. Calls whose task it now
+   * names are added to the list, and terminals and tool calls whose tasks it no
+   * longer holds ended, without saying how.
    */
   private levelChanged(
     tasks: Array<{
@@ -1316,6 +1357,7 @@ export class SessionTasks {
       ambient?: boolean;
     }>,
   ): void {
+    const previous = this.level;
     this.level = new Map(
       tasks.map((task) => [
         task.task_id,
@@ -1328,10 +1370,30 @@ export class SessionTasks {
         },
       ]),
     );
+    // A task that left the live set ended, also when no task event said so: a
+    // call whose task leaves the level before its result must not be kept.
+    for (const taskId of previous.keys()) {
+      if (!this.level.has(taskId)) this.endedTasks.add(taskId);
+    }
     for (const [taskId, terminal] of this.terminals) {
       if (this.level.get(taskId)?.ambient === false) terminal.leveled = true;
     }
+    // A call whose task joined the level after its result is part of that task
+    // again: it stays in progress (or paused, as a task update already set it)
+    // and the next list names it. When the task is not the call's, the call ends
+    // completed, as its result reported it.
+    for (const [taskId, call] of this.toolCalls) {
+      if (!call.unleveled) continue;
+      const task = this.level.get(taskId);
+      if (!task) continue;
+      call.unleveled = false;
+      if (call.toolUse === undefined || !keepsTaskCall(call.toolUse.name, task.taskType)) {
+        this.endToolCall(taskId, "completed");
+      }
+    }
     for (const taskId of [...this.terminals.keys(), ...this.toolCalls.keys()]) {
+      // A kept call waits for a later level that names its task.
+      if (this.toolCalls.get(taskId)?.unleveled) continue;
       if (!this.level.has(taskId)) this.taskEnded(taskId, "completed");
     }
     this.publish();
@@ -2275,9 +2337,9 @@ export class SessionTasks {
       // A command without a terminal yet is one that foreground work waits on.
       // A subagent is listed as its session.
       if (task.taskType === "local_bash" || task.taskType === "local_agent") continue;
-      // A task joins the level before its `task_started`, and before the tool
-      // call that starts it returns. Until both, the task is unknown or part
-      // of that tool call.
+      // A task usually joins the level before its `task_started` and the tool
+      // call that starts it returns, but not always: a call that arrived before
+      // its task joined the level is kept unleveled (see `toolResults`).
       const started = this.started.get(taskId);
       if (!started || (started.toolUseId && !this.returned.has(started.toolUseId))) continue;
       const parent = task.parentTaskId ? this.children.get(task.parentTaskId) : undefined;
