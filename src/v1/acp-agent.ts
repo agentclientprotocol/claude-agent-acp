@@ -246,11 +246,15 @@ import {
   MCP_APPS_KEY,
   MCP_RESOURCES_READ_METHOD,
   MCP_TOOLS_CALL_METHOD,
+  MCP_TOOLS_LIST_METHOD,
   mcpAppsCapability,
   McpAppsSession,
   mcpToolResults,
   parseMcpResourcesReadRequest,
   parseMcpToolsCallRequest,
+  parseMcpToolsListRequest,
+  type McpAppTool,
+  type McpToolsListRequest,
   type McpCallToolResult,
   type McpResourcesReadRequest,
   type McpResourcesReadResponse,
@@ -3260,6 +3264,12 @@ export class ClaudeAcpAgent {
   async callMcpTool(params: McpToolsCallRequest): Promise<McpCallToolResult> {
     const session = this.liveMcpAppsSession(params.sessionId);
     return session.mcpApps.callTool(session.query, params);
+  }
+
+  /** `_session/mcp/tools/list` (see `mcp-apps.ts`). */
+  async listMcpAppTools(params: McpToolsListRequest): Promise<{ tools: McpAppTool[] }> {
+    const session = this.liveMcpAppsSession(params.sessionId);
+    return session.mcpApps.listTools(session.query, params);
   }
 
   private liveMcpAppsSession(sessionId: string): Session & { mcpApps: McpAppsSession } {
@@ -12098,6 +12108,11 @@ export function v1AgentApp(
       MCP_TOOLS_CALL_METHOD,
       { parse: parseMcpToolsCallRequest },
       ofRootSession("call an MCP tool in", (ctx) => agent.callMcpTool(ctx.params)),
+    )
+    .onRequest<McpToolsListRequest, { tools: McpAppTool[] }>(
+      MCP_TOOLS_LIST_METHOD,
+      { parse: parseMcpToolsListRequest },
+      ofRootSession("list the MCP tools of", (ctx) => agent.listMcpAppTools(ctx.params)),
     );
   return sessionIndex.onSessionIndexRequests(app, () => agent);
 }

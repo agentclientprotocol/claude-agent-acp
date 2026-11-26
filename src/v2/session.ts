@@ -101,6 +101,8 @@ import {
   type McpResourcesReadRequest,
   type McpResourcesReadResponse,
   type McpToolsCallRequest,
+  type McpAppTool,
+  type McpToolsListRequest,
 } from "../mcp-apps.js";
 
 /** What a session needs of its connection. */
@@ -1175,6 +1177,11 @@ export class V2Session implements RequestTarget {
   /** `_session/mcp/tools/call` (see `mcp-apps.ts`). Runs on the session's query, also between turns. */
   callMcpTool(params: McpToolsCallRequest): Promise<McpCallToolResult> {
     return this.mcpApps.callTool(this.liveQuery(), params);
+  }
+
+  /** `_session/mcp/tools/list` (see `mcp-apps.ts`). */
+  listMcpAppTools(params: McpToolsListRequest): Promise<{ tools: McpAppTool[] }> {
+    return this.mcpApps.listTools(this.liveQuery(), params);
   }
 
   private liveQuery(): Query {

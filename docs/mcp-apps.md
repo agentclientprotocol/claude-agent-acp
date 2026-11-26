@@ -15,7 +15,7 @@ MCP App has three gaps:
 2. It cannot read the `ui://` resource, because it has no connection to the server.
 3. It cannot run the tool calls that the page makes.
 
-This extension closes those gaps with one capability, one `_meta` key on tool calls, and two
+This extension closes those gaps with one capability, one `_meta` key on tool calls, and three
 methods. It uses only `_meta` and `_`-prefixed methods, so agents and clients that do not know it
 are unaffected.
 
@@ -44,13 +44,14 @@ The agent answers with the methods it serves:
   "mcpApps": {
     "version": 1,
     "resourcesRead": "_session/mcp/resources/read",
-    "toolsCall": "_session/mcp/tools/call"
+    "toolsCall": "_session/mcp/tools/call",
+    "toolsList": "_session/mcp/tools/list"
   }
 }
 ```
 
 An agent sends `_meta.mcpApp` (section 2) only to a client that declared a `version` of 1 or more.
-The two methods work for any client.
+The methods work for any client.
 
 ## 2. App tool calls: `_meta.mcpApp`
 
@@ -145,6 +146,36 @@ Request:
 Response: the server's `CallToolResult`. A tool that fails comes back as a result with
 `isError: true` where the agent can tell it apart from a transport error.
 
+## 4a. `_session/mcp/tools/list`
+
+The tools of one server of the session, with what a host needs to decide on a page's call: the
+MCP annotations and the tool's MCP Apps `_meta.ui` (its `visibility`). It sends no session update.
+
+Request: `{ "sessionId": "…", "server": "basic" }`
+
+Response:
+
+```json
+{
+  "tools": [
+    {
+      "name": "list-tasks",
+      "annotations": { "readOnlyHint": true },
+      "ui": { "visibility": ["app"] }
+    },
+    {
+      "name": "complete-task",
+      "annotations": { "readOnlyHint": false },
+      "ui": { "visibility": ["app"] }
+    }
+  ]
+}
+```
+
+A host can run a read-only tool for the page at once, and ask the user first about any other, as
+MCP says of tools without `readOnlyHint: true`. A server that the session has not connected fails
+with Invalid params.
+
 ## 5. Errors
 
 | Case                                                                                                                 | Error                                                        |
@@ -162,7 +193,8 @@ The extension carries data; the client is the MCP Apps host. It should:
 
 - render the resource in a sandboxed frame with the CSP the resource declares;
 - forward the page's `tools/call` only to the server the page came from (`mcpApp.server`);
-- decide which of the page's calls need the user's consent, or pass `checkPermissions: true`;
+- decide which of the page's calls need the user's consent (`_session/mcp/tools/list` gives the annotations), or pass `checkPermissions: true`;
+- forward only calls to tools the page may use: a tool whose `ui.visibility` leaves out `"app"` is the model's only;
 - treat everything the page sends as untrusted input.
 
 ## 7. Claude Code

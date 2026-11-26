@@ -23,6 +23,7 @@ export const MCP_APPS_KEY = "mcpApps";
 export const MCP_APP_TOOL_CALL_KEY = "mcpApp";
 export const MCP_RESOURCES_READ_METHOD = "_session/mcp/resources/read";
 export const MCP_TOOLS_CALL_METHOD = "_session/mcp/tools/call";
+export const MCP_TOOLS_LIST_METHOD = "_session/mcp/tools/list";
 
 /** Claude Code's capabilities (`system/init` and the initialize response). */
 const TOOL_UI_META = "mcp_tool_ui_meta_v1";
@@ -41,6 +42,7 @@ export type McpAppsCapability = {
   version: typeof MCP_APPS_VERSION;
   resourcesRead: typeof MCP_RESOURCES_READ_METHOD;
   toolsCall: typeof MCP_TOOLS_CALL_METHOD;
+  toolsList: typeof MCP_TOOLS_LIST_METHOD;
 };
 
 export function mcpAppsCapability(): McpAppsCapability {
@@ -48,6 +50,7 @@ export function mcpAppsCapability(): McpAppsCapability {
     version: MCP_APPS_VERSION,
     resourcesRead: MCP_RESOURCES_READ_METHOD,
     toolsCall: MCP_TOOLS_CALL_METHOD,
+    toolsList: MCP_TOOLS_LIST_METHOD,
   };
 }
 
@@ -121,6 +124,47 @@ export function parseMcpResourcesReadRequest(params: unknown): McpResourcesReadR
     throw RequestError.invalidParams(undefined, "Only ui:// resources can be read");
   }
   return { sessionId, server, uri };
+}
+
+export type McpToolsListRequest = { sessionId: string; server: string };
+
+/** A tool of `_session/mcp/tools/list`: what a host needs to decide on an app's call to it. */
+export type McpAppTool = {
+  name: string;
+  description?: string;
+  /** MCP tool annotations: `readOnlyHint`, `destructiveHint`, `openWorldHint`. */
+  annotations?: Record<string, boolean>;
+  /** The tool's MCP Apps `_meta.ui` (`resourceUri`, `visibility`). */
+  ui?: Record<string, unknown>;
+};
+
+export function parseMcpToolsListRequest(params: unknown): McpToolsListRequest {
+  const { sessionId, server } = (params ?? {}) as Record<string, unknown>;
+  if (!nonEmptyString(sessionId) || !nonEmptyString(server)) {
+    throw RequestError.invalidParams(
+      undefined,
+      "tools/list params require a non-empty sessionId and server",
+    );
+  }
+  return { sessionId, server };
+}
+
+/** Claude Code's tool annotations (`readOnly`…) under their MCP names (`readOnlyHint`…). */
+export function toAppTools(tools: NonNullable<McpServerStatus["tools"]>): McpAppTool[] {
+  return tools.map((tool) => {
+    const a = tool.annotations;
+    const annotations: Record<string, boolean> = {};
+    if (a?.readOnly !== undefined) annotations.readOnlyHint = a.readOnly;
+    if (a?.destructive !== undefined) annotations.destructiveHint = a.destructive;
+    if (a?.openWorld !== undefined) annotations.openWorldHint = a.openWorld;
+    const ui = tool._meta?.ui;
+    return {
+      name: tool.name,
+      ...(tool.description ? { description: tool.description } : {}),
+      ...(Object.keys(annotations).length ? { annotations } : {}),
+      ...(ui && typeof ui === "object" ? { ui: ui as Record<string, unknown> } : {}),
+    };
+  });
 }
 
 export function parseMcpToolsCallRequest(params: unknown): McpToolsCallRequest {
@@ -353,6 +397,19 @@ export class McpAppsSession {
       }
     }
     return updates;
+  }
+
+  /** `_session/mcp/tools/list`: the tools of one connected server, with their annotations. */
+  async listTools(query: Query, request: McpToolsListRequest): Promise<{ tools: McpAppTool[] }> {
+    const statuses = await query.mcpServerStatus();
+    const status = statuses.find((s) => s.name === request.server && s.status === "connected");
+    if (!status) {
+      throw RequestError.invalidParams(
+        undefined,
+        `No connected MCP server named ${request.server}`,
+      );
+    }
+    return { tools: toAppTools(status.tools ?? []) };
   }
 
   /** `_session/mcp/resources/read`: Claude Code reads the resource from the server it dialed. */

@@ -10,6 +10,7 @@ import {
   mcpToolResults,
   parseMcpResourcesReadRequest,
   parseMcpToolsCallRequest,
+  toAppTools,
 } from "../mcp-apps.js";
 
 const ALL_CAPABILITIES = [
@@ -232,5 +233,27 @@ describe("McpAppsSession", () => {
         checkPermissions: true,
       }),
     ).rejects.toThrow(/permissions/);
+  });
+});
+
+describe("tool list", () => {
+  it("names Claude Code's annotations as MCP does", () => {
+    expect(
+      toAppTools([
+        {
+          name: "get",
+          annotations: { readOnly: true, openWorld: false },
+          _meta: { ui: { visibility: ["app"] } },
+        },
+        { name: "set" },
+      ] as NonNullable<McpServerStatus["tools"]>),
+    ).toEqual([
+      {
+        name: "get",
+        annotations: { readOnlyHint: true, openWorldHint: false },
+        ui: { visibility: ["app"] },
+      },
+      { name: "set" },
+    ]);
   });
 });

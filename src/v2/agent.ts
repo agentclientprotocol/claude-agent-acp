@@ -113,9 +113,13 @@ import {
   MCP_APPS_KEY,
   MCP_RESOURCES_READ_METHOD,
   MCP_TOOLS_CALL_METHOD,
+  MCP_TOOLS_LIST_METHOD,
   mcpAppsCapability,
   parseMcpResourcesReadRequest,
   parseMcpToolsCallRequest,
+  parseMcpToolsListRequest,
+  type McpAppTool,
+  type McpToolsListRequest,
   type McpCallToolResult,
   type McpResourcesReadRequest,
   type McpResourcesReadResponse,
@@ -185,6 +189,12 @@ export function v2AgentApp(
         MCP_TOOLS_CALL_METHOD,
         { parse: parseMcpToolsCallRequest },
         ({ params }) => agent.session(params.sessionId, MCP_TOOLS_CALL_METHOD).callMcpTool(params),
+      )
+      .onRequest<McpToolsListRequest, { tools: McpAppTool[] }>(
+        MCP_TOOLS_LIST_METHOD,
+        { parse: parseMcpToolsListRequest },
+        ({ params }) =>
+          agent.session(params.sessionId, MCP_TOOLS_LIST_METHOD).listMcpAppTools(params),
       )
       // `session/cancel` of a session that is not active is ignored. A
       // subagent's session advertises `cancel`: it stops the subagent's run.
