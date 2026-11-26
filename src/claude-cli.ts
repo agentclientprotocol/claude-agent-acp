@@ -34,6 +34,13 @@ export async function claudeCliPath(): Promise<string> {
 /** How an option reaches the Claude CLI: in a flag, or over stdin in the SDK's initialize request. */
 type Delivery = NonNullable<Options["mcpServersDelivery"]>;
 
+/** Whether the client's `extraArgs` name `sdk-url`: a remote session. */
+export function isRemoteSession(clientExtraArgs: Options["extraArgs"]): boolean {
+  return Object.keys(clientExtraArgs ?? {}).some(
+    (name) => name === "sdk-url" || name.startsWith("sdk-url="),
+  );
+}
+
 /**
  * The SDK options that say how a session's MCP servers and its `settings`
  * reach the CLI of {@link claudeCliPath}. A client's own options replace them.
@@ -65,9 +72,7 @@ export function cliDelivery(clientExtraArgs: Options["extraArgs"]): {
   settingsDelivery: Delivery;
 } {
   const delivery = process.env.CLAUDE_CODE_EXECUTABLE ? "argv" : "initialize";
-  const settingsInFlag = Object.keys(clientExtraArgs ?? {}).some(
-    (name) => name === "settings" || name === "sdk-url" || name.startsWith("sdk-url="),
-  );
+  const settingsInFlag = "settings" in (clientExtraArgs ?? {}) || isRemoteSession(clientExtraArgs);
   return { mcpServersDelivery: delivery, settingsDelivery: settingsInFlag ? "argv" : delivery };
 }
 

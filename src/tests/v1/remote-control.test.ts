@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { ClaudeAcpAgent } from "../../v1/acp-agent.js";
 import type { AcpClient } from "../../acp-client.js";
 import { RemoteControlAtStartup } from "../../remote-control.js";
-import { mockSessionState } from "./session-doubles.js";
+import { mockSessionState, runningAdapterCommands } from "./session-doubles.js";
 
 /** A stream that stays open, like the real one: a consumer that reaches its end
  *  closes the session. */
@@ -325,6 +325,43 @@ describe("/remote-control", () => {
       await start;
     });
 
+    it("still sends the notice when a session/cancel comes while Remote Control starts", async () => {
+      const request = pendingRequest();
+      const { agent, sessionUpdate } = createAgent(
+        { enableRemoteControl: request.enableRemoteControl, interrupt: vi.fn() },
+        { remoteControlAtStartup: new RemoteControlAtStartup(true), input: { end: vi.fn() } },
+      );
+      const { enableRemoteControl, finish } = request;
+
+      const start = agent.connectRemoteControlAtStartup("session-1");
+      await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalled());
+      await agent.cancel({ sessionId: "session-1" });
+      finish({ session_url: "https://claude.ai/code/s" });
+      await start;
+
+      expect(messageText(sessionUpdate)).toContain("Remote Control connected");
+    });
+
+    it("closes without waiting for a Remote Control request that never answers", async () => {
+      const { agent } = createAgent(
+        {
+          enableRemoteControl: vi.fn(() => new Promise<never>(() => {})),
+          interrupt: vi.fn(),
+          close: vi.fn(),
+        },
+        { remoteControlAtStartup: new RemoteControlAtStartup(true), input: { end: vi.fn() } },
+      );
+      const error = vi.spyOn((agent as any).logger, "error");
+
+      void agent.connectRemoteControlAtStartup("session-1");
+      await vi.waitFor(() => expect(agent.sessions["session-1"].adapterCommands?.busy).toBe(true));
+      const started = Date.now();
+      await agent.closeSession({ sessionId: "session-1" });
+
+      expect(Date.now() - started).toBeLessThan(1000);
+      expect(error).not.toHaveBeenCalledWith(expect.stringContaining("did not end"));
+    });
+
     it("sends no notice when the query closed while Remote Control was starting", async () => {
       const { agent, sessionUpdate, enableRemoteControl, finish } = createPendingAgent({
         remoteControlAtStartup: new RemoteControlAtStartup(true),
@@ -397,7 +434,10 @@ describe("Remote Control at session start", () => {
     ],
     [
       "a /remote-control command runs",
-      () => ({ ...startsWith(), remoteControlCommand: new Promise(() => {}) }),
+      () => ({
+        ...startsWith(),
+        adapterCommands: runningAdapterCommands(new Promise<void>(() => {}), { abortable: true }),
+      }),
     ],
     // A close before the setup response's timer ran.
     [
@@ -532,6 +572,6 @@ describe("Remote Control at session start", () => {
       "Session session-1: failed to send the Remote Control notice:",
       expect.objectContaining({ message: "connection closed" }),
     );
-    expect(agent.sessions["session-1"].remoteControlCommand).toBeUndefined();
+    expect(agent.sessions["session-1"].adapterCommands?.busy).toBeFalsy();
   });
 });

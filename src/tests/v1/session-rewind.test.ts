@@ -23,7 +23,7 @@ import {
   writeTranscript,
 } from "../helpers.js";
 import { writeRewindPoint } from "../../session-rewind.js";
-import { successfulResultMessage, userEcho } from "./session-doubles.js";
+import { runningAdapterCommands, successfulResultMessage, userEcho } from "./session-doubles.js";
 
 const sdk = vi.hoisted(() => ({
   query: vi.fn(),
@@ -617,13 +617,13 @@ describe("_session/rewind on v1", { timeout: 10_000 }, () => {
         const held = vi.spyOn(command.promise, "catch");
 
         const prompting = rewindDuring(sessionId, reached.promise, () => {
-          agent.sessions[sessionId]!.remoteControlCommand = command.promise;
+          agent.sessions[sessionId]!.adapterCommands = runningAdapterCommands(command.promise);
           gate.resolve();
         });
 
         await vi.waitFor(() => expect(held).toHaveBeenCalled());
         expect(queries.flatMap((query) => query.prompts)).toEqual([]);
-        agent.sessions[sessionId]!.remoteControlCommand = undefined;
+        agent.sessions[sessionId]!.adapterCommands = undefined;
         command.resolve();
         await prompting;
         expect(queries[1]!.prompts).toHaveLength(1);
@@ -683,7 +683,7 @@ describe("_session/rewind on v1", { timeout: 10_000 }, () => {
         const sessionId = await start();
         const session = agent.sessions[sessionId]!;
         const command = deferred();
-        session.remoteControlCommand = command.promise;
+        session.adapterCommands = runningAdapterCommands(command.promise);
         const held = vi.spyOn(command.promise, "catch");
 
         const prompting = prompt(sessionId, "edited");
@@ -730,13 +730,15 @@ describe("_session/rewind on v1", { timeout: 10_000 }, () => {
     it("answers busy while a /remote-control command is in flight", async () => {
       const sessionId = await start();
       const command = deferred();
-      agent.sessions[sessionId]!.remoteControlCommand = command.promise;
+      agent.sessions[sessionId]!.adapterCommands = runningAdapterCommands(command.promise, {
+        abortable: true,
+      });
 
       expect(await rewind(sessionId)).toEqual({ rewound: false, reason: "busy" });
 
       expect(queries).toHaveLength(1);
       expect(queries[0]!.close).not.toHaveBeenCalled();
-      agent.sessions[sessionId]!.remoteControlCommand = undefined;
+      agent.sessions[sessionId]!.adapterCommands = undefined;
     });
 
     it("fails with -32002 for a session that the agent does not hold", async () => {

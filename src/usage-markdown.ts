@@ -93,6 +93,20 @@ export function escapeMarkdown(value: string): string {
   return value.replace(/([\\`*_[\]<>|])/g, "\\$1").replace(/[\r\n]+/g, " ");
 }
 
+/** The text as a Markdown code span. The fence is longer than the longest
+ *  backtick run in the text, so the span shows the text unchanged. The user
+ *  can copy a server name from it into `/mcp reconnect`. */
+export function codeSpan(text: string): string {
+  const longestRun = Math.max(0, ...(text.match(/`+/g) ?? []).map((run) => run.length));
+  const fence = "`".repeat(longestRun + 1);
+  // CommonMark strips one space from each end of a span that is not all spaces
+  // (line endings count as spaces), so a pad keeps the text unchanged. Plain
+  // string checks, not one regex: `^ .*[^ ].* $` backtracks quadratically.
+  const strippedByCommonMark = text.startsWith(" ") && text.endsWith(" ") && /[^ \r\n]/.test(text);
+  const pad = text.startsWith("`") || text.endsWith("`") || strippedByCommonMark ? " " : "";
+  return `${fence}${pad}${text}${pad}${fence}`;
+}
+
 function formatDuration(milliseconds: number): string {
   const seconds = Math.max(0, Math.round(milliseconds / 1000));
   if (seconds < 60) return `${seconds}s`;

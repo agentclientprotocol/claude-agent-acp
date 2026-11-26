@@ -12,7 +12,7 @@ import type { Options, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent } from "../../v1/acp-agent.js";
 import type { AcpClient } from "../../acp-client.js";
 import { initializeClient } from "../helpers.js";
-import { successfulResultMessage } from "./session-doubles.js";
+import { runningAdapterCommands, successfulResultMessage } from "./session-doubles.js";
 
 const execFileSpy = vi.hoisted(() => vi.fn());
 
@@ -460,6 +460,21 @@ describe("idle compaction in the agent", () => {
     await waiting;
 
     expect(claude.received).toEqual(["hi", "hi"]);
+    await agent.dispose();
+  });
+
+  it("does not compact while an adapter command runs", async () => {
+    const claude = scriptClaudeCode();
+    const { agent, sessionId } = await connect();
+    await promptHi(agent, sessionId);
+    await claude.untilIdle();
+
+    agent.sessions[sessionId]!.adapterCommands = runningAdapterCommands(new Promise(() => {}), {
+      abortable: true,
+    });
+    await vi.advanceTimersByTimeAsync(54 * MINUTE_MS);
+
+    expect(claude.received).toEqual(["hi"]);
     await agent.dispose();
   });
 

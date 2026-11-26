@@ -102,3 +102,18 @@ describe("cliDelivery", () => {
     });
   });
 });
+
+describe("isRemoteSession", () => {
+  it.each<{ extraArgs: Record<string, string | null> | undefined; remote: boolean }>([
+    { extraArgs: undefined, remote: false },
+    { extraArgs: {}, remote: false },
+    { extraArgs: { settings: "{}" }, remote: false },
+    { extraArgs: { "sdk-url": "wss://example.test" }, remote: true },
+    { extraArgs: { "sdk-url=wss://example.test": null }, remote: true },
+    { extraArgs: { "sdk-urls": "x" }, remote: false },
+  ])("is $remote for $extraArgs", async ({ extraArgs, remote }) => {
+    const { isRemoteSession } = await load();
+
+    expect(isRemoteSession(extraArgs)).toBe(remote);
+  });
+});

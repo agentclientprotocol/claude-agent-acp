@@ -31,6 +31,7 @@ import {
   type SessionMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import packageJson from "../../package.json" with { type: "json" };
+import { sessionAdapterOptions } from "../adapter-command.js";
 import { messageIdForGrouping } from "../sdk-to-acp.js";
 import type { Logger } from "../logger.js";
 import { customAgents } from "../session-config-options.js";
@@ -761,7 +762,10 @@ class V2Agent implements AgentHandle, SessionConnection {
       persist: false,
     });
     try {
-      return fields(probe.config, await listed(new SessionCommands(probe.query)));
+      return fields(
+        probe.config,
+        await listed(new SessionCommands(probe.query, sessionAdapterOptions(setup).remoteSession)),
+      );
     } finally {
       probe.query.close();
       probe.settings.dispose();
@@ -1213,6 +1217,7 @@ class V2Agent implements AgentHandle, SessionConnection {
       input,
       perTaskStopAffordance,
       additionalDirectories,
+      sessionAdapterOptions(params),
     );
     const elicitationOptions = session.elicitations.queryOptions();
     const subagent = subagentHooks((input) => session.tasks.subagentHook(input));

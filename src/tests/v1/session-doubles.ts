@@ -7,10 +7,60 @@
 
 import { vi } from "vitest";
 import { randomUUID } from "crypto";
+import type { Query } from "@anthropic-ai/claude-agent-sdk";
+import type { AdapterCommand } from "../../adapter-command.js";
+import { AdapterCommands } from "../../v1/adapter-commands.js";
 import { SessionBackgroundWork } from "../../v1/background-work.js";
 import { clientTakesPromptSuggestions, PromptSuggestions } from "../../prompt-suggestions.js";
 import { SessionTitles } from "../../session-titles.js";
 import { DEFAULT_CONTEXT_WINDOW } from "../../session-usage.js";
+
+/**
+ * A session's adapter commands with something running until `done` settles.
+ * By default it is Remote Control starting with the query, which has no abort
+ * (`abortable` false); with `abortable` it is an adapter command that a
+ * `session/cancel` or close stops. The host is inert: Claude is never working,
+ * the session stays alive and uncancelled, and nothing reaches a client.
+ */
+export function runningAdapterCommands(
+  done: Promise<void>,
+  { abortable = false }: { abortable?: boolean } = {},
+): AdapterCommands {
+  const commands = new AdapterCommands({
+    sessionEndedMessage: "ended",
+    query: () => ({}) as Query,
+    terminalCommands: () => undefined,
+    claudeIsWorking: () => false,
+    ensureConsumer: () => {},
+    reply: async () => {},
+    alive: () => true,
+    endedBeforeStart: () => undefined,
+    commandRan: () => {},
+    context: () => ({
+      cwd: "/test",
+      env: {},
+      remoteSession: false,
+      query: () => undefined,
+      logError: () => {},
+    }),
+  });
+  if (!abortable) {
+    commands.hold(() => done).catch(() => {});
+    return commands;
+  }
+  const command: AdapterCommand = {
+    name: "plugin",
+    busyMessage: "busy",
+    inFlightMessage: "in flight",
+    run: (signal) =>
+      new Promise((resolve) => {
+        signal.addEventListener("abort", () => resolve(""), { once: true });
+        void done.then(() => resolve(""));
+      }),
+  };
+  commands.begin(command, 0).catch(() => {});
+  return commands;
+}
 
 /** Stand-in agent for a `SessionTitles` whose test doesn't care about titles:
  *  swallows the publish and the log, and never matches the identity check. */
