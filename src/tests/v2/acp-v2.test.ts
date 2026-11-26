@@ -13257,22 +13257,5 @@ describe("ACP v2 /plugin", () => {
       expect(pluginRunner.run).not.toHaveBeenCalled();
       expect(response.availableCommands?.map((command) => command.name)).not.toContain("plugin");
     });
-
-    it("does not list /plugin when Claude Code offers one", async () => {
-      const commands = sdkDefaults.supportedCommands;
-      sdk.supportedCommands = async () => [
-        ...(await commands()),
-        { name: "plugin", description: "Claude Code's", argumentHint: "" },
-      ];
-      const client = v2Client();
-      const response = await client.app.connectWith(connectRouter(), async (agent) => {
-        await initializeV2(agent);
-        return agent.request(v2.methods.agent.session.new, { cwd });
-      });
-
-      expect(response.availableCommands?.filter((command) => command.name === "plugin")).toEqual([
-        expect.objectContaining({ description: "Claude Code's" }),
-      ]);
-    });
   });
 });

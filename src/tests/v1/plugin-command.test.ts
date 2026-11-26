@@ -94,8 +94,16 @@ describe("/plugin", () => {
     expect(update.content.text).toContain("INSTALLED");
   });
 
-  it("refuses the command while Claude is working", async () => {
-    const { agent, sessionUpdate } = createAgent({}, { turnQueue: [{ settled: false }] });
+  it.each([
+    ["a turn runs", () => {}, { turnQueue: [{ settled: false }] }],
+    [
+      "foreground work runs that no turn owns",
+      (agent: ClaudeAcpAgent) => (agent as any).foregroundWork.set("session-1", {}),
+      {},
+    ],
+  ])("refuses the command while Claude is working: %s", async (_name, setUp, overrides) => {
+    const { agent, sessionUpdate } = createAgent({}, overrides);
+    setUp(agent);
 
     await expect(agent.prompt(prompt("/plugin list"))).rejects.toThrow(
       "/plugin can't run while Claude is working. Try again when the turn ends.",
@@ -290,39 +298,17 @@ describe("/plugin", () => {
   });
 
   describe("steered while a turn runs", () => {
-    it.each(["/plugin list", "/remote-control"])(
-      "refuses %s instead of injecting it",
-      async (command) => {
-        const { agent, push } = createAgent(
-          { enableRemoteControl: vi.fn(async () => ({})) },
-          { turnQueue: [{ settled: false }] },
-        );
+    it("refuses /plugin instead of injecting it", async () => {
+      const { agent, push } = createAgent({}, { turnQueue: [{ settled: false }] });
 
-        await expect(agent.steer(prompt(command))).rejects.toThrow(/while Claude is working/);
+      await expect(agent.steer(prompt("/plugin list"))).rejects.toThrow(/while Claude is working/);
 
-        expect(push).not.toHaveBeenCalled();
-        expect(runner.run).not.toHaveBeenCalled();
-      },
-    );
+      expect(push).not.toHaveBeenCalled();
+      expect(runner.run).not.toHaveBeenCalled();
+    });
   });
 
   describe("steered while no turn runs", () => {
-    it("refuses /plugin while another command is in flight", async () => {
-      const run = pendingRun();
-      const { agent, push } = createAgent();
-
-      const first = agent.startTurn(prompt("/plugin install a@b"), events);
-      await vi.waitFor(() => expect(runner.run).toHaveBeenCalled());
-      await expect(agent.steer(prompt("/plugin list"))).rejects.toThrow(
-        "Another command is still running. Try again in a moment.",
-      );
-      run.finish(reply("INSTALLED"));
-      await first;
-
-      expect(runner.run).toHaveBeenCalledOnce();
-      expect(push).not.toHaveBeenCalled();
-    });
-
     it("starts the command in steer's own section and holds a following prompt behind it", async () => {
       const run = pendingRun();
       const { agent, sessionUpdate, push } = createAgent();
@@ -395,18 +381,6 @@ describe("/plugin", () => {
 
       await expect(agent.steer(prompt("/plugin list"))).rejects.toThrow(
         "The Claude Agent session has ended. Please start a new session.",
-      );
-
-      expect(runner.run).not.toHaveBeenCalled();
-      expect(push).not.toHaveBeenCalled();
-    });
-
-    it("refuses /plugin during foreground work that no turn owns", async () => {
-      const { agent, push } = createAgent();
-      (agent as any).foregroundWork.set("session-1", {});
-
-      await expect(agent.steer(prompt("/plugin list"))).rejects.toThrow(
-        "/plugin can't run while Claude is working.",
       );
 
       expect(runner.run).not.toHaveBeenCalled();

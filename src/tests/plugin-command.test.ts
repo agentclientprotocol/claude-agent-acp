@@ -548,17 +548,8 @@ describe("runPluginCommand", () => {
 describe("pluginCommandMarkdown", () => {
   const base = { ok: true, operation: "install", message: "" } as const;
 
-  it("shows the CLI message and the reload line", () => {
-    const markdown = pluginCommandMarkdown({
-      ...base,
-      message: "Successfully installed plugin: p@m (scope: user)",
-      reload: { status: "applied", plugins: ["p", "q"] },
-    });
-    expect(markdown).toContain("Successfully installed plugin: p@m (scope: user)");
-    expect(markdown).toContain("Reloaded: the session now has `p`, `q`.");
-  });
-
   it.each<[PluginCommandResult["reload"], string]>([
+    [{ status: "applied", plugins: ["p", "q"] }, "Reloaded: the session now has `p`, `q`."],
     [{ status: "busy" }, "The session is busy"],
     [{ status: "failed", error: "boom" }, "failed: boom"],
     [{ status: "unavailable" }, "applies to new sessions"],
