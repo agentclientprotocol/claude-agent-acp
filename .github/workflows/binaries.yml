@@ -13,6 +13,10 @@ on:
         description: Upload each archive as a workflow artifact for the release job.
         type: boolean
         default: false
+      ref:
+        description: Tag or commit to build. Defaults to the commit that triggered the workflow (github.sha).
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -24,6 +28,8 @@ jobs:
     timeout-minutes: 20
     strategy:
       fail-fast: false
+      # scripts/missing-release-archives.sh reads the `archive:` lines to know
+      # which archives a release needs.
       matrix:
         include:
           - target: bun-linux-x64
@@ -61,6 +67,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.ref }}
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:

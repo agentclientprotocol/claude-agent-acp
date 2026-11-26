@@ -26,6 +26,7 @@ import {
   copyFileSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   symlinkSync,
@@ -123,7 +124,29 @@ if (positionals.length === 0) {
       probe.stdout || probe.error,
     );
   } finally {
-    rmSync(scratch, { recursive: true, force: true });
+    removeScratch(scratch);
+  }
+}
+
+/**
+ * Windows sometimes refuses to delete a scratch directory right after a
+ * process that ran from it exits: rmSync threw EPERM on `acp-layout-*` in about
+ * 2% of windows-11-arm runs, after every check had passed. rmSync retries EPERM
+ * and EBUSY, waiting 200ms longer each time on Windows. A directory that is
+ * still locked after that is left in the temp directory with a warning that
+ * lists what is left, instead of failing the smoke test.
+ */
+function removeScratch(dir) {
+  try {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  } catch (error) {
+    let left;
+    try {
+      left = readdirSync(dir, { recursive: true }).join(", ");
+    } catch (listError) {
+      left = String(listError);
+    }
+    console.warn(`warn could not remove ${dir} (left: ${left}): ${error.message}`);
   }
 }
 
@@ -252,7 +275,7 @@ if (values.full) {
   try {
     await fullSmoke(work);
   } finally {
-    rmSync(work, { recursive: true, force: true });
+    removeScratch(work);
   }
 }
 

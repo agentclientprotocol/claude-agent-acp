@@ -1,0 +1,77 @@
+# Re-runs a release's failed binary builds, up to twice, so that a flaky
+# runner doesn't leave the GitHub release missing archives and the registry on
+# the previous version. The usual cause is GitHub finding no macOS arm64 runner
+# within 15 minutes ("The job was not acquired by Runner of type hosted even
+# after multiple attempts"). No retry inside binaries.yml can cover that: the
+# job never starts. Re-running the failed jobs also re-runs upload-binaries and
+# trigger-registry-update, which depend on them; publish-npm is not re-run.
+name: Retry release binaries
+
+on:
+  workflow_run:
+    workflows: [Publish and Release]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  rerun:
+    name: Re-run failed binary builds
+    # Only the first attempt: this job waits for its own re-runs, and whether
+    # their completion triggers workflow_run again depends on the GITHUB_TOKEN
+    # rules, so a later attempt must not start a second loop over the same run.
+    if: ${{ github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.run_attempt == 1 }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write # re-run the failed jobs
+    # Two re-runs, each up to 15 minutes in the runner queue plus the build.
+    timeout-minutes: 75
+    steps:
+      - name: Re-run while only the binaries fail
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        #language=bash
+        run: |
+          # filter=latest: each job's most recent attempt, so a job that passed
+          # on an earlier attempt doesn't count as failed.
+          failed_jobs() {
+            gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?filter=latest&per_page=100" \
+              --jq '.jobs[] | select(.conclusion != "success" and .conclusion != "skipped") | "\(.name) (\(.conclusion))"'
+          }
+
+          for rerun in 1 2; do
+            failed="$(failed_jobs)"
+            if [ -z "$failed" ]; then
+              echo "Run $RUN_ID succeeded after $((rerun - 1)) re-run(s)." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "Jobs of run $RUN_ID that did not succeed:"
+            echo "$failed"
+
+            # Anything else failing (npm, the preview tag, the registry
+            # dispatch) has its own recovery in docs/RELEASES.md; re-running it
+            # blindly could publish twice.
+            if grep -v -e '^Build binaries / ' -e '^Attach binaries to the release ' <<<"$failed"; then
+              echo "::notice::Not re-running run $RUN_ID: the jobs above failed outside the binary builds."
+              exit 0
+            fi
+
+            gh run rerun "$RUN_ID" --failed --repo "$GITHUB_REPOSITORY"
+            echo "Re-ran the failed jobs of run $RUN_ID ($rerun of 2)." >> "$GITHUB_STEP_SUMMARY"
+            # The re-run is queued asynchronously; wait for it to show before
+            # watching, or the watch returns on the previous attempt's result.
+            for _ in $(seq 30); do
+              [ "$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json status --jq .status)" != completed ] && break
+              sleep 2
+            done
+            gh run watch "$RUN_ID" --repo "$GITHUB_REPOSITORY" --interval 30 >/dev/null || true
+          done
+
+          failed="$(failed_jobs)"
+          if [ -n "$failed" ]; then
+            echo "::error title=Release binaries still failing::Run $RUN_ID still has failed jobs after 2 re-runs: $(paste -sd ';' - <<<"$failed")"
+            exit 1
+          fi
+          echo "Run $RUN_ID succeeded after 2 re-runs." >> "$GITHUB_STEP_SUMMARY"

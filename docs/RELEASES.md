@@ -208,12 +208,44 @@ npm versions are immutable. If the package already published and only the
 registry update failed, pass `-f publish_npm=false` so the run skips publishing
 and only re-dispatches the registry update.
 
-### The release has no executables
+Either way, the run also checks the release's
+[executables](#the-release-is-missing-executables) before it dispatches. If the
+release has every archive, nothing is rebuilt. Otherwise it builds them from the
+tagged commit, attaches the ones the release lacks, then dispatches. Pass the
+tag as `ref`, as above: when archives need building, a `ref` that is not the
+tag's commit fails rather than attach archives built from a different commit. A
+version with no GitHub release fails until the release is created.
+
+### The release is missing executables
 
 `build-binaries` and `upload-binaries` don't gate npm, so a failed build only
-leaves the release without archives. Re-run the failed jobs of that publish run
-(`gh run rerun <run-id> --failed`); the upload uses `--clobber`, so archives
-already attached are replaced rather than duplicated.
+leaves the release without that platform's archive. `upload-binaries` attaches
+every archive that did build, adds a notice to the top of the release notes
+naming the missing ones, and fails with a "`v<version>` lacks archives" error.
+`trigger-registry-update` is skipped until the release has every archive, since
+the registry rejects a release with any missing.
+
+[`retry-binaries.yml`](../.github/workflows/retry-binaries.yml) re-runs the
+failed jobs of that run up to twice, as long as nothing but the binary builds
+failed. That covers the usual causes: no macOS arm64 runner picking up the job
+within 15 minutes, and a transient network error in a setup step. Re-running
+the failed jobs also re-runs the upload, which removes the notice once nothing
+is missing, and then the registry update.
+
+If archives are still missing after that, fix the cause and re-run the failed
+jobs of the publish run yourself (`gh run rerun <run-id> --failed`). The upload
+checks the release, not the run's build artifacts, so this still works after
+those expire at 7 days. It only adds archives the release lacks and never
+replaces one already attached, since a rebuild is not byte-identical and
+someone may already have downloaded it.
+
+GitHub re-runs a run only within 30 days of it. After that, run the publish
+workflow against the tag, which builds the missing archives, attaches them and
+updates the registry:
+
+```sh
+gh workflow run publish.yml -f ref="v<version>" -f publish_npm=false
+```
 
 ### A preview published but the commit was not tagged
 
