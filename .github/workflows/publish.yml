@@ -89,13 +89,10 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
   # A manual stable run has no release-please output to say which release it
-  # is for, or whether that release still needs its archives. This finds the
-  # release for the version at `ref` and counts the archives attached to it,
-  # so a hand-made release (docs/RELEASES.md, "The release PR merged but
-  # nothing was tagged") gets them, and a complete one is never rebuilt: the
-  # registry may already hold the attached archives' sha256, and a rebuild is
-  # not byte-identical (newer Bun, new archive timestamps), so it would not
-  # match them.
+  # is for, or whether that release still lacks archives. This finds the
+  # release for the version at `ref` and lists the archives it lacks, so a
+  # hand-made release (docs/RELEASES.md, "The release PR merged but nothing was
+  # tagged") gets them, and a complete one is not rebuilt.
   find-release:
     name: Find the release's archives
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.channel == 'stable' }}
@@ -106,48 +103,49 @@ jobs:
     outputs:
       tag: ${{ steps.find.outputs.tag }}
       build: ${{ steps.find.outputs.build }}
-    # Reads `ref` through the API rather than checking it out, so nothing from
-    # it lands on the runner. Only the tag's commit is ever built.
     steps:
-      - name: Count the archives on the release
+      # The workflow's own commit, for scripts/missing-release-archives.sh.
+      # `ref` is only read through the API, so nothing from it lands on the
+      # runner, and only the tag's commit is ever built.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: List the archives the release lacks
         id: find
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           REF: ${{ inputs.ref }}
         #language=bash
         run: |
-          version="$(gh api --method GET "repos/$GITHUB_REPOSITORY/contents/package.json" \
+          version="$(gh api --method GET "repos/$GH_REPO/contents/package.json" \
             -H "Accept: application/vnd.github.raw+json" -f ref="$REF" --jq .version)"
           tag="v$version"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          if ! count="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets \
-            --jq '[.assets[].name | select(startswith("claude-agent-acp-"))] | length')"; then
-            echo "::error title=No release $tag::'$REF' is version ${tag#v}, which has no GitHub release. Create it first (docs/RELEASES.md, 'The release PR merged but nothing was tagged')."
+          if ! missing="$(scripts/missing-release-archives.sh "$tag")"; then
+            echo "::error title=No release $tag::'$REF' is version $version, which has no GitHub release. Create it first (docs/RELEASES.md, 'The release PR merged but nothing was tagged')."
             exit 1
           fi
 
-          # One archive per entry of the build matrix in binaries.yml.
-          if [ "$count" -eq 8 ]; then
+          if [ -z "$missing" ]; then
             echo "build=false" >> "$GITHUB_OUTPUT"
-            echo "$tag already has all 8 archives; not rebuilding them." >> "$GITHUB_STEP_SUMMARY"
+            echo "$tag already has every archive; not rebuilding them." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
           # binaries.yml builds the tag. A `ref` naming another commit would
           # get archives of a commit it didn't ask for, so refuse it.
-          tagged="$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha)"
-          if [ "$(gh api "repos/$GITHUB_REPOSITORY/commits/$REF" --jq .sha)" != "$tagged" ]; then
-            echo "::error title=$tag needs its archives::'$REF' is not the commit $tag points to ($tagged). Run again with ref=$tag to build them."
+          tagged="$(gh api "repos/$GH_REPO/commits/$tag" --jq .sha)"
+          if [ "$(gh api "repos/$GH_REPO/commits/$REF" --jq .sha)" != "$tagged" ]; then
+            echo "::error title=$tag lacks archives::'$REF' is not the commit $tag points to ($tagged). Run again with ref=$tag to build them."
             exit 1
           fi
           echo "build=true" >> "$GITHUB_OUTPUT"
-          echo "$tag has $count of 8 archives; building all of them." >> "$GITHUB_STEP_SUMMARY"
+          echo "$tag lacks $(paste -sd ' ' - <<<"$missing"); building them." >> "$GITHUB_STEP_SUMMARY"
 
   # Standalone executables for the GitHub release: every stable release from
-  # release-please, and a manual stable run whose release lacks them. They
-  # don't gate the npm publish: a failed build leaves the release without
-  # binaries, fails upload-binaries and holds back the registry update.
-  # retry-binaries.yml re-runs the failed jobs, which attaches them.
+  # release-please, and a manual stable run whose release lacks some. They
+  # don't gate the npm publish: a failed build leaves the release without that
+  # platform's archive, fails upload-binaries and holds back the registry
+  # update. retry-binaries.yml re-runs the failed jobs, which attaches it.
   build-binaries:
     name: Build binaries
     needs: [release-please, find-release]
@@ -163,45 +161,80 @@ jobs:
       # Empty on a push, which builds the release merge commit the run is for.
       ref: ${{ needs.find-release.outputs.tag }}
 
+  # Attaches every archive that built, even when another platform's build
+  # failed, so those platforms can download it while the failure is fixed. It
+  # succeeds only once the release has every archive, which is what lets the
+  # registry update run. It checks the release rather than this run's
+  # artifacts, so a re-run after the 7-day artifact retention still completes
+  # the release from the archives attached earlier.
   upload-binaries:
     name: Attach binaries to the release
     runs-on: ubuntu-latest
     needs: [release-please, find-release, build-binaries]
-    # Also runs when a build failed, to fail where it shows instead of being
-    # skipped. It then attaches nothing: the registry needs every platform's
-    # archive, so a partial set would not unblock it either.
     if: ${{ !cancelled() && (needs.release-please.outputs.release_created == 'true' || needs.find-release.outputs.build == 'true') }}
     permissions:
       contents: write
     timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.release-please.outputs.tag_name || needs.find-release.outputs.tag }}
     steps:
-      - name: Check that every platform built
-        if: ${{ needs.build-binaries.result != 'success' }}
-        env:
-          TAG: ${{ needs.release-please.outputs.tag_name || needs.find-release.outputs.tag }}
-          RESULT: ${{ needs.build-binaries.result }}
-        run: |
-          echo "::error title=$TAG has no binaries::A Build binaries job ended in '$RESULT', so nothing was attached to $TAG and the registry was not updated. retry-binaries.yml re-runs the failed jobs up to twice; after that, run: gh run rerun $GITHUB_RUN_ID --failed --repo $GITHUB_REPOSITORY"
-          exit 1
+      # The workflow's own commit, for scripts/missing-release-archives.sh.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      # Archives from every attempt of this run that are still within the
+      # 7-day retention. With none (every build failed) it downloads nothing.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
           merge-multiple: true
-      - name: Upload to the release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.release-please.outputs.tag_name || needs.find-release.outputs.tag }}
+      - name: Attach the archives the release lacks
+        #language=bash
         run: |
-          # One archive per entry of the build matrix in binaries.yml. A re-run
-          # more than 7 days later finds only the archives it rebuilt, since
-          # the others' artifacts have expired.
-          shopt -s nullglob
-          archives=(artifacts/*)
-          if [ "${#archives[@]}" -ne 8 ]; then
-            echo "::error title=$TAG has no binaries::Expected 8 archives, found ${#archives[@]} (${archives[*]}), so nothing was attached to $TAG."
+          # Never replaces an archive the release already has: someone may have
+          # downloaded it or the registry may hold its sha256, and a rebuild is
+          # not byte-identical. --clobber only replaces an upload that never
+          # finished, which the script lists as missing.
+          missing="$(scripts/missing-release-archives.sh "$TAG")"
+          upload=()
+          while read -r name; do
+            if [ -n "$name" ] && [ -f "artifacts/$name" ]; then
+              upload+=("artifacts/$name")
+            fi
+          done <<<"$missing"
+          if [ "${#upload[@]}" -gt 0 ]; then
+            gh release upload "$TAG" "${upload[@]}" --clobber
+          fi
+      - name: Check the release has every archive
+        # Also after a failed upload, so the notice matches what is attached.
+        if: ${{ !cancelled() }}
+        #language=bash
+        run: |
+          missing="$(scripts/missing-release-archives.sh "$TAG")"
+
+          # Keep a notice at the top of the release notes while archives are
+          # missing, so someone looking for one knows why it isn't there.
+          start="<!-- missing-binaries -->"
+          end="<!-- /missing-binaries -->"
+          body="$(gh release view "$TAG" --json body --jq .body)"
+          # The notes without an earlier notice and the blank line after it.
+          notes="$(awk -v start="$start" -v end="$end" '
+            drop_blank { drop_blank = 0; if ($0 == "") next }
+            $0 == start { skip = 1 }
+            skip { if ($0 == end) { skip = 0; drop_blank = 1 } next }
+            { print }' <<<"$body")"
+          if [ -n "$missing" ]; then
+            notice="$start"$'\n'"> [!WARNING]"$'\n'"> Not attached yet: $(paste -sd ' ' - <<<"$missing" | sed 's/ /, /g'). They will be attached once their build is fixed."$'\n'"$end"
+            notes="$notice"$'\n\n'"$notes"
+          fi
+          if [ "$notes" != "$body" ]; then
+            gh release edit "$TAG" --notes "$notes"
+          fi
+
+          if [ -n "$missing" ]; then
+            echo "::error title=$TAG lacks archives::The release still lacks $(paste -sd ' ' - <<<"$missing"), so the registry was not updated. retry-binaries.yml re-runs the failed jobs up to twice; after that, run: gh run rerun $GITHUB_RUN_ID --failed --repo $GITHUB_REPOSITORY"
             exit 1
           fi
-          gh release upload "$TAG" "${archives[@]}" --clobber --repo "$GITHUB_REPOSITORY"
 
   # Same shape as publish-npm. Tagging is a separate job, so nothing here needs
   # write access to the repository.
@@ -315,7 +348,8 @@ jobs:
 
   trigger-registry-update:
     # A stable release dispatches only once its release has every archive:
-    # upload-binaries attached them, or find-release found all 8 already there.
+    # upload-binaries found them all attached, or find-release found nothing
+    # missing.
     # The registry takes each archive's sha256 from the release assets when it
     # bumps the version, and rejects the update while one is missing. Previews
     # are npm-only and dispatch without archives.

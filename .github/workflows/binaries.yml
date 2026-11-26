@@ -28,6 +28,8 @@ jobs:
     timeout-minutes: 20
     strategy:
       fail-fast: false
+      # scripts/missing-release-archives.sh reads the `archive:` lines to know
+      # which archives a release needs.
       matrix:
         include:
           - target: bun-linux-x64

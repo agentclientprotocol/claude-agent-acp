@@ -1,5 +1,5 @@
 # Re-runs a release's failed binary builds, up to twice, so that a flaky
-# runner doesn't leave the GitHub release without archives and the registry on
+# runner doesn't leave the GitHub release missing archives and the registry on
 # the previous version. The usual cause is GitHub finding no macOS arm64 runner
 # within 15 minutes ("The job was not acquired by Runner of type hosted even
 # after multiple attempts"). No retry inside binaries.yml can cover that: the
