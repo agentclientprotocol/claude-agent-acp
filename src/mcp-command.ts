@@ -1,6 +1,6 @@
 import type { AvailableCommand } from "@agentclientprotocol/sdk/unstable";
 import type { McpServerStatus, Query } from "@anthropic-ai/claude-agent-sdk";
-import { escapeMarkdown } from "./usage-markdown.js";
+import { codeSpan, escapeMarkdown } from "./usage-markdown.js";
 import { raceTimeoutAndAbort } from "./utils.js";
 
 /** The `/mcp` entry of `available_commands_update`. The adapter shows the
@@ -103,20 +103,6 @@ function needsReconnect(status: McpServerStatus): boolean {
   return (
     status.status === "failed" || status.status === "pending" || status.status === "needs-auth"
   );
-}
-
-/** The text as a Markdown code span. The fence is longer than the longest
- *  backtick run in the text, so the span shows the text unchanged. The user
- *  can copy a server name from it into `/mcp reconnect`. */
-function codeSpan(text: string): string {
-  const longestRun = Math.max(0, ...(text.match(/`+/g) ?? []).map((run) => run.length));
-  const fence = "`".repeat(longestRun + 1);
-  // CommonMark strips one space from each end of a span that is not all spaces
-  // (line endings count as spaces), so a pad keeps the text unchanged. Plain
-  // string checks, not one regex: `^ .*[^ ].* $` backtracks quadratically.
-  const strippedByCommonMark = text.startsWith(" ") && text.endsWith(" ") && /[^ \r\n]/.test(text);
-  const pad = text.startsWith("`") || text.endsWith("`") || strippedByCommonMark ? " " : "";
-  return `${fence}${pad}${text}${pad}${fence}`;
 }
 
 function isErrorCode(segment: string): boolean {

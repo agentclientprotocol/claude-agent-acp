@@ -5,9 +5,9 @@
  * The list is built by the v1 core's `getAvailableSlashCommands`, so both
  * cores advertise the same commands: Claude Code's commands without the
  * unsupported and terminal-bound ones, MCP prompts as `mcp:<server>:<name>`,
- * the adapter's `/mcp`, and the adapter's `/remote-control` when the query
- * serves Remote Control and Claude Code offers no command of that name (see
- * `remote-control.ts`).
+ * the adapter's `/mcp`, the adapter's `/remote-control` when the query
+ * serves Remote Control, and `/plugin` unless the session is remote, each only
+ * when Claude Code offers no command of that name (see `adapter-command.ts`).
  *
  * `/mcp` is served as on v1 (`runMcpCommand`): Claude Code runs the command,
  * and the adapter's server list replaces Claude Code's text in the turn's
@@ -24,7 +24,10 @@ export class SessionCommands {
   /** Claude Code's terminal-bound commands, from the turn's `system/init`. */
   private terminalCommands: string[] | undefined;
 
-  constructor(private readonly query: Query) {}
+  constructor(
+    private readonly query: Query,
+    private readonly remoteSession = false,
+  ) {}
 
   /** The session's commands, in v2 form. */
   async list(): Promise<v2.AvailableCommand[]> {
@@ -79,7 +82,15 @@ export class SessionCommands {
 
   private render(commands: SlashCommand[]): v2.AvailableCommand[] {
     return v2AvailableCommands(
-      getAvailableSlashCommands(commands, this.terminalCommands, undefined, undefined, this.query),
+      getAvailableSlashCommands(
+        commands,
+        this.terminalCommands,
+        undefined,
+        undefined,
+        this.query,
+        undefined,
+        this.remoteSession,
+      ),
     );
   }
 }

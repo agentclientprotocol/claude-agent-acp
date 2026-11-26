@@ -299,16 +299,17 @@ import {
   warnClaudeSubscriptionGuardDegraded,
 } from "../hide-claude-auth.js";
 import {
-  adapterRemoteControlCommand,
   isRemoteHumanMessage,
-  parseRemoteControlCommand,
   RemoteControlAtStartup,
-  type RemoteControlCommand,
-  type RemoteControlQuery,
-  runRemoteControlCommand,
   startsWithRemoteControl,
 } from "../remote-control.js";
-import { connectAtStartup, holdingPrompts } from "./remote-control.js";
+import { connectAtStartup } from "./remote-control.js";
+import {
+  type AdapterCommand,
+  adapterCommand,
+  mayBeAdapterCommand,
+  sessionAdapterOptions,
+} from "../adapter-command.js";
 import {
   AGENT_FILE_CHANGE_REPORT_CAPABILITY,
   agentFileChangeReportMeta,
@@ -1007,11 +1008,13 @@ export type Session = {
    *  back yet. Claude Code stamps the echo with the same human origin as a
    *  message typed in another client, so the uuid is what tells the two apart. */
   sentUserUuids?: Set<string>;
-  /** The Remote Control change that is running, a `/remote-control` command or
-   *  Remote Control starting with the query, from its request to its answer.
-   *  Prompts wait for it (see `holdingPrompts`), and `startTurn` refuses a
-   *  `/remote-control` meanwhile. */
-  remoteControlCommand?: Promise<void>;
+  /** The adapter command (`/remote-control`, `/plugin`) that is running, or
+   *  Remote Control starting with the query (see `connectAtStartup`), from its
+   *  request to its answer. Prompts wait for `done`, and a command is refused
+   *  meanwhile. `abort` stops a command on `session/cancel` and teardown; the
+   *  start of Remote Control has none, as it can't be stopped, and teardown
+   *  does not wait for it. */
+  adapterCommand?: { done: Promise<void>; abort?: AbortController };
   /** Remote Control at the start of this query, which Claude Code can ask for
    *  at `initialize` (see {@link ClaudeAcpAgent.connectRemoteControlAtStartup}). */
   remoteControlAtStartup?: RemoteControlAtStartup;
@@ -2270,10 +2273,10 @@ export class ClaudeAcpAgent {
     return rewindSession(params, {
       logger: this.logger,
       clearedContext: session.claudeSessionId !== undefined,
-      // A `/remote-control` command in flight answers into the session's output
+      // An adapter command in flight answers into the session's output
       // after the query that the rewind closes was asked for it.
       claudeIsWorking: () =>
-        this.claudeIsWorking(sessionId, session) || session.remoteControlCommand !== undefined,
+        this.claudeIsWorking(sessionId, session) || session.adapterCommand !== undefined,
       // A closed query also ends the background tasks and subagents.
       hasBackgroundWork: () =>
         [...session.liveBackgroundTasks.values()].some((task) => !task.endedPerLevel),
@@ -2692,55 +2695,19 @@ export class ClaudeAcpAgent {
 
     // Only a prompt that is the command awaits here: an await on every prompt
     // would let other work run between its checks and its turn's enqueue.
-    const isRemoteControl = parseRemoteControlCommand(params.prompt) !== null;
-    const askRemoteControl = () =>
-      adapterRemoteControlCommand(params.prompt, session.query, session.terminalSlashCommands);
-    let remoteControl = isRemoteControl ? await askRemoteControl() : null;
-    // A rewind that closed the query during that await did not see the command
-    // (`remoteControlCommand` is not set yet). It goes on with the session the
-    // rewind leaves, and is asked again of its query.
-    while (isRemoteControl && this.rewindToFollow(params.sessionId, session)) {
-      session = await this.followRewind(params.sessionId, session);
-      remoteControl = await askRemoteControl();
-    }
-    if (remoteControl) {
-      // The reply bypasses the turn queue, so it would land inside the output of
-      // a turn that is still running. Refuse instead of interleaving.
-      // `foregroundWork` also covers
-      // a cycle that Claude Code started on its own, such as its follow-up
-      // after a background subagent finished, which is not in `turnQueue`.
-      if (this.claudeIsWorking(params.sessionId, session)) {
-        throw RequestError.invalidRequest(
-          undefined,
-          "Remote Control can't be changed while Claude is working. Try again when the turn ends.",
+    if (mayBeAdapterCommand(params.prompt)) {
+      const resolved = await this.resolveAdapterCommand(params.sessionId, session, params.prompt);
+      session = resolved.session;
+      if (resolved.command) {
+        await this.beginAdapterCommand(
+          params.sessionId,
+          session,
+          resolved.command,
+          received,
+          events,
         );
+        return;
       }
-      if (session.remoteControlCommand) {
-        throw RequestError.invalidRequest(
-          undefined,
-          "Remote Control is already being changed. Try again in a moment.",
-        );
-      }
-      // A restart of the query keeps what the user chose last.
-      session.remoteControlAtStartup?.commandRan(remoteControl.command);
-      // The request goes over the network. Until it and its reply are done,
-      // the prompts that follow are held back, as they would otherwise start a
-      // turn that the reply lands in. The query stream's reader starts first:
-      // it also starts after the session's setup response and after a query
-      // restart, but a command that comes before the setup's timer ran (see
-      // `afterSetupResponse`) answers without a turn and would leave the
-      // stream unread until that timer.
-      await holdingPrompts(
-        session,
-        () => this.ensureConsumer(session, params.sessionId),
-        () => {
-          // Answered by the adapter without a model turn.
-          events.inserted(randomUUID());
-          return this.runRemoteControlCommand(params.sessionId, remoteControl);
-        },
-      );
-      events.ended({ stopReason: "end_turn" });
-      return;
     }
 
     const subscriptionGuard = this.runClaudeSubscriptionGuard(params.sessionId, session);
@@ -2794,24 +2761,24 @@ export class ClaudeAcpAgent {
       if (cleared?.length) await this.publishPromptSuggestions(params.sessionId, cleared);
     }
 
-    // A Remote Control change still in flight, a `/remote-control` command or
-    // Remote Control starting with the query, answers into the session's
+    // An adapter command, or Remote Control starting with the query, still in
+    // flight answers into the session's
     // output; wait for its answer before this prompt's turn can begin. A rewind
     // may have replaced the session during the awaits above, including the
-    // change's network call, and a change may be in flight on the successor
-    // too (a `/remote-control` prompt that the same rewind held, or the start
-    // on the rewind's new query). So wait for the current session's change,
-    // follow a rewind, and look again, until neither is pending. The check
-    // that ends the loop and the turn's enqueue below have no await between
-    // them, so no change can start in between. A failure of a command's reply
-    // is reported to the command's own prompt, and one of the start is logged.
-    // A change that was waited for is done: `holdingPrompts` clears the field
-    // in a `finally` that may run after this wait resumes, so it is not
-    // waited for twice.
+    // command's network call, and a command may be in flight on the successor
+    // too (a command prompt that the same rewind held, or the start on the
+    // rewind's new query). So wait for
+    // the current session's command, follow a rewind, and look again, until
+    // neither is pending. The check that ends the loop and the turn's enqueue
+    // below have no await between them, so no command can start in between.
+    // A failure of a command's reply is reported to the command's own prompt,
+    // and one of the start is logged.
+    // A command that was waited for is done: its prompt clears the field in a
+    // `finally` that may run after this wait resumes, so it is not waited for twice.
     let waited: Promise<void> | undefined;
     for (;;) {
-      if (session.remoteControlCommand && session.remoteControlCommand !== waited) {
-        waited = session.remoteControlCommand;
+      if (session.adapterCommand && session.adapterCommand.done !== waited) {
+        waited = session.adapterCommand.done;
         await waited.catch(() => {});
         continue;
       }
@@ -2835,7 +2802,7 @@ export class ClaudeAcpAgent {
     // that ended meanwhile fails the prompt as the check above does.
     // A `session/cancel` that arrived after this prompt, during the awaits
     // above, ends it the same way.
-    if (session.tornDown || received <= (this.cancelledThrough.get(params.sessionId) ?? 0)) {
+    if (this.endedBeforeStart(params.sessionId, session, received)) {
       session.fileChangeReporter?.finish(fileChangeReport, "cancelled");
       events.ended({ stopReason: "cancelled" });
       return;
@@ -2959,14 +2926,122 @@ export class ClaudeAcpAgent {
       .catch((error) => this.logger.error(`Session ${sessionId}: cursor_update failed:`, error));
   }
 
-  /** Runs the command, and sends its reply (see `runRemoteControlCommand`). */
-  private async runRemoteControlCommand(
+  /** Asks whether the prompt is an adapter command, following a rewind. The
+   *  caller checks `mayBeAdapterCommand` first, so that only a command-shaped
+   *  prompt awaits. Returns the session the rewind leaves, which the caller
+   *  goes on with. */
+  private async resolveAdapterCommand(
     sessionId: string,
-    { query, command }: { query: RemoteControlQuery; command: RemoteControlCommand },
+    session: Session,
+    prompt: PromptRequest["prompt"],
+  ): Promise<{ session: Session; command: AdapterCommand | null }> {
+    const askCommand = () =>
+      adapterCommand(
+        prompt,
+        session.query,
+        session.terminalSlashCommands,
+        this.adapterCommandContext(sessionId, session),
+      );
+    let command = await askCommand();
+    // A rewind that closed the query during that await did not see the command
+    // (`adapterCommand` is not set yet). It goes on with the session the
+    // rewind leaves, and is asked again of its query.
+    while (this.rewindToFollow(sessionId, session)) {
+      session = await this.followRewind(sessionId, session);
+      command = await askCommand();
+    }
+    return { session, command };
+  }
+
+  /** Refuses a command that would reply into a running turn or start beside
+   *  another command. */
+  private assertAdapterCommandCanStart(
+    sessionId: string,
+    session: Session,
+    command: AdapterCommand,
+  ): void {
+    // The reply bypasses the turn queue, so it would land inside the output of
+    // a turn that is still running. Refuse instead of interleaving.
+    // `foregroundWork` also covers
+    // a cycle that Claude Code started on its own, such as its follow-up
+    // after a background subagent finished, which is not in `turnQueue`.
+    if (this.claudeIsWorking(sessionId, session)) {
+      throw RequestError.invalidRequest(undefined, command.busyMessage);
+    }
+    if (session.adapterCommand) {
+      throw RequestError.invalidRequest(undefined, command.inFlightMessage);
+    }
+  }
+
+  /** Starts the command. Everything that can refuse it runs before the first
+   *  await and throws synchronously, except a prompt that was cancelled or
+   *  whose session was torn down: that one ends through `events.ended`
+   *  (`cancelled`) without running the command, so a caller that does not
+   *  await the promise must check `endedBeforeStart` itself first. The promise
+   *  settles when the command and its reply are done, after `events.ended`. */
+  private beginAdapterCommand(
+    sessionId: string,
+    session: Session,
+    command: AdapterCommand,
+    received: number,
+    events: TurnEvents,
   ): Promise<void> {
-    const text = await runRemoteControlCommand(query, command, (message) =>
-      this.logger.error(message),
-    );
+    // A `session/cancel` or `session/close` during the awaits before this call
+    // found no command in flight to abort, so the command must not start now.
+    if (this.endedBeforeStart(sessionId, session, received)) {
+      events.ended({ stopReason: "cancelled" });
+      return Promise.resolve();
+    }
+    if (this.sessions[sessionId] !== session || session.queryClosed) {
+      throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+    }
+    this.assertAdapterCommandCanStart(sessionId, session, command);
+    // A restart of the query keeps what the user chose last.
+    if (command.remoteControl) session.remoteControlAtStartup?.commandRan(command.remoteControl);
+    // Once Remote Control is on, other clients can start turns or send
+    // messages on their own. Something has to read the query stream for
+    // those to reach this client. The reader starts after the session's
+    // setup response and after a query restart; a command that comes before
+    // the setup's timer ran (see `afterSetupResponse`) answers without a
+    // turn and would leave the stream unread until that timer.
+    this.ensureConsumer(session, sessionId);
+    // Answered by the adapter without a model turn.
+    events.inserted(randomUUID());
+    // The command can take a network call or a minute-long `git clone`. Until
+    // it and its reply are done, `adapterCommand` holds back the prompts that
+    // follow, which would otherwise start a turn that the reply lands in.
+    const abort = new AbortController();
+    const done = this.runAdapterCommand(sessionId, command, abort.signal);
+    session.adapterCommand = { done, abort };
+    return (async () => {
+      try {
+        await done;
+      } finally {
+        session.adapterCommand = undefined;
+      }
+      events.ended({ stopReason: abort.signal.aborted ? "cancelled" : "end_turn" });
+    })();
+  }
+
+  /** What the adapter command of this session needs from it. */
+  private adapterCommandContext(sessionId: string, session: Session) {
+    return {
+      cwd: session.cwd,
+      ...sessionAdapterOptions(session.creationParams),
+      // The query can be replaced by a rewind or respawn while the command runs.
+      query: () => this.sessions[sessionId]?.query,
+      logError: (message: string) => this.logger.error(message),
+    };
+  }
+
+  /** Runs the command, and sends its reply unless the command was aborted. */
+  private async runAdapterCommand(
+    sessionId: string,
+    command: AdapterCommand,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const text = await command.run(signal);
+    if (signal.aborted) return;
     await this.client.sessionUpdate({
       sessionId,
       update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
@@ -3373,6 +3448,31 @@ export class ClaudeAcpAgent {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
 
+    // The adapter answers this command itself; injected, it would reach Claude
+    // Code, which refuses it. With nothing running it starts below through the
+    // same `beginAdapterCommand` as a prompt, in the synchronous section that
+    // checks and reserves it; a detached `prompt()` would re-decide it after
+    // further awaits and could refuse where steer's caller cannot see.
+    let command: AdapterCommand | null = null;
+    let received = 0;
+    if (mayBeAdapterCommand(params.prompt)) {
+      // Before the await, as `startTurn` does: a `session/cancel` during it
+      // finds no command in flight to abort, and must still cancel this one.
+      received = ++this.promptsReceived;
+      const resolved = await this.resolveAdapterCommand(sessionId, session, params.prompt);
+      command = resolved.command;
+      // A close during the await leaves `session` stale.
+      const current = this.sessions[sessionId];
+      if (!current) {
+        throw RequestError.sessionNotFound(sessionId);
+      }
+      session = current;
+      if (session.queryClosed) {
+        throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+      }
+      if (command) this.assertAdapterCommandCanStart(sessionId, session, command);
+    }
+
     // "A turn is running" = the queue holds an unsettled turn. This covers both
     // the activated turn and one just submitted but not yet echoed/activated,
     // which is exactly the window in which steering is meaningful. This check
@@ -3388,6 +3488,29 @@ export class ClaudeAcpAgent {
         // The opt-in path leaves the content untouched so the Host can retry via
         // a normal session/prompt whose lifecycle owns the continuation result.
         return { outcome: "promptRequired", reason: "noRunningTurn" };
+      }
+
+      if (command) {
+        // No await since the checks above and the reservation inside, so no
+        // prompt can enqueue a turn between them. A busy, in-flight, cancelled
+        // or ended session rejects `steer`; what remains after it returns is the
+        // command itself, whose failure can only be logged.
+        if (this.endedBeforeStart(sessionId, session, received)) {
+          if (session.tornDown) throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+          throw RequestError.requestCancelled(
+            undefined,
+            "The command was cancelled before it started.",
+          );
+        }
+        session.idleCompaction?.disarm("prompt");
+        const failed = (error: unknown) =>
+          this.logger.error(`Session ${sessionId}: steered new turn failed: ${error}`);
+        this.beginAdapterCommand(sessionId, session, command, received, {
+          inserted() {},
+          ended() {},
+          failed,
+        }).catch(failed);
+        return { outcome: "startedNewTurn" };
       }
 
       // The detached `prompt()` below swallows its own rejection, so run the
@@ -5503,6 +5626,7 @@ export class ClaudeAcpAgent {
                       session.skillPaths,
                       session.query,
                       session.skillFiles,
+                      sessionAdapterOptions(session.creationParams).remoteSession,
                     ),
                   },
                 });
@@ -7801,6 +7925,7 @@ export class ClaudeAcpAgent {
       return;
     }
     session.cancelled = true;
+    session.adapterCommand?.abort?.abort();
     session.idleCompaction?.disarm("cancel");
     // Only prompts received before this cancel are cancelled. A prompt that
     // arrives while the awaits below run is queued and runs after the cancel
@@ -8202,9 +8327,10 @@ export class ClaudeAcpAgent {
   }
 
   /** Cleanly tear down a session: cancel in-flight work, release stream
-   *  resources, and remove it from the session map. Returns once the turns it
-   *  cancels have ended, so their `session/prompt` responses go out before
-   *  the caller answers. A wedged consumer holds it at most
+   *  resources, and remove it from the session map. Returns once the turns and
+   *  the adapter command (`/plugin`, `/remote-control`) it aborts have ended,
+   *  so their `session/prompt` responses go out before the caller answers. A
+   *  wedged consumer or command holds it at most
    *  {@link TEARDOWN_TURN_END_TIMEOUT_MS}. */
   private async teardownSession(sessionId: string): Promise<void> {
     const session = this.sessions[sessionId];
@@ -8213,9 +8339,13 @@ export class ClaudeAcpAgent {
     }
     session.tornDown = true;
     const turns = [...(session.turnQueue ?? [])];
-    const turnsEnded = Promise.all(
-      turns.flatMap((turn) => (turn.completion ? [turn.completion] : [])),
-    );
+    const turnsEnded = Promise.all([
+      ...turns.flatMap((turn) => (turn.completion ? [turn.completion] : [])),
+      // Only a command that the cancel aborts: Remote Control starting with
+      // the query is not stopped by it, and a pending request would hold the
+      // close for the whole timeout.
+      ...(session.adapterCommand?.abort ? [session.adapterCommand.done.catch(() => {})] : []),
+    ]);
     try {
       await this.cancelTurns({ sessionId }, { awaitInterrupt: false });
     } catch (error) {
@@ -9045,6 +9175,13 @@ export class ClaudeAcpAgent {
     }
   }
 
+  /** Whether the prompt received as number `received` must end `cancelled`
+   *  instead of starting: its session was closed, or a `session/cancel` came
+   *  after the prompt. */
+  private endedBeforeStart(sessionId: string, session: Session, received: number): boolean {
+    return session.tornDown || received <= (this.cancelledThrough.get(sessionId) ?? 0);
+  }
+
   /** Whether Claude is working in the session `sessionId`: an unsettled turn in
    *  its queue, or foreground work that no turn owns, such as a cycle that
    *  Claude Code started on its own. */
@@ -9838,6 +9975,7 @@ export class ClaudeAcpAgent {
       (session.skillPaths ??= new Map()),
       session.query,
       session.skillFiles,
+      sessionAdapterOptions(session.creationParams).remoteSession,
     );
   }
 
@@ -11300,6 +11438,7 @@ export class ClaudeAcpAgent {
           // is wrapped in `withPendingUserInput`.
           isBusy: () =>
             this.claudeIsWorking(sessionId, registered) ||
+            registered.adapterCommand !== undefined ||
             (registered.openUserInputs?.size ?? 0) > 0,
           contextTokens: () => registered.contextUsedTokens,
           settings: () =>

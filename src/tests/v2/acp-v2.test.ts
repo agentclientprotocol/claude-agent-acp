@@ -25,6 +25,8 @@ import { v2DiffContent } from "../../diff.js";
 import { type AcpProtocols, acpProtocolRouter, acpProtocolsFromEnv } from "../../serve.js";
 import { v1PermissionResponse, v2PermissionRequest } from "../../v2/permissions.js";
 import { v1PromptRequest } from "../../v2/prompt.js";
+import { SessionConfig } from "../../v2/config.js";
+import { SessionReports } from "../../v2/reports.js";
 import { V2Terminals } from "../../v2/terminal.js";
 import { V2ToolCallMeta } from "../../v2/tool-call-meta.js";
 import { v2RestartedToolCall } from "../../v2/tool-call.js";
@@ -47,6 +49,12 @@ import {
 import packageJson from "../../../package.json" with { type: "json" };
 
 const execFileSpy = vi.hoisted(() => vi.fn());
+const pluginRunner = vi.hoisted(() => ({ run: vi.fn() }));
+
+vi.mock("../../plugin-command.js", async () => ({
+  ...(await vi.importActual<typeof import("../../plugin-command.js")>("../../plugin-command.js")),
+  runPluginCommand: pluginRunner.run,
+}));
 
 vi.mock("node:child_process", async () => {
   const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
@@ -529,6 +537,7 @@ const SESSION_COMMANDS: v2.AvailableCommand[] = [
     description: "Show the MCP servers and their status, or reconnect, enable, or disable a server",
     input: { type: "text", hint: "[reconnect|enable|disable [<server>|all]]" },
   },
+  expect.objectContaining({ type: "command", name: "plugin" }),
 ];
 
 describe("ACP v2 sessions", () => {
@@ -12950,3 +12959,320 @@ async function previewToolUse(
     }
   }
 }
+
+describe("ACP v2 /plugin", () => {
+  const pluginReply = (message: string) => ({ ok: false, operation: "install", message });
+
+  beforeEach(() => {
+    pluginRunner.run.mockReset();
+    pluginRunner.run.mockResolvedValue(pluginReply("INSTALLED"));
+  });
+
+  it("runs /plugin itself, without Claude Code, and answers as agent text", async () => {
+    const echoed = scriptTurns(async function* (options) {
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("/plugin install foo@bar"),
+      });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      await client.authUpdate(1);
+    });
+
+    expect(pluginRunner.run).toHaveBeenCalledOnce();
+    expect(pluginRunner.run.mock.calls[0][1]).toMatchObject({ cwd });
+    expect(echoed).toEqual([]);
+    expect(client.updates("agent_message_chunk")[0].content).toMatchObject({
+      text: expect.stringContaining("INSTALLED"),
+    });
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      "user_message",
+      "running",
+      "agent_message_chunk",
+      "idle end_turn",
+    ]);
+  });
+
+  it("runs /plugin sent while Claude works once the turn ends", async () => {
+    const release = Promise.withResolvers<void>();
+    scriptTurns(async function* (options) {
+      await release.promise;
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("work") });
+      const command = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("/plugin list"),
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(pluginRunner.run).not.toHaveBeenCalled();
+      release.resolve();
+      await command;
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates)).toEqual([
+          "user_message",
+          "running",
+          "idle end_turn",
+          "user_message",
+          "running",
+          "agent_message_chunk",
+          "idle end_turn",
+        ]),
+      );
+      await client.authUpdate(1);
+    });
+    expect(pluginRunner.run).toHaveBeenCalledOnce();
+  });
+
+  it("aborts the command on cancel, sends no reply and ends the turn cancelled", async () => {
+    let signal: AbortSignal | undefined;
+    const started = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<unknown>();
+    pluginRunner.run.mockImplementation(async (_command, deps: { signal: AbortSignal }) => {
+      signal = deps.signal;
+      started.resolve();
+      return finish.promise;
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("/plugin install foo@bar"),
+      });
+      await started.promise;
+      expect(signal?.aborted).toBe(false);
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+      await vi.waitFor(() => expect(signal?.aborted).toBe(true));
+      finish.resolve(pluginReply("TOO LATE"));
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle cancelled"));
+      await client.authUpdate(1);
+    });
+
+    expect(client.updates("agent_message_chunk")).toEqual([]);
+    expect(turnTrace(client.sessionUpdates)).toEqual(["user_message", "running", "idle cancelled"]);
+  });
+
+  describe("behind the subscription guard", () => {
+    const promptTexts = (spy: { mock: { calls: unknown[][] } }) =>
+      spy.mock.calls.map(([prompt]) => JSON.stringify(prompt));
+
+    it("titles the session once the guard passes and the command ran", async () => {
+      const argv = process.argv;
+      process.argv = [...argv, "--hide-claude-auth"];
+      const titled = vi.spyOn(SessionReports.prototype, "promptSent");
+      scriptTurns(async function* (options) {
+        yield result(options);
+      });
+      const client = v2Client();
+      try {
+        await client.app.connectWith(connectRouter(), async (agent) => {
+          await initializeV2(agent);
+          const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+          await agent.request(v2.methods.agent.session.prompt, {
+            sessionId,
+            prompt: text("/plugin list"),
+          });
+          await vi.waitFor(() =>
+            expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"),
+          );
+          await client.authUpdate(1);
+        });
+      } finally {
+        process.argv = argv;
+      }
+      const titledCalls = promptTexts(titled);
+      titled.mockRestore();
+
+      expect(pluginRunner.run).toHaveBeenCalledOnce();
+      expect(titledCalls).toHaveLength(1);
+    });
+
+    it("titles nothing for a command that a cancel answered while it waited for idle", async () => {
+      const argv = process.argv;
+      process.argv = [...argv, "--hide-claude-auth"];
+      const apiKey = { apiKeySource: "ANTHROPIC_API_KEY", apiProvider: "firstParty" };
+      sdk.initializationResult = async () => ({
+        ...(await sdkDefaults.initializationResult()),
+        account: apiKey,
+      });
+      sdk.accountInfo = async () => apiKey;
+      const titled = vi.spyOn(SessionReports.prototype, "promptSent");
+      const release = Promise.withResolvers<void>();
+      scriptTurns(async function* (options) {
+        await release.promise;
+        yield result(options);
+      });
+      const client = v2Client();
+      try {
+        await client.app.connectWith(connectRouter(), async (agent) => {
+          await initializeV2(agent);
+          const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+          await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("work") });
+          await vi.waitFor(() => expect(titled).toHaveBeenCalledTimes(1));
+          const command = agent
+            .request(v2.methods.agent.session.prompt, {
+              sessionId,
+              prompt: text("/plugin list"),
+            })
+            .catch((error: unknown) => error);
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+          await expect(command).resolves.toMatchObject({ code: -32800 });
+          release.resolve();
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        });
+      } finally {
+        process.argv = argv;
+        release.resolve();
+      }
+      const titledCalls = promptTexts(titled);
+      titled.mockRestore();
+
+      expect(pluginRunner.run).not.toHaveBeenCalled();
+      expect(titledCalls).toHaveLength(1);
+      expect(titledCalls[0]).toContain("work");
+    });
+  });
+
+  describe("when the adapter does not serve it", () => {
+    it("leaves /plugin to Claude Code, behind the subscription guard", async () => {
+      const argv = process.argv;
+      process.argv = [...argv, "--hide-claude-auth"];
+      const apiKey = { apiKeySource: "ANTHROPIC_API_KEY", apiProvider: "firstParty" };
+      sdk.initializationResult = async () => ({
+        ...(await sdkDefaults.initializationResult()),
+        account: apiKey,
+      });
+      const commands = sdkDefaults.supportedCommands;
+      sdk.supportedCommands = async () => [
+        ...(await commands()),
+        { name: "plugin", description: "Claude Code's", argumentHint: "" },
+      ];
+      const accountInfo = vi.fn(async () => apiKey);
+      sdk.accountInfo = accountInfo;
+      const echoed = scriptTurns(async function* (options) {
+        yield result(options);
+      });
+      const client = v2Client();
+      try {
+        await client.app.connectWith(connectRouter(), async (agent) => {
+          await initializeV2(agent);
+          const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+          accountInfo.mockClear();
+          await agent.request(v2.methods.agent.session.prompt, {
+            sessionId,
+            prompt: text("/plugin list"),
+          });
+          await vi.waitFor(() => expect(echoed).toHaveLength(1));
+          await client.authUpdate(1);
+        });
+      } finally {
+        process.argv = argv;
+      }
+
+      expect(pluginRunner.run).not.toHaveBeenCalled();
+      expect(accountInfo).toHaveBeenCalled();
+    });
+
+    it("titles nothing and sends no notice when the guard refuses the /plugin it does not serve", async () => {
+      const argv = process.argv;
+      process.argv = [...argv, "--hide-claude-auth"];
+      vi.stubEnv("CLAUDE_CODE_EXECUTABLE", "/usr/bin/false");
+      const apiKey = { apiKeySource: "ANTHROPIC_API_KEY", apiProvider: "firstParty" };
+      sdk.initializationResult = async () => ({
+        ...(await sdkDefaults.initializationResult()),
+        account: apiKey,
+      });
+      const titled = vi.spyOn(SessionReports.prototype, "promptSent");
+      const notified = vi.spyOn(SessionConfig.prototype, "promptSent");
+      const echoed = scriptTurns(async function* (options) {
+        yield result(options);
+      });
+      const client = v2Client();
+      try {
+        await client.app.connectWith(connectRouter(), async (agent) => {
+          await initializeV2(agent);
+          const { sessionId } = await agent.request(v2.methods.agent.session.new, {
+            cwd,
+            _meta: { claudeCode: { options: { extraArgs: { "sdk-url": "wss://example.test" } } } },
+          });
+          sdk.accountInfo = async () => ({
+            email: "user@example.com",
+            subscriptionType: "max",
+            apiProvider: "firstParty",
+          });
+          await expect(
+            agent.request(v2.methods.agent.session.prompt, {
+              sessionId,
+              prompt: text("/plugin list"),
+            }),
+          ).rejects.toMatchObject({ code: -32000 });
+          await client.authUpdate(1);
+        });
+      } finally {
+        process.argv = argv;
+        vi.unstubAllEnvs();
+      }
+      const [titledCalls, notifiedCalls] = [titled.mock.calls.length, notified.mock.calls.length];
+      titled.mockRestore();
+      notified.mockRestore();
+
+      expect(pluginRunner.run).not.toHaveBeenCalled();
+      expect(echoed).toEqual([]);
+      expect(titledCalls).toBe(0);
+      expect(notifiedCalls).toBe(0);
+    });
+
+    it("leaves /plugin to Claude Code in a remote session, and does not list it", async () => {
+      const echoed = scriptTurns(async function* (options) {
+        yield result(options);
+      });
+      const client = v2Client();
+      const response = await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const response = await agent.request(v2.methods.agent.session.new, {
+          cwd,
+          _meta: { claudeCode: { options: { extraArgs: { "sdk-url": "wss://example.test" } } } },
+        });
+        await agent.request(v2.methods.agent.session.prompt, {
+          sessionId: response.sessionId,
+          prompt: text("/plugin list"),
+        });
+        await vi.waitFor(() => expect(echoed).toHaveLength(1));
+        await client.authUpdate(1);
+        return response;
+      });
+
+      expect(pluginRunner.run).not.toHaveBeenCalled();
+      expect(response.availableCommands?.map((command) => command.name)).not.toContain("plugin");
+    });
+
+    it("does not list /plugin when Claude Code offers one", async () => {
+      const commands = sdkDefaults.supportedCommands;
+      sdk.supportedCommands = async () => [
+        ...(await commands()),
+        { name: "plugin", description: "Claude Code's", argumentHint: "" },
+      ];
+      const client = v2Client();
+      const response = await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        return agent.request(v2.methods.agent.session.new, { cwd });
+      });
+
+      expect(response.availableCommands?.filter((command) => command.name === "plugin")).toEqual([
+        expect.objectContaining({ description: "Claude Code's" }),
+      ]);
+    });
+  });
+});

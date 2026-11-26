@@ -90,7 +90,8 @@ import { StoppedWork } from "./stopped-work.js";
 import { SessionReports } from "./reports.js";
 import { SessionElicitations } from "./elicitation.js";
 import { SessionOutput } from "./stream.js";
-import { SessionRemoteControl } from "./remote-control.js";
+import type { AdapterCommandContext } from "../adapter-command.js";
+import { SessionAdapterCommands } from "./adapter-commands.js";
 import { RemoteControlAtStartup } from "../remote-control.js";
 import { SessionTasks, type RequestTarget, type RequestContext } from "./tasks.js";
 
@@ -229,8 +230,8 @@ export class V2Session implements RequestTarget {
    * them, also after a resume of the active session.
    */
   mcpServersRefused = false;
-  /** The adapter's `/remote-control`, and messages typed in other clients. */
-  private readonly remoteControl: SessionRemoteControl;
+  /** The adapter's own commands, and messages typed in other clients. */
+  private readonly adapterCommands: SessionAdapterCommands;
   /** Who waits for {@link turnBoundary}, with whether it waits for a restart. */
   private readonly boundaryWaiters: Array<{
     restart: boolean;
@@ -252,6 +253,11 @@ export class V2Session implements RequestTarget {
      * in them and in `cwd`.
      */
     workspaceDirectories: readonly string[] = additionalDirectories,
+    /** Where the adapter's commands run: the CLI's env, and whether Claude Code is remote. */
+    private readonly adapter: Pick<AdapterCommandContext, "env" | "remoteSession"> = {
+      env: process.env,
+      remoteSession: false,
+    },
   ) {
     this.output = new SessionOutput(
       sessionId,
@@ -358,9 +364,12 @@ export class V2Session implements RequestTarget {
       target: (agentId) => this.target(agentId),
       query: () => this.query,
     });
-    this.remoteControl = new SessionRemoteControl({
+    this.adapterCommands = new SessionAdapterCommands({
       logger: connection.logger,
       sessionId,
+      cwd,
+      env: adapter.env,
+      remoteSession: adapter.remoteSession,
       query: () => this.query,
       terminalCommands: () => this.commands.terminal(),
       idle: () => this.turnBoundary(false),
@@ -368,8 +377,8 @@ export class V2Session implements RequestTarget {
         this.inserted(uuid);
         this.openTurn(undefined);
       },
-      end: (text, messageId) => {
-        this.output.agentMessage(text, messageId);
+      end: (reply) => {
+        if (reply) this.output.agentMessage(reply.text, reply.messageId);
         this.closeTurn();
       },
       working: () => !this.atTurnBoundary(false),
@@ -398,7 +407,7 @@ export class V2Session implements RequestTarget {
     this.hasHistory = resumed;
     this.mcpServers = JSON.stringify(mcpServers);
     this.mcpServersRefused = mcpServersRefused;
-    this.commands = new SessionCommands(query);
+    this.commands = new SessionCommands(query, this.adapter.remoteSession);
     void this.consume(query);
   }
 
@@ -408,21 +417,21 @@ export class V2Session implements RequestTarget {
    * {@link connectRemoteControlAtStartup}.
    */
   setRemoteControlAtStartup(asked: boolean): void {
-    this.remoteControl.atStartup = new RemoteControlAtStartup(asked);
+    this.adapterCommands.atStartup = new RemoteControlAtStartup(asked);
   }
 
   /**
    * A restart replaced the query of `previous` with this session's: Remote
    * Control that the user turned off there stays off (see
-   * `SessionRemoteControl.restartedFrom`).
+   * `SessionAdapterCommands.restartedFrom`).
    */
   remoteControlRestartedFrom(previous: V2Session): void {
-    this.remoteControl.restartedFrom(previous.remoteControl);
+    this.adapterCommands.restartedFrom(previous.adapterCommands);
   }
 
   /**
    * Starts Remote Control for a query that Claude Code asked to start with it
-   * (see `SessionRemoteControl.connectAtStartup`), in line with the session's
+   * (see `SessionAdapterCommands.connectAtStartup`), in line with the session's
    * prompts: the prompts after it wait for its notice, as they wait for the
    * adapter's `/remote-control`.
    */
@@ -430,7 +439,7 @@ export class V2Session implements RequestTarget {
     this.pushes = this.pushes.then(async () => {
       if (this.closed) return;
       try {
-        await this.remoteControl.connectAtStartup();
+        await this.adapterCommands.connectAtStartup();
       } catch (error) {
         this.connection.logger.error(
           `Session ${this.sessionId}: failed to start Remote Control with the session`,
@@ -499,7 +508,8 @@ export class V2Session implements RequestTarget {
    * runs in the prompt's turn among the session's prompts, so they keep their
    * order, and a cancel or close answers a prompt that waits for it with
    * -32800 as any prompt not inserted yet. Its refusal answers the prompt.
-   * The adapter's `/remote-control` is not guarded.
+   * A prompt that the adapter serves itself (`/remote-control`, `/plugin`) is
+   * not guarded; one that it does not serve is, before it goes to Claude Code.
    *
    * A prompt with an `idempotencyKey` inserts at most one message for the
    * key (see `prompt-keys.ts`): a retry of a prompt that is not answered yet
@@ -541,9 +551,12 @@ export class V2Session implements RequestTarget {
     { uuid, stored }: KeyedAttempt,
     signal: AbortSignal,
   ): Promise<v2.PromptResponse> {
-    const remoteControl = this.remoteControl.mayRun(request.prompt);
-    const guarded = guard && !remoteControl ? guard : undefined;
-    // A prompt that the guard refuses titles nothing and sends no notice.
+    // Whether the adapter may serve the prompt itself: `run` decides, and a prompt
+    // that it does not serve goes to Claude Code through the guard like any other.
+    const adapterCommand = this.adapterCommands.mayRun(request.prompt);
+    const guarded = guard && !adapterCommand ? guard : undefined;
+    // A prompt that the guard refuses titles nothing and sends no notice: one that
+    // may be an adapter command waits for `run` to serve it, or for the guard.
     const sent = () => {
       this.reports.promptSent(request.prompt);
       // The notice of a mode fallback at the session's start, which sends it at once.
@@ -552,11 +565,11 @@ export class V2Session implements RequestTarget {
     const message: SDKUserMessage = { ...promptToClaude(request), uuid };
     /** What a prompt that is new to the session registers before it goes to Claude Code. */
     const accept = () => {
-      if (!guarded) sent();
+      if (!guard) sent();
       // Only a prompt that goes to Claude Code gets a file-change report, as
-      // on v1: the adapter's `/remote-control` registers it once it passes
+      // on v1: a prompt that may be an adapter command registers once it passes
       // the prompt on (below).
-      if (!remoteControl) this.fileChanges?.requested(uuid, params._meta);
+      if (!adapterCommand) this.fileChanges?.requested(uuid, params._meta);
       const localCommand = this.commands.localCommand(request.prompt);
       if (localCommand) this.localCommands.set(uuid, localCommand);
     };
@@ -584,6 +597,17 @@ export class V2Session implements RequestTarget {
       if (signal.aborted) withdraw();
       // A cancel or close answered it before it went out.
       const answered = () => this.pending.get(uuid) !== pending || this.closed;
+      /** Runs the guard. `false` once its refusal or a cancel answered the prompt. */
+      const passGuard = async (check: (query: Query) => Promise<void> | undefined) => {
+        try {
+          // Set by `start`, which runs before the agent lists the session.
+          await check(this.query!);
+        } catch (error) {
+          this.failPrompt(uuid, error);
+          return false;
+        }
+        return !answered();
+      };
       this.pushes = this.pushes
         .then(() => this.interrupting)
         .then(async () => {
@@ -600,25 +624,31 @@ export class V2Session implements RequestTarget {
             accept();
           }
           if (guarded) {
-            try {
-              // Set by `start`, which runs before the agent lists the session.
-              await guarded(this.query!);
-            } catch (error) {
-              this.failPrompt(uuid, error);
-              return;
-            }
-            if (answered()) return;
+            if (!(await passGuard(guarded))) return;
             sent();
           }
-          // The prompts after the adapter's `/remote-control` wait for it.
-          if (remoteControl) {
+          // The prompts after an adapter command wait for it.
+          if (adapterCommand) {
             try {
-              if (await this.remoteControl.run(request.prompt, uuid, () => !answered())) return;
+              const outcome = await this.adapterCommands.run(
+                request.prompt,
+                uuid,
+                () => !answered(),
+              );
+              if (outcome !== "not-served") {
+                // A prompt that a cancel or close answered titles nothing.
+                if (guard && outcome === "ran") sent();
+                return;
+              }
             } catch (error) {
               this.failPrompt(uuid, error);
               return;
             }
             if (answered()) return;
+            if (guard) {
+              if (!(await passGuard(guard))) return;
+              sent();
+            }
             this.fileChanges?.requested(uuid, params._meta);
           }
           if (this.foreground || [...this.pending.values()].some((prompt) => prompt.pushed)) {
@@ -629,7 +659,7 @@ export class V2Session implements RequestTarget {
             if (message.priority === "now") this.steeredPrompts.add(uuid);
           }
           pending.pushed = true;
-          this.remoteControl.pushed(uuid);
+          this.adapterCommands.pushed(uuid);
           this.input.push(message);
           this.reports.promptQueued(request.prompt);
         });
@@ -642,7 +672,7 @@ export class V2Session implements RequestTarget {
    * prompt of the session waits to go to Claude Code, which the restart would
    * answer with -32800. No live subagent remains. Background commands and
    * tool tasks end when the old query retires. Without it, for
-   * the adapter's `/remote-control`, whose own prompt waits for the boundary.
+   * an adapter command such as `/remote-control`, whose own prompt waits for the boundary.
    */
   atTurnBoundary(restart: boolean): boolean {
     return (
@@ -701,7 +731,7 @@ export class V2Session implements RequestTarget {
             resolve();
             return;
           }
-          this.remoteControl.pushed(message.uuid);
+          this.adapterCommands.pushed(message.uuid);
           this.input.push(message);
         });
     });
@@ -714,7 +744,7 @@ export class V2Session implements RequestTarget {
    * human `origin` that `promptToClaude` stamps.
    *
    * These prompts continue the open turn (`clear-context.ts`), so they do not
-   * wait on {@link pushes}: a `/remote-control` there waits for the turn to
+   * wait on {@link pushes}: an adapter command (`/remote-control`) there waits for the turn to
    * end, which needs them. The client's prompts keep their order among
    * themselves on `pushes`.
    */
@@ -727,7 +757,7 @@ export class V2Session implements RequestTarget {
       .then(() => this.interrupting)
       .then(() => {
         if (this.closed) return;
-        this.remoteControl.pushed(uuid);
+        this.adapterCommands.pushed(uuid);
         this.input.push(message);
       });
   }
@@ -794,6 +824,7 @@ export class V2Session implements RequestTarget {
     }
     for (const request of this.requests) request.coveredByCancel = true;
     this.turnLocalCommand?.abort.abort();
+    this.adapterCommands.abort();
     // The subagents that the work waits on stop with it. Background ones go on.
     this.tasks.cancelForeground();
     if (heldTurn) this.closeTurn();
@@ -1161,7 +1192,7 @@ export class V2Session implements RequestTarget {
               return;
             }
             // A message typed in another client of the session.
-            const remote = this.remoteControl.remoteMessage(message);
+            const remote = this.adapterCommands.remoteMessage(message);
             if (remote !== undefined) this.output.userMessage(remote, message.uuid);
             this.promptStarted(message.uuid);
           }

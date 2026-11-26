@@ -463,6 +463,23 @@ describe("idle compaction in the agent", () => {
     await agent.dispose();
   });
 
+  it("does not compact while an adapter command runs", async () => {
+    const claude = scriptClaudeCode();
+    const { agent, sessionId } = await connect();
+    await promptHi(agent, sessionId);
+    await claude.untilIdle();
+
+    const abort = new AbortController();
+    const done = new Promise<void>((resolve) =>
+      abort.signal.addEventListener("abort", () => resolve(), { once: true }),
+    );
+    agent.sessions[sessionId]!.adapterCommand = { done, abort };
+    await vi.advanceTimersByTimeAsync(54 * MINUTE_MS);
+
+    expect(claude.received).toEqual(["hi"]);
+    await agent.dispose();
+  });
+
   /** The idle `/compact` is not a user prompt, so it asks for no title; a client prompt in the same session does. */
   it("does not feed the idle compaction's prompt to the title machinery", async () => {
     const claude = scriptClaudeCode();

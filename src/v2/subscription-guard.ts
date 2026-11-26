@@ -18,7 +18,8 @@
  *   restarts the query at the next prompt that finds the session idle (see
  *   `restarts.ts`), so its start judges the current account.
  *
- * The `/remote-control` command that the adapter runs is not guarded.
+ * A command that the adapter serves (`/remote-control`, `/plugin`) is not
+ * guarded. One that Claude Code serves is.
  */
 import type { AccountInfo, Query } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "../logger.js";
