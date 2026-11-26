@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { ClaudeAcpAgent } from "../../v1/acp-agent.js";
 import type { AcpClient } from "../../acp-client.js";
 import { RemoteControlAtStartup } from "../../remote-control.js";
-import { mockSessionState } from "./session-doubles.js";
+import { mockSessionState, runningAdapterCommands } from "./session-doubles.js";
 
 /** A stream that stays open, like the real one: a consumer that reaches its end
  *  closes the session. */
@@ -354,7 +354,7 @@ describe("/remote-control", () => {
       const error = vi.spyOn((agent as any).logger, "error");
 
       void agent.connectRemoteControlAtStartup("session-1");
-      await vi.waitFor(() => expect(agent.sessions["session-1"].adapterCommand).toBeDefined());
+      await vi.waitFor(() => expect(agent.sessions["session-1"].adapterCommands?.busy).toBe(true));
       const started = Date.now();
       await agent.closeSession({ sessionId: "session-1" });
 
@@ -436,7 +436,7 @@ describe("Remote Control at session start", () => {
       "a /remote-control command runs",
       () => ({
         ...startsWith(),
-        adapterCommand: { done: new Promise<void>(() => {}), abort: new AbortController() },
+        adapterCommands: runningAdapterCommands(new Promise<void>(() => {}), { abortable: true }),
       }),
     ],
     // A close before the setup response's timer ran.
@@ -572,6 +572,6 @@ describe("Remote Control at session start", () => {
       "Session session-1: failed to send the Remote Control notice:",
       expect.objectContaining({ message: "connection closed" }),
     );
-    expect(agent.sessions["session-1"].adapterCommand).toBeUndefined();
+    expect(agent.sessions["session-1"].adapterCommands?.busy).toBeFalsy();
   });
 });

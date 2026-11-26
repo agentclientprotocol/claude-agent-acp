@@ -65,10 +65,10 @@ const messages = (sessionUpdate: ReturnType<typeof createAgent>["sessionUpdate"]
   (sessionUpdate.mock.calls as any[][]).map(([notification]) => notification.update);
 
 /** A `supportedCommands` that stays open until `settle`. */
-function pendingDecision() {
+function pendingDecision(offered: { name: string }[] = []) {
   let settle!: () => void;
   const gate = new Promise<void>((resolve) => (settle = resolve));
-  return { supportedCommands: async () => (await gate, []), settle };
+  return { supportedCommands: async () => (await gate, offered), settle };
 }
 
 const steerFailures = (logged: { mock: { calls: unknown[][] } }) =>
@@ -153,7 +153,7 @@ describe("/plugin", () => {
 
       expect((await command).stopReason).toBe("cancelled");
       expect(sessionUpdate).not.toHaveBeenCalled();
-      expect(agent.sessions["session-1"].adapterCommand).toBeUndefined();
+      expect(agent.sessions["session-1"].adapterCommands?.busy).toBeFalsy();
     });
   });
 
@@ -224,6 +224,23 @@ describe("/plugin", () => {
 
       await outcome;
       expect(runner.run).not.toHaveBeenCalled();
+      expect(push).not.toHaveBeenCalled();
+    });
+
+    it("rejects a steer of a command that Claude Code serves when the query closed during the lookup", async () => {
+      const decision = pendingDecision([{ name: "plugin" }]);
+      const { agent, push } = createAgent({ supportedCommands: decision.supportedCommands });
+
+      const steered = agent.steer({
+        ...prompt("/plugin list"),
+        _meta: { steering: { idleBehavior: "promptRequired" } },
+      });
+      const outcome = expect(steered).rejects.toThrow("The Claude Agent session has ended");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      agent.sessions["session-1"].queryClosed = true;
+      decision.settle();
+
+      await outcome;
       expect(push).not.toHaveBeenCalled();
     });
 
