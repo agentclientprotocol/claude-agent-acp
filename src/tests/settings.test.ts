@@ -216,4 +216,44 @@ describe("SettingsManager", () => {
       expect(settingsManager.getSettings().permissions?.defaultMode).toBe("acceptEdits");
     });
   });
+
+  describe("the policy the CLI reports", () => {
+    it("outranks the user settings and survives a reload", async () => {
+      await fs.promises.writeFile(
+        path.join(process.env.CLAUDE_CONFIG_DIR!, "settings.json"),
+        JSON.stringify({ model: "fable", effortLevel: "high" }),
+      );
+      settingsManager = new SettingsManager(tempDir);
+      await settingsManager.initialize();
+      expect(settingsManager.getSettings().model).toBe("fable");
+
+      await settingsManager.adoptCliPolicy({
+        model: "claude-sonnet-5-5[1m]",
+        effortLevel: "medium",
+        permissions: { disableBypassPermissionsMode: "disable" },
+      });
+      const expectPolicy = () =>
+        expect(settingsManager.getSettings()).toMatchObject({
+          model: "claude-sonnet-5-5[1m]",
+          effortLevel: "medium",
+          permissions: { disableBypassPermissionsMode: "disable" },
+        });
+      expectPolicy();
+
+      // Another cwd resolves the settings again.
+      await settingsManager.setCwd(path.join(tempDir, "user-config"));
+      expectPolicy();
+    });
+
+    it("leaves the settings alone when the CLI reports none", async () => {
+      await fs.promises.writeFile(
+        path.join(process.env.CLAUDE_CONFIG_DIR!, "settings.json"),
+        JSON.stringify({ model: "fable" }),
+      );
+      settingsManager = new SettingsManager(tempDir);
+      await settingsManager.initialize();
+      await settingsManager.adoptCliPolicy(undefined);
+      expect(settingsManager.getSettings().model).toBe("fable");
+    });
+  });
 });

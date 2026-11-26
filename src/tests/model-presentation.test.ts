@@ -329,3 +329,51 @@ it.skipIf(!process.env.RUN_INTEGRATION_TESTS)(
   },
   30000,
 );
+
+describe("startup model settings from the running CLI", () => {
+  beforeEach(() => vi.stubEnv("ANTHROPIC_MODEL", undefined));
+  afterEach(() => vi.unstubAllEnvs());
+
+  it.each([
+    { source: "older SDK", getSettings: undefined, expected: "fable" },
+    {
+      source: "older CLI",
+      getSettings: async () => {
+        throw new Error("Unsupported request");
+      },
+      expected: "fable",
+    },
+    {
+      source: "response without effective settings",
+      getSettings: async () => ({ applied: {} }),
+      expected: "fable",
+    },
+    {
+      source: "removed CLI model pin",
+      getSettings: async () => ({ effective: {} }),
+      expected: "default",
+    },
+  ])("uses the correct model with $source", async ({ getSettings, expected }) => {
+    const models: ModelInfo[] = [
+      {
+        value: "default",
+        resolvedModel: "claude-sonnet-5-5",
+        displayName: "Default",
+        description: "",
+      },
+      { value: "fable", resolvedModel: "claude-fable-5-2", displayName: "Fable", description: "" },
+    ];
+    const setModel = vi.fn();
+    const state = await getAvailableModels(
+      { getSettings, setModel } as unknown as Query,
+      models,
+      models,
+      { getSettings: () => ({ model: "fable" }) },
+      { log: vi.fn(), error: vi.fn() },
+      false,
+      "model-settings-test",
+    );
+    expect(state.currentModelId).toBe(expected);
+    expect(setModel).not.toHaveBeenCalled();
+  });
+});

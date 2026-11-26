@@ -11,6 +11,7 @@ import {
 import { AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY, withAirMeta } from "./air-extension.js";
 import { bedrockRegionPrefix } from "./gateway-models.js";
 import { modelReasoningEffortsMeta } from "./session-effort.js";
+import { readQuerySettings } from "./query-settings.js";
 
 export const MODEL_CONFIG_ID = "model";
 
@@ -738,7 +739,15 @@ export async function getAvailableModels(
     };
   }
 
-  const settings = settingsManager.getSettings();
+  // The host SDK's resolveSettings can omit remote managed settings before
+  // remote-policy eligibility is initialized. The running CLI has resolved
+  // them already; use its effective settings instead of re-applying a stale pin.
+  const querySettings = await readQuerySettings(query);
+  const settings = querySettings?.effective ?? settingsManager.getSettings();
+  const appliedModel =
+    typeof querySettings?.applied?.model === "string" && querySettings.applied.model.trim()
+      ? querySettings.applied.model
+      : undefined;
 
   let currentModel = models[0];
   let resolvedFromInput: string | undefined;
@@ -810,7 +819,16 @@ export async function getAvailableModels(
   // When the switch fails, the SDK stays on the model it ran before it.
   const modelBeforeSwitch = (): ModelInfo =>
     switchToListed && sdkDefault !== undefined ? sdkDefault : models[0];
+  // The CLI reports a wire model without the context hint (e.g. Sonnet's
+  // managed [1m] pin). Keep its running configuration when the picker alias
+  // resolves to that model, rather than switching away from the pinned context.
+  const cliRunsSelectedModel =
+    appliedModel !== undefined &&
+    sdkSawSameValue &&
+    stripContextHints(canonicalizeModelId(currentModel.resolvedModel ?? currentModel.value)) ===
+      stripContextHints(canonicalizeModelId(appliedModel));
   const skipSetModel =
+    cliRunsSelectedModel ||
     (resolvedFromInput === undefined && !switchToListed) ||
     (!isResumedSession && currentModel.value === resolvedFromInput && sdkSawSameValue);
   if (!skipSetModel) {

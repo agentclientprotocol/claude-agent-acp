@@ -51,6 +51,7 @@ import {
   startAroundRefusedMcpServers,
 } from "../mcp-servers.js";
 import { ALLOW_BYPASS, autoModeDisabled } from "../permissions/modes.js";
+import { cliPolicySettings, readQuerySettings } from "../query-settings.js";
 import {
   clientTakesPromptSuggestions,
   promptSuggestionOptions,
@@ -1381,6 +1382,14 @@ class V2Agent implements AgentHandle, SessionConnection {
     // Read again for every query, so a restart's new query starts it too,
     // unless the user turned it off (`restarts.ts` carries that over).
     session.setRemoteControlAtStartup(startsWithRemoteControl(initialization));
+    // From here on the settings include the policy Claude Code applies, which
+    // the host resolver can miss (see `adoptCliPolicy`). The bypass flag and
+    // the mode the query started with stay: Claude Code enforces its policy on them.
+    await settings.adoptCliPolicy(cliPolicySettings(await readQuerySettings(q)));
+    const policySettings = settings.getSettings();
+    const offerBypass =
+      allowBypass && policySettings.permissions?.disableBypassPermissionsMode !== "disable";
+    const offerAuto = allowAuto && !autoModeDisabled(policySettings);
     let models;
     try {
       models = await sessionModels(
@@ -1408,7 +1417,7 @@ class V2Agent implements AgentHandle, SessionConnection {
       config = await SessionConfig.start(
         sessionId,
         q,
-        { mode, builtInDefault, allowBypass, allowAuto },
+        { mode, builtInDefault, allowBypass: offerBypass, allowAuto: offerAuto },
         models.models,
         models.modelInfos,
         models.currentModelInfo,

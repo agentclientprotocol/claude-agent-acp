@@ -661,6 +661,102 @@ describe("ClaudeAcpAgent settings", () => {
     expect(response.modes.currentModeId).toBe("auto");
   });
 
+  it("reports the CLI's managed model instead of the host resolver's user model", async () => {
+    await fs.promises.writeFile(
+      path.join(tempDir, "settings.json"),
+      JSON.stringify({ model: "fable" }),
+    );
+    const setModel = vi.fn();
+    querySpy.mockImplementation(() =>
+      makeMockQuery({
+        initializationResult: async () => ({
+          models: [
+            {
+              value: "default",
+              resolvedModel: "claude-sonnet-5-5",
+              displayName: "Default",
+              description: "Sonnet 5.5",
+            },
+            {
+              value: "sonnet",
+              resolvedModel: "claude-sonnet-5-5",
+              displayName: "Sonnet 5.5",
+              description: "",
+            },
+            {
+              value: "fable",
+              resolvedModel: "claude-fable-5-2",
+              displayName: "Fable 5.2",
+              description: "",
+            },
+          ],
+        }),
+        getSettings: async () => ({
+          effective: { model: "claude-sonnet-5-5[1m]" },
+          applied: { model: "claude-sonnet-5-5" },
+        }),
+        setModel,
+      }),
+    );
+    const { ClaudeAcpAgent } = await import("../../v1/acp-agent.js");
+    const agent = new ClaudeAcpAgent(createMockClient());
+    const response = await (agent as any).createSession({ cwd: tempDir, mcpServers: [] });
+
+    expect(response.configOptions.find((option: any) => option.id === "model").currentValue).toBe(
+      "sonnet",
+    );
+    expect(setModel).not.toHaveBeenCalled();
+  });
+
+  it("applies the CLI's managed effort and bypass lock over the user settings", async () => {
+    await fs.promises.writeFile(
+      path.join(tempDir, "settings.json"),
+      JSON.stringify({ effortLevel: "high" }),
+    );
+    const applyFlagSettings = vi.fn();
+    querySpy.mockImplementation(() =>
+      makeMockQuery({
+        initializationResult: async () => ({
+          models: [
+            {
+              value: "default",
+              displayName: "Default",
+              description: "",
+              supportsEffort: true,
+              supportedEffortLevels: ["low", "medium", "high"],
+            },
+          ],
+        }),
+        getSettings: async () => ({
+          sources: [
+            { source: "userSettings", settings: { effortLevel: "high" } },
+            {
+              source: "policySettings",
+              settings: {
+                effortLevel: "low",
+                permissions: { disableBypassPermissionsMode: "disable" },
+              },
+            },
+          ],
+        }),
+        applyFlagSettings,
+      }),
+    );
+    const { ClaudeAcpAgent } = await import("../../v1/acp-agent.js");
+    const agent = new ClaudeAcpAgent(createMockClient());
+    (agent as any).clientCapabilities = {
+      _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
+    };
+    const response = await (agent as any).createSession({ cwd: tempDir, mcpServers: [] });
+    const option = (id: string) => response.configOptions.find((entry: any) => entry.id === id);
+
+    expect(option("effort").currentValue).toBe("low");
+    expect(applyFlagSettings).toHaveBeenCalledWith({ effortLevel: "low" });
+    expect(option("mode").options.map((entry: any) => entry.value)).not.toContain(
+      "bypassPermissions",
+    );
+  });
+
   it("ignores model from settings when it is not a string", async () => {
     await fs.promises.writeFile(
       path.join(tempDir, "settings.json"),
