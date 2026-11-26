@@ -90,6 +90,14 @@ const sdk = vi.hoisted(() => ({
   enableRemoteControl: undefined as ((...args: unknown[]) => Promise<unknown>) | undefined,
   /** Whether Claude Code asks at `initialize` for Remote Control to start with the query. */
   remoteControlAtStartup: false,
+  /** The live CLI settings, including policy the host resolver has not loaded. */
+  settingsReport: undefined as
+    | {
+        effective?: Settings;
+        applied?: { model: string };
+        sources?: Array<{ source: string; settings: Settings }>;
+      }
+    | undefined,
 }));
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
@@ -175,6 +183,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         cancelAsyncMessage: fake.cancelAsyncMessage,
         setPermissionMode: fake.setPermissionMode,
         setModel: fake.setModel,
+        ...(sdk.settingsReport ? { getSettings: async () => sdk.settingsReport } : {}),
         stopTask: fake.stopTask,
         close: fake.close,
         applyFlagSettings: fake.applyFlagSettings,
@@ -252,6 +261,7 @@ beforeEach(async () => {
   sdk.startGate = undefined;
   sdk.enableRemoteControl = undefined;
   sdk.remoteControlAtStartup = false;
+  sdk.settingsReport = undefined;
   vi.mocked(forkSession).mockClear();
 });
 
@@ -613,6 +623,66 @@ describe("ACP v2 core", () => {
     expect((response.authMethods ?? []).map((method) => method.methodId)).toContain(
       "console-login",
     );
+  });
+
+  it("reports the CLI's managed model instead of the host resolver's user model", async () => {
+    const hostSettings = vi
+      .spyOn(SettingsManager.prototype, "getSettings")
+      .mockReturnValue({ model: "fable" });
+    onTestFinished(() => hostSettings.mockRestore());
+    sdk.models = [
+      {
+        value: "default",
+        resolvedModel: "claude-sonnet-5-5",
+        displayName: "Default",
+        description: "Sonnet 5.5",
+      },
+      {
+        value: "sonnet",
+        resolvedModel: "claude-sonnet-5-5",
+        displayName: "Sonnet 5.5",
+        description: "",
+      },
+      {
+        value: "fable",
+        resolvedModel: "claude-fable-5-2",
+        displayName: "Fable 5.2",
+        description: "",
+      },
+    ];
+    sdk.settingsReport = {
+      effective: { model: "claude-sonnet-5-5[1m]" },
+      applied: { model: "claude-sonnet-5-5" },
+    };
+    await v2Client().connect(async (agent) => {
+      const { response, claude } = await openSession(agent);
+      expect(response.configOptions?.find((option) => option.configId === "model")).toMatchObject({
+        currentValue: "sonnet",
+      });
+      expect(claude.setModel).not.toHaveBeenCalled();
+    });
+  });
+
+  it("does not offer bypass when the CLI's managed settings disable it", async () => {
+    const modes = async () =>
+      v2Client().connect(async (agent) => {
+        const { response } = await openSession(agent);
+        const mode = response.configOptions?.find((option) => option.configId === "mode") as {
+          options: Array<{ value: string }>;
+        };
+        return mode.options.map((option) => option.value);
+      });
+    expect(await modes()).toContain("bypassPermissions");
+
+    sdk.settingsReport = {
+      sources: [
+        {
+          source: "policySettings",
+          settings: { permissions: { disableBypassPermissionsMode: "disable" } },
+        },
+      ],
+    };
+    expect(await modes()).not.toContain("bypassPermissions");
   });
 
   it.each(["environment", "caller object", "caller file"])(

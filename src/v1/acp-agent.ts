@@ -443,6 +443,7 @@ import {
   ultracodeWorkflowsEnabled,
   type UltracodeOptionState,
 } from "../session-ultracode.js";
+import { cliPolicySettings, readQuerySettings } from "../query-settings.js";
 import {
   buildConfigOptions,
   clientSupportsBooleanConfigOptions,
@@ -11077,6 +11078,16 @@ export class ClaudeAcpAgent {
         }
       }
 
+      // From here on the settings include the policy the CLI applies, which
+      // the host resolver can miss (see `adoptCliPolicy`). The values decided
+      // before the CLI started (the SDK's bypass flag, the spawn-time mode)
+      // stay as they are: the CLI enforces its policy on those itself.
+      await settingsManager.adoptCliPolicy(cliPolicySettings(await readQuerySettings(q)));
+      const policySettings = settingsManager.getSettings();
+      const offerBypass =
+        allowBypass && policySettings.permissions?.disableBypassPermissionsMode !== "disable";
+      const offerAuto = allowAuto && !autoModeDisabled(policySettings);
+
       // Apply the effective `availableModels` allowlist before any
       // downstream model handling. `initializationResult.models` is already
       // policy-filtered by the CLI; we rebuild the picker from the allowlist
@@ -11137,8 +11148,8 @@ export class ClaudeAcpAgent {
         builtInDefault: builtInPermissionMode,
         currentModelInfo,
         currentModelId: models.currentModelId,
-        allowBypass,
-        allowAuto,
+        allowBypass: offerBypass,
+        allowAuto: offerAuto,
       });
       timing.phase("modes");
 

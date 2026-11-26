@@ -5,6 +5,7 @@ import type {
 } from "@agentclientprotocol/sdk/unstable";
 import type { ModelInfo, Query } from "@anthropic-ai/claude-agent-sdk";
 import { ULTRACODE_CONFIG_ID } from "./session-config-ids.js";
+import { readQuerySettings } from "./query-settings.js";
 
 export { ULTRACODE_CONFIG_ID } from "./session-config-ids.js";
 
@@ -24,33 +25,21 @@ export type UltracodeSettingsReport = {
   requested?: boolean;
 };
 
-// `Query.getSettings()` exists at runtime (sdk.mjs) but is missing from the
-// SDK's type declarations as of 0.3.319.
-type GetSettingsQuery = Query & {
-  getSettings?: () => Promise<{
-    applied?: { ultracodeAvailable?: unknown; ultracodeRequested?: unknown };
-  }>;
-};
-
 /** Ask the CLI whether ultracode is available and requested for the session.
  *  Returns undefined when the SDK has no `getSettings` or the request fails;
  *  callers then fall back to {@link modelSupportsUltracode}. */
 export async function readUltracodeSettings(
   query: Query,
 ): Promise<UltracodeSettingsReport | undefined> {
-  const getSettings = (query as GetSettingsQuery).getSettings;
-  if (typeof getSettings !== "function") return undefined;
-  try {
-    const applied = (await getSettings.call(query))?.applied;
-    return {
-      available:
-        typeof applied?.ultracodeAvailable === "boolean" ? applied.ultracodeAvailable : undefined,
-      requested:
-        typeof applied?.ultracodeRequested === "boolean" ? applied.ultracodeRequested : undefined,
-    };
-  } catch {
-    return undefined;
-  }
+  const settings = await readQuerySettings(query);
+  if (!settings) return undefined;
+  const applied = settings.applied;
+  return {
+    available:
+      typeof applied?.ultracodeAvailable === "boolean" ? applied.ultracodeAvailable : undefined,
+    requested:
+      typeof applied?.ultracodeRequested === "boolean" ? applied.ultracodeRequested : undefined,
+  };
 }
 
 /** The CLI supports ultracode on exactly the models that support `xhigh`

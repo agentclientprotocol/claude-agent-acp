@@ -64,6 +64,8 @@ export class SettingsManager {
   private managedApiKeyHelper?: string;
   private managedCompactionSettings: CompactionSettings = {};
   private managedShowClearContextOnPlanAccept?: boolean;
+  /** The policy tier the session's CLI reported (see {@link adoptCliPolicy}). */
+  private cliPolicy?: Settings;
   /** The policy sources last logged as not loaded (see {@link unloadedPolicySources}). */
   private unloadedPolicy?: string;
   private watchers: fs.FSWatcher[] = [];
@@ -121,7 +123,10 @@ export class SettingsManager {
    */
   private async loadAllSettings(): Promise<void> {
     try {
-      const resolved = await resolveSettings({ cwd: this.cwd });
+      const resolved = await resolveSettings({
+        cwd: this.cwd,
+        ...(this.cliPolicy && { serverManagedSettings: this.cliPolicy }),
+      });
       // Once per change: a reload after each settings file edit would repeat it.
       const unloaded = unloadedPolicySources(resolved);
       if (unloaded !== this.unloadedPolicy) {
@@ -225,6 +230,21 @@ export class SettingsManager {
         this.logger.error("Failed to reload settings:", error);
       }
     }, 100);
+  }
+
+  /**
+   * Resolves the settings again with the policy tier the session's CLI
+   * reports. `resolveSettings` in this process can miss remote managed
+   * settings that the CLI applies, and then every value read here (the model,
+   * the effort, the bypass and auto mode locks, the model allowlist) is the
+   * user's own instead of the policy's. The CLI has verified what it reports,
+   * so it goes in as the server-managed tier and later reloads keep it.
+   */
+  async adoptCliPolicy(policy: Settings | undefined): Promise<void> {
+    if (!policy || this.disposed) return;
+    if (JSON.stringify(policy) === JSON.stringify(this.cliPolicy)) return;
+    this.cliPolicy = policy;
+    await this.loadAllSettings();
   }
 
   /**
