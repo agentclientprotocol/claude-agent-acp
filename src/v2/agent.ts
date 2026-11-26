@@ -108,6 +108,19 @@ import {
 } from "./setup.js";
 import type { SubagentReplay } from "./subagent-replay.js";
 import { SubscriptionGuard } from "./subscription-guard.js";
+import {
+  clientSupportsMcpApps,
+  MCP_APPS_KEY,
+  MCP_RESOURCES_READ_METHOD,
+  MCP_TOOLS_CALL_METHOD,
+  mcpAppsCapability,
+  parseMcpResourcesReadRequest,
+  parseMcpToolsCallRequest,
+  type McpCallToolResult,
+  type McpResourcesReadRequest,
+  type McpResourcesReadResponse,
+  type McpToolsCallRequest,
+} from "../mcp-apps.js";
 
 /** The sessions per `session/list` page. */
 const SESSION_LIST_PAGE_SIZE = 1000;
@@ -161,6 +174,17 @@ export function v2AgentApp(
       )
       .onRequest(v2.methods.agent.toolCall.cancel, ({ params }) =>
         agent.cancelItem(params.sessionId, { toolCallId: params.toolCallId }),
+      )
+      .onRequest<McpResourcesReadRequest, McpResourcesReadResponse>(
+        MCP_RESOURCES_READ_METHOD,
+        { parse: parseMcpResourcesReadRequest },
+        ({ params }) =>
+          agent.session(params.sessionId, MCP_RESOURCES_READ_METHOD).readMcpResource(params),
+      )
+      .onRequest<McpToolsCallRequest, McpCallToolResult>(
+        MCP_TOOLS_CALL_METHOD,
+        { parse: parseMcpToolsCallRequest },
+        ({ params }) => agent.session(params.sessionId, MCP_TOOLS_CALL_METHOD).callMcpTool(params),
       )
       // `session/cancel` of a session that is not active is ignored. A
       // subagent's session advertises `cancel`: it stops the subagent's run.
@@ -220,6 +244,7 @@ class V2Agent implements AgentHandle, SessionConnection {
   elicitation: ElicitationSupport = { form: false, url: false };
   /** The AIR extensions that the client takes (see `air.ts`). */
   air: AirSupport = NO_AIR;
+  mcpApps = false;
   /** The forms of the predicted follow-up prompt that the client takes, read at `initialize`. */
   promptSuggestions: PromptSuggestionForms = { meta: false, update: false };
 
@@ -378,6 +403,7 @@ class V2Agent implements AgentHandle, SessionConnection {
       url: request.capabilities?.elicitation?.url != null,
     };
     this.air = airSupport(request.capabilities);
+    this.mcpApps = clientSupportsMcpApps(request.capabilities);
     this.promptSuggestions = {
       meta: this.air.client,
       update: clientTakesPromptSuggestions(request.capabilities?.session),
@@ -393,7 +419,8 @@ class V2Agent implements AgentHandle, SessionConnection {
         // `providers/list`, `set`, and `disable`, served for every client.
         providers: {},
         auth,
-        _meta,
+        // `_session/mcp/resources/read` and `_session/mcp/tools/call`.
+        _meta: { ..._meta, [MCP_APPS_KEY]: mcpAppsCapability() },
       },
       authMethods,
     };
@@ -1346,6 +1373,10 @@ class V2Agent implements AgentHandle, SessionConnection {
     let initialization;
     try {
       initialization = await q.initializationResult();
+      // The initialize response is untyped about its `capabilities`.
+      session.mcpApps.cliReported(
+        (initialization as { capabilities?: unknown } | undefined)?.capabilities,
+      );
     } catch (error) {
       q.close();
       settings.dispose();

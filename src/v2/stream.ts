@@ -275,6 +275,20 @@ export class SessionOutput {
     this.emit([{ sessionId: this.sessionId, update }]);
   }
 
+  /**
+   * Adds `_meta` keys to tool calls that the client was told about, such as
+   * `_meta.mcpApp` after an app tool's result (see `mcp-apps.ts`). The
+   * reports of the tool calls went out before.
+   */
+  toolCallMeta(updates: readonly { toolCallId: string; _meta: Record<string, unknown> }[]): void {
+    this.emit(
+      updates.map(({ toolCallId, _meta }) => ({
+        sessionId: this.sessionId,
+        update: { sessionUpdate: "tool_call_update" as const, toolCallId, _meta },
+      })),
+    );
+  }
+
   /** Whether the stream mapped the tool call `toolCallId`, shown or routed away. */
   holds(toolCallId: string): boolean {
     return this.emittedToolCalls.has(toolCallId);

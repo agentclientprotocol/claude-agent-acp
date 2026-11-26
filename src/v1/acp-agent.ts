@@ -242,6 +242,21 @@ import {
   type SessionRewindResponse,
 } from "../session-rewind.js";
 import {
+  clientSupportsMcpApps,
+  MCP_APPS_KEY,
+  MCP_RESOURCES_READ_METHOD,
+  MCP_TOOLS_CALL_METHOD,
+  mcpAppsCapability,
+  McpAppsSession,
+  mcpToolResults,
+  parseMcpResourcesReadRequest,
+  parseMcpToolsCallRequest,
+  type McpCallToolResult,
+  type McpResourcesReadRequest,
+  type McpResourcesReadResponse,
+  type McpToolsCallRequest,
+} from "../mcp-apps.js";
+import {
   clientSystemPrompt,
   sessionSystemPrompt,
   SYSTEM_PROMPT_CAPABILITY,
@@ -1026,6 +1041,8 @@ export type Session = {
   /** True once the first `system`/init has started the first skill file read,
    *  so the per-turn init re-emit does not start another. */
   skillFilesRequested?: boolean;
+  /** The MCP Apps capabilities of the session's Claude Code (see `mcp-apps.ts`). */
+  mcpApps?: McpAppsSession;
   /** A skill file read is running; a trigger meanwhile sets `skillFilesRerun`. */
   skillFilesRefreshing?: boolean;
   /** A trigger came in during a running read, which may have read the state
@@ -1976,6 +1993,8 @@ export class ClaudeAcpAgent {
           // never a status payload. The state itself travels on
           // `_auth/status_update`; there is nothing for a client to ask for.
           authStatus: authStatusCapability(),
+          // `_session/mcp/resources/read` and `_session/mcp/tools/call`.
+          [MCP_APPS_KEY]: mcpAppsCapability(),
         },
         promptCapabilities: {
           image: true,
@@ -3227,6 +3246,29 @@ export class ClaudeAcpAgent {
           session.settingsManager.getApiKeyHelper(session.effortSettingsOverride),
         ),
     });
+  }
+
+  /** `_session/mcp/resources/read` (see `mcp-apps.ts`). Sends no session update. */
+  async readMcpResource(params: McpResourcesReadRequest): Promise<McpResourcesReadResponse> {
+    const session = this.liveMcpAppsSession(params.sessionId);
+    return session.mcpApps.readResource(session.query, params);
+  }
+
+  /** `_session/mcp/tools/call` (see `mcp-apps.ts`). Runs on the session's query,
+   *  also between turns. With `checkPermissions`, an ask goes out as an ordinary
+   *  permission request. */
+  async callMcpTool(params: McpToolsCallRequest): Promise<McpCallToolResult> {
+    const session = this.liveMcpAppsSession(params.sessionId);
+    return session.mcpApps.callTool(session.query, params);
+  }
+
+  private liveMcpAppsSession(sessionId: string): Session & { mcpApps: McpAppsSession } {
+    const session = this.sessions[sessionId];
+    if (!session) throw RequestError.sessionNotFound(sessionId);
+    if (session.tornDown || session.queryClosed || !session.mcpApps) {
+      throw RequestError.invalidRequest(undefined, SESSION_ENDED_MESSAGE);
+    }
+    return session as Session & { mcpApps: McpAppsSession };
   }
 
   async goal(params: GoalRequest): Promise<GoalControlResponse> {
@@ -5152,6 +5194,7 @@ export class ClaudeAcpAgent {
                 if (message.capabilities?.includes("msg_lifecycle_v1")) {
                   session.msgLifecycleV1 = true;
                 }
+                session.mcpApps?.cliReported(message.capabilities);
                 if (message.capabilities?.includes("request_marker_lists_v1")) {
                   session.requestMarkerListsV1 = true;
                 }
@@ -7437,6 +7480,14 @@ export class ClaudeAcpAgent {
               }
             }
 
+            // Named before `toAcpNotifications` drops their tool uses from the cache.
+            const mcpAppResults =
+              message.type === "user" &&
+              message.parent_tool_use_id === null &&
+              session.mcpApps &&
+              clientSupportsMcpApps(this.clientCapabilities)
+                ? mcpToolResults(content, session.toolUseCache)
+                : [];
             for (const notification of toAcpNotifications(
               content,
               message.message.role,
@@ -7480,6 +7531,17 @@ export class ClaudeAcpAgent {
                   runningTerminal,
                 ),
               );
+            }
+            if (mcpAppResults.length && session.mcpApps) {
+              for (const update of await session.mcpApps.toolCallUpdates(
+                session.query,
+                mcpAppResults,
+                toolUseResult,
+                session.abortController.signal,
+                (text) => this.logger.error(text),
+              )) {
+                await sendUpdate({ sessionId: params.sessionId, update });
+              }
             }
             break;
           }
@@ -11304,6 +11366,10 @@ export class ClaudeAcpAgent {
         subagentChecklists: creationOpts.replayState?.subagentChecklists ?? new Set(),
         toolUseCache: {},
         emittedToolCalls: new Set(),
+        // The initialize response is untyped about its `capabilities`.
+        mcpApps: new McpAppsSession(
+          (initializationResult as { capabilities?: unknown } | undefined)?.capabilities,
+        ),
         eagerToolCallSessions: new Map(),
         liveBackgroundTasks: new Map(),
         background: new SessionBackgroundWork(sessionId),
@@ -12022,6 +12088,16 @@ export function v1AgentApp(
       GOAL_CONTROL_METHOD,
       { parse: parseGoalRequest },
       (ctx) => agent.goal(ctx.params),
+    )
+    .onRequest<McpResourcesReadRequest, McpResourcesReadResponse>(
+      MCP_RESOURCES_READ_METHOD,
+      { parse: parseMcpResourcesReadRequest },
+      ofRootSession("read an MCP resource of", (ctx) => agent.readMcpResource(ctx.params)),
+    )
+    .onRequest<McpToolsCallRequest, McpCallToolResult>(
+      MCP_TOOLS_CALL_METHOD,
+      { parse: parseMcpToolsCallRequest },
+      ofRootSession("call an MCP tool in", (ctx) => agent.callMcpTool(ctx.params)),
     );
   return sessionIndex.onSessionIndexRequests(app, () => agent);
 }
