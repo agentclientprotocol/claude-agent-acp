@@ -1715,6 +1715,17 @@ export class ClaudeAcpAgent {
   sessions: {
     [key: string]: Session;
   };
+  /** Serializes create/teardown for one `sessionId` so two racing calls (a
+   *  client retry after a reconnect whose response never arrived, `session/load`
+   *  racing `session/close`, etc.) can't both decide to tear down and recreate
+   *  the same session concurrently. Without this, both recreations spawn their
+   *  own Claude Agent subprocess, the second overwrites the first in
+   *  `this.sessions`, and the first is never reachable again to close -- an
+   *  orphan outliving even the SDK's own kill escalation.
+   *  See https://github.com/agentclientprotocol/claude-agent-acp/issues/1011. */
+  private sessionLifecycleLocks = new Map<string, Promise<void>>();
+  private disposing = false;
+  private disposal?: Promise<void>;
   client: AcpClient;
   clientCapabilities?: ClientCapabilities;
   /** The tool call report choices, read once from {@link clientCapabilities} in `initialize`. */
@@ -1843,14 +1854,19 @@ export class ClaudeAcpAgent {
       currentSession: (id) => this.sessions[id],
       closeQueryStream: (session) => this.closeQueryStream(session),
       restartSession: async (params, options) => {
-        const previous = this.sessions[options.publicSessionId];
-        await this.createSession(params, options);
-        const session = this.sessions[options.publicSessionId];
-        if (!session) throw new Error("Fresh Claude context was not created");
-        // Remote Control that the user turned off stays off on the fresh query,
-        // and so through a later restart of it.
-        session.remoteControlAtStartup?.restartedFrom(previous?.remoteControlAtStartup);
-        return session;
+        const original = this.sessions[options.publicSessionId];
+        return this.withSessionLifecycleLock(options.publicSessionId, async () => {
+          if (!original || this.sessions[options.publicSessionId] !== original) {
+            throw new Error("Clear-context restart aborted");
+          }
+          await this.createSession(params, options);
+          const session = this.sessions[options.publicSessionId];
+          if (!session) throw new Error("Fresh Claude context was not created");
+          // Remote Control that the user turned off stays off on the fresh query,
+          // and so through a later restart of it.
+          session.remoteControlAtStartup?.restartedFrom(original.remoteControlAtStartup);
+          return session;
+        });
       },
       applyFastMode: (session, enabled) => this.applyFastMode(session, enabled),
       applyUltracode: (session, enabled) => this.applyUltracode(session, enabled),
@@ -2053,15 +2069,26 @@ export class ClaudeAcpAgent {
   }
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
+    this.assertAgentActive();
     // Without `configOptions`: a restart of the query restores the session's choices itself.
     const { configOptions, ...request } = params;
     const initial = initialConfigOptions(configOptions);
     while (this.providerUpdate) await this.providerUpdate;
-    const created = await this.createSession(request, {
-      // Revisit these meta values once we support resume
-      resume: (params._meta as NewSessionMeta | undefined)?.claudeCode?.options?.resume,
+    const resume = (params._meta as NewSessionMeta | undefined)?.claudeCode?.options?.resume;
+    // Anonymous creations also need a lane that shutdown can drain.
+    const response = await this.withSessionLifecycleLock(resume || randomUUID(), async () => {
+      if (resume && this.sessions[resume]) {
+        await this.validateCwd(params.cwd, params.additionalDirectories);
+        clientSystemPrompt(params.systemPrompt);
+        await this.teardownSession(resume);
+      }
+      const created = await this.createSession(request, { resume });
+      if (resume) return this.withInitialConfigOptions(created, initial);
+      // The new session id becomes available only after creation.
+      return this.queueSessionLifecycle(created.sessionId, () =>
+        this.withInitialConfigOptions(created, initial),
+      );
     });
-    const response = await this.withInitialConfigOptions(created, initial);
     this.afterSetupResponse(response.sessionId, params.mcpServers);
     return response;
   }
@@ -2212,15 +2239,16 @@ export class ClaudeAcpAgent {
     // The fork row can lack `forkedFrom`: the scan reads it from the first
     // 64 KB of the transcript only. So the fork is held back by its id too.
     this.sessionIndex.onForkCreated(params.sessionId, sessionId);
-    const { modes, configOptions } = await this.withInitialConfigOptions(
-      await this.getOrCreateSession({
+    const { modes, configOptions } = await this.getOrCreateSession(
+      {
         sessionId,
         cwd: params.cwd,
         mcpServers: params.mcpServers,
         additionalDirectories: params.additionalDirectories,
         systemPrompt: params.systemPrompt,
         _meta: params._meta,
-      }),
+      },
+      undefined,
       initial,
     );
     this.afterSetupResponse(sessionId, params.mcpServers ?? []);
@@ -2236,8 +2264,9 @@ export class ClaudeAcpAgent {
 
   /**
    * `_session/rewind` (see `session-rewind.ts`). Queued with the session's
-   * configuration changes, so a mode or model change sent meanwhile lands on
-   * the resumed query. A prompt sent meanwhile waits for it in `startTurn`:
+   * lifecycle and configuration changes, so closing waits for replacement and
+   * a mode or model change sent meanwhile lands on the resumed query.
+   * A prompt sent meanwhile waits for it in `startTurn`:
    * the rewind closes the query the prompt would otherwise run on.
    */
   rewindSession(params: SessionRewindRequest): Promise<SessionRewindResponse> {
@@ -2249,7 +2278,9 @@ export class ClaudeAcpAgent {
     const rewind = (async () => {
       // Outside the queue: a provider update queues its own restart there.
       while (this.providerUpdate) await this.providerUpdate;
-      return this.serializeConfigurationChange(sessionId, () => this.rewindLiveSession(params));
+      return this.withSessionLifecycleLock(sessionId, () =>
+        this.serializeConfigurationChange(sessionId, () => this.rewindLiveSession(params)),
+      );
     })();
     const settled = rewind.then(
       () => undefined,
@@ -2318,32 +2349,33 @@ export class ClaudeAcpAgent {
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+    this.assertAgentActive();
     const initial = initialConfigOptions(params.configOptions);
     while (this.providerUpdate) await this.providerUpdate;
-    const result = await this.withInitialConfigOptions(
-      await this.getOrCreateSession(params),
-      initial,
-    );
+    const result = await this.getOrCreateSession(params, undefined, initial);
 
     this.afterSetupResponse(params.sessionId, params.mcpServers ?? []);
     return result;
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+    this.assertAgentActive();
     const timing = new SessionTiming(this.logger, "load", params.sessionId);
     const initial = initialConfigOptions(params.configOptions);
     while (this.providerUpdate) await this.providerUpdate;
-    let result: NewSessionResponse;
-    if (this.sessions[params.sessionId]) {
-      const resumedSession = await readResumedSession(params.sessionId, this.logger);
-      result = await this.getOrCreateSession(params, { resumedSession });
-      timing.phase("session-ready");
-      await this.replaySessionHistory(params.sessionId, resumedSession.messages);
-    } else {
-      result = await this.createSessionWhileReplaying(params, timing);
-    }
-    timing.phase("replay");
-    result = await this.withInitialConfigOptions(result, initial);
+    const result = await this.withSessionLifecycleLock(params.sessionId, async () => {
+      let response: NewSessionResponse;
+      if (this.sessions[params.sessionId]) {
+        const resumedSession = await readResumedSession(params.sessionId, this.logger);
+        response = await this.getOrCreateSessionLocked(params, { resumedSession });
+        timing.phase("session-ready");
+        await this.replaySessionHistory(params.sessionId, resumedSession.messages);
+      } else {
+        response = await this.createSessionWhileReplaying(params, timing);
+      }
+      timing.phase("replay");
+      return this.withInitialConfigOptions(response, initial);
+    });
 
     // After the replay, so the commands do not interleave with the history.
     this.afterSetupResponse(params.sessionId, params.mcpServers ?? []);
@@ -3085,9 +3117,13 @@ export class ClaudeAcpAgent {
   }
 
   private async awaitSignOutRespawn(sessionId: string, session: Session): Promise<Session> {
-    const respawn = (session.signOutRespawn ??= this.recreateSignedOutQuery(
+    const respawn = (session.signOutRespawn ??= this.withSessionLifecycleLock(
       sessionId,
-      session,
+      async () => {
+        if (this.sessions[sessionId] === session && session.needsSignOutRespawn) {
+          await this.recreateSignedOutQuery(sessionId, session);
+        }
+      },
     ).finally(() => {
       session.signOutRespawn = undefined;
     }));
@@ -8189,6 +8225,39 @@ export class ClaudeAcpAgent {
     }
   }
 
+  /** Runs `fn` after any lifecycle operation already in flight for `sessionId`
+   *  settles, and lets the next one wait on this one in turn. Reentrant calls
+   *  for the same `sessionId` from inside an already-locked `fn` would deadlock
+   *  (the queue would wait on itself), so this must only be called from a
+   *  top-level request handler, never from `teardownSession` or other helpers
+   *  it already calls internally. */
+  private withSessionLifecycleLock<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
+    this.assertAgentActive();
+    return this.queueSessionLifecycle(sessionId, fn);
+  }
+
+  private assertAgentActive(): void {
+    if (this.disposing) {
+      throw RequestError.internalError(undefined, "Agent is shutting down");
+    }
+  }
+
+  private queueSessionLifecycle<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.sessionLifecycleLocks.get(sessionId) ?? Promise.resolve();
+    const current = previous.then(fn, fn);
+    const settled = current.then(
+      () => {},
+      () => {},
+    );
+    this.sessionLifecycleLocks.set(sessionId, settled);
+    void settled.then(() => {
+      if (this.sessionLifecycleLocks.get(sessionId) === settled) {
+        this.sessionLifecycleLocks.delete(sessionId);
+      }
+    });
+    return current;
+  }
+
   /** Mark a session's SDK query stream as permanently ended and release the
    *  resources tied to it: drop the consumer handle, dispose the settings
    *  watchers, end the input stream, and close the query (which terminates the
@@ -8303,9 +8372,26 @@ export class ClaudeAcpAgent {
   }
 
   /** Tear down all active sessions. Called when the ACP connection closes. */
-  async dispose(): Promise<void> {
+  dispose(): Promise<void> {
+    if (this.disposal) return this.disposal;
+    this.disposing = true;
     this.sessionIndex.dispose();
-    await Promise.all(Object.keys(this.sessions).map((id) => this.teardownSession(id)));
+    // Drain accepted creators and cancel current turns that a provider change
+    // may be waiting on, without allowing teardown to race a replacement.
+    const sessionIds = new Set([
+      ...Object.keys(this.sessions),
+      ...this.sessionLifecycleLocks.keys(),
+    ]);
+    for (const id of sessionIds) this.exitPlan.cancel(id);
+    const drains = [...sessionIds].map((id) =>
+      this.queueSessionLifecycle(id, () => this.teardownSession(id)),
+    );
+    this.disposal = (async () => {
+      await Promise.allSettled([...drains, ...(this.providerUpdate ? [this.providerUpdate] : [])]);
+      // An anonymous creator may have registered under a newly generated id.
+      await Promise.all(Object.keys(this.sessions).map((id) => this.teardownSession(id)));
+    })();
+    return this.disposal;
   }
 
   /**
@@ -8324,7 +8410,9 @@ export class ClaudeAcpAgent {
 
   /** Idempotent: a session that is not loaded here is already closed. */
   async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
-    await this.endSession(params.sessionId);
+    this.exitPlan.cancel(params.sessionId);
+    // A close waits for any in-flight load or resume of the same session.
+    await this.withSessionLifecycleLock(params.sessionId, () => this.endSession(params.sessionId));
     return {};
   }
 
@@ -8349,7 +8437,10 @@ export class ClaudeAcpAgent {
 
   /** Per client: see {@link sessionIndex.SessionIndexConnection.deleteSession}. */
   async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
-    return this.sessionIndex.deleteSession(params);
+    this.exitPlan.cancel(params.sessionId);
+    return this.withSessionLifecycleLock(params.sessionId, async () => {
+      return this.sessionIndex.deleteSession(params);
+    });
   }
 
   setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
@@ -10377,6 +10468,29 @@ export class ClaudeAcpAgent {
       systemPrompt?: NewSessionRequest["systemPrompt"];
       _meta?: NewSessionRequest["_meta"];
     },
+    options: { resumedSession?: ResumedSessionSnapshot; optionsOnly?: boolean } = {},
+    initial: readonly InitialSessionConfigOption[] = [],
+  ): Promise<NewSessionResponse> {
+    // Locked so two concurrent calls for the same sessionId (e.g. a client
+    // retrying `session/load` after a dropped reconnect, without knowing the
+    // first attempt already landed) can't both read the same stale-fingerprint
+    // session, both tear it down, and both spawn a replacement -- see the lock's
+    // own doc comment for why that orphans a subprocess.
+    return this.withSessionLifecycleLock(params.sessionId, async () => {
+      const response = await this.getOrCreateSessionLocked(params, options);
+      return this.withInitialConfigOptions(response, initial);
+    });
+  }
+
+  private async getOrCreateSessionLocked(
+    params: {
+      sessionId: string;
+      cwd: string;
+      mcpServers?: NewSessionRequest["mcpServers"];
+      additionalDirectories?: NewSessionRequest["additionalDirectories"];
+      systemPrompt?: NewSessionRequest["systemPrompt"];
+      _meta?: NewSessionRequest["_meta"];
+    },
     {
       resumedSession,
       optionsOnly,
@@ -11379,14 +11493,19 @@ export class ClaudeAcpAgent {
    * session with the same ID so subsequent turns inherit the new environment.
    */
   private async enqueueProviderUpdate(config: ProviderConfig | undefined): Promise<void> {
+    this.assertAgentActive();
     const previous = this.providerUpdate?.catch(() => undefined) ?? Promise.resolve();
+    const pendingLifecycles = [...this.sessionLifecycleLocks.values()];
     const update = previous.then(async () => {
+      await Promise.all(pendingLifecycles);
+      if (this.disposing) return;
       // The listing runs in the queue, so `providers/set`, `providers/disable`
       // and logout apply in the order they arrived. A failed listing fails this
       // `providers/set` before the provider replaces the current one.
       if (config) {
         await withListedModels(config, this.providerConfig, this.logger);
       }
+      if (this.disposing) return;
       const sessions = Object.entries(this.sessions);
       const activeTurns = sessions.flatMap(([, session]) =>
         (session.turnQueue ?? []).flatMap((turn) => (turn.completion ? [turn.completion] : [])),
@@ -11400,8 +11519,11 @@ export class ClaudeAcpAgent {
 
       this.providerConfig = config;
       for (const [sessionId] of sessions) {
-        await this.serializeConfigurationChange(sessionId, () =>
-          this.restartSessionForProvider(sessionId),
+        if (this.disposing) return;
+        await this.withSessionLifecycleLock(sessionId, () =>
+          this.serializeConfigurationChange(sessionId, () =>
+            this.restartSessionForProvider(sessionId),
+          ),
         );
       }
     });

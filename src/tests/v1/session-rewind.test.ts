@@ -305,6 +305,27 @@ describe("_session/rewind on v1", { timeout: 10_000 }, () => {
       expect(resumed.prompts).toHaveLength(1);
     });
 
+    it("closes the replacement query after an in-flight rewind", async () => {
+      const sessionId = await start();
+      const gate = deferred();
+      initializationGate = gate.promise;
+      const rewinding = rewind(sessionId);
+      let closing: ReturnType<ClaudeAcpAgent["closeSession"]> | undefined;
+      try {
+        await vi.waitFor(() => expect(queries).toHaveLength(2));
+        closing = agent.closeSession({ sessionId });
+        gate.resolve();
+        expect(await rewinding).toEqual({ rewound: true });
+        await closing;
+        expect(agent.sessions[sessionId]).toBeUndefined();
+        expect(queries[0]!.close).toHaveBeenCalledTimes(1);
+        expect(queries[1]!.close).toHaveBeenCalledTimes(1);
+      } finally {
+        gate.resolve();
+        await Promise.allSettled([rewinding, closing]);
+      }
+    });
+
     it("gives the edited message a cursor after the entity that the client keeps, and rewinds again", async () => {
       const sessionId = await start();
       await (agent as any).replaySessionHistory(sessionId);
