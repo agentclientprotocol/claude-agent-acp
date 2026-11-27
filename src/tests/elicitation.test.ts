@@ -4,8 +4,9 @@ import type {
   CreateElicitationResponse,
   EnumOption,
 } from "@agentclientprotocol/sdk/unstable";
-import type { ElicitationRequest } from "@anthropic-ai/claude-agent-sdk";
+import type { ElicitationRequest, McpServerStatus } from "@anthropic-ai/claude-agent-sdk";
 import {
+  answerMcpManage,
   applyAskElicitationResponse,
   askUserQuestionsToCreateRequest,
   AskUserQuestion,
@@ -13,6 +14,8 @@ import {
   extractAskUserQuestions,
   extractRefusalFallbackPrompt,
   mcpElicitationToCreateRequest,
+  mcpManageCommandFromResponse,
+  mcpManageToCreateRequest,
   refusalFallbackResultFromResponse,
   refusalFallbackToCreateRequest,
 } from "../elicitation.js";
@@ -707,5 +710,114 @@ describe("refusalFallbackResultFromResponse", () => {
     for (const response of cases) {
       expect(refusalFallbackResultFromResponse(response)).toBe("cancelled");
     }
+  });
+});
+
+describe("the /mcp form", () => {
+  const STATUSES: McpServerStatus[] = [
+    { name: "github", status: "connected" },
+    { name: "old", status: "disabled" },
+    { name: "linear", status: "needs-auth" },
+    { name: "db", status: "failed", error: "spawn db-mcp ENOENT" },
+    { name: "db", status: "failed", error: "duplicate from another scope" },
+  ];
+
+  function form(action?: "reconnect" | "enable" | "disable") {
+    const request = mcpManageToCreateRequest(STATUSES, SESSION_ID, action) as Extract<
+      CreateElicitationRequest,
+      { mode: "form" }
+    >;
+    const properties = request.requestedSchema.properties as Record<string, any>;
+    return { request, properties };
+  }
+
+  it("lists each server once, the ones that need attention first, with status and error", () => {
+    const { request, properties } = form();
+    expect(request).toMatchObject({ mode: "form", sessionId: SESSION_ID });
+    expect(request.requestedSchema.required).toEqual(["action", "servers"]);
+    expect(properties.servers.items.anyOf).toEqual([
+      { const: "db", title: "db: failed, spawn db-mcp ENOENT" },
+      { const: "linear", title: "linear: need authentication" },
+      { const: "github", title: "github: connected" },
+      { const: "old", title: "old: disabled" },
+    ]);
+    expect(properties.servers.minItems).toBe(1);
+  });
+
+  it("defaults the action to reconnect when a server needs it, and to disable otherwise", () => {
+    expect(form().properties.action.default).toBe("reconnect");
+    const healthy = mcpManageToCreateRequest(
+      [{ name: "github", status: "connected" }],
+      SESSION_ID,
+    ) as Extract<CreateElicitationRequest, { mode: "form" }>;
+    expect((healthy.requestedSchema.properties as Record<string, any>).action.default).toBe(
+      "disable",
+    );
+  });
+
+  it("takes the default action from a prompt that named one", () => {
+    expect(form("enable").properties.action.default).toBe("enable");
+  });
+
+  it("maps an accepted form to a command for the chosen servers", () => {
+    const response = {
+      action: "accept",
+      content: { action: "enable", servers: ["old", "github"] },
+    } as unknown as CreateElicitationResponse;
+    expect(mcpManageCommandFromResponse(response, STATUSES)).toEqual({
+      action: "enable",
+      all: false,
+      servers: ["old", "github"],
+    });
+  });
+
+  it("runs nothing for a dismissed or malformed form", () => {
+    const cases = [
+      { action: "decline" },
+      { action: "cancel" },
+      { action: "accept" },
+      { action: "accept", content: { action: "reconnect", servers: [] } },
+      { action: "accept", content: { action: "reconnect", servers: ["unknown"] } },
+      { action: "accept", content: { action: "delete", servers: ["db"] } },
+      { action: "accept", content: { action: "reconnect", servers: "db" } },
+      { action: "accept", content: { servers: ["db"] } },
+    ] as unknown as CreateElicitationResponse[];
+    for (const response of cases) {
+      expect(mcpManageCommandFromResponse(response, STATUSES)).toBeNull();
+    }
+  });
+
+  it("drops the servers that are not in the list but keeps the ones that are", () => {
+    const response = {
+      action: "accept",
+      content: { action: "reconnect", servers: ["unknown", "db", 3] },
+    } as unknown as CreateElicitationResponse;
+    expect(mcpManageCommandFromResponse(response, STATUSES)).toEqual({
+      action: "reconnect",
+      all: false,
+      servers: ["db"],
+    });
+  });
+
+  it("answers null when the elicitation is withdrawn or the client rejects it", async () => {
+    const errors: unknown[] = [];
+    const logger = { error: (...args: unknown[]) => errors.push(args) };
+    await expect(
+      answerMcpManage(STATUSES, {
+        sessionId: SESSION_ID,
+        elicit: async () => ({ withdrawn: true }),
+        logger,
+      }),
+    ).resolves.toBeNull();
+    await expect(
+      answerMcpManage(STATUSES, {
+        sessionId: SESSION_ID,
+        elicit: async () => {
+          throw new Error("-32602");
+        },
+        logger,
+      }),
+    ).resolves.toBeNull();
+    expect(errors).toHaveLength(1);
   });
 });

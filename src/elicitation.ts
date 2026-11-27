@@ -17,12 +17,14 @@ import type {
   AskUserQuestionInput,
   AskUserQuestionOutput,
 } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
+import type { McpServerStatus } from "@anthropic-ai/claude-agent-sdk";
 import {
   AIR_CUSTOM_ANSWER_FIELDS_KEY,
   AIR_CUSTOM_ANSWER_KEY,
   LEGACY_AIR_CUSTOM_ANSWER_KEY,
   withAirMeta,
 } from "./air-extension.js";
+import { mcpNeedsReconnect, mcpServerChoices, type McpCommand } from "./mcp-command.js";
 
 /**
  * Bridges between the Claude Agent SDK's elicitation/dialog callbacks and ACP's
@@ -691,4 +693,102 @@ export async function answerUserDialog(
     return { behavior: "cancelled" };
   }
   return { behavior: "completed", result: refusalFallbackResultFromResponse(outcome.response) };
+}
+
+const MCP_ACTIONS = ["reconnect", "enable", "disable"] as const;
+type McpAction = (typeof MCP_ACTIONS)[number];
+
+const MCP_ACTION_TITLES: Record<McpAction, string> = {
+  reconnect: "Reconnect",
+  enable: "Enable",
+  disable: "Disable",
+};
+
+/** Form-field keys of the `/mcp` form. */
+const MCP_ACTION_KEY = "action";
+const MCP_SERVERS_KEY = "servers";
+
+/**
+ * Render the `/mcp` server choice as an ACP form elicitation: a single-select
+ * for the action and a multi-select for the servers. `action` is the default
+ * of the first field. With none, it is `reconnect` when some server needs one
+ * and `disable` otherwise.
+ */
+export function mcpManageToCreateRequest(
+  statuses: McpServerStatus[],
+  sessionId: string,
+  action?: McpAction,
+): CreateElicitationRequest {
+  const defaultAction = action ?? (mcpNeedsReconnect(statuses) ? "reconnect" : "disable");
+  return {
+    mode: "form",
+    sessionId,
+    message: "Choose an action and the MCP servers to apply it to.",
+    requestedSchema: {
+      type: "object",
+      properties: {
+        [MCP_ACTION_KEY]: {
+          type: "string",
+          title: "Action",
+          oneOf: MCP_ACTIONS.map((value) => ({ const: value, title: MCP_ACTION_TITLES[value] })),
+          default: defaultAction,
+        },
+        [MCP_SERVERS_KEY]: {
+          type: "array",
+          title: "Servers",
+          minItems: 1,
+          items: {
+            anyOf: mcpServerChoices(statuses).map(({ name, title }) => ({ const: name, title })),
+          },
+        },
+      },
+      required: [MCP_ACTION_KEY, MCP_SERVERS_KEY],
+    },
+  };
+}
+
+/**
+ * Map the `/mcp` form response to the command to run. Decline, cancel, an
+ * unknown action, and a selection with no server of the list give null, so a
+ * dismissed or half-filled form runs nothing.
+ */
+export function mcpManageCommandFromResponse(
+  response: CreateElicitationResponse,
+  statuses: McpServerStatus[],
+): McpCommand | null {
+  const content = acceptedElicitationContent(response);
+  const action = MCP_ACTIONS.find((value) => value === content[MCP_ACTION_KEY]);
+  const selected = content[MCP_SERVERS_KEY];
+  if (action === undefined || !Array.isArray(selected)) return null;
+  const known = new Set(statuses.map((status) => status.name));
+  const servers = selected.filter(
+    (name): name is string => typeof name === "string" && known.has(name),
+  );
+  return servers.length === 0 ? null : { action, all: false, servers };
+}
+
+/**
+ * Asks the user, through `elicit`, what to do with the MCP servers, and
+ * returns the `/mcp` command they chose. Null when they dismissed the form,
+ * it was withdrawn, or the client couldn't show it. Nothing runs then, and
+ * `/mcp` shows the plain list.
+ */
+export async function answerMcpManage(
+  statuses: McpServerStatus[],
+  {
+    sessionId,
+    action,
+    elicit,
+    logger,
+  }: { sessionId: string; action?: McpAction; elicit: Elicit; logger: ElicitationLogger },
+): Promise<McpCommand | null> {
+  let outcome: ElicitationOutcome;
+  try {
+    outcome = await elicit(mcpManageToCreateRequest(statuses, sessionId, action));
+  } catch (error) {
+    logger.error(`Failed to present the /mcp elicitation: ${error}`);
+    return null;
+  }
+  if ("withdrawn" in outcome) return null;
+  return mcpManageCommandFromResponse(outcome.response, statuses);
 }

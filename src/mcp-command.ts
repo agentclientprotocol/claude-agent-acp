@@ -20,10 +20,26 @@ const MCP_ACTION_TIMEOUT_MS = 30_000;
 
 /** A `/mcp` prompt that gets a replacement for its Claude Code text. `all` is
  *  true for `all` and for a reconnect without a server name, as in Claude
- *  Code. `server` is undefined for an enable or a disable without a name. */
+ *  Code. `server` is undefined for an enable or a disable without a name.
+ *  `servers` comes only from the form of {@link McpChooser}, which can pick
+ *  several servers. It wins over `server`. */
 export type McpCommand =
   | { action: "status" }
-  | { action: "reconnect" | "enable" | "disable"; all: boolean; server?: string };
+  | {
+      action: "reconnect" | "enable" | "disable";
+      all: boolean;
+      server?: string;
+      servers?: string[];
+    };
+
+/** Asks the user which servers to act on, after the server list. Resolves to
+ *  the command the user chose, or null when they dismissed the question, the
+ *  client can't show it, or it failed. `action` is the action a prompt like
+ *  `/mcp enable` already named. */
+export type McpChooser = (
+  statuses: McpServerStatus[],
+  action?: "reconnect" | "enable" | "disable",
+) => Promise<McpCommand | null>;
 
 /** Parse a prompt that is exactly `/mcp`, or `/mcp reconnect`, `/mcp enable`,
  *  or `/mcp disable` with an optional server name or `all`. Any other `/mcp`
@@ -245,6 +261,36 @@ export function formatMcpStatus(statuses: McpServerStatus[]): string {
   return blocks.join("\n\n");
 }
 
+/** One server of the `/mcp` form: its name and the line the user reads. */
+export type McpServerChoice = { name: string; title: string };
+
+/** The servers of the `/mcp` form, one for each name. The servers that need
+ *  attention come first, in the order of the list. The line carries the
+ *  status and, for a failed server, the short error. */
+export function mcpServerChoices(statuses: McpServerStatus[]): McpServerChoice[] {
+  const rank = (status: McpServerStatus) => {
+    const index = GROUP_ORDER.indexOf(status.status);
+    return index === -1 ? GROUP_ORDER.length : index;
+  };
+  const choices = new Map<string, McpServerChoice>();
+  for (const status of [...statuses].sort((a, b) => rank(a) - rank(b))) {
+    if (choices.has(status.name)) continue;
+    const error = status.error ? cleanMcpError(status.error) : "";
+    const label = SUMMARY_LABELS[status.status] ?? status.status;
+    choices.set(status.name, {
+      name: status.name,
+      title: error === "" ? `${status.name}: ${label}` : `${status.name}: ${label}, ${error}`,
+    });
+  }
+  return [...choices.values()];
+}
+
+/** True when some server needs a reconnect, so `reconnect` is the likely
+ *  action for the `/mcp` form. */
+export function mcpNeedsReconnect(statuses: McpServerStatus[]): boolean {
+  return statuses.some(needsReconnect);
+}
+
 /** The SDK query methods that `/mcp` uses. */
 export type McpControlQuery = Pick<
   Query,
@@ -297,6 +343,7 @@ function actionTargets(
   command: Extract<McpCommand, { all: boolean }>,
   statuses: McpServerStatus[],
 ): string[] {
+  if (command.servers !== undefined) return [...new Set(command.servers)];
   if (!command.all) return command.server === undefined ? [] : [command.server];
   const names = statuses
     .filter((status) => {
@@ -319,30 +366,65 @@ function nothingToDoLine(action: McpCommand["action"]): string {
  *  SDK mode, so the adapter runs them through the SDK control API. The result
  *  of each server goes above the server list. An error of one server does
  *  not stop the others. When the first status read fails or `signal`
- *  aborts, the turn keeps the text of Claude Code. */
+ *  aborts, the turn keeps the text of Claude Code.
+ *
+ *  With `choose`, a `/mcp` without arguments, and an enable or a disable
+ *  without a server, ask the user what to do before the list goes out. If the
+ *  user picks something, that command runs and its result takes the place of
+ *  the plain list. */
 export async function runMcpCommand(
   query: McpControlQuery,
   command: McpCommand,
   originalOutput: string,
   signal: AbortSignal,
   logError: (message: string) => void,
+  choose?: McpChooser,
 ): Promise<McpCommandOutcome> {
   const reconnected: string[] = [];
   const keep: McpCommandOutcome = { markdown: null, reconnected };
-  if (command.action === "status") {
-    // The list replaces the Claude Code summary line.
+  const asksForServers =
+    choose !== undefined &&
+    (command.action === "status" ||
+      (!command.all && command.server === undefined && command.servers === undefined));
+  if (command.action === "status" || asksForServers) {
     const statuses = await readMcpServerStatus(query, signal, logError);
-    return { markdown: statuses ? formatMcpStatus(statuses) : null, reconnected };
+    if (!statuses) return keep;
+    const chosen =
+      asksForServers && statuses.length > 0
+        ? await choose(statuses, command.action === "status" ? undefined : command.action)
+        : null;
+    if (signal.aborted) return keep;
+    if (chosen !== null && chosen.action !== "status") {
+      // Claude Code's text was only the summary line, so it isn't passed on.
+      return runMcpAction(query, chosen, statuses, "", signal, logError);
+    }
+    // The list replaces the Claude Code summary line.
+    return { markdown: formatMcpStatus(statuses), reconnected };
   }
   const before = await readMcpServerStatus(query, signal, logError);
   if (!before) return keep;
+  return runMcpAction(query, command, before, originalOutput, signal, logError);
+}
+
+/** Run a reconnect, an enable, or a disable of `command` on the servers that
+ *  `before` read, and build the text of {@link runMcpCommand}. */
+async function runMcpAction(
+  query: McpControlQuery,
+  command: Extract<McpCommand, { all: boolean }>,
+  before: McpServerStatus[],
+  originalOutput: string,
+  signal: AbortSignal,
+  logError: (message: string) => void,
+): Promise<McpCommandOutcome> {
+  const reconnected: string[] = [];
+  const keep: McpCommandOutcome = { markdown: null, reconnected };
 
   const cliSentences = sentences(originalOutput).filter(
     (sentence) => !isTerminalSentence(sentence),
   );
   const cliNamesUnknown = cliSentences.some((sentence) => /no MCP server named/i.test(sentence));
   const results: string[] = [];
-  if (!command.all && command.server === undefined) {
+  if (!command.all && command.server === undefined && command.servers === undefined) {
     results.push(`Name a server or \`all\`, for example \`/mcp ${command.action} <server>\`.`);
   }
   const known = new Set(before.map((status) => status.name));
