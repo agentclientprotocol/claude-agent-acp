@@ -119,7 +119,6 @@ import {
   restrictedChild,
   SubagentAwareSessionCapabilities,
   subagentForm,
-  type SubagentState,
 } from "../acp-subagents.js";
 import {
   childModelOption,
@@ -127,7 +126,6 @@ import {
   isNativeSubagentControlUpdate,
   NativeSubagent,
   NativeSubagentRuntime,
-  nativeSubagentState,
   type ModelEntry,
   responseModelEntry,
   resumedNativeSubagentId,
@@ -256,8 +254,9 @@ import {
 import {
   type ReplayChild,
   RfdSubagentReplay,
+  NativeReplayEnds,
+  type NativeReplayChild,
   ReplayTranscript,
-  replaySubagentTerminalState,
 } from "../subagent-replay.js";
 import {
   readHistoryAcrossCompactions,
@@ -8496,20 +8495,11 @@ export class ClaudeAcpAgent {
     const form = subagentForm(this.clientCapabilities);
     const nativeReplayEnabled = form === "air";
     const replayCompactionUpdates = clientSupportsCompactionUpdates(this.clientCapabilities);
-    const replayTerminalStates = new Map<string, "completed" | "failed" | "cancelled">();
     const replayChildren = new Map<
       string,
-      {
-        sessionId: string;
-        parentToolUseId?: string;
+      NativeReplayChild & {
         name: string;
         task: string;
-        reconstructable: boolean;
-        announced: boolean;
-        terminalState?: "completed" | "failed" | "cancelled";
-        /** The state of the last persisted task notification of the child.
-         *  It comes after the launch tool_result, so it wins. */
-        notifiedState?: SubagentState;
         /** The model id of the child's latest response in its transcript. */
         responseModel?: string;
         /** The `model` option entry that the replay sent to the child. */
@@ -8521,13 +8511,21 @@ export class ClaudeAcpAgent {
     // no model to the list, and each child's model is its id until the load
     // response refines it (see `publishCurrentSubagentStates`).
     const replayModels = pending ? undefined : this.subagentModels(sessionId);
+    const replayEnds = new NativeReplayEnds(replayChildren, sessionId);
 
-    // Registers the Agent and Task launches of `list`, and the terminal state
-    // of each launch from its tool_result.
+    // Registers the Agent and Task launches of `list`, and the tool results
+    // and the task notifications that can end them. The replay reads the
+    // notifications of the same messages (see `restoreTaskNotification`).
     const registerLaunches = (list: SessionMessage[]): void => {
       for (const message of list) {
-        const content = (message as unknown as { message?: { content?: unknown } }).message
-          ?.content;
+        const inner = (message as unknown as { message?: { role?: unknown; content?: unknown } })
+          .message;
+        const content = inner?.content;
+        if (inner?.role === "user" && !isReplayHiddenMetaMessage(message)) {
+          for (const notification of taskNotificationsOf(content)) {
+            replayEnds.takeNotification(notification);
+          }
+        }
         if (!Array.isArray(content)) continue;
         const ownerToolUseId = parentToolUseIdOf(message);
         for (const block of content) {
@@ -8539,7 +8537,7 @@ export class ClaudeAcpAgent {
             "tool_use_id" in block &&
             typeof block.tool_use_id === "string"
           ) {
-            replayTerminalStates.set(block.tool_use_id, replaySubagentTerminalState(block));
+            replayEnds.takeResult(block.tool_use_id, block);
           }
           if (
             typeof block !== "object" ||
@@ -8576,13 +8574,9 @@ export class ClaudeAcpAgent {
             task,
             reconstructable: true,
             announced: false,
-            terminalState: replayTerminalStates.get(block.id),
+            input,
           });
         }
-      }
-      for (const [toolUseId, terminalState] of replayTerminalStates) {
-        const child = replayChildren.get(toolUseId);
-        if (child) child.terminalState = terminalState;
       }
     };
     if (nativeReplayEnabled) registerLaunches(messages);
@@ -8604,7 +8598,6 @@ export class ClaudeAcpAgent {
       }
       if (ancestors.has(parentToolUseId)) {
         child.reconstructable = false;
-        child.terminalState = undefined;
         child.parentToolUseId = undefined;
       }
       if (child.parentToolUseId) {
@@ -8613,12 +8606,9 @@ export class ClaudeAcpAgent {
         await announceReplayChild(child.parentToolUseId, nextAncestors);
       }
       if (!child.announced) {
-        const parentSessionId = child.parentToolUseId
-          ? (replayChildren.get(child.parentToolUseId)?.sessionId ?? sessionId)
-          : sessionId;
         await this.client.sessionUpdate(
           asSdkSessionNotification({
-            sessionId: parentSessionId,
+            sessionId: replayEnds.parentSessionId(child),
             update: {
               sessionUpdate: "subagent_spawned",
               subagentSessionId: child.sessionId,
@@ -8638,6 +8628,7 @@ export class ClaudeAcpAgent {
       nativeReplayEnabled && replayChildren.size > 0
         ? await subagentHistory(sessionId)
         : { agents: new Map() };
+    replayEnds.setRecords(subagents.agents);
     const airReplay = nativeReplayEnabled ? new ReplayTranscript(subagents) : undefined;
     airReplay?.scan(messages, sessionId);
     const replayedSubagents = new Set<string>();
@@ -8687,13 +8678,15 @@ export class ClaudeAcpAgent {
       notification: PersistedTaskNotification,
     ): Promise<void> => {
       if (rfdReplay?.taskNotification(notification.task_id, notification.status)) return;
-      const toolUseId = notification.tool_use_id;
+      const toolUseId = replayEnds.launchIdOf(notification);
       if (!toolUseId) return;
       const child = replayChildren.get(toolUseId);
       const toolUse = replayToolUses.get(toolUseId);
       if (child || (toolUse && isNativeSubagentControlTool(toolUse.name))) {
-        const state = nativeSubagentState(notification.status);
-        if (child && state) child.notifiedState = state;
+        // The end goes at the position of the notification, as the live frame sends it.
+        for (const end of replayEnds.atNotification(notification)) {
+          await this.client.sessionUpdate(asSdkSessionNotification(end));
+        }
         return;
       }
       // Like live, a task that no tool call started stays unknown.
@@ -8981,26 +8974,17 @@ export class ClaudeAcpAgent {
       }
       if (childModels.size > 0) this.replayedChildModels.set(sessionId, childModels);
       // Claude history persists sidechain messages and Agent/Task tool uses,
-      // but not task_started/task_updated lifecycle frames. Recover terminal
-      // state from the launch tool_result. Missing results and malformed or
-      // orphan lineage use the draft protocol's deterministic disconnected state.
-      for (const child of [...replayChildren.values()].reverse()) {
-        if (!child.announced) continue;
-        const parentSessionId = child.parentToolUseId
-          ? (replayChildren.get(child.parentToolUseId)?.sessionId ?? sessionId)
-          : sessionId;
-        await this.client.sessionUpdate(
-          asSdkSessionNotification({
-            sessionId: parentSessionId,
-            update: {
-              sessionUpdate: "subagent_state_update",
-              subagentSessionId: child.sessionId,
-              state: child.reconstructable
-                ? (child.notifiedState ?? child.terminalState ?? "disconnected")
-                : "disconnected",
-            },
-          }),
-        );
+      // but not task_started/task_updated lifecycle frames. A child that no
+      // task notification ended gets its end from its launch result:
+      // `completed`, or `failed` (`cancelled` for a stop) for an error. A
+      // background launch, a missing result, and malformed or orphan lineage
+      // give the draft protocol's deterministic `disconnected` state.
+      // A load of a session that runs in this process also ends a child that
+      // still runs. AIR's draft allows no update after a child's end, and the
+      // live stream reports the child under its live session id, not its
+      // replay id. So nothing corrects this replayed end.
+      for (const end of replayEnds.afterHistory()) {
+        await this.client.sessionUpdate(asSdkSessionNotification(end));
       }
     }
     const replayFinishedAt = performance.now();

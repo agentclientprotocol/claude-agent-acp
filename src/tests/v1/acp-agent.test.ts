@@ -2938,6 +2938,7 @@ describe("task notification replay", () => {
     capabilities: ClientCapabilities = {
       _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
     },
+    sessionId = "s1",
   ): Promise<AcpSessionNotification[]> {
     const updates: AcpSessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
@@ -2951,7 +2952,7 @@ describe("task notification replay", () => {
     vi.mocked(getSessionMessages).mockResolvedValueOnce(history);
     await (
       agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
-    ).replaySessionHistory("s1");
+    ).replaySessionHistory(sessionId);
     return updates;
   }
 
@@ -3229,6 +3230,481 @@ describe("task notification replay", () => {
       sessionUpdate: "subagent_state_update",
       subagentSessionId: "s1:replay-subagent:toolu_agent",
       state: "cancelled",
+    });
+  });
+
+  describe("the end of a background Agent", () => {
+    const agentCapabilities = {
+      subagents: {},
+      _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+    } as ClientCapabilities;
+    // The SDK reads the transcript of a subagent only for a session with a UUID.
+    const sid = "33333333-3333-4333-8333-333333333333";
+    const replayed = (history: Parameters<typeof replay>[0]) =>
+      replay(history, agentCapabilities, sid);
+    // `subagentHistory` reads this directory, never the real config.
+    let configDir: string;
+    let projectDir: string;
+    let originalConfigDir: string | undefined;
+    beforeEach(async () => {
+      configDir = await mkdtemp(path.join(os.tmpdir(), "claude-acp-background-end-"));
+      projectDir = path.join(configDir, "projects", "-tmp-proj");
+      await mkdir(path.join(projectDir, sid, "subagents"), { recursive: true });
+      // The SDK reads a subagent transcript only beside a session transcript with a record.
+      await writeFile(
+        path.join(projectDir, `${sid}.jsonl`),
+        JSON.stringify({
+          sessionId: sid,
+          type: "user",
+          uuid: "u0",
+          parentUuid: null,
+          timestamp: "2026-09-24T00:00:00.000Z",
+          message: { role: "user", content: "Explore it" },
+        }) + "\n",
+      );
+      originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
+      process.env.CLAUDE_CONFIG_DIR = configDir;
+    });
+    afterEach(async () => {
+      if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
+      vi.mocked(getSessionInfo).mockReset();
+      await rm(configDir, { recursive: true, force: true });
+    });
+    /** Writes the metadata of the child `agentId` of the launch `toolUseId`, and its transcript. */
+    const writeChild = async (
+      agentId: string,
+      toolUseId: string,
+      meta: Record<string, unknown>,
+      transcript: object[] = [],
+    ) => {
+      // The project directory of the session, which names `projectDir`.
+      vi.mocked(getSessionInfo).mockResolvedValueOnce({ cwd: "/tmp/proj" } as any);
+      const directory = path.join(projectDir, sid, "subagents");
+      await writeFile(
+        path.join(directory, `agent-${agentId}.meta.json`),
+        JSON.stringify({ toolUseId, agentType: "general-purpose", ...meta }),
+      );
+      await writeFile(
+        path.join(directory, `agent-${agentId}.jsonl`),
+        transcript.map((line) => JSON.stringify(line)).join("\n") + "\n",
+      );
+    };
+    const launch = (
+      toolUseId: string,
+      input: Record<string, unknown>,
+      result: string,
+      parent?: string,
+    ) => [
+      record({
+        type: "assistant",
+        uuid: `launch-${toolUseId}`,
+        ...(parent ? { parent_tool_use_id: parent } : {}),
+        message: {
+          id: `m-${toolUseId}`,
+          role: "assistant",
+          model: "claude-opus-5",
+          content: [
+            {
+              type: "tool_use",
+              id: toolUseId,
+              name: "Agent",
+              input: { description: "Explore", prompt: "Look around", ...input },
+            },
+          ],
+        },
+      }),
+      record({
+        type: "user",
+        uuid: `result-${toolUseId}`,
+        ...(parent ? { parent_tool_use_id: parent } : {}),
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: toolUseId,
+              content: [{ type: "text", text: result }],
+            },
+          ],
+        },
+      }),
+    ];
+    const launched = "Async agent launched successfully.\nagentId: a1";
+    const backgroundLaunch = (inputFlag: boolean) =>
+      launch("toolu_agent", inputFlag ? { run_in_background: true } : {}, launched);
+    const notificationOf = (status: string, toolUseId: string | null, taskId: string) =>
+      "<task-notification>\n" +
+      `<task-id>${taskId}</task-id>\n` +
+      (toolUseId ? `<tool-use-id>${toolUseId}</tool-use-id>\n` : "") +
+      `<status>${status}</status>\n` +
+      '<summary>Agent "Explore" finished</summary>\n</task-notification>';
+    /** A task notification of the child `taskId`; `toolUseId: null` leaves out the tool use id. */
+    const agentNotification = (
+      status: string,
+      {
+        uuid = `u-${status}`,
+        toolUseId = "toolu_agent",
+        taskId = "a1",
+      }: { uuid?: string; toolUseId?: string | null; taskId?: string } = {},
+    ) =>
+      record({
+        type: "user",
+        uuid,
+        message: { role: "user", content: notificationOf(status, toolUseId, taskId) },
+        origin: { kind: "task-notification" },
+      });
+    const later = record({
+      type: "user",
+      uuid: "u9",
+      message: { role: "user", content: "What did it find?" },
+    });
+    const short = (id: string | undefined) =>
+      id === sid ? "s1" : id?.replace(`${sid}:replay-subagent:`, "");
+    const trace = (updates: AcpSessionNotification[]) =>
+      updates.flatMap(({ sessionId: target, update }) => {
+        const fields = update as {
+          subagentSessionId?: string;
+          state?: string;
+          content?: { text?: string };
+        };
+        switch (update.sessionUpdate) {
+          case "subagent_spawned":
+            return [[short(target), "spawned", short(fields.subagentSessionId)]];
+          case "subagent_state_update":
+            return [[short(target), "end", short(fields.subagentSessionId), fields.state]];
+          case "user_message_chunk":
+          case "agent_message_chunk":
+            return [[short(target), update.sessionUpdate, fields.content?.text]];
+          default:
+            return [];
+        }
+      });
+
+    it.each([
+      { status: "completed", state: "completed" },
+      { status: "failed", state: "failed" },
+      { status: "stopped", state: "cancelled" },
+      { status: "killed", state: "cancelled" },
+    ])(
+      "sends the $status end once, at the position of its notification",
+      async ({ status, state }) => {
+        const updates = await replayed([
+          ...backgroundLaunch(false),
+          agentNotification(status),
+          later,
+        ]);
+
+        expect(trace(updates)).toEqual([
+          ["s1", "spawned", "toolu_agent"],
+          ["s1", "end", "toolu_agent", state],
+          ["s1", "user_message_chunk", "What did it find?"],
+        ]);
+        expect(
+          updates.find(({ update }) => update.sessionUpdate === "subagent_state_update")?.update,
+        ).toEqual({
+          sessionUpdate: "subagent_state_update",
+          subagentSessionId: `${sid}:replay-subagent:toolu_agent`,
+          state,
+        });
+      },
+    );
+
+    it.each([
+      { statuses: ["completed", "completed"], state: "completed" },
+      { statuses: ["completed", "killed"], state: "cancelled" },
+    ])(
+      "sends one end, from the last of the notifications $statuses",
+      async ({ statuses, state }) => {
+        const updates = await replayed([
+          ...backgroundLaunch(true),
+          ...statuses.map((status, index) => agentNotification(status, { uuid: `u-${index}` })),
+          later,
+        ]);
+
+        expect(trace(updates)).toEqual([
+          ["s1", "spawned", "toolu_agent"],
+          ["s1", "end", "toolu_agent", state],
+          ["s1", "user_message_chunk", "What did it find?"],
+        ]);
+      },
+    );
+
+    it("sends the end at the last notification of a child that ran again", async () => {
+      const updates = await replayed([
+        ...backgroundLaunch(true),
+        agentNotification("completed"),
+        record({ type: "user", uuid: "u-again", message: { role: "user", content: "Go on" } }),
+        agentNotification("failed"),
+        later,
+      ]);
+
+      expect(trace(updates)).toEqual([
+        ["s1", "spawned", "toolu_agent"],
+        ["s1", "user_message_chunk", "Go on"],
+        ["s1", "end", "toolu_agent", "failed"],
+        ["s1", "user_message_chunk", "What did it find?"],
+      ]);
+    });
+
+    it.each([false, true])(
+      "does not take the launch result for the end of a child without a notification (input flag %s)",
+      async (inputFlag) => {
+        const updates = await replayed(backgroundLaunch(inputFlag));
+
+        // Nothing in the history ends the child, so the load ends it as disconnected.
+        expect(trace(updates)).toEqual([
+          ["s1", "spawned", "toolu_agent"],
+          ["s1", "end", "toolu_agent", "disconnected"],
+        ]);
+      },
+    );
+
+    it("takes no end from a notification with an unknown status", async () => {
+      const updates = await replayed([
+        ...backgroundLaunch(true),
+        agentNotification("paused"),
+        later,
+      ]);
+
+      expect(trace(updates)).toEqual([
+        ["s1", "spawned", "toolu_agent"],
+        ["s1", "user_message_chunk", "What did it find?"],
+        ["s1", "end", "toolu_agent", "disconnected"],
+      ]);
+    });
+
+    it("ends a foreground child after the history, from its launch result", async () => {
+      const updates = await replayed([...launch("toolu_agent", {}, "Found it."), later]);
+
+      expect(trace(updates)).toEqual([
+        ["s1", "spawned", "toolu_agent"],
+        ["s1", "user_message_chunk", "What did it find?"],
+        ["s1", "end", "toolu_agent", "completed"],
+      ]);
+    });
+
+    it("takes the result text of a foreground child that moved to the background", async () => {
+      // Claude Code can move a foreground child to the background. Its metadata still says foreground.
+      await writeChild("a1", "toolu_agent", { requestShape: "foreground" });
+
+      const updates = await replayed([...launch("toolu_agent", {}, launched), later]);
+
+      expect(trace(updates).filter(([, kind]) => kind === "end")).toEqual([
+        ["s1", "end", "toolu_agent", "disconnected"],
+      ]);
+    });
+
+    it("takes the run_in_background flag of a launch for a background child", async () => {
+      const updates = await replayed([
+        ...launch("toolu_agent", { run_in_background: true }, "Started."),
+        later,
+      ]);
+
+      expect(trace(updates).filter(([, kind]) => kind === "end")).toEqual([
+        ["s1", "end", "toolu_agent", "disconnected"],
+      ]);
+    });
+
+    it("ends an open child with its own later notification, not with its parent's end", async () => {
+      const updates = await replayed([
+        ...backgroundLaunch(true),
+        ...launch(
+          "toolu_inner",
+          { run_in_background: true },
+          "Async agent launched successfully.\nagentId: a2",
+          "toolu_agent",
+        ),
+        agentNotification("completed"),
+        later,
+        agentNotification("failed", { uuid: "u-inner", toolUseId: "toolu_inner", taskId: "a2" }),
+      ]);
+
+      expect(trace(updates)).toEqual([
+        ["s1", "spawned", "toolu_agent"],
+        ["toolu_agent", "spawned", "toolu_inner"],
+        ["toolu_agent", "end", "toolu_inner", "failed"],
+        ["s1", "end", "toolu_agent", "completed"],
+        ["s1", "user_message_chunk", "What did it find?"],
+      ]);
+    });
+
+    it("ends the open children of a child before the child, deepest first", async () => {
+      const updates = await replayed([
+        ...backgroundLaunch(true),
+        ...launch("toolu_inner", {}, "Inner done.", "toolu_agent"),
+        ...launch("toolu_deep", {}, "Deep done.", "toolu_inner"),
+        agentNotification("completed"),
+        later,
+      ]);
+
+      expect(trace(updates)).toEqual([
+        ["s1", "spawned", "toolu_agent"],
+        ["toolu_agent", "spawned", "toolu_inner"],
+        ["toolu_inner", "spawned", "toolu_deep"],
+        ["toolu_inner", "end", "toolu_deep", "completed"],
+        ["toolu_agent", "end", "toolu_inner", "completed"],
+        ["s1", "end", "toolu_agent", "completed"],
+        ["s1", "user_message_chunk", "What did it find?"],
+      ]);
+    });
+
+    it("finds the child of a notification without a tool use id by its agent id", async () => {
+      await writeChild("a1", "toolu_agent", { requestShape: "background" });
+
+      const updates = await replayed([
+        ...backgroundLaunch(true),
+        agentNotification("completed", { uuid: "u-done", toolUseId: null }),
+        later,
+      ]);
+
+      expect(trace(updates)).toEqual([
+        ["s1", "spawned", "toolu_agent"],
+        ["s1", "end", "toolu_agent", "completed"],
+        ["s1", "user_message_chunk", "What did it find?"],
+      ]);
+    });
+
+    it("sends the end after the frames of the child from its transcript", async () => {
+      const child = {
+        sessionId: sid,
+        cwd: "/tmp/proj",
+        version: "2.0.0",
+        userType: "external",
+        isSidechain: true,
+        agentId: "a1",
+        timestamp: "2026-09-24T00:00:00.000Z",
+      };
+      await writeChild("a1", "toolu_agent", { requestShape: "background" }, [
+        {
+          ...child,
+          type: "user",
+          uuid: "c1",
+          parentUuid: null,
+          message: { role: "user", content: "Look around" },
+        },
+        {
+          ...child,
+          type: "assistant",
+          uuid: "c2",
+          parentUuid: "c1",
+          message: {
+            id: "m3",
+            role: "assistant",
+            model: "claude-haiku-4-5",
+            content: [{ type: "text", text: "Child report." }],
+          },
+        },
+      ]);
+
+      const updates = await replayed([
+        ...backgroundLaunch(true),
+        agentNotification("completed"),
+        later,
+      ]);
+
+      expect(trace(updates)).toEqual([
+        ["s1", "spawned", "toolu_agent"],
+        ["toolu_agent", "user_message_chunk", "Look around"],
+        ["toolu_agent", "agent_message_chunk", "Child report."],
+        ["s1", "end", "toolu_agent", "completed"],
+        ["s1", "user_message_chunk", "What did it find?"],
+      ]);
+    });
+
+    it("does not end again a child of a transcript that ended before its parent", async () => {
+      const child = {
+        sessionId: sid,
+        cwd: "/tmp/proj",
+        version: "2.0.0",
+        userType: "external",
+        isSidechain: true,
+        agentId: "a1",
+        timestamp: "2026-09-24T00:00:00.000Z",
+      };
+      await writeChild("a2", "toolu_inner", { requestShape: "background" });
+      await writeChild("a1", "toolu_agent", { requestShape: "background" }, [
+        {
+          ...child,
+          type: "user",
+          uuid: "c1",
+          parentUuid: null,
+          message: { role: "user", content: "Look around" },
+        },
+        {
+          ...child,
+          type: "assistant",
+          uuid: "c2",
+          parentUuid: "c1",
+          message: {
+            id: "m3",
+            role: "assistant",
+            model: "claude-haiku-4-5",
+            content: [
+              {
+                type: "tool_use",
+                id: "toolu_inner",
+                name: "Agent",
+                input: { description: "Dig", prompt: "Dig deeper", run_in_background: true },
+              },
+            ],
+          },
+        },
+        {
+          ...child,
+          type: "user",
+          uuid: "c3",
+          parentUuid: "c2",
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_inner",
+                content: [
+                  { type: "text", text: "Async agent launched successfully.\nagentId: a2" },
+                ],
+              },
+            ],
+          },
+        },
+        {
+          ...child,
+          type: "user",
+          uuid: "c4",
+          parentUuid: "c3",
+          message: { role: "user", content: notificationOf("failed", "toolu_inner", "a2") },
+          origin: { kind: "task-notification" },
+        },
+        {
+          ...child,
+          type: "assistant",
+          uuid: "c5",
+          parentUuid: "c4",
+          message: {
+            id: "m4",
+            role: "assistant",
+            model: "claude-haiku-4-5",
+            content: [{ type: "text", text: "Child report." }],
+          },
+        },
+      ]);
+
+      const updates = await replayed([
+        ...backgroundLaunch(true),
+        agentNotification("completed"),
+        later,
+      ]);
+
+      expect(trace(updates)).toEqual([
+        ["s1", "spawned", "toolu_agent"],
+        ["toolu_agent", "user_message_chunk", "Look around"],
+        ["toolu_agent", "spawned", "toolu_inner"],
+        ["toolu_agent", "end", "toolu_inner", "failed"],
+        ["toolu_agent", "agent_message_chunk", "Child report."],
+        ["s1", "end", "toolu_agent", "completed"],
+        ["s1", "user_message_chunk", "What did it find?"],
+      ]);
     });
   });
 

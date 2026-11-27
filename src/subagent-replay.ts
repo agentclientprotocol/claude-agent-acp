@@ -1,5 +1,6 @@
 /**
- * The replay of subagents to a client on the subagents RFD form.
+ * The replay of subagents to a client on the subagents RFD form, and the ends
+ * of the children of the v1 AIR form (`NativeReplayEnds`).
  *
  * Claude Code keeps each subagent's history in its own transcript, and the
  * subagent's metadata file names the Agent or Task call that launched it (see
@@ -59,6 +60,7 @@ import {
 } from "./native-subagents.js";
 import { noticeUpdate } from "./session-notices.js";
 import type { SubagentHistory, SubagentRecord } from "./subagent-history.js";
+import type { PersistedTaskNotification } from "./task-notifications.js";
 
 type Publish = (notification: AcpSessionNotification) => Promise<void>;
 
@@ -179,7 +181,7 @@ export class ReplayTranscript<Child extends ReplayChild = ReplayChild> {
           if (handback) handback.status = block.is_error === true ? "failed" : "completed";
           const child = this.children.get(block.tool_use_id);
           // A background launch answers at once; its result is not the end.
-          if (child && !child.record.background) {
+          if (child && !isBackgroundLaunch(child.record, child.input, block)) {
             child.launchEnd = replaySubagentTerminalState(block);
           }
         }
@@ -635,6 +637,207 @@ export function replaySubagentTerminalState(
   return /\b(?:cancelled|canceled|interrupted|stopped|killed)\b/.test(text)
     ? "cancelled"
     : "failed";
+}
+
+/**
+ * Whether a launch ran its child in the background. Claude Code answers such
+ * a launch at once, so its tool result `result` is not the end of the child.
+ * The task notification of the child tells the end.
+ *
+ * Each sign only adds evidence: the subagent `record`, the
+ * `run_in_background` flag of the launch `input`, and the text of the result,
+ * "Async agent launched". A metadata file of an older CLI has no request
+ * shape, and Claude Code can move a foreground child to the background, so a
+ * record that says foreground does not hide the other two.
+ */
+export function isBackgroundLaunch(
+  record: SubagentRecord | undefined,
+  input: Record<string, unknown> | undefined,
+  result: Record<string, unknown>,
+): boolean {
+  return (
+    record?.background === true ||
+    input?.run_in_background === true ||
+    (result.is_error !== true &&
+      /^\s*Async agent launched\b/.test(replayContentText(result.content)))
+  );
+}
+
+/** A child of the v1 AIR replay, which sends `subagent_spawned` and `subagent_state_update`. */
+export type NativeReplayChild = {
+  /** Its replay session id. */
+  sessionId: string;
+  /** The launch of its parent child, when a child launched it. */
+  parentToolUseId?: string;
+  /** False for a child without launch metadata or with a cyclic lineage. */
+  reconstructable: boolean;
+  announced: boolean;
+  /** The input of its launch call. */
+  input?: Record<string, unknown>;
+  /** The end that the replay sent. */
+  ended?: SubagentState;
+};
+
+/**
+ * The ends of the children of the v1 AIR replay. As live, the client gets one
+ * end of each child.
+ *
+ * The replay registers the task notifications of a transcript before it
+ * replays the transcript. The last notification of a child with a known
+ * status decides its end, as in the RFD form, and the end goes out at the
+ * position of that notification. The open children that the child launched
+ * end first, deepest first. A child that has its own notification ends with
+ * the state of it, so a real end always beats an end that its parent caused.
+ * A notification of a child that already ended sends nothing. The end of its
+ * parent sent the state of its last registered notification, or the replay
+ * read the notification in a later transcript.
+ * {@link afterHistory} ends each other announced child.
+ */
+export class NativeReplayEnds {
+  /** The subagent records of the session, by launch id. */
+  private records: ReadonlyMap<string, SubagentRecord> = new Map();
+  /** The launch id of each subagent record, by agent id. */
+  private launchByAgent = new Map<string, string>();
+  /** The tool results of the history, by tool use id. */
+  private readonly results = new Map<string, Record<string, unknown>>();
+  /**
+   * The states of the registered task notifications, in registration order,
+   * by `tool:<tool use id>`, or by `agent:<task id>` for a notification
+   * without a tool use id.
+   */
+  private readonly notified = new Map<string, { order: number; state: SubagentState }[]>();
+  private registered = 0;
+  /** How many task notifications of each launch the replay reached. */
+  private readonly reached = new Map<string, number>();
+
+  constructor(
+    private readonly children: ReadonlyMap<string, NativeReplayChild>,
+    private readonly rootSessionId: string,
+  ) {}
+
+  /** Takes the subagent records of the session, once the replay read them. */
+  setRecords(records: ReadonlyMap<string, SubagentRecord>): void {
+    this.records = records;
+    this.launchByAgent = new Map(
+      [...records].map(([launchId, record]) => [record.agentId, launchId]),
+    );
+  }
+
+  /** Takes the tool result `block` of the tool use `toolUseId`. */
+  takeResult(toolUseId: string, block: Record<string, unknown>): void {
+    this.results.set(toolUseId, block);
+  }
+
+  /** Registers a task notification of a transcript before the replay of it. */
+  takeNotification(notification: PersistedTaskNotification): void {
+    const state = nativeSubagentState(notification.status);
+    if (!state) return;
+    const key = notification.tool_use_id
+      ? `tool:${notification.tool_use_id}`
+      : `agent:${notification.task_id}`;
+    const states = this.notified.get(key) ?? [];
+    states.push({ order: this.registered++, state });
+    this.notified.set(key, states);
+  }
+
+  /**
+   * The launch of the task of `notification`: its tool use id, else, as live,
+   * the launch of the subagent whose agent id is the task id.
+   */
+  launchIdOf(notification: PersistedTaskNotification): string | undefined {
+    return notification.tool_use_id ?? this.launchByAgent.get(notification.task_id);
+  }
+
+  /** The session that shows `child`: its parent child, else the root session. */
+  parentSessionId(child: NativeReplayChild): string {
+    return child.parentToolUseId
+      ? (this.children.get(child.parentToolUseId)?.sessionId ?? this.rootSessionId)
+      : this.rootSessionId;
+  }
+
+  /**
+   * The ends that the replay sends at `notification`. Only the last
+   * registered notification of a child with a known status sends them.
+   */
+  atNotification(notification: PersistedTaskNotification): AcpSessionNotification[] {
+    const toolUseId = this.launchIdOf(notification);
+    const child = toolUseId !== undefined ? this.children.get(toolUseId) : undefined;
+    const state = nativeSubagentState(notification.status);
+    if (toolUseId === undefined || !child || !state) return [];
+    const reached = (this.reached.get(toolUseId) ?? 0) + 1;
+    this.reached.set(toolUseId, reached);
+    if (reached < this.notifiedStates(toolUseId).length) return [];
+    if (!child.announced || !child.reconstructable || child.ended) return [];
+    const descendants = [...this.children.entries()]
+      .reverse()
+      .filter(([id, other]) => other.announced && !other.ended && this.descends(id, toolUseId));
+    return [
+      ...descendants.map(([id, other]) => this.end(other, this.endState(id, other))),
+      this.end(child, state),
+    ];
+  }
+
+  /**
+   * The end of each announced child that is not ended, deepest first: its
+   * last notification, else the end of its launch result, else `disconnected`.
+   */
+  afterHistory(): AcpSessionNotification[] {
+    return [...this.children.entries()]
+      .reverse()
+      .filter(([, child]) => child.announced && !child.ended)
+      .map(([id, child]) => this.end(child, this.endState(id, child)));
+  }
+
+  /** The registered notification states of the launch `toolUseId`, in order. */
+  private notifiedStates(toolUseId: string): { order: number; state: SubagentState }[] {
+    const agentId = this.records.get(toolUseId)?.agentId;
+    return [
+      ...(this.notified.get(`tool:${toolUseId}`) ?? []),
+      ...((agentId !== undefined ? this.notified.get(`agent:${agentId}`) : undefined) ?? []),
+    ].sort((a, b) => a.order - b.order);
+  }
+
+  private endState(toolUseId: string, child: NativeReplayChild): SubagentState {
+    if (!child.reconstructable) return "disconnected";
+    return (
+      this.notifiedStates(toolUseId).at(-1)?.state ??
+      this.launchEnd(toolUseId, child) ??
+      "disconnected"
+    );
+  }
+
+  /** The end from the launch result. A background launch has none. */
+  private launchEnd(toolUseId: string, child: NativeReplayChild): SubagentState | undefined {
+    const result = this.results.get(toolUseId);
+    if (!result || isBackgroundLaunch(this.records.get(toolUseId), child.input, result)) {
+      return undefined;
+    }
+    return replaySubagentTerminalState(result);
+  }
+
+  /** Whether the launch `toolUseId` is under the launch `ancestorId`. */
+  private descends(toolUseId: string, ancestorId: string): boolean {
+    const seen = new Set<string>();
+    let parent = this.children.get(toolUseId)?.parentToolUseId;
+    while (parent !== undefined && !seen.has(parent)) {
+      if (parent === ancestorId) return true;
+      seen.add(parent);
+      parent = this.children.get(parent)?.parentToolUseId;
+    }
+    return false;
+  }
+
+  private end(child: NativeReplayChild, state: SubagentState): AcpSessionNotification {
+    child.ended = state;
+    return {
+      sessionId: this.parentSessionId(child),
+      update: {
+        sessionUpdate: "subagent_state_update",
+        subagentSessionId: child.sessionId,
+        state,
+      },
+    };
+  }
 }
 
 /**
