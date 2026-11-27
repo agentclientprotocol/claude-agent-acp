@@ -24,14 +24,15 @@ export type UltracodeSettingsReport = {
   requested?: boolean;
 };
 
+/** The CLI's `get_settings` control response, as far as the adapter reads it. */
+type GetSettingsResponse = {
+  applied?: { ultracodeAvailable?: unknown; ultracodeRequested?: unknown };
+  errors?: Array<Partial<SDKSettingsParseError> | null>;
+};
+
 // `Query.getSettings()` exists at runtime (sdk.mjs) but is missing from the
 // SDK's type declarations as of 0.3.319.
-type GetSettingsQuery = Query & {
-  getSettings?: () => Promise<{
-    applied?: { ultracodeAvailable?: unknown; ultracodeRequested?: unknown };
-    errors?: Array<Partial<SDKSettingsParseError> | null>;
-  }>;
-};
+type GetSettingsQuery = Query & { getSettings?: () => Promise<GetSettingsResponse | undefined> };
 
 /** What the CLI's `get_settings` control response says about the session. */
 export type SettingsReport = {
@@ -44,33 +45,46 @@ export type SettingsReport = {
   settingsErrors: SDKSettingsParseError[];
 };
 
+const NO_REPORT: SettingsReport = { ultracode: undefined, settingsErrors: [] };
+
 /** Ask the CLI whether ultracode is available and requested for the session,
  *  and which settings files it skipped. */
 export async function readSettingsReport(query: Query): Promise<SettingsReport> {
   const getSettings = (query as GetSettingsQuery).getSettings;
-  if (typeof getSettings !== "function") return { ultracode: undefined, settingsErrors: [] };
+  if (typeof getSettings !== "function") return NO_REPORT;
+  let response: GetSettingsResponse | undefined;
   try {
-    const response = await getSettings.call(query);
-    const applied = response?.applied;
-    return {
-      ultracode: {
-        available:
-          typeof applied?.ultracodeAvailable === "boolean" ? applied.ultracodeAvailable : undefined,
-        requested:
-          typeof applied?.ultracodeRequested === "boolean" ? applied.ultracodeRequested : undefined,
-      },
-      // Every entry counts, so a malformed one still refuses the start.
-      settingsErrors: Array.isArray(response?.errors)
-        ? response.errors.map((error: Partial<SDKSettingsParseError> | null) => ({
-            ...(typeof error?.file === "string" ? { file: error.file } : {}),
-            path: typeof error?.path === "string" ? error.path : "",
-            message: typeof error?.message === "string" ? error.message : "invalid settings",
-          }))
-        : [],
-    };
+    response = await getSettings.call(query);
   } catch {
-    return { ultracode: undefined, settingsErrors: [] };
+    return NO_REPORT;
   }
+  return {
+    ultracode: { available: parseAvailable(response), requested: parseRequested(response) },
+    settingsErrors: parseSettingsErrors(response),
+  };
+}
+
+function parseAvailable(response: GetSettingsResponse | undefined): boolean | undefined {
+  const value = response?.applied?.ultracodeAvailable;
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function parseRequested(response: GetSettingsResponse | undefined): boolean | undefined {
+  const value = response?.applied?.ultracodeRequested;
+  return typeof value === "boolean" ? value : undefined;
+}
+
+/** Every entry counts, so a malformed one still refuses the start. */
+function parseSettingsErrors(response: GetSettingsResponse | undefined): SDKSettingsParseError[] {
+  if (!Array.isArray(response?.errors)) return [];
+  return response.errors.map((entry) => {
+    const error: SDKSettingsParseError = {
+      path: typeof entry?.path === "string" ? entry.path : "",
+      message: typeof entry?.message === "string" ? entry.message : "invalid settings",
+    };
+    if (typeof entry?.file === "string") error.file = entry.file;
+    return error;
+  });
 }
 
 /** The CLI supports ultracode on exactly the models that support `xhigh`
