@@ -45,6 +45,10 @@
  *   `agentCapabilities.mcpCapabilities.acp`, which origin/main did not: the
  *   agent now takes MCP servers that the client serves over the ACP
  *   connection (`"type": "acp"`).
+ * - The `initialize` response also advertises
+ *   `agentCapabilities._meta.mcpApps`, which origin/main did not: the agent
+ *   now serves `_session/mcp/resources/read` and `_session/mcp/tools/call`
+ *   (see `docs/mcp-apps.md`).
  * - A SandboxNetworkAccess tool call is settled by a `tool_call_update` with
  *   only its final `status` once its permission request is answered. The
  *   callback runs nothing, so origin/main never settled the call (see
@@ -314,7 +318,7 @@ export function compareWithBaseline(baseline: Recorded[], traffic: Recorded[]): 
         "acp",
       ),
     ),
-  );
+  ).map((record) => withoutAgentCapability(record, "_meta", "mcpApps"));
   const violations: string[] = [];
   const state = new Map<string, Map<string, string>>();
   const summaryChunks = new Map<string, string>();

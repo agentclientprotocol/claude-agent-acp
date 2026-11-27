@@ -94,6 +94,16 @@ import type { AdapterCommandContext } from "../adapter-command.js";
 import { SessionAdapterCommands } from "./adapter-commands.js";
 import { RemoteControlAtStartup } from "../remote-control.js";
 import { SessionTasks, type RequestTarget, type RequestContext } from "./tasks.js";
+import {
+  McpAppsSession,
+  mcpToolResults,
+  type McpCallToolResult,
+  type McpResourcesReadRequest,
+  type McpResourcesReadResponse,
+  type McpToolsCallRequest,
+  type McpAppTool,
+  type McpToolsListRequest,
+} from "../mcp-apps.js";
 
 /** What a session needs of its connection. */
 export interface SessionConnection {
@@ -101,6 +111,8 @@ export interface SessionConnection {
   readonly translator: V2UpdateTranslator;
   /** The AIR extensions that the client takes, read at `initialize` (see `air.ts`). */
   readonly air: AirSupport;
+  /** Whether the client declared `_meta.mcpApps` at `initialize` (see `mcp-apps.ts`). */
+  readonly mcpApps?: boolean;
   /** Sends an update of the session. Updates go out in the order of the calls. */
   send(notification: v2.UpdateSessionNotification): void;
   requestPermission(
@@ -202,6 +214,10 @@ export class V2Session implements RequestTarget {
   private closing: Promise<void> | undefined;
   /** Set by {@link start}. */
   private query: Query | undefined;
+  /** The MCP Apps capabilities of the session's Claude Code (see `mcp-apps.ts`). */
+  readonly mcpApps = new McpAppsSession();
+  /** Aborted when the session closes: an `_meta.mcpApp` status read then stops. */
+  private readonly mcpAppsAbort = new AbortController();
   readonly output: SessionOutput;
   /** Usage, quota, notices, compactions and the title (see {@link SessionReports}). */
   readonly reports: SessionReports;
@@ -877,6 +893,7 @@ export class V2Session implements RequestTarget {
       }
       this.closeTurn();
       this.failPending(RequestError.requestCancelled());
+      this.mcpAppsAbort.abort();
       this.closed = true;
       this.checkBoundary();
       this.endReports();
@@ -1120,9 +1137,61 @@ export class V2Session implements RequestTarget {
    * (see `SessionTasks.restoreResumed`).
    */
   private toolResultMessage(message: SDKUserMessage): void | Promise<void> {
+    // Named before the results go out: the output then drops their tool uses.
+    const mcpAppResults =
+      this.connection.mcpApps && message.parent_tool_use_id === null && this.query
+        ? mcpToolResults(message.message.content, this.output.toolUses())
+        : [];
     const restoring = this.tasks.restoreResumed(this.output, message);
-    if (restoring) return restoring.then(() => this.toolResults(message));
+    if (restoring) {
+      return restoring.then(() => {
+        this.toolResults(message);
+        return this.mcpAppResults(mcpAppResults, message);
+      });
+    }
     this.toolResults(message);
+    if (mcpAppResults.length) return this.mcpAppResults(mcpAppResults, message);
+  }
+
+  /** `_meta.mcpApp` of the app tools of `results`, after their own reports (see `mcp-apps.ts`). */
+  private async mcpAppResults(
+    results: ReturnType<typeof mcpToolResults>,
+    message: SDKUserMessage,
+  ): Promise<void> {
+    if (!results.length || !this.query || this.closed) return;
+    const updates = await this.mcpApps.toolCallUpdates(
+      this.query,
+      results,
+      message.tool_use_result,
+      this.mcpAppsAbort.signal,
+      (text) => this.connection.logger.error(text),
+    );
+    if (!this.closed) this.output.toolCallMeta(updates);
+  }
+
+  /** `_session/mcp/resources/read` (see `mcp-apps.ts`). Sends no session update. */
+  readMcpResource(params: McpResourcesReadRequest): Promise<McpResourcesReadResponse> {
+    return this.mcpApps.readResource(this.liveQuery(), params);
+  }
+
+  /** `_session/mcp/tools/call` (see `mcp-apps.ts`). Runs on the session's query, also between turns. */
+  callMcpTool(params: McpToolsCallRequest): Promise<McpCallToolResult> {
+    return this.mcpApps.callTool(this.liveQuery(), params);
+  }
+
+  /** `_session/mcp/tools/list` (see `mcp-apps.ts`). */
+  listMcpAppTools(params: McpToolsListRequest): Promise<{ tools: McpAppTool[] }> {
+    return this.mcpApps.listTools(this.liveQuery(), params);
+  }
+
+  private liveQuery(): Query {
+    if (!this.query || this.closed) {
+      throw RequestError.invalidRequest(
+        { sessionId: this.sessionId },
+        "The session's Claude Code has stopped. Resume the session and try again.",
+      );
+    }
+    return this.query;
   }
 
   private toolResults(message: SDKUserMessage): void {
@@ -1206,6 +1275,7 @@ export class V2Session implements RequestTarget {
         switch (message.subtype) {
           case "init":
             if (message.capabilities?.includes("msg_lifecycle_v1")) this.lifecycleFrames = true;
+            this.mcpApps.cliReported(message.capabilities);
             this.elicitations.init(message.capabilities);
             // A fresh init (such as after a reinitialize) can carry another Fast mode state.
             this.fastModeReported(message, "init");
@@ -1526,6 +1596,7 @@ export class V2Session implements RequestTarget {
     if (this.closing || this.closed) {
       this.tasks.queryEnded(undefined);
       this.failPending(RequestError.requestCancelled());
+      this.mcpAppsAbort.abort();
       this.closed = true;
       return;
     }
@@ -1556,6 +1627,7 @@ export class V2Session implements RequestTarget {
             }),
       });
     }
+    this.mcpAppsAbort.abort();
     this.closed = true;
     this.checkBoundary();
     this.connection.ended(this);
