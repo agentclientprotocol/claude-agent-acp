@@ -17,7 +17,7 @@
  */
 import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
-import type { AccountInfo, ModelInfo } from "@anthropic-ai/claude-agent-sdk";
+import type { AccountInfo, ModelInfo, Options, Settings } from "@anthropic-ai/claude-agent-sdk";
 import type { AuthStatusKind } from "../auth-status.js";
 import type { Logger } from "../logger.js";
 import { terminalAuthMethods } from "../auth-methods.js";
@@ -27,7 +27,12 @@ import {
   gatewayAuthStatus,
   notLoggedInAuthStatus,
 } from "../auth-status.js";
-import { AuthStatusReporter, cliLogout, type AuthStatusSettings } from "../auth-status-reporter.js";
+import {
+  AuthStatusReporter,
+  cliLogout,
+  type AuthStatusSettings,
+  type SessionAccountReporter,
+} from "../auth-status-reporter.js";
 import { clearContextWindowCache } from "../context-window.js";
 import {
   createEnvForProvider,
@@ -72,8 +77,15 @@ export interface AuthEvents {
    */
   routeChanged(): Promise<void>;
   /** An auth status probe read the identity `kind`. */
-  probed(kind: AuthStatusKind): void;
+  probed(kind: AuthStatusKind, appliesTo: (sessionId: string) => boolean): void;
 }
+
+type SessionAuthSettings = {
+  manager: AuthStatusSettings;
+  override?: Settings;
+  env?: Options["env"];
+  reportAccount: SessionAccountReporter;
+};
 
 export class V2Auth {
   private gatewayLogin?: GatewayAuthRequest;
@@ -83,7 +95,7 @@ export class V2Auth {
   /** How many of {@link providerUpdate} have not settled. */
   private providerUpdates = 0;
   /** The settings of each live session, for the probe at the start of its prompts. */
-  private readonly sessionSettings = new Map<string, AuthStatusSettings>();
+  private readonly sessionSettings = new Map<string, SessionAuthSettings>();
   private readonly status: AuthStatusReporter;
   /**
    * Counts the route changes that restarted the live sessions. A session
@@ -103,7 +115,13 @@ export class V2Auth {
       logger,
       gatewayLogin: () => this.gatewayLogin !== undefined,
       providerOverride: () => this.provider !== undefined,
-      onProbe: (kind) => events.probed(kind),
+      onProbe: (kind, appliesTo) =>
+        events.probed(kind, (sessionId) => {
+          const settings = this.sessionSettings.get(sessionId);
+          return (
+            settings !== undefined && appliesTo(settings.manager, settings.override, settings.env)
+          );
+        }),
     });
   }
 
@@ -260,15 +278,16 @@ export class V2Auth {
    * reports nothing when a login or a logout came in between.
    */
   sessionStarting(
-    settings: AuthStatusSettings,
+    manager: AuthStatusSettings,
+    override?: Settings,
+    env?: Options["env"],
   ): (sessionId: string, account: AccountInfo | undefined) => void {
-    this.status.useSettings(settings);
-    const epoch = this.status.epoch;
+    this.status.useSettings(manager, override, env);
+    const reportAccount = this.status.sessionAccountReporter(manager, override, env);
+    const reportStartupAccount = reportAccount("startup");
     return (sessionId, account) => {
-      this.sessionSettings.set(sessionId, settings);
-      if (epoch === this.status.epoch) {
-        this.status.publishSessionAccount(account, settings.getApiKeyHelper());
-      }
+      this.sessionSettings.set(sessionId, { manager, override, env, reportAccount });
+      reportStartupAccount(account);
     };
   }
 
@@ -278,16 +297,13 @@ export class V2Auth {
    */
   promptStarted(sessionId: string): void {
     const settings = this.sessionSettings.get(sessionId);
-    if (settings) this.status.useSettings(settings);
+    if (settings) this.status.useSettings(settings.manager, settings.override, settings.env);
     void this.status.probe();
   }
 
-  /** Reports the account that the query of `sessionId` cached, as the identity. */
-  publishAccount(sessionId: string, account: AccountInfo): void {
-    this.status.publishSessionAccount(
-      account,
-      this.sessionSettings.get(sessionId)?.getApiKeyHelper(),
-    );
+  /** Captures the query and selected context before a guarded account read. */
+  accountReporter(sessionId: string): ((account: AccountInfo) => void) | undefined {
+    return this.sessionSettings.get(sessionId)?.reportAccount("cached");
   }
 
   sessionEnded(sessionId: string): void {

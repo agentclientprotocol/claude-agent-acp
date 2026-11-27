@@ -5552,6 +5552,7 @@ describe("permission request cancellation", () => {
       settingsManager: {
         dispose: vi.fn(),
         getApiKeyHelper: () => undefined,
+        getEnvironment: () => ({}),
         getShowClearContextOnPlanAccept: () => false,
         getCwd: () => "/test",
       } as any,
@@ -16010,6 +16011,7 @@ describe("session/close", () => {
       settingsManager: {
         dispose: vi.fn(),
         getApiKeyHelper: () => undefined,
+        getEnvironment: () => ({}),
         getShowClearContextOnPlanAccept: () => false,
         getCwd: () => "/test",
       } as any,
@@ -16135,6 +16137,7 @@ describe("session/delete", () => {
       settingsManager: {
         dispose: vi.fn(),
         getApiKeyHelper: () => undefined,
+        getEnvironment: () => ({}),
         getShowClearContextOnPlanAccept: () => false,
         getCwd: () => "/test",
       } as any,
@@ -16301,6 +16304,7 @@ describe("getOrCreateSession param change detection", () => {
       settingsManager: {
         dispose: vi.fn(),
         getApiKeyHelper: () => undefined,
+        getEnvironment: () => ({}),
         getShowClearContextOnPlanAccept: () => false,
         getCwd: () => "/test",
       } as any,
@@ -20664,6 +20668,7 @@ describe("post-error recovery", () => {
       settingsManager: {
         dispose: vi.fn(),
         getApiKeyHelper: () => undefined,
+        getEnvironment: () => ({}),
         getShowClearContextOnPlanAccept: () => false,
         getCwd: () => "/test",
       } as any,
@@ -21041,6 +21046,7 @@ describe("post-error recovery", () => {
       {
         settingsManager: {
           getApiKeyHelper: () => undefined,
+          getEnvironment: () => ({}),
           getShowClearContextOnPlanAccept: () => false,
           getCwd: () => "/test",
           dispose: vi.fn(() => {
@@ -29328,6 +29334,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       settingsManager: {
         dispose: vi.fn(),
         getApiKeyHelper: () => undefined,
+        getEnvironment: () => ({}),
         getShowClearContextOnPlanAccept: () => false,
         getCwd: () => "/test",
       } as any,
@@ -31241,6 +31248,7 @@ describe("agent selection config option", () => {
         settingsManager: {
           dispose: vi.fn(),
           getApiKeyHelper: () => undefined,
+          getEnvironment: () => ({}),
           getShowClearContextOnPlanAccept: () => false,
           getCwd: () => "/test",
         } as any,

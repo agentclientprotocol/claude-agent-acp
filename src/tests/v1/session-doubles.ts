@@ -121,6 +121,7 @@ export function mockSessionState(
       dispose: vi.fn(),
       getSettings: () => ({}),
       getApiKeyHelper: () => undefined,
+      getEnvironment: () => ({}),
       getShowClearContextOnPlanAccept: () => false,
       getCwd: () => process.cwd(),
     },

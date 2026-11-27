@@ -36,8 +36,8 @@ import {
 export interface GuardAuth {
   /** Whether a provider or a gateway login routes the traffic. */
   overridesRoute(): boolean;
-  /** Reports the account a session's query cached, as the identity. */
-  publishAccount(sessionId: string, account: AccountInfo): void;
+  /** Captures the query and selected context before a guarded account read. */
+  accountReporter(sessionId: string): ((account: AccountInfo) => void) | undefined;
 }
 
 type GuardedSession = {
@@ -100,8 +100,7 @@ export class SubscriptionGuard {
       query,
       guardState: session.state,
       logger: this.logger,
-      // The guard reads the account anyway: it keeps the identity current.
-      onAccount: (account) => this.auth.publishAccount(sessionId, account),
+      onAccount: this.auth.accountReporter(sessionId),
     });
   }
 
@@ -110,12 +109,14 @@ export class SubscriptionGuard {
     if (shouldHideClaudeAuth()) this.accountMayHaveChanged(sessionId);
   }
 
-  /** An auth status probe read `kind`: a session started on another kind restarts. */
-  probed(kind: AuthStatusKind): void {
+  /** A session in the probe's credential scope restarts if its cached kind differs. */
+  probed(kind: AuthStatusKind, appliesTo: (sessionId: string) => boolean): void {
     if (!this.active()) return;
     for (const [sessionId, session] of this.sessions) {
       // No kind: the account said nothing that this read could contradict.
-      if (session.kind && session.kind !== kind) this.accountMayHaveChanged(sessionId);
+      if (session.kind && session.kind !== kind && appliesTo(sessionId)) {
+        this.accountMayHaveChanged(sessionId);
+      }
     }
   }
 

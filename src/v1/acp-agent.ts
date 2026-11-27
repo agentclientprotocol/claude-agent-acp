@@ -189,7 +189,12 @@ import {
   gatewayAuthStatus,
   notLoggedInAuthStatus,
 } from "../auth-status.js";
-import { AuthStatusReporter, cliLogout } from "../auth-status-reporter.js";
+import {
+  AuthStatusReporter,
+  cliLogout,
+  type AuthProbeScope,
+  type SessionAccountReporter,
+} from "../auth-status-reporter.js";
 import { terminalAuthMethods as authMethodsForTerminal } from "../auth-methods.js";
 import {
   McpOverAcp,
@@ -1469,6 +1474,7 @@ export type Session = {
    *  cached account was swapped. Undefined when the account carried no
    *  identity signal, which is "nothing to compare", not a match. */
   accountKind?: AuthStatusKind;
+  reportAccount?: SessionAccountReporter;
   /** Set under `--hide-claude-auth` when the CLI reported a sign-out during
    *  this session. The query is closed and the account it cached at
    *  `initialize` now describes a credential that no longer works, so the next
@@ -1740,7 +1746,7 @@ export class ClaudeAcpAgent {
     },
     gatewayLogin: () => this.gatewayAuthRequest !== undefined,
     providerOverride: () => this.providerConfig !== undefined,
-    onProbe: (kind) => this.markSessionsWhoseAccountKindChanged(kind),
+    onProbe: (kind, appliesTo) => this.markSessionsWhoseAccountKindChanged(kind, appliesTo),
   });
   /** Last auth identity reported to the client. Undefined means "not determined yet". */
   get currentAuthStatus(): AuthStatus | undefined {
@@ -2463,7 +2469,10 @@ export class ClaudeAcpAgent {
    * creation guard judges it. So a probe can never refuse or abort a turn, and
    * a wrong read costs one query recreation, not a false refusal.
    */
-  private markSessionsWhoseAccountKindChanged(kind: AuthStatusKind): void {
+  private markSessionsWhoseAccountKindChanged(
+    kind: AuthStatusKind,
+    appliesTo: AuthProbeScope,
+  ): void {
     if (!this.claudeSubscriptionGuardActive()) {
       return;
     }
@@ -2473,7 +2482,14 @@ export class ClaudeAcpAgent {
       if (!session.accountKind || session.queryClosed || session.needsSignOutRespawn) {
         continue;
       }
-      if (kind !== session.accountKind) {
+      if (
+        kind !== session.accountKind &&
+        appliesTo(
+          session.settingsManager,
+          session.effortSettingsOverride,
+          (session.creationParams?._meta as NewSessionMeta | undefined)?.claudeCode?.options?.env,
+        )
+      ) {
         // `endQuery: false` is the whole turn-boundary contract: the flag is
         // set now, the query dies at the recreation the next prompt runs.
         this.markSessionForSignOutRespawn(sessionId, session, { endQuery: false });
@@ -3219,13 +3235,7 @@ export class ClaudeAcpAgent {
       query: session.query,
       guardState: (session.claudeSubscriptionGuard ??= {}),
       logger: this.logger,
-      // The guard reads the account anyway; reuse that read to keep the
-      // reported identity current, refusal or not.
-      onAccount: (account) =>
-        this.authStatus.publishSessionAccount(
-          account,
-          session.settingsManager.getApiKeyHelper(session.effortSettingsOverride),
-        ),
+      onAccount: session.reportAccount?.("cached"),
     });
   }
 
@@ -10596,8 +10606,11 @@ export class ClaudeAcpAgent {
 
     const input = new Pushable<SDKUserMessage>();
 
+    const sessionMeta = params._meta as NewSessionMeta | undefined;
+    const userProvidedOptions = sessionMeta?.claudeCode?.options;
     const settingsManager = new SettingsManager(params.cwd, {
       logger: this.logger,
+      launchEnv: userProvidedOptions?.env,
     });
     await settingsManager.initialize();
     timing.phase("settings");
@@ -10609,8 +10622,6 @@ export class ClaudeAcpAgent {
       customInstructions,
     );
 
-    // Extract options from _meta if provided
-    const sessionMeta = params._meta as NewSessionMeta | undefined;
     // Bypass is off for root outside a sandbox, when settings disable it (the
     // CLI refuses bypass then too), and hosts may opt a session out. Decided
     // once here: it gates the SDK flag, the spawn-time mode (the SDK rejects
@@ -10633,7 +10644,6 @@ export class ClaudeAcpAgent {
         { allowBypass, allowAuto },
       );
 
-    const userProvidedOptions = sessionMeta?.claudeCode?.options;
     const forwardSubagentText = this.forwardsSubagentText(params._meta);
 
     // Configure thinking behavior from environment variables
@@ -11019,7 +11029,12 @@ export class ClaudeAcpAgent {
       configuredSettingsObject,
       userProvidedOptions?.env,
     );
-    const authSettingsEpoch = this.authStatus.epoch;
+    const reportAccount = this.authStatus.sessionAccountReporter(
+      settingsManager,
+      configuredSettingsObject,
+      userProvidedOptions?.env,
+    );
+    const reportStartupAccount = reportAccount("startup");
     timing.phase("prepare-query");
 
     // `query()` spawns the CLI at once. Any throw between here and the
@@ -11049,12 +11064,7 @@ export class ClaudeAcpAgent {
       // Publish the identity BEFORE the guard can refuse this session. A
       // refusal is exactly when the client most needs to know which account it
       // was refused for.
-      if (authSettingsEpoch === this.authStatus.epoch) {
-        this.authStatus.publishSessionAccount(
-          initializationResult.account,
-          settingsManager.getApiKeyHelper(configuredSettingsObject),
-        );
-      }
+      reportStartupAccount(initializationResult.account);
 
       // Shared with the per-turn guard, so "warn once" spans the whole session.
       const claudeSubscriptionGuard: ClaudeSubscriptionGuardState = {};
@@ -11319,6 +11329,7 @@ export class ClaudeAcpAgent {
         sessionFailureState:
           creationOpts.replayState?.sessionFailureState ?? createSessionFailureState(),
         claudeSubscriptionGuard,
+        reportAccount,
         accountKind: fromAccountInfo(
           initializationResult.account,
           settingsManager.getApiKeyHelper(configuredSettingsObject),

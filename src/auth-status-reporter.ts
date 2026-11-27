@@ -6,6 +6,9 @@
  * identity).
  */
 import { execFile } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import {
@@ -25,6 +28,7 @@ import {
   mergeAuthStatus,
   parseCliAuthStatus,
   sameAuthStatus,
+  sameIdentity,
   toAcpAuthStatus,
 } from "./auth-status.js";
 import { claudeCliPath } from "./claude-cli.js";
@@ -33,6 +37,7 @@ import {
   isClaudeEnterprisePlan,
   shouldHideClaudeAuth,
 } from "./hide-claude-auth.js";
+import { launchClaudeConfigDir } from "./paths.js";
 import type { SettingsManager } from "./settings.js";
 
 const execFileAsync = promisify(execFile);
@@ -40,7 +45,22 @@ const execFileAsync = promisify(execFile);
 type ReporterLogger = { log: (...args: any[]) => void; error: (...args: any[]) => void };
 
 /** The settings a probe runs under: a session's cwd, its key helper, and its launch env. */
-export type AuthStatusSettings = Pick<SettingsManager, "getCwd" | "getApiKeyHelper">;
+export type AuthStatusSettings = Pick<
+  SettingsManager,
+  "getCwd" | "getApiKeyHelper" | "getEnvironment"
+>;
+
+/** Does a session share the credential sources this probe read? */
+export type AuthProbeScope = (
+  manager: AuthStatusSettings,
+  override?: Settings,
+  env?: Options["env"],
+) => boolean;
+
+/** Capture the selected settings before waiting on a query account read. */
+export type SessionAccountReporter = (
+  source: "startup" | "cached",
+) => (account: AccountInfo | undefined) => void;
 
 export interface AuthStatusReporterOptions {
   /** Sends `_auth/status_update`. */
@@ -52,8 +72,8 @@ export interface AuthStatusReporterOptions {
   gatewayLogin: () => boolean;
   /** A `providers/set` override is active: a session account describes its route. */
   providerOverride: () => boolean;
-  /** A completed probe read `kind`. */
-  onProbe?: (kind: AuthStatusKind) => void;
+  /** A completed probe read `kind` for the sessions in its scope. */
+  onProbe?: (kind: AuthStatusKind, appliesTo: AuthProbeScope) => void;
 }
 
 export class AuthStatusReporter {
@@ -64,13 +84,14 @@ export class AuthStatusReporter {
    * A probe records it at start and publishes only if it has not moved, so a
    * slow read can never overwrite a newer login or logout.
    */
-  epoch = 0;
+  private epoch = 0;
   private settings?: {
     manager: AuthStatusSettings;
     override?: Settings;
     env?: Options["env"];
   };
   private helper?: string;
+  private settingsEnv: Record<string, string> = {};
   /** In-flight `claude auth status --json` probe, shared by every caller so
    *  a concurrent `initialize` and start-of-prompt read never spawn two CLI
    *  processes. */
@@ -85,8 +106,13 @@ export class AuthStatusReporter {
   private loggedProbeTimeout = false;
   /** Numbers the probe runs in start order. */
   private probeRuns = 0;
-  /** The latest-started probe run that published its read. */
-  private publishedRun = 0;
+  /** The latest-started probe that published, with the credential sources it observed. */
+  private lastProbe?: {
+    run: number;
+    status: AuthStatus;
+    refused: boolean;
+    appliesTo: AuthProbeScope;
+  };
   private acpStatus: AcpAuthStatus = { state: "unknown" };
 
   constructor(private readonly options: AuthStatusReporterOptions) {}
@@ -171,12 +197,15 @@ export class AuthStatusReporter {
     launchEnv?: Options["env"],
   ) {
     const helper = manager.getApiKeyHelper(settingsOverride);
+    const settingsEnv = manager.getEnvironment(settingsOverride);
     const changed =
       manager.getCwd() !== (this.settings?.manager.getCwd() ?? process.cwd()) ||
       helper !== this.helper ||
+      JSON.stringify(settingsEnv) !== JSON.stringify(this.settingsEnv) ||
       JSON.stringify(launchEnv) !== JSON.stringify(this.settings?.env);
     this.settings = { manager, override: settingsOverride, env: launchEnv };
     this.helper = helper;
+    this.settingsEnv = settingsEnv;
     if (changed) {
       // The epoch bump discards any probe that read the old context, and the
       // session account may carry no identity signal (an apiKeyHelper), so
@@ -184,6 +213,36 @@ export class AuthStatusReporter {
       this.epoch += 1;
       void this.probe({ fresh: true });
     }
+  }
+
+  /**
+   * Bind display updates to a query at launch. Later accountInfo() calls
+   * return the account cached at launch, so a probe started after launch can
+   * supersede them within the same credential scope.
+   */
+  sessionAccountReporter(
+    manager: AuthStatusSettings,
+    override?: Settings,
+    env?: Options["env"],
+  ): SessionAccountReporter {
+    const launchRun = this.probeRuns;
+    return (source) => {
+      const epoch = this.epoch;
+      return (account) => {
+        if (epoch !== this.epoch) return;
+        const probe = this.lastProbe;
+        this.publishSessionAccount(
+          account,
+          manager.getApiKeyHelper(override),
+          source === "cached" &&
+            probe &&
+            probe.run > launchRun &&
+            probe.appliesTo(manager, override, env)
+            ? probe
+            : undefined,
+        );
+      };
+    };
   }
 
   /**
@@ -211,7 +270,11 @@ export class AuthStatusReporter {
    * under an apiKeyHelper) means "nothing to add", not "logged out" — keep
    * what the CLI probe already established instead of overwriting it.
    */
-  publishSessionAccount(account: AccountInfo | undefined, apiKeyHelper?: string): void {
+  private publishSessionAccount(
+    account: AccountInfo | undefined,
+    apiKeyHelper: string | undefined,
+    probe?: { status: AuthStatus; refused: boolean },
+  ): void {
     if (this.options.providerOverride()) {
       if (!this.loggedOverriddenAccount) {
         this.loggedOverriddenAccount = true;
@@ -226,6 +289,13 @@ export class AuthStatusReporter {
     }
     const fromSession = fromAccountInfo(account, apiKeyHelper);
     if (account && fromSession) {
+      if (probe) {
+        if (sameIdentity(probe.status, fromSession)) {
+          // An older account can fill gaps in the probe for the same identity.
+          this.set(mergeAuthStatus(fromSession, probe.status, "cli"), probe.refused);
+        }
+        return;
+      }
       this.set(
         mergeAuthStatus(this.current, fromSession, "session"),
         shouldHideClaudeAuth() && claudeAuthRefusal(account) !== undefined,
@@ -266,7 +336,11 @@ export class AuthStatusReporter {
     const epoch = this.epoch;
     const run = ++this.probeRuns;
     const context = this.settings;
-    const apiKeyHelper = context?.manager.getApiKeyHelper(context.override);
+    const cwd = context?.manager.getCwd() ?? process.cwd();
+    const processEnv = { ...process.env };
+    const launchEnv = { ...processEnv, ...context?.env };
+    let apiKeyHelper = context?.manager.getApiKeyHelper(context.override);
+    let settingsEnv = context?.manager.getEnvironment(context.override) ?? {};
     // ACP gateway auth bypasses the CLI credential store entirely, so the
     // probe would report an identity that is not the one being used. A mere
     // client provider override (`providers/set`) does NOT skip the probe: it
@@ -276,16 +350,25 @@ export class AuthStatusReporter {
       return this.current;
     }
     let stdout: string;
+    let settingsDir: string | undefined;
     try {
       const cliPath = await claudeCliPath();
       const args = ["auth", "status", "--json"];
-      // `--settings` is a global CLI option: after the `auth status` subcommand the CLI rejects
-      // it with "unknown option '--settings'", so it has to come first.
-      if (context?.override) args.unshift("--settings", JSON.stringify(context.override));
+      if (context?.override) {
+        // Use a private per-probe file because the settings can contain credentials.
+        settingsDir = await mkdtemp(join(tmpdir(), "claude-acp-auth-"));
+        const settingsPath = join(settingsDir, "settings.json");
+        await writeFile(settingsPath, JSON.stringify(context.override), {
+          mode: 0o600,
+          flag: "wx",
+        });
+        // `--settings` is a global CLI option and precedes the auth subcommand.
+        args.unshift("--settings", settingsPath);
+      }
       ({ stdout } = await execFileAsync(cliPath, args, {
         timeout: AUTH_STATUS_PROBE_TIMEOUT_MS,
-        cwd: context?.manager.getCwd() ?? process.cwd(),
-        env: context?.env ? { ...process.env, ...context.env } : process.env,
+        cwd,
+        env: launchEnv,
       }));
     } catch (error) {
       const failed = error as { stdout?: unknown; killed?: boolean; signal?: unknown } | null;
@@ -304,41 +387,49 @@ export class AuthStatusReporter {
       // The logged-out case exits 1 while still printing valid JSON, so the
       // stdout of a failed exec is parsed just like a successful one.
       if (typeof failed?.stdout !== "string" || failed.stdout.trim().length === 0) {
-        logger.error(
-          "claude auth status failed:",
-          error instanceof Error ? error.message : String(error),
-        );
+        // Exec errors can include the command and the CLI's stderr.
+        logger.error("claude auth status failed");
         return undefined;
       }
       stdout = failed.stdout;
+    } finally {
+      if (settingsDir) {
+        try {
+          await rm(settingsDir, { recursive: true, force: true, maxRetries: 2 });
+        } catch {
+          logger.error("Could not remove temporary auth probe settings");
+        }
+      }
     }
     const cli = parseCliAuthStatus(stdout);
     if (!cli) {
       logger.error("claude auth status returned unparseable output");
       return undefined;
     }
-    let status = cliAuthIdentity(cli, apiKeyHelper);
-    if (!context && status?.kind === "api_key" && status.detail === "API key helper") {
+    if (!context) {
       try {
-        const resolved = await resolveSettings({ cwd: process.cwd() });
-        status = cliAuthIdentity(cli, filterEscalatingDefaultMode(resolved).apiKeyHelper);
+        const resolved = await resolveSettings({ cwd });
+        const settings = filterEscalatingDefaultMode(resolved);
+        apiKeyHelper = settings.apiKeyHelper;
+        settingsEnv = settings.env ?? {};
       } catch {
         logger.error("Could not resolve auth source settings");
       }
     }
+    const effectiveEnv = { ...launchEnv, ...settingsEnv };
+    const status = cliAuthIdentity(cli, apiKeyHelper, Boolean(effectiveEnv.ANTHROPIC_AUTH_TOKEN));
     if (epoch !== this.epoch) {
       // A login or logout landed while this probe was running; the newer
       // state wins and this answer is discarded, never published.
       logger.log("[authStatus] discarding a probe that predates the latest auth change");
       return this.current;
     }
-    if (run < this.publishedRun) {
+    if (this.lastProbe && run < this.lastProbe.run) {
       // Probes can overlap (`fresh`) and land out of order. A read that
       // started before one already published is the older of the two.
       logger.log("[authStatus] discarding a probe that a newer one overtook");
       return this.current;
     }
-    this.publishedRun = run;
     // The CLI probe can be poorer than the session `AccountInfo` for the very
     // same login (no organization, say). Keep those extra fields rather than
     // regressing the payload; a different identity replaces it wholesale.
@@ -350,8 +441,35 @@ export class AuthStatusReporter {
       status.kind === "account" &&
       cli.authMethod !== "oauth_token" &&
       !isClaudeEnterprisePlan(cli.subscriptionType);
+    const configDir = launchClaudeConfigDir(cwd, launchEnv);
+    const appliesTo: AuthProbeScope = (manager, override, env) => {
+      // A relative key helper command can resolve differently in another cwd.
+      if (apiKeyHelper !== manager.getApiKeyHelper(override)) return false;
+      if (apiKeyHelper && cwd !== manager.getCwd()) return false;
+      const sessionLaunchEnv = { ...processEnv, ...env };
+      if (configDir !== launchClaudeConfigDir(manager.getCwd(), sessionLaunchEnv)) return false;
+      const sessionEnv = { ...sessionLaunchEnv, ...manager.getEnvironment(override) };
+      return (
+        Object.keys(effectiveEnv).length === Object.keys(sessionEnv).length &&
+        Object.entries(effectiveEnv).every(
+          ([name, value]) => Object.hasOwn(sessionEnv, name) && sessionEnv[name] === value,
+        )
+      );
+    };
+    this.lastProbe = {
+      run,
+      status: merged,
+      refused,
+      appliesTo: (manager, override, env) =>
+        // A watcher may have reloaded the very files this probe read.
+        (manager === context?.manager &&
+          cwd === manager.getCwd() &&
+          override === context.override &&
+          env === context.env) ||
+        appliesTo(manager, override, env),
+    };
     this.set(merged, refused);
-    this.options.onProbe?.(status.kind);
+    this.options.onProbe?.(status.kind, appliesTo);
     return merged;
   }
 }

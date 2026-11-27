@@ -4,7 +4,7 @@
  * against the v2 schema before the SDK handles them.
  */
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -12315,6 +12315,244 @@ describe("ACP v2 providers", () => {
 });
 
 describe("ACP v2 auth", () => {
+  const bearerEnv = { ANTHROPIC_AUTH_TOKEN: "synthetic-bearer-token" };
+
+  it.each([
+    { source: "launch environment", options: { env: bearerEnv }, detail: "ANTHROPIC_AUTH_TOKEN" },
+    {
+      source: "inline settings",
+      options: { settings: { env: bearerEnv } },
+      detail: "ANTHROPIC_AUTH_TOKEN",
+    },
+    {
+      source: "inline settings clearing a launch token",
+      options: {
+        env: { ...bearerEnv, CLAUDE_CODE_OAUTH_TOKEN: "synthetic-setup-token" },
+        settings: { env: { ANTHROPIC_AUTH_TOKEN: "" } },
+      },
+      detail: "OAuth token",
+    },
+  ])(
+    "probes the v2 $source at session startup and again at prompts",
+    async ({ options, detail }) => {
+      vi.stubEnv("ANTHROPIC_AUTH_TOKEN", undefined);
+      scriptTurns(async function* (options) {
+        yield result(options);
+      });
+      const oauth = JSON.stringify({
+        loggedIn: true,
+        authMethod: "oauth_token",
+        apiProvider: "firstParty",
+      });
+      execFileSpy.mockImplementation((_cli, _args, execOptions, callback) => {
+        const stdout = execOptions.cwd === cwd ? oauth : CLI_SUBSCRIPTION;
+        callback(null, { stdout, stderr: "" });
+      });
+      const expectSessionProbe = () => {
+        const [, args, execOptions] = execFileSpy.mock.lastCall!;
+        const expectedArgs = ["auth", "status", "--json"];
+        if (options.settings) {
+          expect(path.isAbsolute(args[1])).toBe(true);
+          expectedArgs.unshift("--settings", args[1]);
+        }
+        expect(args).toEqual(expectedArgs);
+        expect(execOptions.cwd).toBe(cwd);
+        expect(execOptions.env.ANTHROPIC_AUTH_TOKEN).toBe(options.env?.ANTHROPIC_AUTH_TOKEN);
+      };
+      const { app, authUpdate, sessionUpdates } = v2Client();
+      await app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        expect((await authUpdate(1)).authStatus.account?.email).toBe("user@example.com");
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, {
+          cwd,
+          _meta: { claudeCode: { options } },
+        });
+        expect((await authUpdate(2)).authStatus.detail).toBe(detail);
+        expectSessionProbe();
+
+        const otherCwd = await mkdtemp(path.join(tempDir, "other-"));
+        await agent.request(v2.methods.agent.session.new, { cwd: otherCwd });
+        expect((await authUpdate(3)).authStatus.account?.email).toBe("user@example.com");
+
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+        expect((await authUpdate(4)).authStatus.detail).toBe(detail);
+        expectSessionProbe();
+        await vi.waitFor(() => expect(turnTrace(sessionUpdates)).toContain("idle end_turn"));
+      });
+    },
+  );
+
+  it("reports the settings bearer token before and after a session, then reports removal", async () => {
+    const env = {
+      ANTHROPIC_AUTH_TOKEN: "synthetic-bearer-token",
+      ANTHROPIC_BASE_URL: "http://127.0.0.1:8788/test-proxy",
+    };
+    await mkdir(process.env.CLAUDE_CONFIG_DIR!, { recursive: true });
+    await writeFile(
+      path.join(process.env.CLAUDE_CONFIG_DIR!, "settings.json"),
+      JSON.stringify({ env }),
+    );
+    let stdout = JSON.stringify({
+      loggedIn: true,
+      authMethod: "oauth_token",
+      apiProvider: "firstParty",
+    });
+    execFileSpy.mockImplementation((...invocation: unknown[]) => {
+      const callback = invocation.at(-1) as (...args: unknown[]) => void;
+      callback(null, { stdout, stderr: "" });
+    });
+    const account = { tokenSource: "ANTHROPIC_AUTH_TOKEN", apiProvider: "firstParty" };
+    sdk.initializationResult = async () => ({
+      ...(await sdkDefaults.initializationResult()),
+      account,
+    });
+    sdk.accountInfo = async () => account;
+    const argv = process.argv;
+    process.argv = [...argv, "--hide-claude-auth"];
+    try {
+      const { app, authUpdate, acpAuthUpdates } = v2Client();
+      await app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        expect((await authUpdate(1)).authStatus).toEqual({
+          kind: "api_key",
+          label: "Anthropic API key",
+          detail: "ANTHROPIC_AUTH_TOKEN",
+        });
+        await agent.request(v2.methods.agent.session.new, { cwd });
+        expect(await agent.request(v2.methods.agent.auth.status, {})).toMatchObject({
+          state: "authenticated",
+          accounts: [{ _meta: { claudeCode: { kind: "api_key" } } }],
+        });
+        expect(JSON.stringify(acpAuthUpdates)).not.toContain(env.ANTHROPIC_AUTH_TOKEN);
+        expect(JSON.stringify(acpAuthUpdates)).not.toContain("test-proxy");
+        stdout = JSON.stringify({ loggedIn: false, apiProvider: "firstParty" });
+        await agent.request(v2.methods.agent.auth.status, {});
+        await vi.waitFor(() => expect(acpAuthUpdates.at(-1)).toEqual({ state: "unauthenticated" }));
+      });
+    } finally {
+      process.argv = argv;
+    }
+  });
+
+  it("attributes a bearer in the launched Claude config directory", async () => {
+    const childConfig = path.join(tempDir, "claude-child");
+    await mkdir(childConfig);
+    await writeFile(
+      path.join(childConfig, "settings.json"),
+      `\uFEFF${JSON.stringify({ env: bearerEnv })}`,
+    );
+    execFileSpy.mockImplementation((_cli, _args, execOptions, callback) => {
+      if (execOptions.env.CLAUDE_CONFIG_DIR !== childConfig) {
+        callback(null, { stdout: JSON.stringify({ loggedIn: false, apiProvider: "firstParty" }) });
+        return;
+      }
+      void readFile(path.join(execOptions.env.CLAUDE_CONFIG_DIR, "settings.json"), "utf8").then(
+        (contents) => {
+          const bearer = JSON.parse(contents.replace(/^\uFEFF/, "")).env.ANTHROPIC_AUTH_TOKEN;
+          callback(null, {
+            stdout: JSON.stringify({
+              loggedIn: Boolean(bearer),
+              authMethod: "oauth_token",
+              apiProvider: "firstParty",
+            }),
+          });
+        },
+        callback,
+      );
+    });
+    const { app, authUpdate, acpAuthUpdates } = v2Client();
+    await app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      expect((await authUpdate(1)).authStatus.kind).toBe("none");
+      await agent.request(v2.methods.agent.session.new, {
+        cwd,
+        _meta: { claudeCode: { options: { env: { CLAUDE_CONFIG_DIR: childConfig } } } },
+      });
+      expect(sdk.queryOptions[0]?.env?.CLAUDE_CONFIG_DIR).toBe(childConfig);
+      expect((await authUpdate(2)).authStatus).toEqual({
+        kind: "api_key",
+        label: "Anthropic API key",
+        detail: "ANTHROPIC_AUTH_TOKEN",
+      });
+      await vi.waitFor(() =>
+        expect(acpAuthUpdates.at(-1)).toMatchObject({ state: "authenticated" }),
+      );
+    });
+  });
+
+  it.each(["CLI", "SDK"])(
+    "keeps a token removal when the %s account read completes first",
+    async (first) => {
+      vi.stubEnv("ANTHROPIC_AUTH_TOKEN", bearerEnv.ANTHROPIC_AUTH_TOKEN);
+      const probeStarted = Promise.withResolvers<void>();
+      const releaseProbe = Promise.withResolvers<void>();
+      let removed = false;
+      execFileSpy.mockImplementation((_cli, _args, _execOptions, callback) => {
+        const stdout = JSON.stringify({
+          loggedIn: !removed,
+          authMethod: "oauth_token",
+          apiProvider: "firstParty",
+        });
+        if (removed) {
+          probeStarted.resolve();
+          void releaseProbe.promise.then(() => callback(null, { stdout }));
+        } else {
+          callback(null, { stdout });
+        }
+      });
+      const cached = { tokenSource: "ANTHROPIC_AUTH_TOKEN", apiProvider: "firstParty" };
+      sdk.initializationResult = async () => ({
+        ...(await sdkDefaults.initializationResult()),
+        account: cached,
+      });
+      const guardStarted = Promise.withResolvers<void>();
+      const releaseGuard = Promise.withResolvers<typeof cached>();
+      sdk.accountInfo = () => {
+        guardStarted.resolve();
+        return releaseGuard.promise;
+      };
+      scriptTurns(async function* (options) {
+        yield result(options);
+      });
+      const argv = process.argv;
+      process.argv = [...argv, "--hide-claude-auth"];
+      try {
+        const { app, authUpdate, acpAuthUpdates, sessionUpdates } = v2Client();
+        await app.connectWith(connectRouter(), async (agent) => {
+          await initializeV2(agent);
+          expect((await authUpdate(1)).authStatus.kind).toBe("api_key");
+          const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+          vi.stubEnv("ANTHROPIC_AUTH_TOKEN", undefined);
+          removed = true;
+          const prompting = agent.request(v2.methods.agent.session.prompt, {
+            sessionId,
+            prompt: text("hi"),
+          });
+          await Promise.all([guardStarted.promise, probeStarted.promise]);
+          if (first === "CLI") {
+            releaseProbe.resolve();
+            expect((await authUpdate(2)).authStatus.kind).toBe("none");
+          }
+          releaseGuard.resolve(cached);
+          await prompting;
+          await vi.waitFor(() => expect(turnTrace(sessionUpdates)).toContain("idle end_turn"));
+          if (first === "SDK") {
+            releaseProbe.resolve();
+            expect((await authUpdate(2)).authStatus.kind).toBe("none");
+          }
+          await vi.waitFor(() =>
+            expect(acpAuthUpdates.at(-1)).toEqual({ state: "unauthenticated" }),
+          );
+          expect(acpAuthUpdates).toHaveLength(2);
+        });
+      } finally {
+        releaseProbe.resolve();
+        releaseGuard.resolve(cached);
+        process.argv = argv;
+      }
+    },
+  );
+
   it("pushes the auth status of the connection after initialize", async () => {
     const { app, authUpdate } = v2Client();
     const update = await app.connectWith(connectRouter(), async (agent) => {
@@ -12490,6 +12728,93 @@ describe("ACP v2 subscription guard (--hide-claude-auth)", () => {
       account: accounts[Math.min(started++, accounts.length - 1)],
     });
   }
+
+  it("keeps an inline API key helper on the same query after an auth probe", async () => {
+    const account = { apiProvider: "firstParty", apiKeySource: "apiKeyHelper" };
+    accountsAtStart(account);
+    sdk.accountInfo = async () => account;
+    const stdout = JSON.stringify({ ...account, loggedIn: true, authMethod: "none" });
+    let startupProbe: { settingsPath: string; finish: () => void } | undefined;
+    execFileSpy.mockImplementation((_cli, args, _options, callback) => {
+      const finish = () => callback(null, { stdout });
+      if (args[0] === "--settings" && !startupProbe) {
+        startupProbe = { settingsPath: args[1], finish };
+      } else {
+        finish();
+      }
+    });
+    scriptTurns(async function* (options) {
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      expect((await client.authUpdate(1)).authStatus.kind).toBe("api_key");
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, {
+        cwd,
+        _meta: { claudeCode: { options: { settings: { apiKeyHelper: "central proxy start" } } } },
+      });
+      expect((await client.authUpdate(2)).authStatus.kind).toBe("gateway");
+      await vi.waitFor(() => expect(startupProbe).toBeDefined());
+      startupProbe!.finish();
+      await vi.waitFor(async () => {
+        await expect(access(startupProbe!.settingsPath)).rejects.toMatchObject({ code: "ENOENT" });
+      });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      expect(sdk.queryOptions).toHaveLength(1);
+    });
+  });
+
+  it("keeps both stable queries when a bearer session and a setup-token session alternate", async () => {
+    const bearer = { tokenSource: "ANTHROPIC_AUTH_TOKEN", apiProvider: "firstParty" };
+    const setup = { tokenSource: "CLAUDE_CODE_OAUTH_TOKEN", apiProvider: "firstParty" };
+    const oauth = JSON.stringify({
+      loggedIn: true,
+      authMethod: "oauth_token",
+      apiProvider: "firstParty",
+    });
+    execFileSpy.mockImplementation((_cli, _args, _options, callback) => {
+      callback(null, { stdout: oauth });
+    });
+    sdk.initializationResult = async () => ({
+      ...(await sdkDefaults.initializationResult()),
+      account: sdk.queryOptions.at(-1)?.env?.ANTHROPIC_AUTH_TOKEN ? bearer : setup,
+    });
+    scriptTurns(async function* (options) {
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      await client.authUpdate(1);
+      const start = (env: Record<string, string>) =>
+        agent.request(v2.methods.agent.session.new, {
+          cwd,
+          _meta: { claudeCode: { options: { env } } },
+        });
+      const a = await start({ ANTHROPIC_AUTH_TOKEN: "synthetic-bearer" });
+      const b = await start({ CLAUDE_CODE_OAUTH_TOKEN: "synthetic-setup" });
+      sdk.accountInfo = async () => setup;
+      await agent.request(v2.methods.agent.session.prompt, {
+        sessionId: b.sessionId,
+        prompt: text("setup"),
+      });
+      await client.authUpdate(3);
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      sdk.accountInfo = async () => bearer;
+      await agent.request(v2.methods.agent.session.prompt, {
+        sessionId: a.sessionId,
+        prompt: text("bearer"),
+      });
+      await vi.waitFor(() =>
+        expect(
+          turnTrace(client.sessionUpdates).filter((event) => event === "idle end_turn"),
+        ).toHaveLength(2),
+      );
+      expect(sdk.queryOptions).toHaveLength(2);
+    });
+  });
 
   it.each([
     ["a subscription would pay", SUBSCRIPTION, NOT_SUPPORTED],
