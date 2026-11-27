@@ -11447,6 +11447,9 @@ export class ClaudeAcpAgent {
     keepState?: ReplayState,
   ): Promise<void> {
     this.closeQueryStream(session);
+    // The SDK waits a bounded time for Claude Code to write its final cost state at exit.
+    await session.query[Symbol.asyncDispose]?.();
+    if (session.tornDown) throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     // Keep the old record visible so closeSession and dispose can mark it torn down.
     // Without the creation-time effort: restoreSessionChoices restores the current pin instead.
     await this.recreateLiveSession(withoutEffort(creationParams), sessionId, {
