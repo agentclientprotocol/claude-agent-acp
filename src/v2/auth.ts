@@ -42,6 +42,7 @@ import {
   providerConfigFromSetRequest,
   type ProviderRouteSettings,
   providerRouteSettings,
+  sameProviderConfig,
   validatedGatewayAuthRequest,
   withListedModels,
 } from "../providers.js";
@@ -198,20 +199,25 @@ export class V2Auth {
 
   async setProvider(params: v2.SetProviderRequest): Promise<v2.SetProviderResponse> {
     const config = providerConfigFromSetRequest(params);
-    await this.updateProvider(async () => {
-      this.provider = await withListedModels(config, this.provider, this.logger);
+    const changed = await this.updateProvider(async () => {
+      await withListedModels(config, this.provider, this.logger);
+      if (sameProviderConfig(this.provider, config)) return false;
+      this.provider = config;
+      return true;
     });
-    await this.rerouted();
+    if (changed) await this.rerouted();
     return {};
   }
 
   async disableProvider(params: v2.DisableProviderRequest): Promise<v2.DisableProviderResponse> {
     // An unknown provider: idempotent success.
     if (params.providerId === PROVIDER_ID) {
-      await this.updateProvider(async () => {
+      const changed = await this.updateProvider(async () => {
+        if (this.provider === undefined) return false;
         this.provider = undefined;
+        return true;
       });
-      await this.rerouted();
+      if (changed) await this.rerouted();
     }
     return {};
   }
@@ -294,7 +300,7 @@ export class V2Auth {
     this.sessionSettings.delete(sessionId);
   }
 
-  private updateProvider(update: () => Promise<void>): Promise<void> {
+  private updateProvider<T>(update: () => Promise<T>): Promise<T> {
     const next = this.providerUpdate.catch(() => undefined).then(update);
     this.providerUpdate = next;
     this.providerUpdates++;

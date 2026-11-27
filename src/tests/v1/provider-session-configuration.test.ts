@@ -66,6 +66,7 @@ describe("provider updates preserve session configuration", { timeout: 10_000 },
   let rejectModel: boolean;
   let agentsAvailable: boolean;
   let rejectConfigUpdate: boolean;
+  let providerRevision: number;
   let models: typeof MODELS;
   let mcpServers: Array<{ name: string; status: string }>;
   /** What a query that resumes a session sends before it reads a prompt. */
@@ -142,6 +143,7 @@ describe("provider updates preserve session configuration", { timeout: 10_000 },
     missingResume = rejectModel = false;
     agentsAvailable = true;
     rejectConfigUpdate = false;
+    providerRevision = 0;
     models = MODELS;
     mcpServers = [];
     backlog = [];
@@ -181,7 +183,10 @@ describe("provider updates preserve session configuration", { timeout: 10_000 },
   });
 
   function refresh() {
-    return agent.unstable_setProvider(PROVIDER);
+    return agent.unstable_setProvider({
+      ...PROVIDER,
+      headers: { "x-test-route-revision": String(++providerRevision) },
+    });
   }
 
   function newSession(meta?: any) {

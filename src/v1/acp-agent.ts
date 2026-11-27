@@ -423,6 +423,7 @@ import {
   type ProviderConfig,
   providerConfigFromSetRequest,
   providerRouteSettings,
+  sameProviderConfig,
   validatedGatewayAuthRequest,
   withListedModels,
 } from "../providers.js";
@@ -2552,7 +2553,7 @@ export class ClaudeAcpAgent {
       // plain CLI login needs nothing here: the running CLI picks up the
       // logout by itself.
       if (hadRoutingOverride) {
-        await this.enqueueProviderUpdate(undefined);
+        await this.enqueueProviderUpdate(undefined, true);
       }
     }
 
@@ -11368,11 +11369,14 @@ export class ClaudeAcpAgent {
   }
 
   /**
-   * Provider routing is baked into the environment of each SDK Query. Wait for
-   * all submitted turns to settle, close every query, then resume each Claude
-   * session with the same ID so subsequent turns inherit the new environment.
+   * Provider routing is baked into each SDK Query's environment. When it
+   * changes, wait for submitted turns to settle and resume each live session
+   * with the same ID under the new environment.
    */
-  private async enqueueProviderUpdate(config: ProviderConfig | undefined): Promise<void> {
+  private async enqueueProviderUpdate(
+    config: ProviderConfig | undefined,
+    forceRestart = false,
+  ): Promise<void> {
     const previous = this.providerUpdate?.catch(() => undefined) ?? Promise.resolve();
     const update = previous.then(async () => {
       // The listing runs in the queue, so `providers/set`, `providers/disable`
@@ -11381,6 +11385,8 @@ export class ClaudeAcpAgent {
       if (config) {
         await withListedModels(config, this.providerConfig, this.logger);
       }
+      // Logout has already cleared the route, but its queries still need replacing.
+      if (!forceRestart && sameProviderConfig(this.providerConfig, config)) return;
       const sessions = Object.entries(this.sessions);
       const activeTurns = sessions.flatMap(([, session]) =>
         (session.turnQueue ?? []).flatMap((turn) => (turn.completion ? [turn.completion] : [])),

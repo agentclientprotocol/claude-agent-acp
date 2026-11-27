@@ -187,7 +187,10 @@ describe("session hooks with the Claude Code binary", () => {
         expect((await readFile(log, "utf8")).split("\n").filter(Boolean)).toHaveLength(6);
       });
       expect(await hooksSinceLastCheck()).toEqual(["ide", "project", "user"]);
-      await agent.unstable_setProvider(provider);
+      await agent.unstable_setProvider({
+        ...provider,
+        headers: { "x-test-route-revision": "2" },
+      });
 
       for (const sessionId of sessions) {
         const session = agent.sessions[sessionId];
