@@ -2,6 +2,8 @@ import { describe, expect, it, Mock, vi, afterEach, beforeEach } from "vitest";
 import { ClaudeAcpAgent } from "../../v1/acp-agent.js";
 import { AcpClient } from "../../acp-client.js";
 import { loggableBaseUrl } from "../../providers.js";
+import { Pushable } from "../../utils.js";
+import { successfulResultMessage, userEcho } from "./session-doubles.js";
 
 const mockQuery = vi.hoisted(() =>
   vi.fn(() => {
@@ -911,6 +913,90 @@ describe("providers", () => {
       expect(modelOptionValues(response)).toEqual(["default", "opus", "sonnet", "haiku"]);
       expect(mockQuery.mock.calls.at(-1)![0].options.env).not.toHaveProperty(
         "ANTHROPIC_BEDROCK_REGION_PREFIX",
+      );
+    });
+
+    it("keeps routing through a gateway whose credential may serve but not list models", async () => {
+      const [agent, mockQuery] = await createAgentMock();
+      mockQueryWithModels(mockQuery);
+      const fetchMock = vi.fn(async () => new Response("forbidden", { status: 403 }));
+      vi.stubGlobal("fetch", fetchMock);
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+
+      // The credential is allowed to send messages but not to list models: a
+      // 403 says nothing about inference, so the switch keeps working.
+      await expect(
+        agent.unstable_setProvider({
+          providerId: "main",
+          apiType: "anthropic",
+          baseUrl: "https://gateway.example",
+          headers: { authorization: "Bearer send-only" },
+        }),
+      ).resolves.toEqual({});
+
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(modelOptionValues(response)).toEqual(["default", "opus", "sonnet", "haiku"]);
+      expect(mockQuery.mock.calls.at(-1)![0].options.env).toMatchObject({
+        ANTHROPIC_AUTH_TOKEN: "acp-proxy",
+        ANTHROPIC_BASE_URL: "https://gateway.example",
+      });
+      // A prompt is served on the session the gateway route created; the SDK
+      // query double streams the echo and one successful result, then stays open.
+      const session = (agent as any).sessions[response.sessionId];
+      const input = new Pushable<any>();
+      session.input = input;
+      const pushed = input[Symbol.asyncIterator]();
+      let step = 0;
+      session.query.next = async () => {
+        if (step === 0) {
+          step = 1;
+          const { value } = await pushed.next();
+          return { done: false, value: userEcho(value) };
+        }
+        if (step === 1) {
+          step = 2;
+          return { done: false, value: successfulResultMessage() };
+        }
+        return new Promise(() => {});
+      };
+      await expect(
+        agent.prompt({ sessionId: response.sessionId, prompt: [{ type: "text", text: "hi" }] }),
+      ).resolves.toMatchObject({ stopReason: "end_turn" });
+      expect(fetchMock).toHaveBeenCalledOnce();
+    });
+
+    it("keeps the current provider when the listing rejects the token", async () => {
+      const [agent, mockQuery] = await createAgentMock();
+      mockQueryWithModels(mockQuery);
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => new Response("unauthorized", { status: 401 })),
+      );
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+
+      await expect(
+        agent.unstable_setProvider({
+          providerId: "main",
+          apiType: "anthropic",
+          baseUrl: "https://gateway.example",
+          headers: { authorization: "Bearer expired" },
+        }),
+      ).rejects.toMatchObject({
+        code: -32603,
+        message: expect.stringContaining(
+          "Model listing GET /v1/models returned 401: the gateway rejected the token",
+        ),
+      });
+
+      expect((await agent.unstable_listProviders({})).providers[0].current).toEqual({
+        apiType: "anthropic",
+        baseUrl: "https://api.anthropic.com",
+      });
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(modelOptionValues(response)).toEqual(["default", "opus", "sonnet", "haiku"]);
+      expect(mockQuery.mock.calls.at(-1)![0].options.env).not.toHaveProperty(
+        "ANTHROPIC_BASE_URL",
+        "https://gateway.example",
       );
     });
 
