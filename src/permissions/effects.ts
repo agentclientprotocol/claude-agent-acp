@@ -6,11 +6,22 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 import type { DurablePermissionChangeSet } from "./normalization.js";
 import { PERMISSION_OPTION_ID } from "./options.js";
+import { plainString } from "./options/shared.js";
 
 export interface ClaudePermissionSelection {
   optionId: string;
   contextResetMode?: PermissionMode;
+  /** The client's reason for a selected reject (see {@link rejectDenyMessage}). */
+  denyMessage?: string;
 }
+
+/** The `_meta` of a selected permission outcome, as the client sends it. */
+type SelectedOutcomeMeta = {
+  claudeCode?: {
+    /** With the reject option: why the client refused, for Claude to read. */
+    denyMessage?: string;
+  };
+};
 
 export interface ClaudePermissionEffectContext {
   toolName: string;
@@ -28,7 +39,27 @@ export function parseClaudePermissionSelection(
   const optionId = response.outcome.optionId;
   const contextResetMode =
     toolName === "ExitPlanMode" ? exitPlanClearContextMode(optionId) : undefined;
-  return { optionId, ...(contextResetMode ? { contextResetMode } : {}) };
+  const denyMessage = rejectDenyMessage(optionId, response.outcome._meta);
+  return {
+    optionId,
+    ...(contextResetMode ? { contextResetMode } : {}),
+    ...(denyMessage ? { denyMessage } : {}),
+  };
+}
+
+/**
+ * The text that Claude reads as the result of a tool the client refused, when
+ * the client gave one with the reject option: the outcome's
+ * `_meta.claudeCode.denyMessage`, trimmed. ACP gives a permission outcome no
+ * reason field, and without the reason Claude learns only that it was refused
+ * and tends to retry the same call. Undefined for any other option, and for a
+ * missing, blank or non-string value: the reject then keeps its fixed message,
+ * "User refused permission to run tool" (ExitPlanMode: "User chose to keep
+ * planning").
+ */
+function rejectDenyMessage(optionId: string, meta: unknown): string | undefined {
+  if (optionId !== PERMISSION_OPTION_ID.reject) return undefined;
+  return plainString((meta as SelectedOutcomeMeta | null | undefined)?.claudeCode?.denyMessage);
 }
 
 function allow(
@@ -153,7 +184,7 @@ function applyExitPlanModeSelection(
     // A regular deny lets Claude continue planning and ask another question.
     // Interrupt stops this ACP turn; the adapter maps Claude's internal
     // diagnostic for that intentional stop back to cancellation.
-    return deny(context, "User chose to keep planning", true);
+    return deny(context, selection.denyMessage ?? "User chose to keep planning", true);
   }
   return applyCommonSelection(selection, context);
 }
@@ -169,7 +200,7 @@ function applyCommonSelection(
       if (!context.durableChangeSet) throw new Error("Invalid durable permission selection");
       return allow(context, context.durableChangeSet.updates, true);
     case PERMISSION_OPTION_ID.reject:
-      return deny(context);
+      return deny(context, selection.denyMessage);
     default:
       throw new Error(`Unknown permission option: ${selection.optionId}`);
   }

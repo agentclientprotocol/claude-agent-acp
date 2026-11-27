@@ -687,6 +687,23 @@ The adapter groups the options as `allow_once`, then `allow_always`, then the re
 Options of the same kind keep their builder order.
 The client must return the selected option id unchanged.
 
+Any client can tell Claude why it selected `reject`, in the outcome's `_meta.claudeCode.denyMessage`:
+
+```json
+{
+  "outcome": {
+    "outcome": "selected",
+    "optionId": "reject",
+    "_meta": { "claudeCode": { "denyMessage": "Run the tests with npm run test:run instead." } }
+  }
+}
+```
+
+Claude reads that string, trimmed, as the result of the refused tool, instead of `User refused permission to run tool`.
+For `ExitPlanMode` it replaces `User chose to keep planning`, and the turn still ends.
+A missing, blank, or non-string value keeps the fixed message.
+The other options ignore the key.
+
 ### Durable SDK suggestions
 
 Before a suggestion can become a durable choice, the adapter validates the complete array and clones it.
