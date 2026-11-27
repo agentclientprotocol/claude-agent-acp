@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.113.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.113.0...v0.113.1) (2026-11-27)
+
+
+### Bug Fixes
+
+* refuse to start a session when Claude Code skipped an invalid settings file ([#1719](https://github.com/agentclientprotocol/claude-agent-acp/issues/1719)) ([e28b50d](https://github.com/agentclientprotocol/claude-agent-acp/commit/e28b50d4f401dc9c3a4fdc8eda27e29989658ba8))
+
 ## [0.113.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.112.0...v0.113.0) (2026-11-26)
 
 
