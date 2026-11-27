@@ -90,10 +90,11 @@ import {
 import { noticeUpdate } from "../session-notices.js";
 import {
   createUltracodeConfigOption,
-  readUltracodeSettings,
+  readSettingsReport,
   ultracodeSupported,
   ultracodeWorkflowsEnabled,
 } from "../session-ultracode.js";
+import { invalidSettingsError } from "../startup-failure.js";
 import { v1SetSessionConfigOptionRequest, v2ConfigOptions } from "./session-requests.js";
 
 type ConfigQuery = Pick<
@@ -252,7 +253,9 @@ export class SessionConfig {
       ? undefined
       : normalizeFastModeDisabledReason(setup.fastMode.disabledReason);
     const settings = setup.effortSettings();
-    const ultracodeReport = await readUltracodeSettings(query);
+    const { ultracode: ultracodeReport, settingsErrors } = await readSettingsReport(query);
+    const settingsError = invalidSettingsError(settingsErrors);
+    if (settingsError) throw settingsError;
     const ultracodeEnabled = ultracodeReport?.requested ?? settings.ultracode === true;
     const workflowsEnabled = ultracodeWorkflowsEnabled(ultracodeReport, currentModelInfo);
     const clientEffort = setup.client?.effort;

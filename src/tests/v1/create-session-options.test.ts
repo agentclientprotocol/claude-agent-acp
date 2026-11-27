@@ -32,6 +32,8 @@ let initModels: Record<string, unknown>[] | undefined;
 /** Holds the CLI initialization until the test resolves it. */
 let initGate: Promise<void> | undefined;
 let initError: Error | undefined;
+/** The settings files that Claude Code reports as skipped (`get_settings` `errors`). */
+let settingsErrors: Array<{ file?: string; path: string; message: string }> | undefined;
 /** When set, Claude Code refuses a start that has MCP servers with it. */
 let mcpServersRefusal: Error | undefined;
 let missingConversation: string | undefined;
@@ -90,6 +92,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
           contextUsageCalls.push(opts);
           return contextUsageResult ? contextUsageResult() : Promise.resolve(DEFAULT_CONTEXT_USAGE);
         },
+        getSettings: async () => ({ applied: {}, errors: settingsErrors }),
         mcpServerStatus: () => mcpServerStatusResult(),
         mcpAuthenticate: (serverName: string) => mcpAuthenticateImpl(serverName),
         ...(enableRemoteControlImpl ? { enableRemoteControl: enableRemoteControlImpl } : {}),
@@ -148,6 +151,7 @@ describe("createSession options merging", () => {
     initModels = undefined;
     initGate = undefined;
     initError = undefined;
+    settingsErrors = undefined;
     mcpServersRefusal = undefined;
     missingConversation = undefined;
     optionsRefusal = undefined;
@@ -1969,6 +1973,25 @@ describe("createSession options merging", () => {
         data: { startupFailureReason: reason },
       });
       expect(closeSpy).toHaveBeenCalled();
+    });
+
+    it.each([
+      ["session/new", () => agent.newSession({ cwd: process.cwd(), mcpServers: [] })],
+      ["session/options", () => agent.sessionOptions({ cwd: process.cwd() })],
+    ])("refuses %s when Claude Code skipped a settings file", async (_method, request) => {
+      settingsErrors = [
+        { file: "/home/u/.claude/settings.json", path: "", message: "Invalid or malformed JSON" },
+      ];
+      await expect(request()).rejects.toMatchObject({
+        code: RequestError.internalError().code,
+        message:
+          "Internal error: Claude Code skipped the invalid settings file /home/u/.claude/settings.json " +
+          "(Invalid or malformed JSON), so its permission rules, sandbox settings and hooks would not apply. " +
+          "Fix the file and start the session again.",
+        data: { settingsErrors },
+      });
+      expect(closeSpy).toHaveBeenCalledOnce();
+      expect(Object.keys(agent.sessions)).toEqual([]);
     });
 
     it("starts a session without the MCP servers that Claude Code refuses", async () => {

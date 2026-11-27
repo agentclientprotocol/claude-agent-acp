@@ -91,6 +91,8 @@ const sdk = vi.hoisted(() => ({
   }),
   /** The query is closed, as `session/close` closes it. */
   close: (): void => {},
+  /** What Claude Code answers to `get_settings`. */
+  getSettings: async (): Promise<Record<string, unknown>> => ({ applied: {} }),
   initializationResult: async (): Promise<Record<string, unknown>> => ({
     models: [
       {
@@ -166,6 +168,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         stopTask: (taskId: string) => sdk.stopTask(taskId),
         getTaskOutput: (taskId: string) => sdk.getTaskOutput(taskId),
         close: () => sdk.close(),
+        getSettings: () => sdk.getSettings(),
         accountInfo: () => sdk.accountInfo(),
         setMcpServers: (servers: Record<string, unknown>) => sdk.setMcpServers(servers),
         setModel: (model?: string) => sdk.setModel(model),
@@ -711,6 +714,33 @@ describe("ACP v2 sessions", () => {
         message: 'Internal error: Invalid proxy URL in HTTPS_PROXY: "not a url".',
         data: { startupFailureReason: "proxy_invalid" },
       });
+      await authUpdate(1);
+    });
+  });
+
+  it.each([
+    ["session/new", v2.methods.agent.session.new],
+    ["session/options", v2.methods.agent.session.options],
+  ])("rejects %s when Claude Code skipped a settings file", async (_name, method) => {
+    const errors = [
+      { file: "/home/u/.claude/settings.json", path: "", message: "Invalid or malformed JSON" },
+    ];
+    sdk.getSettings = async () => ({ applied: {}, errors });
+    const close = vi.fn();
+    sdk.close = close;
+    const { app, authUpdate } = v2Client();
+    await app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      await expect(agent.request(method, { cwd })).rejects.toMatchObject({
+        code: -32603,
+        message:
+          "Internal error: Claude Code skipped the invalid settings file /home/u/.claude/settings.json " +
+          "(Invalid or malformed JSON), so its permission rules, sandbox settings and hooks would not apply. " +
+          "Fix the file and start the session again.",
+        data: { settingsErrors: errors },
+      });
+      expect(close).toHaveBeenCalledOnce();
+      expect((agents[0] as unknown as { sessions: Map<string, unknown> }).sessions.size).toBe(0);
       await authUpdate(1);
     });
   });

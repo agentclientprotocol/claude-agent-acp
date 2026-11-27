@@ -1,5 +1,8 @@
 import { RequestError } from "@agentclientprotocol/sdk/unstable";
-import type { SDKStartupFailureReason } from "@anthropic-ai/claude-agent-sdk";
+import type {
+  SDKSettingsParseError,
+  SDKStartupFailureReason,
+} from "@anthropic-ai/claude-agent-sdk";
 
 /** Makes the CLI write an `error_during_execution` result with a
  *  `startup_failure_reason` before it exits on a known startup failure. Without
@@ -47,4 +50,28 @@ export function startupFailureReasonOf(error: unknown): string | undefined {
   const reason = (error.data as { startupFailureReason?: unknown } | undefined)
     ?.startupFailureReason;
   return typeof reason === "string" ? reason : undefined;
+}
+
+/** The ACP error for a session whose settings files the CLI skipped, or
+ *  `undefined` for an empty list. A skipped file's permission rules, sandbox
+ *  and hooks do not apply, so the session does not start. E.g. `Claude Code
+ *  skipped the invalid settings file /home/u/.claude/settings.json (Invalid or
+ *  malformed JSON), so its permission rules, sandbox settings and hooks would
+ *  not apply. Fix the file and start the session again.` */
+export function invalidSettingsError(errors: SDKSettingsParseError[]): RequestError | undefined {
+  if (errors.length === 0) return undefined;
+  const skipped = errors.map((error) => {
+    const field = error.path === "" ? "" : `${error.path}: `;
+    const file =
+      error.file === undefined
+        ? "an invalid settings file"
+        : `the invalid settings file ${error.file}`;
+    return `${file} (${field}${error.message})`;
+  });
+  const many = errors.length > 1;
+  const message =
+    `Claude Code skipped ${skipped.join("; ")}, so ${many ? "their" : "its"} permission rules, ` +
+    `sandbox settings and hooks would not apply. Fix the ${many ? "files" : "file"} ` +
+    `and start the session again.`;
+  return RequestError.internalError({ settingsErrors: errors }, message);
 }

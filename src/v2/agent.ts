@@ -725,7 +725,9 @@ class V2Agent implements AgentHandle, SessionConnection {
    * hooks in it, as in every query.
    *
    * It sends no update, and it creates, resumes and changes no session. A
-   * `sessionId` without a stored conversation fails with `-32002`.
+   * `sessionId` without a stored conversation fails with `-32002`. A start
+   * that would fail fails it too, e.g. when Claude Code skipped an invalid
+   * settings file.
    */
   async sessionOptions(params: v2.SessionOptionsRequest): Promise<v2.SessionOptionsResponse> {
     const { sessionId } = params;
@@ -1402,7 +1404,8 @@ class V2Agent implements AgentHandle, SessionConnection {
     }
     // A failed sync of the mode is logged (`SessionModeManager.initialize`),
     // and a failed read of the agents or of ultracode leaves them out. Only
-    // the effort that `recommendedValue` sets can fail the start.
+    // the effort that `recommendedValue` sets, and settings files that Claude
+    // Code skipped, can fail the start.
     let config;
     try {
       config = await SessionConfig.start(
@@ -1429,6 +1432,11 @@ class V2Agent implements AgentHandle, SessionConnection {
     } catch (error) {
       q.close();
       settings.dispose();
+      // A live session under this id keeps its entries.
+      if (!this.sessions.has(sessionId)) {
+        this.auth.sessionEnded(sessionId);
+        this.guard.sessionEnded(sessionId);
+      }
       throw error;
     }
     return {

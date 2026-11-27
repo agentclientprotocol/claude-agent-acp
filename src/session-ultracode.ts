@@ -3,7 +3,7 @@ import type {
   SessionConfigOption,
   SetSessionConfigOptionRequest,
 } from "@agentclientprotocol/sdk/unstable";
-import type { ModelInfo, Query } from "@anthropic-ai/claude-agent-sdk";
+import type { ModelInfo, Query, SDKSettingsParseError } from "@anthropic-ai/claude-agent-sdk";
 import { ULTRACODE_CONFIG_ID } from "./session-config-ids.js";
 
 export { ULTRACODE_CONFIG_ID } from "./session-config-ids.js";
@@ -29,27 +29,47 @@ export type UltracodeSettingsReport = {
 type GetSettingsQuery = Query & {
   getSettings?: () => Promise<{
     applied?: { ultracodeAvailable?: unknown; ultracodeRequested?: unknown };
+    errors?: Array<Partial<SDKSettingsParseError> | null>;
   }>;
 };
 
-/** Ask the CLI whether ultracode is available and requested for the session.
- *  Returns undefined when the SDK has no `getSettings` or the request fails;
- *  callers then fall back to {@link modelSupportsUltracode}. */
-export async function readUltracodeSettings(
-  query: Query,
-): Promise<UltracodeSettingsReport | undefined> {
+/** What the CLI's `get_settings` control response says about the session. */
+export type SettingsReport = {
+  /** Undefined when the SDK has no `getSettings` or the request fails; callers
+   *  then fall back to {@link modelSupportsUltracode}. */
+  ultracode: UltracodeSettingsReport | undefined;
+  /** Settings files that the CLI skipped, e.g. `{ file: "/home/u/.claude/settings.json",
+   *  path: "", message: "Invalid or malformed JSON" }`. Empty when the CLI
+   *  reports none or cannot be asked. */
+  settingsErrors: SDKSettingsParseError[];
+};
+
+/** Ask the CLI whether ultracode is available and requested for the session,
+ *  and which settings files it skipped. */
+export async function readSettingsReport(query: Query): Promise<SettingsReport> {
   const getSettings = (query as GetSettingsQuery).getSettings;
-  if (typeof getSettings !== "function") return undefined;
+  if (typeof getSettings !== "function") return { ultracode: undefined, settingsErrors: [] };
   try {
-    const applied = (await getSettings.call(query))?.applied;
+    const response = await getSettings.call(query);
+    const applied = response?.applied;
     return {
-      available:
-        typeof applied?.ultracodeAvailable === "boolean" ? applied.ultracodeAvailable : undefined,
-      requested:
-        typeof applied?.ultracodeRequested === "boolean" ? applied.ultracodeRequested : undefined,
+      ultracode: {
+        available:
+          typeof applied?.ultracodeAvailable === "boolean" ? applied.ultracodeAvailable : undefined,
+        requested:
+          typeof applied?.ultracodeRequested === "boolean" ? applied.ultracodeRequested : undefined,
+      },
+      // Every entry counts, so a malformed one still refuses the start.
+      settingsErrors: Array.isArray(response?.errors)
+        ? response.errors.map((error: Partial<SDKSettingsParseError> | null) => ({
+            ...(typeof error?.file === "string" ? { file: error.file } : {}),
+            path: typeof error?.path === "string" ? error.path : "",
+            message: typeof error?.message === "string" ? error.message : "invalid settings",
+          }))
+        : [],
     };
   } catch {
-    return undefined;
+    return { ultracode: undefined, settingsErrors: [] };
   }
 }
 

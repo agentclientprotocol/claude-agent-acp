@@ -9,7 +9,7 @@ import type { AcpClient } from "../../acp-client.js";
 import {
   createUltracodeConfigOption,
   modelSupportsUltracode,
-  readUltracodeSettings,
+  readSettingsReport,
   resolveUltracodeEnabled,
   ULTRACODE_CONFIG_ID,
   ULTRACODE_OFF,
@@ -17,6 +17,7 @@ import {
   ultracodeSupported,
   ultracodeWorkflowsEnabled,
 } from "../../session-ultracode.js";
+import { invalidSettingsError } from "../../startup-failure.js";
 import { makeMockQuery } from "../helpers.js";
 
 const { querySpy } = vi.hoisted(() => ({ querySpy: vi.fn() }));
@@ -106,25 +107,53 @@ describe("ultracode helpers", () => {
     expect(ultracodeSupported(true, OLD_OPUS)).toBe(false);
   });
 
-  it("reads the CLI's ultracode report and tolerates CLIs without one", async () => {
+  it("reads the CLI's settings report and tolerates CLIs without one", async () => {
     await expect(
-      readUltracodeSettings(
+      readSettingsReport(
         getSettingsQuery(async () => ({
           applied: { ultracodeAvailable: true, ultracodeRequested: false },
         })),
       ),
-    ).resolves.toEqual({ available: true, requested: false });
+    ).resolves.toEqual({ ultracode: { available: true, requested: false }, settingsErrors: [] });
     await expect(
-      readUltracodeSettings(getSettingsQuery(async () => ({ applied: {} }))),
-    ).resolves.toEqual({ available: undefined, requested: undefined });
-    await expect(readUltracodeSettings(getSettingsQuery(undefined))).resolves.toBeUndefined();
+      readSettingsReport(getSettingsQuery(async () => ({ applied: {} }))),
+    ).resolves.toEqual({
+      ultracode: { available: undefined, requested: undefined },
+      settingsErrors: [],
+    });
+    await expect(readSettingsReport(getSettingsQuery(undefined))).resolves.toEqual({
+      ultracode: undefined,
+      settingsErrors: [],
+    });
     await expect(
-      readUltracodeSettings(
+      readSettingsReport(
         getSettingsQuery(async () => {
           throw new Error("unsupported control request");
         }),
       ),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ ultracode: undefined, settingsErrors: [] });
+  });
+
+  it("reports the settings files that the CLI skipped", async () => {
+    const skipped = {
+      file: "/home/u/.claude/settings.json",
+      path: "",
+      message: "Invalid or malformed JSON",
+    };
+    await expect(
+      readSettingsReport(
+        getSettingsQuery(async () => ({
+          applied: {},
+          errors: [skipped, { path: "hooks", message: 3 }, null],
+        })),
+      ),
+    ).resolves.toMatchObject({
+      settingsErrors: [
+        skipped,
+        { path: "hooks", message: "invalid settings" },
+        { path: "", message: "invalid settings" },
+      ],
+    });
   });
 });
 
@@ -292,5 +321,42 @@ describe("ultracode session config option", () => {
     ).rejects.toThrow("nope");
     expect(agent.sessions[sessionId].ultracodeEnabled).toBe(false);
     expect(ultracodeOption()).toEqual(createUltracodeConfigOption(false, true));
+  });
+});
+
+describe("invalidSettingsError", () => {
+  const USER = "/home/u/.claude/settings.json";
+  const PROJECT = "/work/.claude/settings.json";
+  const JSON_ERROR = { file: USER, path: "", message: "Invalid or malformed JSON" };
+
+  it("is undefined when the CLI skipped no file", () => {
+    expect(invalidSettingsError([])).toBeUndefined();
+  });
+
+  it.each([
+    [
+      "a whole-file error",
+      [JSON_ERROR],
+      `Claude Code skipped the invalid settings file ${USER} (Invalid or malformed JSON), so its permission rules, sandbox settings and hooks would not apply. Fix the file and start the session again.`,
+    ],
+    [
+      "a field path",
+      [{ file: USER, path: "permissions.deny", message: "Expected array" }],
+      `Claude Code skipped the invalid settings file ${USER} (permissions.deny: Expected array), so its permission rules, sandbox settings and hooks would not apply. Fix the file and start the session again.`,
+    ],
+    [
+      "several files",
+      [JSON_ERROR, { file: PROJECT, path: "hooks", message: "Expected object" }],
+      `Claude Code skipped the invalid settings file ${USER} (Invalid or malformed JSON); the invalid settings file ${PROJECT} (hooks: Expected object), so their permission rules, sandbox settings and hooks would not apply. Fix the files and start the session again.`,
+    ],
+    [
+      "no file",
+      [{ path: "", message: "Invalid or malformed JSON" }],
+      "Claude Code skipped an invalid settings file (Invalid or malformed JSON), so its permission rules, sandbox settings and hooks would not apply. Fix the file and start the session again.",
+    ],
+  ])("names the skipped files for %s", (_name, errors, message) => {
+    const error = invalidSettingsError(errors)!;
+    expect(error.message).toBe(`Internal error: ${message}`);
+    expect(error.data).toEqual({ settingsErrors: errors });
   });
 });
