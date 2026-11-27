@@ -704,6 +704,72 @@ describe("NativeSubagentRuntime lifecycle", () => {
       );
     });
 
+    it("routes resumed AIR output under the original Agent launch id", async () => {
+      const { runtime, published, logged } = await finishedWorker("completed");
+
+      await runtime.taskStarted(
+        {
+          taskId: "worker-1",
+          toolUseId: "send-1",
+          subagentType: "Explore",
+          description: "Resumed run",
+        },
+        async () => {},
+      );
+
+      // Resumed AIR output carries the original Agent launch ID
+      await expect(runtime.route(output("resumed"), async () => {})).resolves.toMatchObject({
+        sessionId: "worker-1:generation:2",
+      });
+
+      // Output using the new SendMessage tool-use ID also routes to generation 2
+      const sendOutput = {
+        ...output("from send"),
+        update: {
+          ...output("from send").update,
+          _meta: { claudeCode: { parentToolUseId: "send-1" } },
+        },
+      } as AcpSessionNotification;
+      await expect(runtime.route(sendOutput, async () => {})).resolves.toMatchObject({
+        sessionId: "worker-1:generation:2",
+      });
+
+      // Generation 2 finishes
+      await runtime.finishTask("worker-1", "completed", async () => {}, "send-1");
+
+      // Late updates under either ID are now dropped
+      await expect(runtime.route(output("late launch"), async () => {})).resolves.toBeNull();
+      await expect(runtime.route(sendOutput, async () => {})).resolves.toBeNull();
+
+      expect(lifecycle(published)).toEqual([
+        ["root", "subagent_spawned", "worker-1"],
+        ["root", "subagent_state_update", "worker-1"],
+        ["root", "subagent_spawned", "worker-1:generation:2"],
+        ["root", "subagent_state_update", "worker-1:generation:2"],
+      ]);
+      expect(
+        logged.filter((line) =>
+          line.includes("ignoring late update for terminal subagent worker-1:generation:2"),
+        ),
+      ).toHaveLength(2);
+    });
+
+    it("routes resumed AIR output under the original Agent launch id when resumed via sendMessageResumed", async () => {
+      const { runtime, published, logged } = await finishedWorker("completed");
+
+      await runtime.sendMessageResumed("worker-1", async () => {}, "Continue work", "send-1");
+
+      await expect(runtime.route(output("resumed"), async () => {})).resolves.toMatchObject({
+        sessionId: "worker-1:generation:2",
+      });
+      expect(published.at(-1)?.update).toMatchObject({
+        sessionUpdate: "subagent_spawned",
+        subagentSessionId: "worker-1:generation:2",
+        prompt: "Continue work",
+      });
+      expect(logged).toEqual([]);
+    });
+
     it("sends the SendMessage text as the prompt of the new generation", async () => {
       const { runtime, published } = await finishedWorker("completed");
 
