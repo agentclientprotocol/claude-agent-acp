@@ -251,3 +251,50 @@ export class ResultUsage {
     };
   }
 }
+
+/** The end of a turn of several results: the last result, with their usage summed. */
+export function combinedEnd(ends: TurnEnd[]): TurnEnd {
+  const total: AccumulatedUsage = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedReadTokens: 0,
+    cachedWriteTokens: 0,
+  };
+  const rows: ModelTokenTally = {};
+  for (const { _meta } of ends) {
+    add(total, _meta.quota.token_count);
+    for (const row of _meta.quota.model_usage) {
+      add(
+        (rows[row.model] ??= {
+          inputTokens: 0,
+          outputTokens: 0,
+          cachedReadTokens: 0,
+          cachedWriteTokens: 0,
+        }),
+        row.token_count,
+      );
+    }
+  }
+  const last = ends[ends.length - 1];
+  const meta = quotaMeta(total, rows);
+  return {
+    result: last.result,
+    usage: { ...total, totalTokens: meta.quota.token_count.totalTokens },
+    _meta: meta,
+  };
+}
+
+function add(
+  into: AccumulatedUsage,
+  count: {
+    inputTokens: number;
+    outputTokens: number;
+    cachedInputTokens: number;
+    cachedWriteTokens: number;
+  },
+): void {
+  into.inputTokens += count.inputTokens;
+  into.outputTokens += count.outputTokens;
+  into.cachedReadTokens += count.cachedInputTokens;
+  into.cachedWriteTokens += count.cachedWriteTokens;
+}

@@ -74,7 +74,17 @@ with replay, which `replay_complete` ends, `session/close`, `session/prompt`, `s
 `session/fork`, `session/status`, `session/options` (with initial `configOptions` on `session/new`,
 `session/resume` and `session/fork`), `session/set_title`, additional directories, config options (the mode is one), plans, notices,
 compaction, display terminals for commands, permission requests, elicitation, providers, auth, and
-[subagents](docs/subagent-sessions.md). Steering is v1 only for now.
+[subagents](docs/subagent-sessions.md).
+
+Both protocol versions advertise `_meta.steering.supported: true` in `initialize`.
+On v2 a `session/prompt` during foreground work already goes to Claude Code as a priority follow-up.
+Clients can also send `_session/steering` with `sessionId` and `prompt` to get an `injected`
+response as soon as the message enters Claude Code's queue. Both paths defer delivery while
+permission or elicitation input is open.
+
+With no foreground work, `_session/steering` starts a prompt and returns `startedNewTurn` once
+Claude Code takes it in. Set `_meta.steering.idleBehavior` to `"promptRequired"` to receive
+`{ "outcome": "promptRequired", "reason": "noRunningTurn" }` without starting a prompt.
 
 On v2, the `command` of a stdio MCP server must be an absolute path, such as `/usr/local/bin/npx`.
 `session/new`, `session/resume` and `session/fork` fail with `-32602` for a relative one, such as
