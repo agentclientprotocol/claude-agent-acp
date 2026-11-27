@@ -17,7 +17,7 @@ import {
   ultracodeSupported,
   ultracodeWorkflowsEnabled,
 } from "../../session-ultracode.js";
-import { invalidSettingsError } from "../../startup-failure.js";
+import { rejectSkippedSettings } from "../../startup-failure.js";
 import { makeMockQuery } from "../helpers.js";
 
 const { querySpy } = vi.hoisted(() => ({ querySpy: vi.fn() }));
@@ -144,16 +144,10 @@ describe("ultracode helpers", () => {
       readSettingsReport(
         getSettingsQuery(async () => ({
           applied: {},
-          errors: [skipped, { path: "hooks", message: 3 }, null],
+          errors: [skipped],
         })),
       ),
-    ).resolves.toMatchObject({
-      settingsErrors: [
-        skipped,
-        { path: "hooks", message: "invalid settings" },
-        { path: "", message: "invalid settings" },
-      ],
-    });
+    ).resolves.toMatchObject({ settingsErrors: [skipped] });
   });
 });
 
@@ -324,13 +318,13 @@ describe("ultracode session config option", () => {
   });
 });
 
-describe("invalidSettingsError", () => {
+describe("rejectSkippedSettings", () => {
   const USER = "/home/u/.claude/settings.json";
   const PROJECT = "/work/.claude/settings.json";
   const JSON_ERROR = { file: USER, path: "", message: "Invalid or malformed JSON" };
 
-  it("is undefined when the CLI skipped no file", () => {
-    expect(invalidSettingsError([])).toBeUndefined();
+  it("does nothing when the CLI skipped no file", () => {
+    expect(() => rejectSkippedSettings([])).not.toThrow();
   });
 
   it.each([
@@ -355,8 +349,11 @@ describe("invalidSettingsError", () => {
       "Claude Code skipped an invalid settings file (Invalid or malformed JSON), so its permission rules, sandbox settings and hooks would not apply. Fix the file and start the session again.",
     ],
   ])("names the skipped files for %s", (_name, errors, message) => {
-    const error = invalidSettingsError(errors)!;
-    expect(error.message).toBe(`Internal error: ${message}`);
-    expect(error.data).toEqual({ settingsErrors: errors });
+    expect(() => rejectSkippedSettings(errors)).toThrow(
+      expect.objectContaining({
+        message: `Internal error: ${message}`,
+        data: { settingsErrors: errors },
+      }),
+    );
   });
 });

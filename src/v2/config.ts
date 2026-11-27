@@ -94,7 +94,7 @@ import {
   ultracodeSupported,
   ultracodeWorkflowsEnabled,
 } from "../session-ultracode.js";
-import { invalidSettingsError } from "../startup-failure.js";
+import { rejectSkippedSettings } from "../startup-failure.js";
 import { v1SetSessionConfigOptionRequest, v2ConfigOptions } from "./session-requests.js";
 
 type ConfigQuery = Pick<
@@ -254,8 +254,7 @@ export class SessionConfig {
       : normalizeFastModeDisabledReason(setup.fastMode.disabledReason);
     const settings = setup.effortSettings();
     const { ultracode: ultracodeReport, settingsErrors } = await readSettingsReport(query);
-    const settingsError = invalidSettingsError(settingsErrors);
-    if (settingsError) throw settingsError;
+    rejectSkippedSettings(settingsErrors);
     const ultracodeEnabled = ultracodeReport?.requested ?? settings.ultracode === true;
     const workflowsEnabled = ultracodeWorkflowsEnabled(ultracodeReport, currentModelInfo);
     const clientEffort = setup.client?.effort;

@@ -52,26 +52,31 @@ export function startupFailureReasonOf(error: unknown): string | undefined {
   return typeof reason === "string" ? reason : undefined;
 }
 
-/** The ACP error for a session whose settings files the CLI skipped, or
- *  `undefined` for an empty list. A skipped file's permission rules, sandbox
- *  and hooks do not apply, so the session does not start. E.g. `Claude Code
+/** Throws the ACP error for a session whose settings files the CLI skipped,
+ *  and does nothing for an empty list. A skipped file's permission rules,
+ *  sandbox and hooks do not apply, so the session does not start. E.g. `Claude Code
  *  skipped the invalid settings file /home/u/.claude/settings.json (Invalid or
  *  malformed JSON), so its permission rules, sandbox settings and hooks would
  *  not apply. Fix the file and start the session again.` */
-export function invalidSettingsError(errors: SDKSettingsParseError[]): RequestError | undefined {
-  if (errors.length === 0) return undefined;
-  const skipped = errors.map((error) => {
-    const field = error.path === "" ? "" : `${error.path}: `;
-    const file =
-      error.file === undefined
-        ? "an invalid settings file"
-        : `the invalid settings file ${error.file}`;
-    return `${file} (${field}${error.message})`;
-  });
-  const many = errors.length > 1;
-  const message =
-    `Claude Code skipped ${skipped.join("; ")}, so ${many ? "their" : "its"} permission rules, ` +
-    `sandbox settings and hooks would not apply. Fix the ${many ? "files" : "file"} ` +
-    `and start the session again.`;
-  return RequestError.internalError({ settingsErrors: errors }, message);
+export function rejectSkippedSettings(errors: SDKSettingsParseError[]): void {
+  if (errors.length === 0) return;
+  throw RequestError.internalError({ settingsErrors: errors }, invalidSettingsMessage(errors));
+}
+
+function invalidSettingsMessage(errors: SDKSettingsParseError[]): string {
+  const skipped = errors.map(describeSkippedFile).join("; ");
+  if (errors.length === 1) {
+    return `Claude Code skipped ${skipped}, so its permission rules, sandbox settings and hooks would not apply. Fix the file and start the session again.`;
+  }
+  return `Claude Code skipped ${skipped}, so their permission rules, sandbox settings and hooks would not apply. Fix the files and start the session again.`;
+}
+
+/** E.g. `the invalid settings file /home/u/.claude/settings.json (permissions.deny: Expected array)`. */
+function describeSkippedFile(error: SDKSettingsParseError): string {
+  const name =
+    error.file === undefined
+      ? "an invalid settings file"
+      : `the invalid settings file ${error.file}`;
+  const detail = error.path === "" ? error.message : `${error.path}: ${error.message}`;
+  return `${name} (${detail})`;
 }

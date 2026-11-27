@@ -27,7 +27,7 @@ export type UltracodeSettingsReport = {
 /** The CLI's `get_settings` control response, as far as the adapter reads it. */
 type GetSettingsResponse = {
   applied?: { ultracodeAvailable?: unknown; ultracodeRequested?: unknown };
-  errors?: Array<Partial<SDKSettingsParseError> | null>;
+  errors?: SDKSettingsParseError[];
 };
 
 // `Query.getSettings()` exists at runtime (sdk.mjs) but is missing from the
@@ -74,17 +74,8 @@ function parseRequested(response: GetSettingsResponse | undefined): boolean | un
   return typeof value === "boolean" ? value : undefined;
 }
 
-/** Every entry counts, so a malformed one still refuses the start. */
 function parseSettingsErrors(response: GetSettingsResponse | undefined): SDKSettingsParseError[] {
-  if (!Array.isArray(response?.errors)) return [];
-  return response.errors.map((entry) => {
-    const error: SDKSettingsParseError = {
-      path: typeof entry?.path === "string" ? entry.path : "",
-      message: typeof entry?.message === "string" ? entry.message : "invalid settings",
-    };
-    if (typeof entry?.file === "string") error.file = entry.file;
-    return error;
-  });
+  return response?.errors ?? [];
 }
 
 /** The CLI supports ultracode on exactly the models that support `xhigh`

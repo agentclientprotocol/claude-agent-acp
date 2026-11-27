@@ -472,7 +472,7 @@ import {
 import { isLoginRequiredText, resultEnd, turnErrorData } from "../result-end.js";
 import {
   STARTUP_FAILURE_RESULTS_ENV,
-  invalidSettingsError,
+  rejectSkippedSettings,
   startupFailureError,
 } from "../startup-failure.js";
 import { recordStreamedDelta, unstreamedRemainder, type StreamedBlock } from "../streamed-text.js";
@@ -11220,8 +11220,7 @@ export class ClaudeAcpAgent {
         },
         ultracode,
       );
-      const settingsError = invalidSettingsError(settingsErrors);
-      if (settingsError) throw settingsError;
+      rejectSkippedSettings(settingsErrors);
       if (creationOpts.optionsOnly) {
         this.discardUnregisteredQuery(q, input, settingsManager);
         return { sessionId, modes, configOptions };
