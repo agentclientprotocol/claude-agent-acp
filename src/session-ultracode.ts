@@ -3,7 +3,7 @@ import type {
   SessionConfigOption,
   SetSessionConfigOptionRequest,
 } from "@agentclientprotocol/sdk/unstable";
-import type { ModelInfo, Query } from "@anthropic-ai/claude-agent-sdk";
+import type { ModelInfo, Query, SDKSettingsParseError } from "@anthropic-ai/claude-agent-sdk";
 import { ULTRACODE_CONFIG_ID } from "./session-config-ids.js";
 
 export { ULTRACODE_CONFIG_ID } from "./session-config-ids.js";
@@ -24,33 +24,58 @@ export type UltracodeSettingsReport = {
   requested?: boolean;
 };
 
-// `Query.getSettings()` exists at runtime (sdk.mjs) but is missing from the
-// SDK's type declarations as of 0.3.319.
-type GetSettingsQuery = Query & {
-  getSettings?: () => Promise<{
-    applied?: { ultracodeAvailable?: unknown; ultracodeRequested?: unknown };
-  }>;
+/** The CLI's `get_settings` control response, as far as the adapter reads it. */
+type GetSettingsResponse = {
+  applied?: { ultracodeAvailable?: unknown; ultracodeRequested?: unknown };
+  errors?: SDKSettingsParseError[];
 };
 
-/** Ask the CLI whether ultracode is available and requested for the session.
- *  Returns undefined when the SDK has no `getSettings` or the request fails;
- *  callers then fall back to {@link modelSupportsUltracode}. */
-export async function readUltracodeSettings(
-  query: Query,
-): Promise<UltracodeSettingsReport | undefined> {
+// `Query.getSettings()` exists at runtime (sdk.mjs) but is missing from the
+// SDK's type declarations as of 0.3.319.
+type GetSettingsQuery = Query & { getSettings?: () => Promise<GetSettingsResponse | undefined> };
+
+/** What the CLI's `get_settings` control response says about the session. */
+export type SettingsReport = {
+  /** Undefined when the SDK has no `getSettings` or the request fails; callers
+   *  then fall back to {@link modelSupportsUltracode}. */
+  ultracode: UltracodeSettingsReport | undefined;
+  /** Settings files that the CLI skipped, e.g. `{ file: "/home/u/.claude/settings.json",
+   *  path: "", message: "Invalid or malformed JSON" }`. Empty when the CLI
+   *  reports none or cannot be asked. */
+  settingsErrors: SDKSettingsParseError[];
+};
+
+const NO_REPORT: SettingsReport = { ultracode: undefined, settingsErrors: [] };
+
+/** Ask the CLI whether ultracode is available and requested for the session,
+ *  and which settings files it skipped. */
+export async function readSettingsReport(query: Query): Promise<SettingsReport> {
   const getSettings = (query as GetSettingsQuery).getSettings;
-  if (typeof getSettings !== "function") return undefined;
+  if (typeof getSettings !== "function") return NO_REPORT;
+  let response: GetSettingsResponse | undefined;
   try {
-    const applied = (await getSettings.call(query))?.applied;
-    return {
-      available:
-        typeof applied?.ultracodeAvailable === "boolean" ? applied.ultracodeAvailable : undefined,
-      requested:
-        typeof applied?.ultracodeRequested === "boolean" ? applied.ultracodeRequested : undefined,
-    };
+    response = await getSettings.call(query);
   } catch {
-    return undefined;
+    return NO_REPORT;
   }
+  return {
+    ultracode: { available: parseAvailable(response), requested: parseRequested(response) },
+    settingsErrors: parseSettingsErrors(response),
+  };
+}
+
+function parseAvailable(response: GetSettingsResponse | undefined): boolean | undefined {
+  const value = response?.applied?.ultracodeAvailable;
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function parseRequested(response: GetSettingsResponse | undefined): boolean | undefined {
+  const value = response?.applied?.ultracodeRequested;
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function parseSettingsErrors(response: GetSettingsResponse | undefined): SDKSettingsParseError[] {
+  return response?.errors ?? [];
 }
 
 /** The CLI supports ultracode on exactly the models that support `xhigh`

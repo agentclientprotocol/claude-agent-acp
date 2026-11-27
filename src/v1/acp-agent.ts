@@ -437,7 +437,7 @@ import {
 } from "../session-effort.js";
 import {
   createUltracodeConfigOption,
-  readUltracodeSettings,
+  readSettingsReport,
   ULTRACODE_CONFIG_ID,
   ultracodeSupported,
   ultracodeWorkflowsEnabled,
@@ -470,7 +470,11 @@ import {
   readContextWindow,
 } from "../context-window.js";
 import { isLoginRequiredText, resultEnd, turnErrorData } from "../result-end.js";
-import { STARTUP_FAILURE_RESULTS_ENV, startupFailureError } from "../startup-failure.js";
+import {
+  STARTUP_FAILURE_RESULTS_ENV,
+  rejectSkippedSettings,
+  startupFailureError,
+} from "../startup-failure.js";
 import { recordStreamedDelta, unstreamedRemainder, type StreamedBlock } from "../streamed-text.js";
 import { subagentHookOptions } from "../subagent-configuration.js";
 
@@ -2075,7 +2079,8 @@ export class ClaudeAcpAgent {
    * hooks in it, as in every query.
    *
    * It sends no update, and it creates, loads and changes no session. A
-   * `sessionId` that is neither held nor stored fails with `-32002`.
+   * `sessionId` that is neither held nor stored fails with `-32002`. It fails
+   * as the start would when Claude Code skipped an invalid settings file.
    */
   async sessionOptions(params: SessionOptionsRequest): Promise<SessionOptionsResponse> {
     while (this.providerUpdate) await this.providerUpdate;
@@ -11190,7 +11195,7 @@ export class ClaudeAcpAgent {
       // The CLI reports whether ultracode can run (workflows enabled and a
       // supporting model) and whether the session already requests it (an
       // `ultracode: true` setting). Without a report, fall back to settings.
-      const ultracodeReport = await readUltracodeSettings(q);
+      const { ultracode: ultracodeReport, settingsErrors } = await readSettingsReport(q);
       timing.phase("ultracode");
       const ultracodeEnabled = ultracodeReport?.requested ?? effortSettings.ultracode === true;
       const workflowsEnabled = ultracodeWorkflowsEnabled(ultracodeReport, currentModelInfo);
@@ -11215,6 +11220,7 @@ export class ClaudeAcpAgent {
         },
         ultracode,
       );
+      rejectSkippedSettings(settingsErrors);
       if (creationOpts.optionsOnly) {
         this.discardUnregisteredQuery(q, input, settingsManager);
         return { sessionId, modes, configOptions };

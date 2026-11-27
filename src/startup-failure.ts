@@ -1,5 +1,8 @@
 import { RequestError } from "@agentclientprotocol/sdk/unstable";
-import type { SDKStartupFailureReason } from "@anthropic-ai/claude-agent-sdk";
+import type {
+  SDKSettingsParseError,
+  SDKStartupFailureReason,
+} from "@anthropic-ai/claude-agent-sdk";
 
 /** Makes the CLI write an `error_during_execution` result with a
  *  `startup_failure_reason` before it exits on a known startup failure. Without
@@ -47,4 +50,33 @@ export function startupFailureReasonOf(error: unknown): string | undefined {
   const reason = (error.data as { startupFailureReason?: unknown } | undefined)
     ?.startupFailureReason;
   return typeof reason === "string" ? reason : undefined;
+}
+
+/** Throws the ACP error for a session whose settings files the CLI skipped,
+ *  and does nothing for an empty list. A skipped file's permission rules,
+ *  sandbox and hooks do not apply, so the session does not start. E.g. `Claude Code
+ *  skipped the invalid settings file /home/u/.claude/settings.json (Invalid or
+ *  malformed JSON), so its permission rules, sandbox settings and hooks would
+ *  not apply. Fix the file and start the session again.` */
+export function rejectSkippedSettings(errors: SDKSettingsParseError[]): void {
+  if (errors.length === 0) return;
+  throw RequestError.internalError({ settingsErrors: errors }, invalidSettingsMessage(errors));
+}
+
+function invalidSettingsMessage(errors: SDKSettingsParseError[]): string {
+  const skipped = errors.map(describeSkippedFile).join("; ");
+  if (errors.length === 1) {
+    return `Claude Code skipped ${skipped}, so its permission rules, sandbox settings and hooks would not apply. Fix the file and start the session again.`;
+  }
+  return `Claude Code skipped ${skipped}, so their permission rules, sandbox settings and hooks would not apply. Fix the files and start the session again.`;
+}
+
+/** E.g. `the invalid settings file /home/u/.claude/settings.json (permissions.deny: Expected array)`. */
+function describeSkippedFile(error: SDKSettingsParseError): string {
+  const name =
+    error.file === undefined
+      ? "an invalid settings file"
+      : `the invalid settings file ${error.file}`;
+  const detail = error.path === "" ? error.message : `${error.path}: ${error.message}`;
+  return `${name} (${detail})`;
 }
