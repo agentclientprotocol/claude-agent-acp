@@ -6,6 +6,7 @@ import { stripLocalCommandMetadata } from "../message-filters.js";
 import { readHistoryAcrossCompactions } from "../resumed-session.js";
 import { messageIdForGrouping } from "../sdk-to-acp.js";
 import { assistantMessageText } from "../session-failure-extension.js";
+import { activeSessionMessages, readRewindPoint } from "../session-rewind.js";
 import { errorCode } from "./project-dirs.js";
 import type { IndexRow } from "./session-index.js";
 
@@ -29,13 +30,12 @@ export async function readTranscriptText(
 ): Promise<TranscriptText | undefined> {
   try {
     signal?.throwIfAborted();
-    const initial = await bigintStat(row.filePath);
+    const { initial, rewindPoint, revision } = await transcriptState(row);
     if (!initial.isFile()) return undefined;
-    const revision = revisionOf(initial);
     if (mode === "transcriptRevision") return { revision };
     if (initial.size > MAX_TRANSCRIPT_BYTES) return { revision, messages: [], truncated: true };
 
-    const read = await readEntries(row.filePath, Number(initial.size), revision, signal);
+    const read = await readEntries(row.filePath, Number(initial.size), revisionOf(initial), signal);
     const entries = read.entries;
     let truncated = read.truncated;
     const chain = await getSessionMessages(row.sessionId, {
@@ -43,7 +43,7 @@ export async function readTranscriptText(
     });
     const history = await readHistoryAcrossCompactions(
       row.sessionId,
-      chain,
+      activeSessionMessages(chain, rewindPoint),
       {
         error: () => {
           truncated = true;
@@ -55,7 +55,7 @@ export async function readTranscriptText(
     );
     signal?.throwIfAborted();
     const result = project(history);
-    if (revision !== revisionOf(await bigintStat(row.filePath))) {
+    if (revision !== (await transcriptState(row)).revision) {
       throw new Error("The transcript changed during the read");
     }
     return { revision, messages: result.messages, truncated: truncated || result.truncated };
@@ -67,6 +67,17 @@ export async function readTranscriptText(
       "Could not read the session transcript text. Retry the request.",
     );
   }
+}
+
+async function transcriptState(row: IndexRow) {
+  const initial = await bigintStat(row.filePath);
+  const rewindPoint = await readRewindPoint(row.sessionId, undefined, row.filePath);
+  const revision = JSON.stringify([
+    revisionOf(initial),
+    rewindPoint?.resumeSessionAt,
+    rewindPoint?.droppedPromptUuid,
+  ]);
+  return { initial, rewindPoint, revision };
 }
 
 function revisionOf({ dev, ino, size, mtimeNs, ctimeNs }: Awaited<ReturnType<typeof bigintStat>>) {

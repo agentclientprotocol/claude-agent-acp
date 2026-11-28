@@ -1664,9 +1664,12 @@ Each returned row adds an object at `_meta.jetbrains.air.transcriptTextSnapshot`
 The agent reads the current saved conversation without opening the session.
 The roles are `user`, `assistant` and `compact_summary`. Message order follows
 the conversation. Tool payloads, reasoning and internal messages are excluded.
-The revision describes the returned snapshot. The agent omits a missing session,
+Search applies the same rewind point as history replay: discarded messages are
+excluded even while their records remain in the transcript. The revision covers
+the selected transcript copy and its rewind point, so a rewind changes it before
+the next prompt or resume. Another copy's rewind point does not apply. The agent omits a missing session,
 rejects a read that changed while in progress, and marks a projection partial
-when it reaches a size limit. An empty complete projection means the read
+when it reaches a size limit or skips malformed JSON records. An empty complete projection means the read
 succeeded and found no searchable text. Ordinary batch and list calls still
 return only metadata.
 

@@ -38,6 +38,7 @@ import {
   v1SetSessionConfigOptionRequest,
   v2ConfigOptions,
 } from "../../v2/session-requests.js";
+import { writeRewindPoint } from "../../session-rewind.js";
 import { encodeProjectPath } from "../../session-index/project-dirs.js";
 import { LIST_CHANGES_METHOD, type ListChanges } from "../../session-index/list-subscriptions.js";
 import type { BatchGetSessionsResponse } from "../../session-index/service.js";
@@ -549,6 +550,74 @@ const SESSION_COMMANDS: v2.AvailableCommand[] = [
 describe("ACP v2 sessions", () => {
   describe("sessionIndex", () => {
     describe("_session/batch_get", () => {
+      it("returns the replayed messages after a rewind with a new revision", async () => {
+        const sessionId = randomUUID();
+        const sessionCwd = await realpath(cwd);
+        const directory = path.join(tempDir, "claude", "projects", encodeProjectPath(sessionCwd));
+        await writeTranscript(directory, sessionId, [
+          { cwd: sessionCwd, ...transcriptUser("u1", "first question") },
+          transcriptAssistant("a1", "first answer"),
+          transcriptUser("u2", "dropped question"),
+          transcriptAssistant("a2", "dropped answer"),
+        ]);
+        const actual = await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
+          "@anthropic-ai/claude-agent-sdk",
+        );
+        vi.mocked(getSessionInfo).mockImplementation(actual.getSessionInfo);
+        await vi
+          .mocked(getSessionMessages)
+          .withImplementation(actual.getSessionMessages, async () => {
+            const client = v2Client();
+            await client.app.connectWith(connectRouter(), async (agent) => {
+              await initializeV2(agent, {
+                _meta: {
+                  jetbrains: {
+                    air: { version: 1, capabilities: ["sessionIndex", "sessionTranscriptText"] },
+                  },
+                },
+              });
+              const read = async (include?: "transcriptRevision" | "transcriptTextSnapshot") => {
+                const result = await agent.request<BatchGetSessionsResponse>("_session/batch_get", {
+                  sessionIds: [sessionId],
+                  ...(include && { _meta: { jetbrains: { air: { include, cwd: sessionCwd } } } }),
+                });
+                return (result.sessions[0]?._meta as any)?.jetbrains.air.transcriptTextSnapshot;
+              };
+              expect(await read()).toBeUndefined();
+              const before = await read("transcriptTextSnapshot");
+              expect(before.messages).toHaveLength(4);
+              await writeRewindPoint(sessionId, { resumeSessionAt: "a1", droppedPromptUuid: "u2" });
+              const afterRevision = await read("transcriptRevision");
+              expect(afterRevision.revision).not.toBe(before.revision);
+              const after = await read("transcriptTextSnapshot");
+              expect(after).toEqual({
+                revision: afterRevision.revision,
+                messages: [
+                  { role: "user", text: "first question" },
+                  { role: "assistant", text: "first answer" },
+                ],
+                truncated: false,
+              });
+              await agent.request(v2.methods.agent.session.resume, {
+                sessionId,
+                cwd: sessionCwd,
+                replayFrom: { type: "start" },
+              });
+              const replayed = client.sessionUpdates.flatMap(({ update }) =>
+                update.sessionUpdate === "user_message_chunk" ||
+                update.sessionUpdate === "agent_message_chunk"
+                  ? [update.content]
+                  : [],
+              );
+              expect(replayed).toEqual([
+                { type: "text", text: "first question" },
+                { type: "text", text: "first answer" },
+              ]);
+              expect(sdk.queryOptions).toHaveLength(1);
+              await client.authUpdate(1);
+            });
+          });
+      });
       it("returns negotiated transcript text without opening a session", async () => {
         const row = await stored("saved question");
         const client = v2Client();

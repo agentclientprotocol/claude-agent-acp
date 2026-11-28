@@ -364,8 +364,11 @@ export type RewindPoint = {
 };
 
 /** `<projectDir>/<sessionId>/rewind.json`, beside the session's `subagents/`. */
-async function rewindPointFile(sessionId: string): Promise<string | undefined> {
-  const transcript = await findTranscript(sessionId);
+async function rewindPointFile(
+  sessionId: string,
+  transcriptPath?: string,
+): Promise<string | undefined> {
+  const transcript = transcriptPath ?? (await findTranscript(sessionId));
   return transcript && path.join(path.dirname(transcript), sessionId, "rewind.json");
 }
 
@@ -389,13 +392,15 @@ export async function writeRewindPoint(sessionId: string, point: RewindPoint): P
  * `rewind.json`, ENOENT). A record that cannot be read (EACCES, EISDIR) or
  * parsed fails with an internal error: reading it as "no rewind" would show or
  * resume the dropped turns. The file stays, so the client can retry.
+ * `transcriptPath` selects the sidecar of an already resolved transcript copy.
  */
 export async function readRewindPoint(
   sessionId: string,
   logger?: Logger,
+  transcriptPath?: string,
 ): Promise<RewindPoint | undefined> {
   try {
-    const file = await rewindPointFile(sessionId);
+    const file = await rewindPointFile(sessionId, transcriptPath);
     if (!file) return undefined;
     let point: Partial<RewindPoint>;
     try {

@@ -13,6 +13,7 @@ import {
   deleteSession,
   forkSession as sdkForkSession,
   getSessionInfo,
+  getSessionMessages,
   listSessions,
 } from "@anthropic-ai/claude-agent-sdk";
 import { spawn } from "node:child_process";
@@ -42,6 +43,7 @@ import {
   type ListChanges,
 } from "../../session-index/list-subscriptions.js";
 import { SessionTitles } from "../../session-titles.js";
+import { writeRewindPoint } from "../../session-rewind.js";
 import {
   initializeClient,
   transcriptAssistant,
@@ -69,6 +71,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
     ...actual,
     deleteSession: vi.fn(actual.deleteSession),
     getSessionInfo: vi.fn(actual.getSessionInfo),
+    getSessionMessages: vi.fn(actual.getSessionMessages),
     listSessions: vi.fn(actual.listSessions),
   };
 });
@@ -372,7 +375,8 @@ describe("_session/batch_get", () => {
 
   it("projects the selected copy before opening it and detects edits at the same mtime", async () => {
     const sessionId = randomUUID();
-    const otherCwd = path.join(workspace, "other");
+    // An id-only rewind lookup must encounter the foreign copy before `chosen`.
+    const otherCwd = path.join(workspace, "a-other");
     const cwd = path.join(workspace, "chosen");
     const directory = path.join(configDir, "projects", encodeProjectPath(cwd));
     const transcript = path.join(directory, `${sessionId}.jsonl`);
@@ -416,6 +420,12 @@ describe("_session/batch_get", () => {
       prompt: "other project",
       mtimeMs: mtime.getTime() + 5000,
     });
+    const otherSidecar = path.join(configDir, "projects", encodeProjectPath(otherCwd), sessionId);
+    await fs.mkdir(otherSidecar, { recursive: true });
+    await fs.writeFile(
+      path.join(otherSidecar, "rewind.json"),
+      JSON.stringify({ resumeSessionAt: "summary", droppedPromptUuid: "later" }),
+    );
 
     let agent!: ClaudeAcpAgent;
     const connection = acpClient({ name: "search-text-test" }).connect(
@@ -484,6 +494,84 @@ describe("_session/batch_get", () => {
     } finally {
       connection.close();
       await agent.dispose();
+    }
+  });
+
+  it("uses replay's rewind point for transcript text and changes its revision", async () => {
+    const sessionId = randomUUID();
+    const directory = path.join(configDir, "projects", encodeProjectPath(workspace));
+    await writeLinkedTranscript(directory, sessionId, [
+      { cwd: workspace, ...transcriptUser("u1", "first question") },
+      transcriptAssistant("a1", "first answer"),
+      transcriptUser("u2", "dropped question"),
+      transcriptAssistant("a2", "dropped answer"),
+    ]);
+    const { agent, updates } = createAgent();
+    try {
+      await initializeClient(agent, air("sessionIndex", "sessionTranscriptText"));
+      const read = async (mode: "transcriptRevision" | "transcriptTextSnapshot") => {
+        const result = await agent.batchGetSessions({
+          sessionIds: [sessionId],
+          transcriptText: { mode, cwd: workspace },
+        });
+        return (result.sessions[0]?._meta as any)?.jetbrains.air.transcriptTextSnapshot;
+      };
+      const before = await read("transcriptTextSnapshot");
+      expect(before.messages).toHaveLength(4);
+      await writeRewindPoint(sessionId, { resumeSessionAt: "a1", droppedPromptUuid: "u2" });
+      await (agent as any).replaySessionHistory(sessionId);
+      const replayed = updates.flatMap((notification: any) => {
+        const update = notification.update;
+        return update.sessionUpdate === "user_message_chunk" ||
+          update.sessionUpdate === "agent_message_chunk"
+          ? [update.content.text]
+          : [];
+      });
+      expect(replayed).toEqual(["first question", "first answer"]);
+      const after = await read("transcriptTextSnapshot");
+      expect(after).toEqual({
+        revision: expect.any(String),
+        messages: [
+          { role: "user", text: replayed[0] },
+          { role: "assistant", text: replayed[1] },
+        ],
+        truncated: false,
+      });
+      expect(after.revision).not.toBe(before.revision);
+      expect(await read("transcriptRevision")).toEqual({ revision: after.revision });
+    } finally {
+      await agent.dispose();
+    }
+  });
+
+  it("rejects a snapshot if its rewind point changes during the read", async () => {
+    const sessionId = randomUUID();
+    const directory = path.join(configDir, "projects", encodeProjectPath(workspace));
+    await writeLinkedTranscript(directory, sessionId, [
+      { cwd: workspace, ...transcriptUser("u1", "first") },
+      transcriptAssistant("a1", "answer"),
+      transcriptUser("u2", "drop"),
+    ]);
+    const actual = await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
+      "@anthropic-ai/claude-agent-sdk",
+    );
+    vi.mocked(getSessionMessages).mockImplementationOnce(async (...args) => {
+      await writeRewindPoint(sessionId, { resumeSessionAt: "a1", droppedPromptUuid: "u2" });
+      return actual.getSessionMessages(...args);
+    });
+    const service = new SessionIndexService({ logError: () => {} });
+    try {
+      await expect(
+        service.batchGet(
+          {
+            sessionIds: [sessionId],
+            transcriptText: { mode: "transcriptTextSnapshot", cwd: workspace },
+          },
+          () => undefined,
+        ),
+      ).rejects.toMatchObject({ code: -32603 });
+    } finally {
+      service.dispose();
     }
   });
 
