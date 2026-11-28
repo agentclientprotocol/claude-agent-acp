@@ -2405,8 +2405,8 @@ export class ClaudeAcpAgent {
   async unsubscribeSessionList(params: ListUnsubscribeRequest) {
     return this.sessionIndex.unsubscribeList(params);
   }
-  async batchGetSessions(params: BatchGetSessionsRequest) {
-    return this.sessionIndex.batchGet(params);
+  async batchGetSessions(params: BatchGetSessionsRequest, signal?: AbortSignal) {
+    return this.sessionIndex.batchGet(params, signal);
   }
   renameSessionTitle(params: RenameSessionRequest) {
     return this.sessionIndex.rename(params);

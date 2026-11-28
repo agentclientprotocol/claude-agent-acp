@@ -139,6 +139,7 @@ type TranscriptMetadata = {
 
 export type IndexRow = {
   sessionId: string;
+  filePath: string;
   cwd: string;
   title: string;
   updatedAtMs: number;
@@ -268,6 +269,7 @@ function toRow({ candidate, metadata }: Resolved, cwd: string): IndexRow {
   return {
     archived: metadata.archived,
     sessionId: candidate.sessionId,
+    filePath: candidate.filePath,
     cwd,
     title: metadata.title,
     updatedAtMs: metadata.updatedAtMs,
@@ -596,7 +598,7 @@ export class SessionIndex {
 
   /** Known ids in request order, using the same rows as the list.
    *  Addresses exact filenames; only rows without a cwd need sibling discovery. */
-  async getSessions(sessionIds: readonly string[]): Promise<IndexRow[]> {
+  async getSessions(sessionIds: readonly string[], requestedCwd?: string): Promise<IndexRow[]> {
     if (sessionIds.length === 0) return [];
     const root = projectsRoot();
     let projectEntries: string[];
@@ -613,7 +615,7 @@ export class SessionIndex {
     // Paths are project directories × ids: bound them per chunk, not per request.
     for (let start = 0; start < ids.length; start += LOOKUP_CHUNK_SIZE) {
       const chunk = ids.slice(start, start + LOOKUP_CHUNK_SIZE);
-      for (const row of await this.lookupRows(root, projectEntries, chunk)) {
+      for (const row of await this.lookupRows(root, projectEntries, chunk, requestedCwd)) {
         byId.set(row.sessionId, row);
       }
     }
@@ -629,6 +631,7 @@ export class SessionIndex {
     root: string,
     projectEntries: readonly string[],
     ids: readonly string[],
+    requestedCwd?: string,
   ): Promise<IndexRow[]> {
     let candidates = await transcriptCandidates(
       projectEntries.flatMap((dirName) =>
@@ -659,6 +662,7 @@ export class SessionIndex {
     }
     return this.collectRows(candidates.sort(byMtimeDescending), {
       inScope: scopeOf(undefined),
+      requestedCwd,
       archived: "all",
       wanted: Infinity,
       unread: async (read, dirNames) => {
@@ -883,6 +887,7 @@ export class SessionIndex {
         dirNames: ReadonlySet<string>,
       ) => readonly TranscriptCandidate[] | Promise<readonly TranscriptCandidate[]>;
       restat?: boolean;
+      requestedCwd?: string;
     },
   ): Promise<IndexRow[]> {
     const { inScope, archived, after, wanted } = options;
@@ -897,6 +902,7 @@ export class SessionIndex {
     const accept = async (resolved: Resolved, cwd: string) => {
       // The SDK leaves out another path that encodes to the same project
       // directory (see scopeOf).
+      if (options.requestedCwd !== undefined && cwd !== options.requestedCwd) return;
       if (!(await inScope(resolved.candidate, resolved.metadata))) return;
       const { sessionId, mtimeMs } = resolved.candidate;
       const previous = bySession.get(sessionId);

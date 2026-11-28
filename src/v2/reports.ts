@@ -77,6 +77,7 @@ export interface ReportsHost {
   compact(): Promise<void>;
   /** The session as titles read it, the same object each time; undefined until it starts and once it ends. */
   titledSession(): TitledSession | undefined;
+  clientTitle(title: string): string;
 }
 
 /** What the session's query was started with (see {@link SessionReports.configure}). */
@@ -156,6 +157,7 @@ export class SessionReports {
       {
         client: { sessionUpdate: async (notification) => host.emit([notification]) },
         logger: host.logger,
+        clientTitle: (title) => host.clientTitle(title),
         get sessions() {
           const session = host.titledSession();
           return session ? { [host.sessionId]: session } : {};

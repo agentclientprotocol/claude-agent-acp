@@ -57,10 +57,14 @@ export function airSupport(capabilities: v2.ClientCapabilities | null | undefine
  * (see `setup.ts`) but not listed: the client declares it, and the agent does
  * not advertise it. Undefined for every other client.
  */
-export function airInitializeMeta(air: AirSupport): Record<string, unknown> | undefined {
+export function airInitializeMeta(
+  air: AirSupport,
+  ...capabilities: string[]
+): Record<string, unknown> | undefined {
   if (!air.client) return undefined;
   return airCapabilityMeta(
     AGENT_FILE_CHANGE_REPORT_CAPABILITY,
     AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
+    ...capabilities,
   );
 }

@@ -104,10 +104,11 @@ export async function readHistoryAcrossCompactions(
   messages: SessionMessage[],
   logger?: ResumeLogger,
   dir?: string,
+  load: () => Promise<SessionStoreEntry[]> = () => loadFullSessionHistory(sessionId, dir),
 ): Promise<SessionMessage[]> {
   if (!isCompactSummaryMessage(messages[0])) return messages;
   try {
-    const entries = (await loadFullSessionHistory(sessionId, dir)).map(linkCompactBoundary);
+    const entries = (await load()).map(linkCompactBoundary);
     const history = await getSessionMessages(sessionId, {
       dir,
       sessionStore: { append: async () => {}, load: async () => entries },

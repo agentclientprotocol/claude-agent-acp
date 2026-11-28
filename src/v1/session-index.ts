@@ -8,30 +8,20 @@
  */
 
 import {
-  RequestError,
   type AgentApp,
   type DeleteSessionRequest,
   type DeleteSessionResponse,
   type InitializeRequest,
-  type ListSessionsRequest,
-  type ListSessionsResponse,
   type SetSessionTitleRequest,
   type SetSessionTitleResponse,
 } from "@agentclientprotocol/sdk/unstable";
 import type { Session } from "./acp-agent.js";
 import type { AcpClient } from "../acp-client.js";
 import type { Logger } from "../logger.js";
-import {
-  AIR_SESSION_ARCHIVE_CAPABILITY,
-  AIR_SESSION_BATCH_GET_CAPABILITY,
-  AIR_SESSION_INDEX_CAPABILITY,
-  AIR_SESSION_LIST_SUBSCRIBE_CAPABILITY,
-  AIR_SESSION_RENAME_CAPABILITY,
-  AIR_SESSION_WORKTREES_CAPABILITY,
-  clientSupportsAirCapability,
-  withAirMeta,
-} from "../air-extension.js";
-import type { OwnSessionState } from "../session-index/activity.js";
+import { withAirMeta } from "../air-extension.js";
+import { SessionBatchGetConnection } from "../session-index/batch-get.js";
+import { SessionIndexConnection as SharedSessionIndexConnection } from "../session-index/connection.js";
+import { archiveSession } from "../session-index/archive.js";
 import { isArchivedTitle, visibleTitle } from "../session-index/archive-title.js";
 import { renameSession, retitleSession, type RetitledSession } from "../session-index/rename.js";
 import {
@@ -108,37 +98,35 @@ export type SessionIndexHost = {
 
 type EmptyResponse = Record<string, never>;
 
-export class SessionIndexConnection {
-  /**
-   * The session index of a client that declared `sessionIndex`. Undefined for
-   * every other client, which keeps the session list, delete and the watchers
-   * exactly as before.
-   */
-  service?: SessionIndexService;
-  /** The transcript writes of a client without `sessionIndex` (see
-   *  {@link transcriptWriter}). */
+export class SessionIndexConnection extends SharedSessionIndexConnection {
+  private readonly batches = new SessionBatchGetConnection(
+    () => this.service,
+    (id) => this.ownSessionState(id),
+  );
   private transcripts?: SessionIndexService;
-  /** When the query of a session failed here, by session id. */
-  private readonly failedQueries = new Map<string, number>();
 
-  constructor(private readonly host: SessionIndexHost) {}
+  constructor(private readonly host: SessionIndexHost) {
+    super({
+      ownSessionState: (sessionId) => {
+        const session = host.agent.sessions[sessionId];
+        return session && !session.queryClosed
+          ? {
+              state: session.lastSessionState,
+              lastTurnEndedAt: session.lastTurnEndedAt,
+              lastTurnFailed: session.lastTurnFailed,
+              costUsd: session.lastTotalCostUsd,
+            }
+          : undefined;
+      },
+      notifyListChanges: (changes) =>
+        host.agent.client.extNotification(LIST_CHANGES_METHOD, changes),
+      logError: (message, error) => host.agent.logger.error(`[session-index] ${message}:`, error),
+    });
+  }
 
-  /** Sets the index up for the client of `initialize`. */
   negotiate(request: InitializeRequest): void {
-    this.service?.dispose();
-    this.service = undefined;
-    if (
-      this.host.isAirClient() &&
-      clientSupportsAirCapability(request.clientCapabilities, AIR_SESSION_INDEX_CAPABILITY)
-    ) {
-      this.service = new SessionIndexService({
-        ownSessionState: (sessionId) => this.ownSessionState(sessionId),
-        notifyListChanges: (changes) =>
-          this.host.agent.client.extNotification(LIST_CHANGES_METHOD, changes),
-        logError: (message, error) =>
-          this.host.agent.logger.error(`[session-index] ${message}:`, error),
-      });
-    }
+    this.batches.negotiate(request.clientCapabilities);
+    this.initialize(request.clientCapabilities);
   }
 
   /** A stored title as the client shows it: an AIR client gets the title
@@ -152,94 +140,14 @@ export class SessionIndexConnection {
    *  itself, batch get, archive, rename, the list subscription and the `agentWorktree`
    *  row field, all only to a client that declared `sessionIndex`. */
   capabilities(): string[] {
-    return this.service
-      ? [
-          AIR_SESSION_INDEX_CAPABILITY,
-          AIR_SESSION_BATCH_GET_CAPABILITY,
-          AIR_SESSION_ARCHIVE_CAPABILITY,
-          AIR_SESSION_RENAME_CAPABILITY,
-          AIR_SESSION_LIST_SUBSCRIBE_CAPABILITY,
-          AIR_SESSION_WORKTREES_CAPABILITY,
-        ]
-      : [];
+    return super.capabilities(...this.batches.capabilities());
   }
 
-  dispose(): void {
-    this.service?.dispose();
-  }
-
-  /** The query of a session that ran here failed (not a cancel): its row
-   *  shows `error` until its transcript changes. */
-  onQueryFailed(sessionId: string): void {
-    this.failedQueries.set(sessionId, Date.now());
-    if (this.failedQueries.size > 1024) {
-      this.failedQueries.delete(this.failedQueries.keys().next().value as string);
-    }
-    this.service?.ownSessionChanged(sessionId);
-  }
-
-  /** A turn of a session started here: an earlier failed query of it no
-   *  longer counts. */
-  onTurnStarted(sessionId: string): void {
-    this.failedQueries.delete(sessionId);
-  }
-
-  onTeardown(sessionId: string): void {
-    // Its row now shows what the registry and the transcript tell.
-    this.service?.ownSessionChanged(sessionId);
-  }
-
-  /** A session this connection runs changed its state, turn end or cost:
-   *  the list subscriptions send it at once. */
-  onOwnSessionChanged(sessionId: string): void {
-    this.service?.ownSessionChanged(sessionId);
-  }
-
-  /**
-   * Runs `fork`, the handler of a `session/fork` request of `sourceId`. The
-   * session list holds back the forks of the source until the response is
-   * out. The client then knows a fork from the response before a list shows
-   * it.
-   */
-  async forking<T>(sourceId: string, fork: () => Promise<T>): Promise<T> {
-    // The forks of this connection: the request handler reads the service
-    // once, so a later `initialize` does not split the start and the answer.
-    const service = this.service;
-    service?.forkStarted(sourceId);
-    try {
-      return await fork();
-    } finally {
-      // The SDK writes the response in the microtasks after the handler
-      // resolves, so a `setTimeout(0)` callback runs after it.
-      setTimeout(() => service?.forkAnswered(sourceId), 0);
-    }
-  }
-
-  /** The `session/fork` of `sourceId` copied the transcript into `forkId`. */
-  onForkCreated(sourceId: string, forkId: string): void {
-    this.service?.forkCreated(sourceId, forkId);
-  }
-
-  /** `_session/list/subscribe`. */
-  subscribeList(params: ListSubscribeRequest): Promise<ListSubscribeResponse> {
-    return this.requireService(LIST_SUBSCRIBE_METHOD).subscribeList(params.cwd);
-  }
-
-  /** `_session/list/unsubscribe`. Idempotent. */
-  unsubscribeList(params: ListUnsubscribeRequest): EmptyResponse {
-    this.requireService(LIST_UNSUBSCRIBE_METHOD).unsubscribeList(params.subscriptionId);
-    return {};
-  }
-
-  /** `session/list` of a `sessionIndex` client; undefined for another one. */
-  list(params: ListSessionsRequest): Promise<ListSessionsResponse> | undefined {
-    return this.service?.list(params, (sessionId) => this.ownSessionState(sessionId));
-  }
-
-  batchGet(params: BatchGetSessionsRequest): Promise<BatchGetSessionsResponse> {
-    return this.requireService(SESSION_BATCH_GET_METHOD).batchGet(params, (sessionId) =>
-      this.ownSessionState(sessionId),
-    );
+  batchGet(
+    params: BatchGetSessionsRequest,
+    signal?: AbortSignal,
+  ): Promise<BatchGetSessionsResponse> {
+    return this.batches.batchGet(params, signal);
   }
 
   /** An AIR client archives with session/delete (see {@link deleteSession}):
@@ -285,31 +193,14 @@ export class SessionIndexConnection {
   async archive(params: SessionIdRequest): Promise<EmptyResponse> {
     const index = this.requireService(SESSION_ARCHIVE_METHOD);
     const { sessionId } = params;
-    const loaded = this.host.agent.sessions[sessionId] !== undefined;
-    // No turn goes on after the archive: the interrupt goes to the CLI ahead
-    // of the rename.
-    if (loaded) await this.host.interruptSession(sessionId);
-    await retitleSession(index, sessionId, archiveTo(true), undefined, this.loaded(sessionId), {
-      mayBeUnwritten: this.isUnwrittenSession(sessionId),
-      sidecar: "existing",
+    const loaded = await archiveSession(index, sessionId, {
+      loaded: () => this.loaded(sessionId),
+      isUnwritten: () => this.isUnwrittenSession(sessionId),
+      interrupt: () => this.host.interruptSession(sessionId),
+      close: () => this.host.teardownSession(sessionId),
+      logError: (message, error) =>
+        this.host.agent.logger.error(`[session-index] ${message}:`, error),
     });
-    if (loaded) {
-      await this.host.teardownSession(sessionId);
-      // The closed CLI may have lost or overwritten the agent name it was
-      // still to write: the transcripts are archived without it once more,
-      // as a best effort, since the CLI took the archived title.
-      try {
-        await index.retitle(sessionId, archiveTo(true), {
-          mayBeUnwritten: true,
-          sidecar: "existing",
-        });
-      } catch (error) {
-        this.host.agent.logger.error(
-          `[session-index] archiving ${sessionId} after its close failed:`,
-          error,
-        );
-      }
-    }
     await this.reportArchived(sessionId, true, loaded);
     return {};
   }
@@ -361,28 +252,6 @@ export class SessionIndexConnection {
     return this.transcripts;
   }
 
-  private requireService(method: string): SessionIndexService {
-    if (!this.service) throw RequestError.methodNotFound(method);
-    return this.service;
-  }
-
-  /** What the session index reports for a session this connection runs. */
-  private ownSessionState(sessionId: string): OwnSessionState | undefined {
-    const session = this.host.agent.sessions[sessionId];
-    if (!session || session.queryClosed) {
-      const failedAt = this.failedQueries.get(sessionId);
-      return failedAt === undefined ? undefined : { queryFailedAt: failedAt };
-    }
-    return {
-      state: session.lastSessionState,
-      lastTurnEndedAt: session.lastTurnEndedAt,
-      // A session loaded again after its query failed here shows the failure
-      // until a turn of it starts.
-      lastTurnFailed: session.lastTurnFailed || this.failedQueries.has(sessionId),
-      costUsd: session.lastTotalCostUsd,
-    };
-  }
-
   /** A new session this connection runs that may have no transcript yet: it
    *  resumed no stored conversation and no turn of it has ended. A session
    *  whose query ended, or that has history, needs its transcript. */
@@ -418,7 +287,10 @@ export class SessionIndexConnection {
 
 /** The agent methods behind the session index extension methods. */
 type SessionIndexMethods = {
-  batchGetSessions(params: BatchGetSessionsRequest): Promise<BatchGetSessionsResponse>;
+  batchGetSessions(
+    params: BatchGetSessionsRequest,
+    signal: AbortSignal,
+  ): Promise<BatchGetSessionsResponse>;
   subscribeSessionList(params: ListSubscribeRequest): Promise<ListSubscribeResponse>;
   unsubscribeSessionList(params: ListUnsubscribeRequest): Promise<EmptyResponse>;
   renameSessionTitle(params: RenameSessionRequest): Promise<EmptyResponse>;
@@ -433,7 +305,7 @@ export function onSessionIndexRequests(app: AgentApp, agent: () => SessionIndexM
     .onRequest<BatchGetSessionsRequest, BatchGetSessionsResponse>(
       SESSION_BATCH_GET_METHOD,
       { parse: parseBatchGetSessionsRequest },
-      (ctx) => agent().batchGetSessions(ctx.params),
+      (ctx) => agent().batchGetSessions(ctx.params, ctx.signal),
     )
     .onRequest<ListSubscribeRequest, ListSubscribeResponse>(
       LIST_SUBSCRIBE_METHOD,

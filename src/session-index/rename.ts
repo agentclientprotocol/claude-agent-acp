@@ -1,6 +1,6 @@
 /**
- * Client renames of a session: `session/set_title` (v1 and v2) and AIR's
- * `_session/rename` (v1). Both cores call {@link renameSession}, which stores
+ * Client renames of a session: `session/set_title` and AIR's
+ * `_session/rename`, on v1 and v2. Both cores call {@link renameSession}, which stores
  * the title in every transcript of the session (see
  * {@link SessionIndexService.retitle}) and, for a session loaded on the
  * connection, makes it the client title that no generated title replaces.
