@@ -67,7 +67,25 @@ import { resolveInitialPermissionMode } from "../session-mode.js";
 import { cutAtRewindPoint, prepareRewoundResume } from "../session-rewind.js";
 import { sanitizeTitle } from "../session-titles.js";
 import { renameSession } from "../session-index/rename.js";
+import { isSessionId } from "../paths.js";
+import { V2SessionIndex } from "./session-index.js";
 import {
+  LIST_CHANGES_METHOD,
+  LIST_SUBSCRIBE_METHOD,
+  LIST_UNSUBSCRIBE_METHOD,
+  parseListSubscribeRequest,
+  parseListUnsubscribeRequest,
+  type ListSubscribeRequest,
+  type ListSubscribeResponse,
+  type ListUnsubscribeRequest,
+} from "../session-index/list-subscriptions.js";
+import {
+  SESSION_ARCHIVE_METHOD,
+  SESSION_UNARCHIVE_METHOD,
+  SESSION_RENAME_METHOD,
+  parseSessionIdRequest,
+  type SessionIdRequest,
+  type RenameSessionRequest,
   parseRenameSessionRequest,
   transcriptWriter,
   type SessionIndexService,
@@ -144,6 +162,31 @@ export function v2AgentApp(
       .onRequest(v2.methods.agent.session.resume, ({ params }) => agent.resumeSession(params))
       .onRequest(v2.methods.agent.session.fork, ({ params }) => agent.forkSession(params))
       .onRequest(v2.methods.agent.session.list, ({ params }) => agent.listSessions(params))
+      .onRequest<ListSubscribeRequest, ListSubscribeResponse>(
+        LIST_SUBSCRIBE_METHOD,
+        { parse: parseListSubscribeRequest },
+        ({ params }) => agent.sessionIndex.subscribeList(params),
+      )
+      .onRequest<ListUnsubscribeRequest, Record<string, never>>(
+        LIST_UNSUBSCRIBE_METHOD,
+        { parse: parseListUnsubscribeRequest },
+        ({ params }) => agent.sessionIndex.unsubscribeList(params),
+      )
+      .onRequest<RenameSessionRequest, Record<string, never>>(
+        SESSION_RENAME_METHOD,
+        { parse: parseRenameSessionRequest },
+        ({ params }) => agent.sessionIndex.rename(params),
+      )
+      .onRequest<SessionIdRequest, Record<string, never>>(
+        SESSION_ARCHIVE_METHOD,
+        { parse: parseSessionIdRequest },
+        ({ params }) => agent.sessionIndex.archive(params),
+      )
+      .onRequest<SessionIdRequest, Record<string, never>>(
+        SESSION_UNARCHIVE_METHOD,
+        { parse: parseSessionIdRequest },
+        ({ params }) => agent.sessionIndex.unarchive(params),
+      )
       .onRequest(v2.methods.agent.session.close, ({ params }) => agent.closeSession(params))
       .onRequest(v2.methods.agent.session.status, ({ params }) => agent.sessionStatus(params))
       .onRequest(v2.methods.agent.session.options, ({ params }) => agent.sessionOptions(params))
@@ -213,6 +256,7 @@ class V2Agent implements AgentHandle, SessionConnection {
   private readonly restarts: SessionRestarts;
   /** The transcript writes of `session/set_title`, made at its first call (see `transcriptWriter`). */
   private transcripts: SessionIndexService | undefined;
+  readonly sessionIndex: V2SessionIndex;
   /** What the client declared in `initialize`. */
   private clientCapabilities: v2.ClientCapabilities | null | undefined;
   /** The elicitation modes that the client advertised in `initialize`. */
@@ -228,6 +272,29 @@ class V2Agent implements AgentHandle, SessionConnection {
     /** Serves the client's `acp` MCP servers to Claude Code (see `mcp-servers.ts`). */
     private readonly mcp: McpOverAcp,
   ) {
+    this.sessionIndex = new V2SessionIndex({
+      logger,
+      ownSessionState: (id) => this.sessions.get(id)?.indexState(),
+      loaded: (id) => this.sessions.get(id)?.reports.retitled(),
+      settled: async (id) => {
+        await this.restarts.settled(id);
+        await this.setupSettled(id);
+      },
+      assertIdle: (id) => {
+        if (this.children.has(id)) throw restrictedChild(id, "change the index of");
+        this.sessions.get(id)?.assertIndexWritable();
+      },
+      close: (id) => this.closeRootSession({ sessionId: id }),
+      setTitle: (params) => this.setTitle(params),
+      send: (notification) => this.send(notification),
+      notify: (changes) => this.ctx.notify(LIST_CHANGES_METHOD, changes),
+      mutationEnded: (id) => this.sessions.get(id)?.indexMutationEnded(),
+      interrupt: (id) => this.sessions.get(id)?.cancel() ?? Promise.resolve(),
+      isUnwritten: (id) => this.sessions.get(id)?.isUnwritten() ?? false,
+      assertRoot: (id) => {
+        if (this.children.has(id)) throw restrictedChild(id, "change the index of");
+      },
+    });
     this.auth = new V2Auth(ctx, logger, {
       routeChanged: () => this.restarts.reroute(),
       probed: (kind) => this.guard.probed(kind),
@@ -262,6 +329,10 @@ class V2Agent implements AgentHandle, SessionConnection {
 
   /** Sends the update, after the `replay_complete` of a replay that holds it (see {@link heldBy}). */
   send(notification: v2.UpdateSessionNotification): void {
+    const kind = notification.update.sessionUpdate;
+    if (kind === "state_update" || kind === "session_info_update" || kind === "usage_update") {
+      this.sessionIndex.onOwnSessionChanged(notification.sessionId);
+    }
     // Before the client can name the child that a `subagent_update` announces.
     this.children.sending(notification);
     const send = () => {
@@ -275,6 +346,18 @@ class V2Agent implements AgentHandle, SessionConnection {
     const held = this.heldBy(notification.sessionId);
     if (held === undefined) send();
     else this.replays.defer(held, send, notification.sessionId);
+  }
+
+  isSessionIndexBusy(sessionId: string): boolean {
+    return this.sessionIndex.isMutating(sessionId);
+  }
+
+  clientTitle(title: string): string {
+    return this.sessionIndex.clientTitle(title);
+  }
+
+  sessionIndexChanged(sessionId: string): void {
+    this.sessionIndex.onOwnSessionChanged(sessionId);
   }
 
   /**
@@ -353,6 +436,7 @@ class V2Agent implements AgentHandle, SessionConnection {
   /** The session's query ended: a later `session/resume` starts it again from its transcript. */
   private stop(sessionId: string, reason: string | RequestError): void {
     this.sessions.delete(sessionId);
+    this.sessionIndex.onQueryFailed(sessionId);
     this.stopped.set(sessionId, reason);
     this.translator.forget(sessionId);
     this.auth.sessionEnded(sessionId);
@@ -372,6 +456,7 @@ class V2Agent implements AgentHandle, SessionConnection {
    */
   initialize(request: v2.InitializeRequest): v2.InitializeResponse {
     this.clientCapabilities = request.capabilities;
+    this.sessionIndex.initialize(request.capabilities);
     this.elicitation = {
       form: request.capabilities?.elicitation?.form != null,
       url: request.capabilities?.elicitation?.url != null,
@@ -382,7 +467,7 @@ class V2Agent implements AgentHandle, SessionConnection {
       update: clientTakesPromptSuggestions(request.capabilities?.session),
     };
     const { authMethods, auth, _meta } = this.auth.initialize(request.capabilities);
-    const airMeta = airInitializeMeta(this.air);
+    const airMeta = airInitializeMeta(this.air, ...this.sessionIndex.capabilities());
     return {
       ...(airMeta ? { _meta: airMeta } : {}),
       protocolVersion: v2.PROTOCOL_VERSION,
@@ -413,11 +498,16 @@ class V2Agent implements AgentHandle, SessionConnection {
    * files of the scenarios (`acp-scenarios-v2.test.ts`) hold it.
    */
   prompt(params: v2.PromptRequest, signal: AbortSignal): Promise<v2.PromptResponse> {
-    const prompt = () =>
-      this.session(params.sessionId, "prompt").prompt(params, signal, (query) =>
+    const prompt = () => {
+      // A restart can await network work before this input is delivered.
+      this.sessionIndex.assertAvailable(params.sessionId);
+      this.sessionIndex.onTurnStarted(params.sessionId);
+      return this.session(params.sessionId, "prompt").prompt(params, signal, (query) =>
         this.guard.beforePrompt(params.sessionId, query),
       );
+    };
     try {
+      this.sessionIndex.assertAvailable(params.sessionId);
       this.session(params.sessionId, "prompt");
       this.auth.promptStarted(params.sessionId);
       const restart = this.restarts.beforePrompt(params.sessionId);
@@ -443,7 +533,12 @@ class V2Agent implements AgentHandle, SessionConnection {
    * request's `configOptions` are set on the fork, over what the copy starts
    * with.
    */
-  async forkSession(params: v2.ForkSessionRequest): Promise<v2.ForkSessionResponse> {
+  forkSession(params: v2.ForkSessionRequest): Promise<v2.ForkSessionResponse> {
+    this.sessionIndex.assertAvailable(params.sessionId);
+    return this.sessionIndex.forking(params.sessionId, () => this.fork(params));
+  }
+
+  private async fork(params: v2.ForkSessionRequest): Promise<v2.ForkSessionResponse> {
     if (this.children.has(params.sessionId)) throw restrictedChild(params.sessionId, "fork");
     // Rejects bad `configOptions`, a bad `cwd` or MCP server before the transcript is copied.
     const initial = initialConfigRequests(params.sessionId, params.configOptions);
@@ -452,6 +547,7 @@ class V2Agent implements AgentHandle, SessionConnection {
       logger: this.logger,
       messageIdForGrouping,
     });
+    this.sessionIndex.onForkCreated(params.sessionId, sessionId);
     const session = await this.startSession(sessionId, params, sessionId);
     // The entries are the fork's: only the copy gave it its id.
     await session.setInitialConfigOptions(initial.map((entry) => ({ ...entry, sessionId })));
@@ -475,6 +571,7 @@ class V2Agent implements AgentHandle, SessionConnection {
    * `replay_complete`, and then what the session held.
    */
   resumeSession(params: v2.ResumeSessionRequest): Promise<v2.ResumeSessionResponse> {
+    this.sessionIndex.assertAvailable(params.sessionId);
     const { sessionId } = params;
     const run = this.resume(params);
     let runs = this.resuming.get(sessionId);
@@ -663,6 +760,8 @@ class V2Agent implements AgentHandle, SessionConnection {
   }
 
   async listSessions(params: v2.ListSessionsRequest): Promise<v2.ListSessionsResponse> {
+    const indexed = this.sessionIndex.list(params);
+    if (indexed) return indexed;
     if (params.cwd != null && !path.isAbsolute(params.cwd)) {
       throw RequestError.invalidParams({ cwd: params.cwd }, "cwd must be an absolute path");
     }
@@ -771,7 +870,13 @@ class V2Agent implements AgentHandle, SessionConnection {
   }
 
   /** Closing is idempotent: a session that is not active closes at once. */
-  async closeSession({ sessionId }: v2.CloseSessionRequest): Promise<v2.CloseSessionResponse> {
+  closeSession(params: v2.CloseSessionRequest): Promise<v2.CloseSessionResponse> {
+    return this.sessionIndex.mutate(params.sessionId, () => this.closeRootSession(params));
+  }
+
+  private async closeRootSession({
+    sessionId,
+  }: v2.CloseSessionRequest): Promise<v2.CloseSessionResponse> {
     if (this.children.has(sessionId)) throw restrictedChild(sessionId, "close");
     // A restart that runs ends first, so the close ends the session it started.
     await this.restarts.closing(sessionId);
@@ -793,16 +898,29 @@ class V2Agent implements AgentHandle, SessionConnection {
     // After the close's last updates, which name the session's children.
     this.children.rootClosed(sessionId);
     this.mcp.sessionClosed(sessionId);
+    this.sessionIndex.onTeardown(sessionId);
     return {};
   }
 
   /** Deleting a session that does not exist succeeds, as v2 asks. */
-  async deleteSession({ sessionId }: v2.DeleteSessionRequest): Promise<v2.DeleteSessionResponse> {
+  deleteSession(params: v2.DeleteSessionRequest): Promise<v2.DeleteSessionResponse> {
+    return this.sessionIndex.mutate(params.sessionId, () => this.deleteStoredSession(params));
+  }
+
+  private async deleteStoredSession({
+    sessionId,
+  }: v2.DeleteSessionRequest): Promise<v2.DeleteSessionResponse> {
     if (this.children.has(sessionId)) throw restrictedChild(sessionId, "delete");
     // A resume that runs, or its start, may make the session live.
     await this.setupSettled(sessionId);
     const live = this.sessions.get(sessionId);
-    if (live || this.stopped.has(sessionId)) await this.closeSession({ sessionId });
+    if (live || this.stopped.has(sessionId)) await this.closeRootSession({ sessionId });
+    if (this.sessionIndex.service) {
+      // v2 deletion is idempotent for a missing stored session too.
+      if (!isSessionId(sessionId)) return {};
+      await this.sessionIndex.service.delete(sessionId, true);
+      return {};
+    }
     try {
       // After a `session/set_title` of the session in flight.
       const remove = () => deleteSession(sessionId, live ? { dir: live.cwd } : undefined);
@@ -822,15 +940,23 @@ class V2Agent implements AgentHandle, SessionConnection {
    */
   async setTitle(params: v2.SetSessionTitleRequest): Promise<v2.SetSessionTitleResponse> {
     const request = parseRenameSessionRequest(params);
+    return this.sessionIndex.mutate(request.sessionId, () => this.retitle(request));
+  }
+
+  private async retitle(request: RenameSessionRequest): Promise<v2.SetSessionTitleResponse> {
     const { sessionId } = request;
     if (this.children.has(sessionId)) throw restrictedChild(sessionId, "retitle");
     // Renamed through the query that runs once a restart or resume settled.
     await this.restarts.settled(sessionId);
     await this.setupSettled(sessionId);
-    const writer = (this.transcripts ??= transcriptWriter(this.logger));
+    if (this.sessionIndex.service) this.sessions.get(sessionId)?.assertIndexWritable();
+    const writer =
+      this.sessionIndex.service ?? (this.transcripts ??= transcriptWriter(this.logger));
     for (;;) {
       const session = this.sessions.get(sessionId);
-      const title = await renameSession(writer, request, session?.reports.retitled());
+      const title = await renameSession(writer, request, session?.reports.retitled(), (title) =>
+        this.sessionIndex.clientTitle(title),
+      );
       // A restart or resume started another query of the session while the
       // rename ran: its CLI may hold the old title and write it back, so it
       // is renamed too. A session that only closed took the title already.
@@ -842,6 +968,7 @@ class V2Agent implements AgentHandle, SessionConnection {
   async setConfigOption(
     params: v2.SetSessionConfigOptionRequest,
   ): Promise<v2.SetSessionConfigOptionResponse> {
+    this.sessionIndex.assertAvailable(params.sessionId);
     // On the new query, when a restart runs.
     await this.restarts.settled(params.sessionId);
     const configOptions = await this.session(params.sessionId, "configure").setConfigOption(params);
@@ -909,6 +1036,8 @@ class V2Agent implements AgentHandle, SessionConnection {
   }
 
   async dispose(): Promise<void> {
+    this.sessionIndex.dispose();
+    this.transcripts?.dispose();
     await this.restarts.dispose();
     await Promise.all([...this.starting.keys()].map((sessionId) => this.startSettled(sessionId)));
     const sessions = [...this.sessions.values()];
@@ -1060,6 +1189,7 @@ class V2Agent implements AgentHandle, SessionConnection {
       mcpServersRefused: opened.mcpServersRefused,
     });
     this.sessions.set(sessionId, session);
+    this.sessionIndex.onOwnSessionChanged(sessionId);
     // The bridge hears of no server that the query started without.
     this.mcp.sessionStarted(sessionId, opened.mcpServersRefused ? [] : opened.request.mcpServers);
     this.stopped.delete(sessionId);

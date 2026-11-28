@@ -56,6 +56,7 @@ import type {
 import { AUTONOMOUS_RESULT_ORIGINS, isAbortedResult } from "../result-end.js";
 import { promptToClaude } from "../prompt-to-claude.js";
 import type { Logger } from "../logger.js";
+import type { OwnSessionState } from "../session-index/activity.js";
 import type { McpCommand } from "../mcp-command.js";
 import type { ElicitationSupport } from "../elicitation.js";
 import { Pushable } from "../utils.js";
@@ -96,6 +97,9 @@ import { SessionTasks, type RequestTarget, type RequestContext } from "./tasks.j
 
 /** What a session needs of its connection. */
 export interface SessionConnection {
+  isSessionIndexBusy(sessionId: string): boolean;
+  sessionIndexChanged(sessionId: string): void;
+  clientTitle(title: string): string;
   readonly logger: Logger;
   readonly translator: V2UpdateTranslator;
   /** The AIR extensions that the client takes, read at `initialize` (see `air.ts`). */
@@ -148,6 +152,9 @@ type McpServers = Parameters<Query["setMcpServers"]>[0];
 type CommandLifecycleFrame = { type: "command_lifecycle"; command_uuid: string; state: string };
 
 export class V2Session implements RequestTarget {
+  private lastTurnEndedAt?: number;
+  private lastTurnFailed = false;
+  private lastTotalCostUsd?: number;
   /** The prompts not inserted yet, by uuid. */
   private readonly pending = new Map<string, PendingPrompt>();
   /** Priority prompts whose reply still belongs to the open foreground work. */
@@ -279,9 +286,14 @@ export class V2Session implements RequestTarget {
       logger: connection.logger,
       promptSuggestions: connection.promptSuggestions,
       emit: (notifications) => this.output.emitV1(notifications),
-      isBusy: () => this.foreground || this.pending.size > 0 || this.requests.size > 0,
+      isBusy: () =>
+        this.foreground ||
+        this.pending.size > 0 ||
+        this.requests.size > 0 ||
+        connection.isSessionIndexBusy(sessionId),
       compact: () => this.compact(),
       titledSession: () => (this.query && !this.closed ? titled : undefined),
+      clientTitle: (title) => connection.clientTitle(title),
     });
     this.output.onAgentText = (content) => this.reports.agentText(content);
     this.fileChanges = TurnFileChanges.create(connection.air.fileChangeReport, {
@@ -471,6 +483,32 @@ export class V2Session implements RequestTarget {
     return this.background.snapshot(this.sessionId, this.foregroundState());
   }
 
+  indexState(): OwnSessionState {
+    return {
+      state: this.foregroundState(),
+      lastTurnEndedAt: this.lastTurnEndedAt,
+      lastTurnFailed: this.lastTurnFailed,
+      costUsd: this.lastTotalCostUsd,
+    };
+  }
+
+  isUnwritten(): boolean {
+    return !this.closed && !this.hasHistory;
+  }
+
+  assertIndexWritable(): void {
+    if (this.foreground || this.pending.size > 0 || this.requests.size > 0) {
+      throw RequestError.invalidRequest(
+        { sessionId: this.sessionId },
+        "Claude is working. Try again when the turn ends.",
+      );
+    }
+  }
+
+  indexMutationEnded(): void {
+    this.checkBoundary();
+  }
+
   /**
    * Replaces the session's MCP servers, as a resume of the active session
    * asks. The same servers stay as they are, connected. `unserved` are the
@@ -646,6 +684,7 @@ export class V2Session implements RequestTarget {
    */
   atTurnBoundary(restart: boolean): boolean {
     return (
+      !this.connection.isSessionIndexBusy(this.sessionId) &&
       !this.closed &&
       !this.foreground &&
       ![...this.pending.values()].some((prompt) => restart || prompt.pushed) &&
@@ -1384,6 +1423,8 @@ export class V2Session implements RequestTarget {
       this.fastModeReported(message, "result");
     }
     this.reports.result(message);
+    this.lastTotalCostUsd = message.total_cost_usd;
+    this.connection.sessionIndexChanged(this.sessionId);
     // Before the result's text below, which can repeat the failed request's.
     this.reportApiError(end);
     // The turn goes on in a fresh context (see `ClearContext`).
@@ -1558,6 +1599,7 @@ export class V2Session implements RequestTarget {
     }
     if (this.foreground) return;
     this.foreground = true;
+    this.lastTurnFailed = false;
     this.lastEnd = undefined;
     this.reportState();
   }
@@ -1588,6 +1630,10 @@ export class V2Session implements RequestTarget {
     this.elicitations.turnEnded();
     this.fileChanges?.turnClosed(cancelled);
     this.foreground = false;
+    this.lastTurnEndedAt = Date.now();
+    this.lastTurnFailed =
+      idleOutcome(this.lastEnd, this.cancelledWork, this.turnReport, this.turnCommand !== undefined)
+        .stopReason === "error";
     this.reportState();
     this.cancelledWork = false;
     this.output.cancelled = false;

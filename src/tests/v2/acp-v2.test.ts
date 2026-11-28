@@ -4,7 +4,7 @@
  * against the v2 schema before the SDK handles them.
  */
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -14,6 +14,7 @@ import {
   forkSession,
   getSessionInfo,
   getSessionMessages,
+  deleteSession,
   type McpHttpServerConfig,
   type Options,
   type SDKUserMessage,
@@ -38,11 +39,15 @@ import {
   v2ConfigOptions,
 } from "../../v2/session-requests.js";
 import { encodeProjectPath } from "../../session-index/project-dirs.js";
+import { LIST_CHANGES_METHOD, type ListChanges } from "../../session-index/list-subscriptions.js";
 import {
   claudeCodeMcpRequest,
   runMcpToolHooks,
   setModelRefusal,
   startupFailure,
+  transcriptUser,
+  transcriptAssistant,
+  writeTranscript,
 } from "../helpers.js";
 import packageJson from "../../../package.json" with { type: "json" };
 
@@ -292,6 +297,7 @@ function v2Client({
   /** The `auth/status_update` notifications. */
   const acpAuthUpdates: v2.AuthStatusUpdateNotification[] = [];
   const sessionUpdates: v2.UpdateSessionNotification[] = [];
+  const listChanges: ListChanges[] = [];
   const elicitations: v2.CreateElicitationRequest[] = [];
   const completedElicitations: v2.CompleteElicitationNotification[] = [];
   const permissionRequests: v2.RequestPermissionRequest[] = [];
@@ -325,6 +331,13 @@ function v2Client({
     .onNotification(v2.methods.client.session.update, ({ params }) => {
       sessionUpdates.push(params);
     })
+    .onNotification(
+      LIST_CHANGES_METHOD,
+      (params) => params as ListChanges,
+      ({ params }) => {
+        listChanges.push(params);
+      },
+    )
     .onRequest(v2.methods.client.elicitation.create, ({ params, signal }) => {
       elicitations.push(params);
       recordCancel(v2.methods.client.elicitation.create, signal);
@@ -361,6 +374,7 @@ function v2Client({
     authUpdate,
     acpAuthUpdates,
     sessionUpdates,
+    listChanges,
     updates,
     elicitations,
     completedElicitations,
@@ -532,6 +546,388 @@ const SESSION_COMMANDS: v2.AvailableCommand[] = [
 ];
 
 describe("ACP v2 sessions", () => {
+  describe("sessionIndex", () => {
+    const indexClient = {
+      _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionIndex"] } } },
+    };
+    const listMeta = (list: object) => ({ jetbrains: { air: { list } } });
+    const fields = (row: v2.SessionInfo) => (row._meta as any).jetbrains.air;
+    async function stored(
+      prompt: string,
+      at = Date.now(),
+      sessionId: string = randomUUID(),
+      workspace?: string,
+    ) {
+      const directory = workspace ?? (await realpath(cwd));
+      const project = path.join(tempDir, "claude", "projects", encodeProjectPath(directory));
+      await writeTranscript(project, sessionId, [
+        {
+          cwd: directory,
+          timestamp: new Date(at).toISOString(),
+          ...transcriptUser(randomUUID(), prompt),
+        },
+        {
+          timestamp: new Date(at + 1).toISOString(),
+          ...transcriptAssistant(randomUUID(), "answer"),
+        },
+      ]);
+      return { sessionId, cwd: directory, file: path.join(project, `${sessionId}.jsonl`) };
+    }
+
+    it.each([false, true])(
+      "negotiates the index and its methods for declared=%s",
+      async (declared) => {
+        const client = v2Client();
+        await client.app.connectWith(connectRouter(), async (agent) => {
+          const response = await initializeV2(agent, declared ? indexClient : {});
+          const capabilities = (response._meta as any)?.jetbrains?.air?.capabilities ?? [];
+          if (declared) {
+            expect(capabilities).toEqual([
+              "agentFileChangeReport",
+              "recommendedValue",
+              "sessionIndex",
+              "sessionArchive",
+              "sessionRename",
+              "sessionListSubscribe",
+              "sessionWorktrees",
+            ]);
+          } else {
+            for (const [method, params] of [
+              ["_session/list/subscribe", { cwd }],
+              ["_session/list/unsubscribe", { subscriptionId: "missing" }],
+              ["_session/rename", { sessionId: randomUUID(), title: "Name" }],
+              ["_session/archive", { sessionId: randomUUID() }],
+              ["_session/unarchive", { sessionId: randomUUID() }],
+            ] as const)
+              await expect(agent.request(method, params)).rejects.toMatchObject({ code: -32601 });
+            expect(capabilities).not.toContain("sessionIndex");
+          }
+          await client.authUpdate(1);
+        });
+      },
+    );
+
+    it("pages indexed rows by activity and binds the cursor to its filters", async () => {
+      const first = await stored("older", Date.now() - 10_000);
+      const second = await stored("newer");
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent, indexClient);
+        const page = await agent.request(v2.methods.agent.session.list, {
+          cwd: first.cwd,
+          _meta: listMeta({ limit: 1 }),
+        });
+        expect(page.sessions.map((s) => s.sessionId)).toEqual([second.sessionId]);
+        expect(fields(page.sessions[0])).toMatchObject({
+          archived: false,
+          state: "idle",
+          model: "claude-opus-5",
+        });
+        const next = await agent.request(v2.methods.agent.session.list, {
+          cwd: first.cwd,
+          cursor: page.nextCursor,
+          _meta: listMeta({ limit: 1 }),
+        });
+        expect(next.sessions.map((s) => s.sessionId)).toEqual([first.sessionId]);
+        await expect(
+          agent.request(v2.methods.agent.session.list, {
+            cwd: first.cwd,
+            cursor: page.nextCursor,
+            _meta: listMeta({ archived: "all" }),
+          }),
+        ).rejects.toMatchObject({ code: -32602 });
+        expect(sdk.queryOptions).toEqual([]);
+        await client.authUpdate(1);
+      });
+    });
+
+    it("pushes renames, filters archives, and deletes every transcript copy", async () => {
+      const row = await stored("original");
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent, indexClient);
+        const { subscriptionId } = await agent.request<{ subscriptionId: string }>(
+          "_session/list/subscribe",
+          { cwd: row.cwd },
+        );
+        await agent.request("_session/rename", { sessionId: row.sessionId, title: "Renamed" });
+        await vi.waitFor(
+          () =>
+            expect(
+              client.listChanges.some(
+                (c) =>
+                  c.subscriptionId === subscriptionId &&
+                  c.sessions.some((s) => s.title === "Renamed"),
+              ),
+            ).toBe(true),
+          { timeout: 4000 },
+        );
+        await agent.request("_session/archive", { sessionId: row.sessionId });
+        expect(
+          (await agent.request(v2.methods.agent.session.list, { cwd: row.cwd })).sessions,
+        ).toEqual([]);
+        const archived = await agent.request(v2.methods.agent.session.list, {
+          cwd: row.cwd,
+          _meta: listMeta({ archived: "archived" }),
+        });
+        expect(archived.sessions[0].title).toBe("Renamed");
+        expect(fields(archived.sessions[0]).archived).toBe(true);
+        await agent.request("_session/unarchive", { sessionId: row.sessionId });
+        expect(
+          (await agent.request(v2.methods.agent.session.list, { cwd: row.cwd })).sessions[0].title,
+        ).toBe("Renamed");
+        await agent.request("_session/list/unsubscribe", { subscriptionId });
+        await agent.request("_session/list/unsubscribe", { subscriptionId });
+        const copy = await stored("copy", Date.now(), row.sessionId, path.join(row.cwd, "copy"));
+        const actual = await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
+          "@anthropic-ai/claude-agent-sdk",
+        );
+        await vi.mocked(deleteSession).withImplementation(actual.deleteSession, async () => {
+          await agent.request(v2.methods.agent.session.delete, { sessionId: row.sessionId });
+        });
+        for (const file of [row.file, copy.file])
+          await expect(readFile(file)).rejects.toMatchObject({ code: "ENOENT" });
+        await agent.request(v2.methods.agent.session.delete, { sessionId: row.sessionId });
+        await agent.request(v2.methods.agent.session.delete, { sessionId: "missing" });
+        await client.authUpdate(1);
+      });
+    });
+
+    it("reports live state, turn end, failure and cost from the v2 session", async () => {
+      const done = Promise.withResolvers<void>();
+      scriptTurns(async function* (options) {
+        await done.promise;
+        yield result(options, {
+          subtype: "error_during_execution",
+          is_error: true,
+          errors: ["failed"],
+          total_cost_usd: 1.25,
+        });
+      });
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent, indexClient);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        const row = await stored("state", Date.now(), sessionId);
+        const get = async () =>
+          fields(
+            (await agent.request(v2.methods.agent.session.list, { cwd: row.cwd })).sessions[0],
+          );
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("work") });
+        expect((await get()).state).toBe("running");
+        await expect(
+          agent.request("_session/rename", { sessionId, title: "Busy" }),
+        ).rejects.toMatchObject({ code: -32600 });
+        await expect(agent.request("_session/unarchive", { sessionId })).rejects.toMatchObject({
+          code: -32600,
+        });
+        done.resolve();
+        await vi.waitFor(() =>
+          expect(client.updates("state_update").some((u) => u.state === "idle")).toBe(true),
+        );
+        expect(await get()).toMatchObject({
+          state: "error",
+          lastTurnEndedAt: expect.any(String),
+          cost: { amount: 1.25, currency: "USD" },
+        });
+        await client.authUpdate(1);
+      });
+    });
+
+    it("blocks prompts and resume for the entire awaited rename, then archives a running session", async () => {
+      const running = Promise.withResolvers<void>();
+      scriptTurns(async function* (options) {
+        await running.promise;
+        yield result(options);
+      });
+      const renamed = Promise.withResolvers<void>();
+      const entered = Promise.withResolvers<void>();
+      sdk.renameSession = async () => {
+        entered.resolve();
+        await renamed.promise;
+      };
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent, indexClient);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        const row = await stored("active", Date.now(), sessionId);
+        const renaming = agent.request("_session/rename", { sessionId, title: "Name" });
+        await entered.promise;
+        await expect(
+          agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("wait") }),
+        ).rejects.toMatchObject({ code: -32600 });
+        await expect(
+          agent.request(v2.methods.agent.session.resume, { sessionId, cwd }),
+        ).rejects.toMatchObject({ code: -32600 });
+        renamed.resolve();
+        await renaming;
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("run") });
+        await agent.request("_session/archive", { sessionId });
+        running.resolve();
+        expect(
+          (await agent.request(v2.methods.agent.session.list, { cwd: row.cwd })).sessions,
+        ).toEqual([]);
+        expect((agents[0] as any).sessions.has(sessionId)).toBe(false);
+        await client.authUpdate(1);
+      });
+    });
+
+    it("holds a fork's list row until its response is delivered", async () => {
+      const source = await stored("source");
+      const forkId = randomUUID();
+      const starting = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const initialize = sdk.initializationResult;
+      sdk.initializationResult = async () => {
+        starting.resolve();
+        await release.promise;
+        return initialize();
+      };
+      vi.mocked(forkSession).mockImplementationOnce(async () => {
+        await stored("fork", Date.now(), forkId);
+        return { sessionId: forkId };
+      });
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent, indexClient);
+        await agent.request("_session/list/subscribe", { cwd: source.cwd });
+        const forked = agent.request(v2.methods.agent.session.fork, {
+          sessionId: source.sessionId,
+          cwd: source.cwd,
+        });
+        await starting.promise;
+        try {
+          const other = await stored("unrelated");
+          await vi.waitFor(
+            () =>
+              expect(
+                client.listChanges
+                  .flatMap((c) => c.sessions)
+                  .some((s) => s.sessionId === other.sessionId),
+              ).toBe(true),
+            { timeout: 4000 },
+          );
+          expect(
+            client.listChanges.flatMap((c) => c.sessions).some((s) => s.sessionId === forkId),
+          ).toBe(false);
+        } finally {
+          release.resolve();
+        }
+        expect((await forked).sessionId).toBe(forkId);
+        await vi.waitFor(
+          () =>
+            expect(
+              client.listChanges.flatMap((c) => c.sessions).some((s) => s.sessionId === forkId),
+            ).toBe(true),
+          { timeout: 4000 },
+        );
+        await client.authUpdate(1);
+      });
+    });
+
+    it("marks an exited query as failed until a new turn completes", async () => {
+      const exit = Promise.withResolvers<void>();
+      sdk.run = async function* () {
+        yield* [];
+        await exit.promise;
+        throw new Error("query failed");
+      };
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent, indexClient);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        const row = await stored("failure", Date.now(), sessionId);
+        exit.resolve();
+        await vi.waitFor(() => expect((agents[0] as any).sessions.has(sessionId)).toBe(false));
+        const get = async () =>
+          fields(
+            (await agent.request(v2.methods.agent.session.list, { cwd: row.cwd })).sessions[0],
+          );
+        expect((await get()).state).toBe("error");
+        scriptTurns(async function* (options) {
+          yield result(options);
+        });
+        await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("retry") });
+        await vi.waitFor(async () => expect((await get()).state).toBe("idle"));
+        await client.authUpdate(1);
+      });
+    });
+
+    it("publishes a resumed title without its archive prefix", async () => {
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent, indexClient);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        vi.mocked(getSessionInfo).mockResolvedValue({
+          sessionId,
+          summary: "[archived] Stored",
+          customTitle: "[archived] Stored",
+          cwd,
+          lastModified: Date.now(),
+        });
+        await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+        expect(client.updates("session_info_update").some((u) => u.title === "Stored")).toBe(true);
+        await client.authUpdate(1);
+      });
+    });
+
+    it("lets a restart finish an older turn before an indexed rename", async () => {
+      const starts = Promise.withResolvers<void>();
+      const finish = Promise.withResolvers<void>();
+      const initializing = Promise.withResolvers<void>();
+      const initialized = Promise.withResolvers<void>();
+      let queries = 0;
+      sdk.run = async function* (prompts, options) {
+        if (queries++ === 0) {
+          await starts.promise;
+          yield assistantText(options, "autonomous work");
+          await finish.promise;
+          yield result(options);
+        }
+        const input = prompts[Symbol.asyncIterator]();
+        while (!(await input.next()).done);
+      };
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent, indexClient);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await stored("waiting", Date.now(), sessionId);
+        const initialize = sdk.initializationResult;
+        sdk.initializationResult = async () => {
+          initializing.resolve();
+          await initialized.promise;
+          return initialize();
+        };
+        const resumed = agent.request(v2.methods.agent.session.resume, {
+          sessionId,
+          cwd,
+          additionalDirectories: [tempDir],
+        });
+        await initializing.promise;
+        const previous = v2Session(sessionId);
+        starts.resolve();
+        await vi.waitFor(() => expect(previous.foreground).toBe(true));
+        const renamed = agent.request("_session/rename", { sessionId, title: "After resume" });
+        try {
+          await vi.waitFor(() =>
+            expect((agents[0] as any).sessionIndex.mutations.has(sessionId)).toBe(true),
+          );
+          initialized.resolve();
+          await vi.waitFor(() => expect(previous.boundaryWaiters.length).toBeGreaterThan(0));
+        } finally {
+          initialized.resolve();
+          finish.resolve();
+        }
+        await Promise.all([resumed, renamed]);
+        expect(client.updates("session_info_update").some((u) => u.title === "After resume")).toBe(
+          true,
+        );
+        await client.authUpdate(1);
+      });
+    });
+  });
+
   it("creates a session with v2 MCP servers, config options, and commands", async () => {
     const client = v2Client();
     const response = await client.app.connectWith(connectRouter(), async (agent) => {

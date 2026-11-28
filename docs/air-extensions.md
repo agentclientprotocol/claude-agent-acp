@@ -157,6 +157,7 @@ The separate `_session/steering` request steers that turn.
 
 The v2 core (`src/v2/`) serves an AIR client only the extensions that ACP v2 does not cover.
 Its `initialize` response lists `agentFileChangeReport` and `recommendedValue`.
+It also serves [session index](#session-index) to clients that declare `sessionIndex`, including indexed lists, subscriptions, rename, archive and unarchive. The default v2 session list is unchanged for other clients.
 It also serves the [permission presentation](#permission-presentation), the [question custom answers](#question-custom-answers), the [predicted follow-up prompt](#predicted-follow-up-prompt), and [load replay end](#load-replay-end).
 The [agent file-change report](#agent-file-change-report) goes out at the end of the turn that serves the prompt, before the turn's idle `state_update`, because a v2 `session/prompt` is answered when Claude Code takes the prompt in.
 ACP v2 covers subagents, background work, plans, patches, compaction, the system prompt, and turn failures itself, so the v2 core serves no `nativeSubagentSessions`, `backgroundSubagents`, `asyncTasks`, `planFile`, `diffPatch`, `contextCompaction`, `customInstructions`, or `sessionFailure`.
@@ -1393,13 +1394,14 @@ The session index makes `session/list` a bounded, ordered page with row metadata
 ### Activation
 
 AIR declares `sessionIndex` in `_meta.jetbrains.air.capabilities`.
-Unlike the other capabilities, the agent advertises `sessionIndex` only to a client that declared it, and never under ACP v2.
-Exactly when it advertises `sessionIndex`, the agent also advertises `sessionBatchGet` (it supports `_session/batch_get`), `sessionArchive` (it supports `_session/archive` and `_session/unarchive`), `sessionRename` (it supports `_session/rename`), `sessionListSubscribe` (it supports `_session/list/subscribe` and `_session/list/unsubscribe`) and `sessionWorktrees` (rows carry `agentWorktree`, see [List response](#list-response)).
-The client does not declare these five; declaring them without `sessionIndex` enables nothing.
+The agent advertises `sessionIndex` only to a client that declared it, on ACP v1 and v2.
+Exactly when it advertises `sessionIndex`, the agent also advertises `sessionArchive` (it supports `_session/archive` and `_session/unarchive`), `sessionRename` (it supports `_session/rename`), `sessionListSubscribe` (it supports `_session/list/subscribe` and `_session/list/unsubscribe`) and `sessionWorktrees` (rows carry `agentWorktree`, see [List response](#list-response)). On ACP v1 it also advertises `sessionBatchGet` (it supports `_session/batch_get`).
+The client does not declare these capabilities; declaring them without `sessionIndex` enables nothing.
 Everything in this section applies only to such a client, except where [Delete and close](#delete-and-close) says otherwise.
 A client without the capability gets the `session/list` of before: the SDK `listSessions` call, pages of 1000 by file mtime, `offset:N` cursors, and no row `_meta`.
 It gets no new notification, and the adapter starts no watcher for it.
 The new methods answer it with `-32601`.
+On v2, rename and unarchive of an open session are refused while a turn or input request is pending. While an indexed rename, archive, unarchive, close or delete is in flight, new prompt, resume and index mutation requests for that session are refused with `-32600`; retry after that request ends. Archive interrupts and closes an open session, as on v1.
 
 ### List request
 
@@ -1496,7 +1498,7 @@ Each row carries `_meta.jetbrains.air` with flat row fields of the RFDs. `archiv
 
 `_session/rename { "sessionId": "…", "title": "…" }` returns `{}`.
 
-ACP's `session/set_title` renames the same way for every client, on v1 and v2, without `sessionIndex`, and returns `{ "title": "…" }`: the title as `session/list` shows it to the client. On v1 an AIR client gets it without the archive prefix, and every other client, and every v2 client, with it.
+ACP's `session/set_title` renames the same way for every client, on v1 and v2, without requiring `sessionIndex`, and returns `{ "title": "…" }`: the title as `session/list` shows it to the client. An AIR v1 client and a v2 `sessionIndex` client get it without the archive prefix; other clients get the stored title with its prefix.
 
 - A blank title is `-32602`. The adapter collapses whitespace and keeps the first 200 characters, trimmed, as the CLI does. An `[archived] ` prefix of the requested title is dropped: a rename never changes the archive state.
 - The title is stored as the title records of [Archive](#archive): a `custom-title` and an `agent-name` record. An archived session keeps its `[archived] ` prefix (and the title is cut to 200 characters with it), so a rename does not unarchive it.
@@ -1708,7 +1710,7 @@ It is idempotent, and an unknown id also returns `{}`.
 
 `session/delete`:
 
-- a `sessionIndex` client: deletes every transcript of the session (empty ones too) and every `<sessionId>/` directory, also one left without a transcript by an earlier failed delete. Anything left behind fails the request. A session that runs here is closed first. As with the CLI, the session is deleted also when another Claude Code process has it open. An unknown session is `-32002`.
+- a `sessionIndex` client: deletes every transcript of the session (empty ones too) and every `<sessionId>/` directory, also one left without a transcript by an earlier failed delete. Anything left behind fails the request. A session that runs here is closed first. As with the CLI, the session is deleted also when another Claude Code process has it open. An unknown session is `-32002` on v1; v2 deletion is idempotent and succeeds for a missing session.
 - an AIR client without `sessionIndex`: archives the session instead of deleting it (the title records of [Archive](#archive)), because AIR uses delete for "Done" and can reopen the session. A session that runs here is closed first. The list hides archived sessions from such a client too: those whose custom title, as the SDK list reports it, is archived. A session without a transcript has nothing to archive, so the delete succeeds, as ACP asks of a session that does not exist.
   A `sessionIndex` client sees such a session as archived (`archived: true`), as AIR's native Claude path does.
 - any other client: the SDK delete. A session without a transcript (unknown, deleted before, or
