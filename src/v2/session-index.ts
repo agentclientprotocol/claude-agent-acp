@@ -43,6 +43,11 @@ export class V2SessionIndex extends SessionIndexConnection {
     (id) => this.ownSessionState(id),
   );
 
+  initialize(capabilities: unknown): void {
+    super.initialize(capabilities);
+    this.batches.negotiate(capabilities);
+  }
+
   capabilities(): string[] {
     return super.capabilities(...this.batches.capabilities());
   }

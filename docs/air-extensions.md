@@ -143,7 +143,7 @@ The `initialize` response of an AIR client carries the agent side of the extensi
 }
 ```
 
-The agent list does not depend on the capabilities that AIR declares, except `sessionIndex`: the agent lists it, together with `sessionBatchGet`, `sessionArchive`, `sessionRename`, `sessionListSubscribe` and `sessionWorktrees`, only for a client that declared `sessionIndex`.
+The agent list does not depend on the capabilities that AIR declares, except `sessionIndex` and `sessionTranscriptText`: the agent lists `sessionIndex`, together with `sessionBatchGet`, `sessionArchive`, `sessionRename`, `sessionListSubscribe` and `sessionWorktrees`, only for a client that declared `sessionIndex`. It also lists `sessionTranscriptText` when that client declared it.
 An extension is active only when the client declared its capability. The client does not declare `sessionBatchGet`, `sessionArchive`, `sessionRename`, `sessionListSubscribe` and `sessionWorktrees`.
 The response to a client that is not AIR has no `_meta.jetbrains` key.
 
@@ -177,6 +177,7 @@ It does not serve the [tool call contract](#tool-call-contract) yet.
 | `backgroundSubagents`    | yes                 | Ends a prompt turn at its result while background subagents still run.                                          | [Background subagents](#background-subagents)           |
 | `sessionIndex`           | on request          | Pages, orders and annotates `session/list`; adds rename, archive and a list subscription.                       | [Session index](#session-index)                         |
 | `sessionBatchGet`        | with `sessionIndex` | Supports `_session/batch_get` for metadata of known session IDs.                                                | [Batch get](#batch-get)                                 |
+| `sessionTranscriptText`  | on request          | Adds saved transcript revisions and text to `_session/batch_get`; requires `sessionIndex`.                      | [Transcript text](#transcript-text)                     |
 | `sessionArchive`         | with `sessionIndex` | Nothing on its own: the agent lists it to tell that it supports `_session/archive` and `_session/unarchive`.    | [Archive](#archive)                                     |
 | `sessionRename`          | with `sessionIndex` | Nothing on its own: the agent lists it to tell that it supports `_session/rename`.                              | [Rename](#rename)                                       |
 | `sessionListSubscribe`   | with `sessionIndex` | Nothing on its own: the agent lists it to tell that it supports `_session/list/subscribe`.                      | [List subscription](#list-subscription)                 |
@@ -1625,10 +1626,18 @@ scope explicitly.
 
 #### Transcript text
 
-An ACP 1 client declares `sessionTranscriptText` with `sessionIndex` in
+An ACP v1 client declares `sessionTranscriptText` with `sessionIndex` in
 `initialize.params.clientCapabilities._meta.jetbrains.air.capabilities`.
 The agent returns `sessionTranscriptText` with its index capabilities when it
 supports the extension.
+
+An ACP v2 client declares the same two capabilities in
+`initialize.params.capabilities._meta.jetbrains.air.capabilities`.
+On both protocols, `sessionIndex` enables `_session/batch_get` and advertises
+`sessionBatchGet`; declaring `sessionTranscriptText` with it enables the text
+selectors below. Declaring `sessionTranscriptText` alone enables neither the
+index nor `_session/batch_get`. The request and response are the same on both
+protocols.
 
 The selector `_meta.jetbrains.air.include` is exactly one string: `transcriptRevision` or `transcriptTextSnapshot`.
 An extended batch read takes one ID from a listed row and the `cwd` of that row.

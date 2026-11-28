@@ -549,6 +549,46 @@ const SESSION_COMMANDS: v2.AvailableCommand[] = [
 describe("ACP v2 sessions", () => {
   describe("sessionIndex", () => {
     describe("_session/batch_get", () => {
+      it("returns negotiated transcript text without opening a session", async () => {
+        const row = await stored("saved question");
+        const client = v2Client();
+        const actual = await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
+          "@anthropic-ai/claude-agent-sdk",
+        );
+        await vi.mocked(getSessionMessages).withImplementation(actual.getSessionMessages, () =>
+          client.app.connectWith(connectRouter(), async (agent) => {
+            const response = await initializeV2(agent, {
+              _meta: {
+                jetbrains: {
+                  air: { version: 1, capabilities: ["sessionIndex", "sessionTranscriptText"] },
+                },
+              },
+            });
+            expect((response._meta as any).jetbrains.air.capabilities).toEqual(
+              expect.arrayContaining(["sessionIndex", "sessionBatchGet", "sessionTranscriptText"]),
+            );
+            const read = async (include?: "transcriptRevision" | "transcriptTextSnapshot") => {
+              const result = await agent.request<BatchGetSessionsResponse>("_session/batch_get", {
+                sessionIds: [row.sessionId],
+                ...(include && { _meta: { jetbrains: { air: { include, cwd: row.cwd } } } }),
+              });
+              return (result.sessions[0]?._meta as any)?.jetbrains.air.transcriptTextSnapshot;
+            };
+            expect(await read()).toBeUndefined();
+            const { revision } = await read("transcriptRevision");
+            expect(await read("transcriptTextSnapshot")).toEqual({
+              revision,
+              messages: [
+                { role: "user", text: "saved question" },
+                { role: "assistant", text: "answer" },
+              ],
+              truncated: false,
+            });
+            expect(sdk.queryOptions).toEqual([]);
+            await client.authUpdate(1);
+          }),
+        );
+      });
       it.each([{ names: [] }, { names: ["sessionTranscriptText"] }, { names: ["sessionIndex"] }])(
         "requires the index for $names",
         async ({ names }) => {
