@@ -8,7 +8,6 @@
  */
 
 import {
-  RequestError,
   type AgentApp,
   type DeleteSessionRequest,
   type DeleteSessionResponse,
@@ -19,12 +18,8 @@ import {
 import type { Session } from "./acp-agent.js";
 import type { AcpClient } from "../acp-client.js";
 import type { Logger } from "../logger.js";
-import {
-  AIR_SESSION_BATCH_GET_CAPABILITY,
-  AIR_SESSION_TRANSCRIPT_TEXT_CAPABILITY,
-  clientSupportsAirCapability,
-  withAirMeta,
-} from "../air-extension.js";
+import { withAirMeta } from "../air-extension.js";
+import { SessionBatchGetConnection } from "../session-index/batch-get.js";
 import { SessionIndexConnection as SharedSessionIndexConnection } from "../session-index/connection.js";
 import { archiveSession } from "../session-index/archive.js";
 import { isArchivedTitle, visibleTitle } from "../session-index/archive-title.js";
@@ -104,7 +99,10 @@ export type SessionIndexHost = {
 type EmptyResponse = Record<string, never>;
 
 export class SessionIndexConnection extends SharedSessionIndexConnection {
-  private clientAdvertisedSessionTranscriptText = false;
+  private readonly batches = new SessionBatchGetConnection(
+    () => this.service,
+    (id) => this.ownSessionState(id),
+  );
   private transcripts?: SessionIndexService;
 
   constructor(private readonly host: SessionIndexHost) {
@@ -127,10 +125,7 @@ export class SessionIndexConnection extends SharedSessionIndexConnection {
   }
 
   negotiate(request: InitializeRequest): void {
-    this.clientAdvertisedSessionTranscriptText = clientSupportsAirCapability(
-      request.clientCapabilities,
-      AIR_SESSION_TRANSCRIPT_TEXT_CAPABILITY,
-    );
+    this.batches.negotiate(request.clientCapabilities);
     this.initialize(request.clientCapabilities);
   }
 
@@ -145,26 +140,14 @@ export class SessionIndexConnection extends SharedSessionIndexConnection {
    *  itself, batch get, archive, rename, the list subscription and the `agentWorktree`
    *  row field, all only to a client that declared `sessionIndex`. */
   capabilities(): string[] {
-    return super.capabilities(
-      AIR_SESSION_BATCH_GET_CAPABILITY,
-      ...(this.clientAdvertisedSessionTranscriptText
-        ? [AIR_SESSION_TRANSCRIPT_TEXT_CAPABILITY]
-        : []),
-    );
+    return super.capabilities(...this.batches.capabilities());
   }
 
   batchGet(
     params: BatchGetSessionsRequest,
     signal?: AbortSignal,
   ): Promise<BatchGetSessionsResponse> {
-    const service = this.requireService(SESSION_BATCH_GET_METHOD);
-    if (params.transcriptText && !this.clientAdvertisedSessionTranscriptText) {
-      throw RequestError.invalidParams(
-        undefined,
-        "Declare sessionTranscriptText in initialize first",
-      );
-    }
-    return service.batchGet(params, (sessionId) => this.ownSessionState(sessionId), signal);
+    return this.batches.batchGet(params, signal);
   }
 
   /** An AIR client archives with session/delete (see {@link deleteSession}):

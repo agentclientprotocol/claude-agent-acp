@@ -1,4 +1,6 @@
 /** The ACP v2 lifecycle around the shared AIR session index. */
+import { SessionBatchGetConnection } from "../session-index/batch-get.js";
+import type { BatchGetSessionsRequest } from "../session-index/service.js";
 import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { Logger } from "../logger.js";
@@ -36,6 +38,19 @@ type IndexHost = {
 };
 
 export class V2SessionIndex extends SessionIndexConnection {
+  private readonly batches = new SessionBatchGetConnection(
+    () => this.service,
+    (id) => this.ownSessionState(id),
+  );
+
+  capabilities(): string[] {
+    return super.capabilities(...this.batches.capabilities());
+  }
+
+  batchGet(params: BatchGetSessionsRequest, signal?: AbortSignal) {
+    return this.batches.batchGet(params, signal);
+  }
+
   private readonly mutations = new Map<string, "waiting" | "writing">();
 
   constructor(private readonly host: IndexHost) {

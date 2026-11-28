@@ -81,6 +81,10 @@ import {
 } from "../session-index/list-subscriptions.js";
 import {
   SESSION_ARCHIVE_METHOD,
+  SESSION_BATCH_GET_METHOD,
+  parseBatchGetSessionsRequest,
+  type BatchGetSessionsRequest,
+  type BatchGetSessionsResponse,
   SESSION_UNARCHIVE_METHOD,
   SESSION_RENAME_METHOD,
   parseSessionIdRequest,
@@ -162,6 +166,11 @@ export function v2AgentApp(
       .onRequest(v2.methods.agent.session.resume, ({ params }) => agent.resumeSession(params))
       .onRequest(v2.methods.agent.session.fork, ({ params }) => agent.forkSession(params))
       .onRequest(v2.methods.agent.session.list, ({ params }) => agent.listSessions(params))
+      .onRequest<BatchGetSessionsRequest, BatchGetSessionsResponse>(
+        SESSION_BATCH_GET_METHOD,
+        { parse: parseBatchGetSessionsRequest },
+        ({ params, signal }) => agent.sessionIndex.batchGet(params, signal),
+      )
       .onRequest<ListSubscribeRequest, ListSubscribeResponse>(
         LIST_SUBSCRIBE_METHOD,
         { parse: parseListSubscribeRequest },

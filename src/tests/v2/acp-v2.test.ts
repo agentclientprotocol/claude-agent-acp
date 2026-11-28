@@ -40,6 +40,7 @@ import {
 } from "../../v2/session-requests.js";
 import { encodeProjectPath } from "../../session-index/project-dirs.js";
 import { LIST_CHANGES_METHOD, type ListChanges } from "../../session-index/list-subscriptions.js";
+import type { BatchGetSessionsResponse } from "../../session-index/service.js";
 import {
   claudeCodeMcpRequest,
   runMcpToolHooks,
@@ -547,6 +548,60 @@ const SESSION_COMMANDS: v2.AvailableCommand[] = [
 
 describe("ACP v2 sessions", () => {
   describe("sessionIndex", () => {
+    describe("_session/batch_get", () => {
+      it.each([{ names: [] }, { names: ["sessionTranscriptText"] }, { names: ["sessionIndex"] }])(
+        "requires the index for $names",
+        async ({ names }) => {
+          const client = v2Client();
+          await client.app.connectWith(connectRouter(), async (agent) => {
+            const response = await initializeV2(agent, {
+              _meta: { jetbrains: { air: { version: 1, capabilities: names } } },
+            });
+            const capabilities = (response._meta as any).jetbrains.air.capabilities;
+            if (names.includes("sessionIndex")) {
+              expect(capabilities).toContain("sessionBatchGet");
+              expect(capabilities).not.toContain("sessionTranscriptText");
+              expect(await agent.request("_session/batch_get", { sessionIds: [] })).toEqual({
+                sessions: [],
+              });
+              await expect(
+                agent.request("_session/batch_get", {
+                  sessionIds: [randomUUID()],
+                  _meta: { jetbrains: { air: { include: "transcriptTextSnapshot", cwd } } },
+                }),
+              ).rejects.toMatchObject({ code: -32602 });
+            } else {
+              expect(capabilities).not.toContain("sessionBatchGet");
+              await expect(
+                agent.request("_session/batch_get", { sessionIds: [] }),
+              ).rejects.toMatchObject({ code: -32601 });
+            }
+            await client.authUpdate(1);
+          });
+        },
+      );
+
+      it("returns the same metadata as the indexed list", async () => {
+        const row = await stored("known");
+        const client = v2Client();
+        await client.app.connectWith(connectRouter(), async (agent) => {
+          await initializeV2(agent, indexClient);
+          const listed = await agent.request(v2.methods.agent.session.list, { cwd: row.cwd });
+          const batch = await agent.request<BatchGetSessionsResponse>("_session/batch_get", {
+            sessionIds: [row.sessionId, randomUUID()],
+          });
+          expect(batch.sessions).toEqual(listed.sessions);
+          expect(
+            (batch.sessions[0]._meta as any).jetbrains.air.transcriptTextSnapshot,
+          ).toBeUndefined();
+          await expect(
+            agent.request("_session/batch_get", { sessionIds: [row.sessionId, row.sessionId] }),
+          ).rejects.toMatchObject({ code: -32602 });
+          expect(sdk.queryOptions).toEqual([]);
+          await client.authUpdate(1);
+        });
+      });
+    });
     const indexClient = {
       _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionIndex"] } } },
     };
@@ -586,6 +641,7 @@ describe("ACP v2 sessions", () => {
               "agentFileChangeReport",
               "recommendedValue",
               "sessionIndex",
+              "sessionBatchGet",
               "sessionArchive",
               "sessionRename",
               "sessionListSubscribe",
